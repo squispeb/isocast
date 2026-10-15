@@ -62,8 +62,9 @@ const REPEATS_PER_CALL: u64 = 300;
 /// error that says why it died.
 const STDERR_TAIL: usize = 8 * 1024;
 /// How many sample blocks one track's writer thread may hold before its
-/// queue drops the new ones: about a second and a half at the engine's
-/// chunk size, so an encoder's hiccup costs samples rather than video.
+/// queue drops the new ones: about two and a half seconds at the
+/// engine's 10 ms chunk, so an encoder's hiccup costs samples rather
+/// than video.
 const AUDIO_QUEUE_DEPTH: usize = 256;
 /// How many bytes of pictures the video thread's queue may hold. The
 /// engine's packet loop must never wait for the child (the samples the
@@ -80,6 +81,14 @@ const VIDEO_QUEUE_FRAMES: std::ops::RangeInclusive<usize> = 2..=64;
 /// slow (a disk-bound encoder draining its backlog) keep putting bytes
 /// in, which resets this.
 const PIPE_STALL: Duration = Duration::from_secs(20);
+/// How long the stderr reader is given to reach a child's end once that
+/// child is gone: it is reading a pipe the child's exit closes, so this
+/// is a formality, not a wait.
+const STDERR_WAIT: Duration = Duration::from_secs(2);
+/// How long a child that is still alive is given to say its last words
+/// in an error message: it has said what it has said by then, and a
+/// take must not wait on a child that is still running.
+const STDERR_GLANCE: Duration = Duration::from_millis(250);
 /// How often the watchdog looks.
 const WATCHDOG_TICK: Duration = Duration::from_millis(100);
 
@@ -108,11 +117,14 @@ pub struct FfmpegFileWriter {
     watchdog: Option<thread::JoinHandle<()>>,
     /// Set when the watchdog is no longer wanted, so it can't outlive
     /// the child it watches (whose pid is reaped by `finish`/`cancel`).
-    stop_watchdog: Arc<AtomicBool>,
+    watchdog_stop: Arc<AtomicBool>,
     /// The child's stderr, drained by its own thread (a chatty encoder
     /// must not deadlock on a pipe nobody reads) and kept to its last
     /// words.
     stderr: Arc<Mutex<Vec<u8>>>,
+    /// Set when that thread has reached the child's end, so a reader can
+    /// be waited for without waiting for a child that is still running.
+    stderr_ended: Arc<AtomicBool>,
     reader: Option<thread::JoinHandle<()>>,
     /// The last picture written: its time and its bytes, what a later
     /// frame's gaps repeat and the tail repeats at Stop.
@@ -140,6 +152,40 @@ struct AudioPipe {
     /// `None` until the child starts and the thread takes the pipe.
     queue: Option<SyncSender<Vec<u8>>>,
     thread: Option<thread::JoinHandle<()>>,
+    /// Bytes of samples a full queue refused: the raw pipe carries no
+    /// timestamps, so dropping them would move every later sample
+    /// earlier, and they go in as silence ahead of the next block that
+    /// fits. The watchdog bounds this: a queue that stays full means a
+    /// write is in flight, and a wedged child is killed within
+    /// [`PIPE_STALL`].
+    owed: usize,
+}
+
+impl AudioPipe {
+    /// `samples` into this track's queue, with the silence it owes ahead
+    /// of them: `false` when the child isn't taking samples (they are
+    /// owed too, so the file's track keeps its length).
+    fn send_samples(&mut self, samples: &[f32]) -> bool {
+        let Some(queue) = self.queue.clone() else {
+            return false;
+        };
+        let bytes = f32_bytes(samples);
+        let owed = std::mem::take(&mut self.owed);
+        let mut block = Vec::with_capacity(owed + bytes.len());
+        block.resize(owed, 0);
+        block.extend_from_slice(bytes);
+        match queue.try_send(block) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
+                // Full: the child is behind. Disconnected: it is gone,
+                // which its exit status will report. Either way these
+                // samples are owed, and the ones after them keep their
+                // places.
+                self.owed = owed + bytes.len();
+                false
+            }
+        }
+    }
 }
 
 impl FfmpegFileWriter {
@@ -172,6 +218,7 @@ impl FfmpegFileWriter {
                     pending: Vec::new(),
                     queue: None,
                     thread: None,
+                    owed: 0,
                 })
                 .collect(),
             encoder: encoder.to_owned(),
@@ -182,8 +229,9 @@ impl FfmpegFileWriter {
             video_thread: None,
             progress: Arc::new(Progress::new()),
             watchdog: None,
-            stop_watchdog: Arc::new(AtomicBool::new(false)),
+            watchdog_stop: Arc::new(AtomicBool::new(false)),
             stderr: Arc::new(Mutex::new(Vec::new())),
+            stderr_ended: Arc::new(AtomicBool::new(false)),
             reader: None,
             last_pts: None,
             last_bytes: None,
@@ -394,6 +442,7 @@ impl FfmpegFileWriter {
             let _ = child.kill();
             let _ = child.wait();
             self.broken = true;
+            self.note_failure("ffmpeg has no stdin to feed the pictures into");
             return Err(anyhow!(
                 "ffmpeg for {} has no stdin to feed the pictures into",
                 self.spec.path.display()
@@ -415,10 +464,9 @@ impl FfmpegFileWriter {
                 let _ = child.kill();
                 let _ = child.wait();
                 self.broken = true;
-                return Err(anyhow!(
-                    "could not start {}'s video writer thread: {err}",
-                    self.spec.path.display()
-                ));
+                let why = format!("the video writer thread: {err}");
+                self.note_failure(&why);
+                return Err(anyhow!("could not start {why}"));
             }
         }
         // Each track's few kilobytes go in from a thread of its own too,
@@ -449,17 +497,29 @@ impl FfmpegFileWriter {
                     let _ = child.kill();
                     let _ = child.wait();
                     self.broken = true;
-                    return Err(anyhow!(
-                        "could not start audio track {index}'s writer thread: {err}"
-                    ));
+                    let why = format!("audio track {index}'s writer thread: {err}");
+                    self.note_failure(&why);
+                    return Err(anyhow!("could not start {why}"));
                 }
             }
         }
-        self.watchdog = start_watchdog(
+        self.watchdog = match start_watchdog(
             child.id(),
             self.progress.clone(),
-            self.stop_watchdog.clone(),
-        );
+            self.watchdog_stop.clone(),
+        ) {
+            Ok(watchdog) => Some(watchdog),
+            // Without it, a wedged encoder would hang the take for
+            // good: the child goes now, like the other failures here.
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                self.broken = true;
+                let why = format!("the encoder watchdog thread: {err}");
+                self.note_failure(&why);
+                return Err(anyhow!("could not start {why}"));
+            }
+        };
         self.child = Some(child);
         self.pixels = Some(pixels);
         // The samples that arrived before the child follow it in.
@@ -473,16 +533,14 @@ impl FfmpegFileWriter {
             if samples.is_empty() {
                 continue;
             }
-            let queued = f32_bytes(&samples).len();
-            let bytes = f32_bytes(&samples).to_vec();
-            if let Some(queue) = &self.audio[track].queue
-                && queue.try_send(bytes).is_err()
-            {
+            if !self.audio[track].send_samples(&samples) {
                 isocast_diagnostics::diagnostic!(
                     "warn";
-                    "{}: audio track {track} arrived with {queued} bytes before its first \
-                     picture, more than the queue holds: the excess is dropped",
-                    self.spec.path.display()
+                    "{}: audio track {track} arrived with {} bytes before its first \
+                     picture, more than the queue takes: the rest goes in as silence \
+                     with the next block that fits",
+                    self.spec.path.display(),
+                    f32_bytes(&samples).len()
                 );
             }
         }
@@ -500,27 +558,40 @@ impl FfmpegFileWriter {
 
     /// A picture's bytes into the video thread's queue: `Ok(false)` when
     /// the queue is full (the child is more than a beat behind, so the
-    /// picture is dropped whole — the previous one repeats for its
-    /// ticks) or when the thread is gone (the child died under it).
+    /// picture is dropped whole — the newest picture already queued
+    /// repeats for its ticks) or when the thread is gone (the child died
+    /// under it).
     fn queue_video(&mut self, bytes: &[u8]) -> Result<bool> {
         let Some(queue) = &self.video else {
             return Ok(false);
         };
-        Ok(matches!(queue.try_send(bytes.to_vec()), Ok(())))
+        Ok(queue.try_send(bytes.to_vec()).is_ok())
+    }
+
+    /// A picture into the queue, waiting for room: for the tail at Stop,
+    /// which must land for the file to reach its end. The watchdog is
+    /// still watching whoever calls this, so a wedged child ends the
+    /// wait rather than the take.
+    fn queue_video_waiting(&mut self, bytes: &[u8]) -> Result<bool> {
+        let Some(queue) = &self.video else {
+            return Ok(false);
+        };
+        Ok(queue.send(bytes.to_vec()).is_ok())
     }
 
     /// The encoder process ended, or one of its pipes broke: latch the
     /// file (every later append says dropped, so the engine counts
-    /// frames, not repeated errors), take its stderr's last words, and
-    /// say why it went.
+    /// frames, not repeated errors) and say why, with the last words
+    /// its stderr has reached.
     fn pipe_died(&mut self, why: impl std::fmt::Display) -> anyhow::Error {
         self.broken = true;
-        // The child may still be in its last breaths; its stderr holds
-        // the reason, and the reader ends at its end.
-        if let Some(child) = self.child.as_mut() {
-            let _ = child.try_wait();
-        }
-        self.drain_stderr();
+        // The child isn't waited for here: reaping it would free its pid
+        // while the watchdog may still be watching (the failing thread
+        // may have left a write blocked in another pipe, which only the
+        // watchdog can end), and this runs in the engine's packet loop,
+        // where no other file may wait either. What the encoder has said
+        // so far is the tail.
+        self.drain_stderr(STDERR_GLANCE);
         let tail = self.stderr_tail();
         anyhow!(
             "the ffmpeg encoder ended early writing {}: {why}; its last words: {tail}",
@@ -537,13 +608,39 @@ impl FfmpegFileWriter {
             .take()
     }
 
-    /// Wait for the stderr reader to reach the child's end, which it
-    /// can only be a moment behind: a broken pipe means the child's
-    /// fds are gone, and a finished child is gone or waited for.
-    fn drain_stderr(&mut self) {
-        if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
+    /// Put `why` in the failure slot (the first one wins), for the
+    /// `finish` that has no exit status to report: a file that never got
+    /// a child, or one whose stream stopped.
+    fn note_failure(&self, why: impl std::fmt::Display) {
+        record_why(&self.failure, &why.to_string());
+    }
+
+    /// No more kills: the watchdog is stopped and joined, so no tick can
+    /// outlive the child it watches. Every reap is preceded by this.
+    fn stop_watchdog(&mut self) {
+        self.watchdog_stop.store(true, Ordering::Release);
+        if let Some(watchdog) = self.watchdog.take() {
+            let _ = watchdog.join();
         }
+    }
+
+    /// Let the stderr reader reach the child's end, for at most `wait`:
+    /// a dead child's reader ends in a moment, a live one's hasn't, and
+    /// nothing here may wait on a child that is still running. The
+    /// handle is joined when the reader is done, and otherwise left to
+    /// end on its own.
+    fn drain_stderr(&mut self, wait: Duration) {
+        let Some(reader) = self.reader.take() else {
+            return;
+        };
+        let deadline = Instant::now() + wait;
+        while !self.stderr_ended.load(Ordering::Acquire) {
+            if Instant::now() >= deadline {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        let _ = reader.join();
     }
 
     /// What the encoder said last: its stderr, kept to its final
@@ -559,15 +656,16 @@ impl FfmpegFileWriter {
     /// writes its errors to a closed pipe.
     fn start_stderr_reader(&mut self, mut stderr: ChildStderr) {
         let tail = self.stderr.clone();
+        let ended = self.stderr_ended.clone();
         let reader = isocast_diagnostics::spawn(
             "ffmpeg stderr",
             move || {
                 let mut chunk = [0u8; 4096];
                 loop {
                     let read = match stderr.read(&mut chunk) {
-                        Ok(0) => return,
+                        Ok(0) => break,
                         Ok(read) => read,
-                        Err(_) => return,
+                        Err(_) => break,
                     };
                     let mut tail = tail.lock().expect("ffmpeg stderr tail poisoned");
                     tail.extend_from_slice(&chunk[..read]);
@@ -576,6 +674,7 @@ impl FfmpegFileWriter {
                         tail.drain(..excess);
                     }
                 }
+                ended.store(true, Ordering::Release);
             },
             |why| {
                 isocast_diagnostics::diagnostic!(
@@ -664,12 +763,19 @@ impl FileWriter for FfmpegFileWriter {
                     // Room ran out before the gap was covered: this
                     // frame is dropped whole rather than half of it
                     // going in (half a frame would shift every
-                    // following one).
+                    // following one), and takes the older picture's
+                    // place as what a later gap repeats — the newest
+                    // picture the encoder can be given is the one that
+                    // should stand in for the ticks, or a queue that is
+                    // always full by one would hold that old one there
+                    // for the rest of the take.
+                    self.last_bytes = Some(bytes);
                     return Ok(false);
                 }
             }
         }
         if !self.queue_video(&bytes)? {
+            self.last_bytes = Some(bytes);
             return Ok(false);
         }
         self.last_pts = Some(pts);
@@ -698,24 +804,21 @@ impl FileWriter for FfmpegFileWriter {
         if samples.is_empty() {
             return Ok(true);
         }
-        let bytes = f32_bytes(samples);
-        // The track's own thread writes it. A queue that is full means
-        // the child has stopped taking samples: they are dropped (and
-        // counted) rather than holding up this file's video.
-        match &pipe.queue {
-            Some(queue) => Ok(match queue.try_send(bytes.to_vec()) {
-                Ok(()) => true,
-                Err(TrySendError::Full(_)) => false,
-                // The thread is gone: the child died under it.
-                Err(TrySendError::Disconnected(_)) => false,
-            }),
-            None => Ok(false),
-        }
+        // The track's own thread writes it, with any silence it owes
+        // ahead of it. A queue that is full means the child has stopped
+        // taking samples: they are dropped (and counted) rather than
+        // holding up this file's video.
+        Ok(pipe.send_samples(samples))
     }
 
     fn finish(mut self, end: Time) -> Result<u64> {
         // Cover the tail: the last picture that arrived may be frames
-        // short of `end`, and the file should play up to its end.
+        // short of `end`, and the file should play up to its end. The
+        // padding waits for room rather than being skipped — a file
+        // whose video stops short of the audio the engine padded to
+        // `end` would end misaligned — while the watchdog is still
+        // watching, so a wedged encoder fails the file instead of the
+        // wait being forever.
         let fps = self.spec.video.fps;
         if !self.broken
             && let Some(last) = self.last_pts
@@ -727,39 +830,49 @@ impl FileWriter for FfmpegFileWriter {
                     .clone()
                     .expect("a written picture's bytes follow its time");
                 for _ in 0..missing {
-                    match self.queue_video(&again) {
+                    match self.queue_video_waiting(&again) {
                         Ok(true) => self.repeats += 1,
-                        // The tail is padding: an ended encoder is
-                        // reported by its exit status below, and a full
-                        // queue at Stop leaves the file short of its end.
+                        // The thread is gone: the child ended on its
+                        // own, and its exit status below says why.
                         _ => break,
                     }
                 }
             }
         }
         // EOF on every pipe: the child flushes and writes its trailer,
-        // and nothing kills it early — what it stored must stay. The
-        // streams' threads go first, each draining what it holds and
-        // closing its pipe, while the watchdog is still watching, so a
-        // child that stops taking bytes breaks them instead of blocking
-        // them.
+        // and nothing kills it early — what it stored must stay. Every
+        // sender goes before any thread is joined, or the two streams
+        // would wait for each other: ffmpeg's muxer holds the stream
+        // that is ahead (the engine has just padded audio to `end`)
+        // until the other reaches it, and each thread would wait for its
+        // peer's EOF. A dropped sender keeps the items already in its
+        // queue: the threads drain those, then close their pipes.
+        for pipe in &mut self.audio {
+            // Silence still owed for blocks the queue refused: the
+            // track must reach the end its video does.
+            if pipe.owed > 0 {
+                let _ = pipe.send_samples(&[]);
+            }
+        }
         for pipe in &mut self.audio {
             pipe.queue = None;
+        }
+        self.video = None;
+        for pipe in &mut self.audio {
             if let Some(thread) = pipe.thread.take() {
                 let _ = thread.join();
             }
         }
-        self.video = None;
         if let Some(thread) = self.video_thread.take() {
             let _ = thread.join();
         }
         // The child is this writer's alone from here: no stray kill may
         // land on a pid that was reaped and handed out again.
-        self.stop_watchdog.store(true, Ordering::Release);
-        if let Some(watchdog) = self.watchdog.take() {
-            let _ = watchdog.join();
-        }
+        self.stop_watchdog();
         let Some(mut child) = self.child.take() else {
+            if let Some(why) = self.stream_failure() {
+                bail!("{}: no file was written: {why}", self.spec.path.display());
+            }
             bail!(
                 "{}: finished without a frame ever arriving, so no file was written",
                 self.spec.path.display()
@@ -775,7 +888,7 @@ impl FileWriter for FfmpegFileWriter {
             }
             thread::sleep(Duration::from_millis(5));
         };
-        self.drain_stderr();
+        self.drain_stderr(STDERR_WAIT);
         let tail = self.stderr_tail();
         // A stream thread's own failure is the story the exit status
         // can't tell: its pipe closed early, so the child may still
@@ -817,27 +930,28 @@ impl FileWriter for FfmpegFileWriter {
     fn cancel(mut self) {
         // The take is abandoned: the process dies, the pipes close, and
         // what it began writing is removed — idempotently, since a
-        // child that never started may have made nothing at all. It
-        // dies first, so the streams' blocked writes break at once.
+        // child that never started may have made nothing at all. The
+        // watchdog goes first (it must never signal a pid this call
+        // reaps), then the child dies, so the streams' blocked writes
+        // break at once.
+        self.stop_watchdog();
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
         }
-        self.stop_watchdog.store(true, Ordering::Release);
         for pipe in &mut self.audio {
             pipe.queue = None;
+        }
+        self.video = None;
+        for pipe in &mut self.audio {
             if let Some(thread) = pipe.thread.take() {
                 let _ = thread.join();
             }
         }
-        self.video = None;
         if let Some(thread) = self.video_thread.take() {
             let _ = thread.join();
         }
-        if let Some(watchdog) = self.watchdog.take() {
-            let _ = watchdog.join();
-        }
-        self.drain_stderr();
+        self.drain_stderr(STDERR_WAIT);
         if let Err(err) = std::fs::remove_file(&self.spec.path)
             && err.kind() != std::io::ErrorKind::NotFound
         {
@@ -845,6 +959,16 @@ impl FileWriter for FfmpegFileWriter {
                 "warn"; "could not remove {}: {err}", self.spec.path.display()
             );
         }
+    }
+}
+
+impl Drop for FfmpegFileWriter {
+    /// A writer that was neither finished nor cancelled — a panic on the
+    /// thread that held it: the watchdog is stopped, so it can't signal
+    /// a pid this writer no longer owns. The child, if any, is left to
+    /// the engine's own cleanup (a dropped `Child` isn't killed).
+    fn drop(&mut self) {
+        self.stop_watchdog();
     }
 }
 
@@ -1094,9 +1218,14 @@ fn audio_writer(
 /// The first thing a stream thread's write failed with, for the writer
 /// to report (the child's exit status may say something else).
 fn record_failure(slot: &Mutex<Option<String>>, err: &std::io::Error) {
+    record_why(slot, &err.to_string());
+}
+
+/// The first reason recorded: later ones are consequences of the first.
+fn record_why(slot: &Mutex<Option<String>>, why: &str) {
     let mut slot = slot.lock().expect("the writer's failure slot is poisoned");
     if slot.is_none() {
-        *slot = Some(err.to_string());
+        *slot = Some(why.to_owned());
     }
 }
 
@@ -1156,7 +1285,7 @@ fn start_watchdog(
     pid: u32,
     progress: Arc<Progress>,
     stop: Arc<AtomicBool>,
-) -> Option<thread::JoinHandle<()>> {
+) -> std::io::Result<thread::JoinHandle<()>> {
     isocast_diagnostics::spawn(
         "encoder watchdog",
         move || {
@@ -1174,9 +1303,8 @@ fn start_watchdog(
                     );
                     // SAFETY: kill takes a pid and a signal and only
                     // reports whether it worked. The child can't have
-                    // been reaped (the writer holds it until its
-                    // `finish`/`cancel`, which both stop this thread
-                    // first), so the pid is still its own.
+                    // been reaped: every reap stops this thread and
+                    // joins it first (see `stop_watchdog`).
                     unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
                     return;
                 }
@@ -1184,7 +1312,6 @@ fn start_watchdog(
         },
         |why| isocast_diagnostics::diagnostic!("error"; "the encoder watchdog stopped: {why}"),
     )
-    .ok()
 }
 
 /// `bytes` into the pipe at `fd`, whole, blocking: each stream has a
@@ -1203,7 +1330,14 @@ fn write_item(fd: RawFd, bytes: &[u8], progress: &Progress) -> std::io::Result<(
 fn write_all(fd: RawFd, bytes: &[u8], progress: &Progress) -> std::io::Result<()> {
     let mut written = 0;
     while written < bytes.len() {
-        let took = write(fd, &bytes[written..])?;
+        // A signal mid-write (a timer, the pool's own threads) is not a
+        // broken pipe: retrying is what `write_all` does, and losing the
+        // frame instead would be a drop nobody asked for.
+        let took = match write(fd, &bytes[written..]) {
+            Ok(took) => took,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        };
         if took == 0 {
             return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
         }
@@ -1224,4 +1358,80 @@ fn write(fd: RawFd, bytes: &[u8]) -> std::io::Result<usize> {
         return Err(std::io::Error::last_os_error());
     }
     Ok(took as usize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A pipe with nothing behind it: what would take the blocks.
+    fn pipe(depth: usize) -> (AudioPipe, Receiver<Vec<u8>>) {
+        let (queue, blocks) = sync_channel(depth);
+        (
+            AudioPipe {
+                pending: Vec::new(),
+                queue: Some(queue),
+                thread: None,
+                owed: 0,
+            },
+            blocks,
+        )
+    }
+
+    /// The f32s in a block of raw sample bytes.
+    fn samples_of(bytes: &[u8]) -> Vec<f32> {
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|four| f32::from_ne_bytes(*four))
+            .collect()
+    }
+
+    /// A block a full queue refused is owed, and goes in as silence
+    /// ahead of the next block that fits: the raw pipe carries no
+    /// timestamps, so without that every later sample would move
+    /// earlier and the file's sound would drift out of sync with its
+    /// video for the rest of the take.
+    #[test]
+    fn refused_samples_are_owed_as_silence() {
+        let (mut pipe, blocks) = pipe(1);
+        assert!(pipe.send_samples(&[1.0, 2.0]), "the first block fits");
+        assert!(!pipe.send_samples(&[3.0, 4.0]), "the queue is full");
+        assert!(!pipe.send_samples(&[5.0, 6.0]), "still full");
+        assert_eq!(pipe.owed, 16, "two stereo f32 blocks are owed");
+
+        assert_eq!(
+            samples_of(&blocks.recv().expect("the first block")),
+            [1.0, 2.0]
+        );
+        assert!(pipe.send_samples(&[7.0, 8.0]), "room again");
+        let block = samples_of(&blocks.recv().expect("the block with its silence"));
+        assert_eq!(block[0..4], [0.0; 4], "the owed silence comes first");
+        assert_eq!(block[4..6], [7.0, 8.0]);
+        assert_eq!(pipe.owed, 0, "the debt is paid");
+    }
+
+    /// A track the child never takes keeps what it owes, so `finish`
+    /// can pay it with silence and reach the end its video does.
+    #[test]
+    fn owed_silence_survives_a_child_that_takes_nothing() {
+        let (mut pipe, blocks) = pipe(1);
+        assert!(pipe.send_samples(&[1.0]));
+        assert!(!pipe.send_samples(&[2.0]));
+        drop(blocks);
+        assert_eq!(pipe.owed, 4);
+        // No queue takes it now: the write failed, and the debt stands
+        // (the file is failing anyway, which its exit status reports).
+        assert!(!pipe.send_samples(&[]));
+        assert_eq!(pipe.owed, 4);
+    }
+
+    /// f32's bytes are the samples the engine handed over, native-endian
+    /// and in order.
+    #[test]
+    fn f32_bytes_are_the_samples_themselves() {
+        let samples = [1.5f32, -2.25, 0.0];
+        assert_eq!(samples_of(f32_bytes(&samples)), samples);
+    }
 }
