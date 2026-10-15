@@ -442,15 +442,25 @@ claude-opus-5-5 review corrections — trust that preamble over the doc's
 body until the body is rewritten); the WIP backend and its state at each
 step live in `docs/notes.md`'s "Linux port WIP" section.
 
-- [ ] **L.0 Backend skeleton (in progress, uncommitted).** A
+- [ ] **L.0 Backend skeleton (in progress).** A
   `isocast-platform-linux` crate behind the existing `Platform` trait:
   synthetic sources through a real FFmpeg-encoded file writer
   (fragmented MOV/MP4, NVENC first), heap pool frames with staged
   GPU copies, absolute clock waits, devices/secrets/volume/doctor
-  inputs, JPEG monitors. Done when `isocast record` writes a
-  synthetic-only take whose files `ffprobe` like the macOS ones, the
-  daemon, CLI and app build on Linux, and `cargo test` covers the
-  pool and the GPU upload/read-back cycle.
+  inputs, JPEG monitors.
+  - [x] **Crate green + daemon wired.** check/clippy/fmt/tests pass;
+    the daemon answers `isocast status --json` from scratch
+    (commits 829b422, 27be626).
+  - [x] **ISO gate.** An 8 s test-pattern + tone take stored 240/240
+    frames with zero drops, ffprobe-matching HEVC+AAC; kill -9 on
+    the process group kept 4.03 s decodable through the fragmented
+    MOV (commit 2b85ce3). The engine gains
+    `Platform::converts_own_inputs` (Linux's FFmpeg converts the
+    frames it takes itself).
+  - [ ] **Program (compositor) gate.** The composited-program take
+    stalls past its end: writer threads starve; per-frame GPU
+    conversion plus read-back plumbing needs rework before this
+    gate (findings in docs/notes.md, 2026-10-15 Linux port WIP).
 - [ ] **L.1 Devices, doctor, tune, media files.** `isocast devices`
   lists this box's displays (portal), windows (Hyprland), cameras
   (V4L2) and audio (PipeWire) with stable ids (node names, not

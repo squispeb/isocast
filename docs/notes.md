@@ -3,6 +3,34 @@
 Short, dated facts a future session needs. Newest entries go at the top of
 each section. Delete entries that stop being true.
 
+## Linux port progress (2026-10-15, delivered through M3)
+
+- **M1 landed (829b422)**: `isocast-platform-linux` compiles green
+  (check + clippy `-D warnings` + 3 unit tests + fmt) — writer,
+  uninhabited stream stubs, systems, keychain, pacing, jpeg; macOS
+  keeps exactly its previous wgpu feature set (verified via
+  `cargo tree --target aarch64-apple-darwin`, no `vulkan` edge).
+- **M2 landed (27be626)**: the daemon runs the engine on Linux
+  through the `HostPlatform` alias (`use … as MacPlatform`); the
+  macOS-only arms stay macOS-only, and the Linux dead-code lint
+  follows the repo's `cfg_attr(not(target_os = "macos"), allow(...))`
+  pattern with the milestone named. Clippy +
+  build green; scratch-socket `isocast status --json` answers.
+- **M3 landed (2b85ce3)**: the ISO gate passed (8 s synthetic take,
+  240/240 frames, ffprobe-matching HEVC+AAC, kill -9 retains 4.03 s
+  via fragmented MOV); the engine's `converts_own_inputs` toggles the
+  per-file Y'CbCr stage off for Linux, which unblocks the ISO path
+  without touching macOS's pipeline (its own convert continues to
+  run there).
+- **Open from the gate**: the composited-program take (see the WIP
+  findings below), and the app check that this session backgrounds
+  (`cargo check -p isocast-ui`, the Skia Linux build).
+- The secrets file is a deliberate plaintext 0600 file (`~/.isocast/secrets.json`):
+  doctor should flag it once the doctor work runs (the OS keyring is
+  L.5+; never log its value; keep per-report redaction covering it).
+
+## Environment
+
 ## Linux port WIP (2026-10-14, uncommitted)
 
 Ryan asked for the Omarchy port (this machine: 5800X + RTX 3060 Ti,
@@ -45,6 +73,12 @@ State on disk (NONE of it committed; the tree's committed state is clean):
 
 Decisions made (see also the doc's preamble):
 
+- Updated 2026-10-15: the crate now compiles and the milestones
+  landed as commits 829b422 (backend crate), 27be626 (daemon/CLI
+  wired over the `HostPlatform` alias), 2b85ce3 (the ISO gate and the
+  engine's `converts_own_inputs` seam). The remaining WIP is the
+  composited-program gate above and the app check.
+
 - **Frame**: heap pools + slot textures + staged copies (reviewer's
   contract gap #11). DMA-BUF later, and then `Gpu::new` needs the
   device-creation hook (finding #12).
@@ -58,9 +92,42 @@ Decisions made (see also the doc's preamble):
   from the frame kind) by spawning the child lazily; buffered audio
   samples flush after the spawn. Exactly-pts recording and fsync
   commits are L.1/L.5 (our own fMP4 muxer; reviewer findings #16/#17).
-- **Live encoders L.0**: ffmpeg-CLI shells with the contract gaps
-  documented (no per-frame keyframe forcing or `set_rate`; finding
-  #17) — the real in-process NVENC/libav encoders are L.5.
+- **Live encoders L.0 (corrected 2026-10-15 by the architect)**:
+  `LiveH264Encoder`/`LiveAacEncoder` are **uninhabited**: record never
+  constructs encoders (only monitor/stream pipelines do, at
+  frame_stream.rs's viewer add), so nothing degrades from stubs; the
+  engine's `create_video_encoder`/`create_audio_encoder` bail naming
+  L.5. The CLI shells stay rejected: they could never honour
+  per-frame forced keyframes or `set_rate`.
+- **The composited-program gate is the thing to fix next
+  (2026-10-15 01:43–01:49 traces, ISOCAST_L0_TRACE harness reverted
+  in 2b85ce3's engine).** With the compositor take
+  (target/scratch/l0/compositor-setup.toml, pattern ISO + program):
+  packets keep arriving well past `shared.end()`, `writers_finished`
+  stays false for tens of seconds, the CLI record never reaches its
+  report (the process sleeps in sigsuspend; kill -9 needed), and the
+  drop warnings show pattern/program dropping 104/50 frames away
+  past 3 s. Working theory for the next session: the program path's
+  per-frame GPU work (ycbcr render pool `target()`/`ycbcr_target()`
+  interplay with the compositor's own importer, and the writer's
+  GPU read-back) is too slow per frame and never releases the file
+  writer's end-of-window signal — `file.rs:180-193` break requires
+  the last video tick to reach `file_end` AND `audio_complete(end)`
+  while the queue never drains. Include in that rework: check
+  whether the wgpu resource assertion seen once ("Cannot get
+  TextureId(0,1), found TextureId(0,2)") is id-only cosmetic or a
+  shared-slice bug in the staged upload; the safest hardening is
+  moving the whole per-file Y'CbCr conversion onto the writer side
+  (making Linux's writer consume its own composited picture and
+  convert there) instead of every report stage touching GPU memory.
+- **Device stable ids** (thearchitect's table, goes into L.1's
+  devices.rs): mics/outputs = PipeWire `node.name` (excluding
+  `*.monitor` for capture sources), cameras = `/dev/v4l/by-id`
+  (re counterparts `by-path`), displays = Hyprland connector `name`,
+  "main" = the monitor at (0,0) else the lowest id, and windows are
+  matched by app class + title, never by per-session numeric address.
+  `probe()` must NOT accept a real source type whose capture doesn't
+  exist yet on Linux: errors correct this with the device list.
 - **Licensing**: LGPL-only libav if ever linked; CLI ffmpeg is a
   separate process (finding #16). No x264/x265/fdk in-tree.
 - `doctor`'s missing-`cfg` and the Linux daemon build are part of the
