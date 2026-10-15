@@ -30,6 +30,8 @@ use isocast_protocol::timeline::{
 };
 use isocast_protocol::{Container, PROGRAM};
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use crate::HostPlatform;
 use crate::timeline::{failed, now_text, read_manifest, unfinished, wrong_state};
 use crate::{Daemon, check_folder};
 
@@ -840,25 +842,24 @@ fn short_file_notes(takes: &[TakeFiles], sources: &[String]) -> Vec<String> {
     notes
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn join_files(spec: &JoinSpec, progress: OnJoinProgress) -> anyhow::Result<Joined> {
     use isocast_engine::Platform;
-    isocast_platform_macos::MacPlatform.join_files(spec, progress)
+    HostPlatform.join_files(spec, progress)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn join_files(_spec: &JoinSpec, _progress: OnJoinProgress) -> anyhow::Result<Joined> {
     anyhow::bail!("exports only run on macOS so far")
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn free_bytes(folder: &Path) -> Option<u64> {
-    isocast_platform_macos::volume(folder)
-        .ok()
-        .map(|v| v.free_bytes)
+    use isocast_engine::Platform;
+    HostPlatform.volume(folder).ok().map(|v| v.free_bytes)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn free_bytes(_folder: &Path) -> Option<u64> {
     None
 }

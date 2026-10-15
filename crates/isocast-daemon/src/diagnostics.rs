@@ -207,19 +207,44 @@ fn timeline(weak: Weak<Daemon>) {
     let mut sampler = isocast_platform_macos::diagnostics::Sampler::default();
     #[cfg(target_os = "macos")]
     let mut device_changes = isocast_platform_macos::diagnostics::DeviceChanges::default();
+    // The sampler, permission and inventory watches all run the macOS
+    // system's own state readers; on Linux these locals stay null until
+    // the Linux samplers land (docs/port-omarchy.md's doctor work).
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(dead_code, unused_variables, unused_mut, unused_assignments)
+    )]
     let mut inventory = Value::Null;
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(dead_code, unused_variables, unused_mut, unused_assignments)
+    )]
     let mut permissions = Value::Null;
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(dead_code, unused_variables, unused_mut, unused_assignments)
+    )]
     let mut sampler_cpu_us = 0.0;
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(dead_code, unused_variables, unused_mut, unused_assignments)
+    )]
     let mut count = 0u64;
     let mut next = Instant::now() + Duration::from_secs(1);
     loop {
         std::thread::sleep(next.saturating_duration_since(Instant::now()));
         next += Duration::from_secs(1);
         let Some(daemon) = weak.upgrade() else { return };
+        // The sampler wall time, thread CPU and folder are sampler
+        // inputs only; Linux reports through status alone until its
+        // samplers land.
+        #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
         let started = Instant::now();
+        #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
         let cpu = thread_cpu();
         let status = daemon.status();
         crate::debug::tick(&daemon, &status);
+        #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
         let folder = {
             let state = daemon.state.lock().unwrap();
             status
@@ -284,8 +309,13 @@ fn timeline(weak: Weak<Daemon>) {
                 }
             }
         }
-        sampler_cpu_us = (thread_cpu() - cpu) * 1e6;
-        count += 1;
+        // macOS only until the Linux samplers land: counting the
+        // sampler's own CPU and the tick index feeds nothing else yet.
+        #[cfg(target_os = "macos")]
+        {
+            sampler_cpu_us = (thread_cpu() - cpu) * 1e6;
+            count += 1;
+        }
         if Instant::now() > next {
             next = Instant::now() + Duration::from_secs(1);
         }
@@ -389,6 +419,10 @@ pub fn bug_report(daemon: &Daemon, params: &BugReportParams) -> Result<BugReport
     }
     folders.sort();
     folders.dedup();
+    // Only the macOS environment reader uses a single folder today;
+    // Linux's snapshot keeps null platform fields until its reader
+    // lands with the doctor work.
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
     let folder = folders
         .first()
         .cloned()

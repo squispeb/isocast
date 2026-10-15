@@ -40,13 +40,18 @@ use isocast_protocol::api::{Check, CheckStatus, Event, Method, RpcError, plugins
 use isocast_protocol::plugin::{
     AudioFilterSpec, Installed, KindClass, MANIFEST, Manifest, Permissions, PluginAction,
     PluginAddParams, PluginChange, PluginEnableParams, PluginInfo, PluginState, Plugins,
-    ProcessInfo, ProcessState, RecordingsAccess, Version,
+    ProcessInfo, ProcessState, Version,
 };
+// The plugin launcher on macOS grants recordings access; Linux's
+// unsandboxed runtime touches the type only through this import.
+#[cfg(target_os = "macos")]
+use isocast_protocol::plugin::RecordingsAccess;
 use isocast_protocol::{Issue, Setup};
 use serde::{Deserialize, Serialize};
 
 /// How long reading a plugin's manifest may take: a folder macOS protects
 /// (Documents, Downloads, Desktop) waits for a permission prompt.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a process has to exit after SIGTERM before it is killed.
 const STOP_GRACE: Duration = Duration::from_secs(3);
@@ -1299,6 +1304,9 @@ struct Launch {
     dir: PathBuf,
     /// Its files.
     folder: PathBuf,
+    /// The grants: enforced by the launcher on macOS; on Linux plugins
+    /// run unsandboxed until Landlock lands (docs/port-omarchy.md L.6).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     granted: Permissions,
     scope: Arc<Scope>,
 }
@@ -1437,6 +1445,9 @@ impl Launch {
 /// The folders a program's own installation may run programs from: a
 /// framework version (Python re-runs itself from its app bundle), a
 /// Homebrew keg, or for macOS's /usr/bin tool stubs, the developer tools.
+/// (The launcher uses this on macOS; Linux's unsandboxed runtime until
+/// L.6 doesn't.)
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn installation(program: &Path) -> Vec<PathBuf> {
     let mut folders = Vec::new();
     let parts: Vec<_> = program.components().collect();

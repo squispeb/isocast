@@ -41,6 +41,7 @@ fn shared_frames(options: shared_frames::Options) -> Result<ExitCode> {
 }
 
 #[cfg(not(target_os = "macos"))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod shared_frames {
     pub struct Options {
         pub target: String,

@@ -2988,6 +2988,7 @@ dependencies = [
  "ctrlc",
  "isocast-diagnostics",
  "isocast-engine",
+ "isocast-platform-linux",
  "isocast-platform-macos",
  "isocast-protocol",
  "isocast-surfaces",
@@ -3030,6 +3031,21 @@ dependencies = [
  "serde_json",
  "taffy",
  "wasmtime",
+ "wgpu",
+]
+
+[[package]]
+name = "isocast-platform-linux"
+version = "0.0.3"
+dependencies = [
+ "anyhow",
+ "image",
+ "isocast-diagnostics",
+ "isocast-engine",
+ "isocast-protocol",
+ "isocast-surfaces",
+ "libc",
+ "serde_json",
  "wgpu",
 ]
 
