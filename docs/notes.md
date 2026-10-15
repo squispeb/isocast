@@ -5,6 +5,56 @@ each section. Delete entries that stop being true.
 
 ## Linux port progress (2026-10-15, delivered through M3)
 
+- **L.1: media files, the doctor's encoder list, windows (2013992,
+  81113ee, ea487ed)**:
+  - `open_media` runs **one ffmpeg child per part** (video → BGRA rows on
+    stdout, sound → 48 kHz stereo f32), the process-per-stream shape the
+    camera and writer use. Times come from the file: a constant-rate
+    stream by frame index over `r_frame_rate`, one stored
+    frame-by-frame by ffprobe's own `pts_time` list, both rebased to the
+    part's first frame; `-fps_mode passthrough` so nothing is duplicated
+    or dropped to reach a nominal rate; a pool with all 32 frames
+    downstream skips that one picture (whole, so later frames stay
+    aligned) instead of ending the file, since `Ok(None)` from
+    `next_video` means *end of file* to `source.rs`. Decoding BGRA
+    rather than macOS's NV12 is the one deliberate divergence.
+  - Verified numerically (scratch fixtures, no picture ever viewed): a
+    6 s 30 fps clapperboard (white/black each second + a 1 kHz tone
+    bursting with it) recorded through the media source keeps its five
+    edges a constant 22 frames apart in the take (zero drift, 180/180
+    frames, 0 dropped/repeated/audio dropouts) with the sound's edges
+    within 1 frame (33 ms) of the picture's; a variable-rate fixture
+    (30 fps then 15; `r` 30/1 against `avg` 20.45) keeps its own 1.000 s
+    transition spacing, where the average rate would give 1.467 s. A
+    missing file, a directory and a non-media file each fail in <1 s
+    with ffprobe's words before recording starts; a sound-only file is
+    a sound source (engine behavior, same as macOS).
+  - **A take starts ~0.7 s into a media file** on Linux: ffmpeg children
+    take that long to spawn and deliver a first frame, and the engine's
+    writers start after the sources are ready. Engine-generic, not a
+    Linux media defect — `restart_on_activate` does not pull a media
+    source back to its start when a take begins.
+  - `devices()`'s window list was **empty**: it read `client["id"]`,
+    which `hyprctl clients -j` never sends (Hyprland names a window by
+    its 64-bit `address`). The id is now the low 32 bits of the address,
+    valid only while the window lives, exactly what the protocol says of
+    `Window::id`; setups match windows by app+title, which Hyprland
+    carries as `class` + `title` (`initialClass` for the "bundle id") —
+    our own window still has `class: ""` (see the app-shell gaps).
+  - The doctor's `hardware_encoders` is filtered by **the devices this
+    box has** (`VideoHardware::runs`): NVENC/`_cuda` needs an NVIDIA
+    render node, `_vaapi`/`_opencl` Intel or AMD, `_qsv` Intel, `_amf`
+    AMD, `_vulkan` any render node, `_v4l2m2m` a `/dev/video*` node, and
+    Android/Apple/Windows/X11-only families nothing here. It listed 29
+    names on this one-GPU box (QSV and AMF among them) and now lists 8:
+    `av1_nvenc, av1_vulkan, ffv1_vulkan, h264_nvenc, h264_vulkan,
+    hevc_nvenc, hevc_vulkan, prores_ks_vulkan`. Which of those *really*
+    run is still `tune`'s job (Ampere has no AV1 encoder).
+  - Measured while looking at NVENC session caps: **12 concurrent
+    `hevc_nvenc` encodes succeed** on driver 610.57.4 (an encode needs
+    ≥ ~145×49 pixels — 64×64 fails with "Frame dimensions are less than
+    the minimum supported value"), so this driver caps nothing the
+    flagship's 4 files would reach. Consumer drivers used to cap at 3.
 - **L.0's program gate is green (d9dfad9)**: a take whose file carried
   both video and audio could hang forever at 0 bytes with no error. The
   writer fed ffmpeg's 64 KiB stdin from the engine's own packet loop;

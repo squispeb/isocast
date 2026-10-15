@@ -528,6 +528,32 @@ step live in `docs/notes.md`'s "Linux port WIP" section.
   choices; `open_media` decodes through FFmpeg. The fragmented-MOV
   writer graduates to exact timestamps and fsynced fragments
   (G.3b's matrix).
+  - [x] **Doctor: this box's hardware encoders (81113ee).** The list is
+    now what this box's devices can run, not every family its ffmpeg
+    was built with (29 names here, Intel's QSV and AMD's AMF among
+    them): NVENC and Vulkan video only, and nothing on a box with no
+    render node. Verified `isocast doctor --json` → 8 encoders, check
+    ok.
+  - [x] **Media files through FFmpeg (2013992).** One child per part,
+    file times rather than a metronome, pool-full frames skipped whole,
+    truncated streams reported; verified numerically on scratch
+    fixtures (sound within 1 frame of the picture, a variable-rate
+    file keeping its own 1.000 s transition spacing).
+  - [x] **Windows (Hyprland) in `devices` (ea487ed).** The parser read
+    an `id` Hyprland never sends for windows; a window's id is now the
+    low 32 bits of its `address`, and all 12 of this box's windows
+    list with app, title and size.
+  - [ ] **Doctor/tune: NVENC session caps.** A consumer driver caps how
+    many encodes run at once, and the flagship records the program plus
+    three ISO files; the doctor should warn before a take, not after.
+  - [ ] **Devices polish.** Camera formats and audio ids on a box with
+    the camera plugged in (needs the C920 back); `permissions` still
+    reports macOS's three grants as granted — L.2's portal is the real
+    answer.
+  - [ ] **Writer: exact timestamps and fsynced fragments.** Waits on
+    G.3b's engine work (still unchecked, macOS-owned); the Linux writer
+    keeps its fragmented-MOV output and the kill-9 gate it passed
+    meanwhile.
 - [ ] **L.2 Screen capture.** The portal's ScreenCast through
   PipeWire, with the Vulkan device-creation hook for DMA-BUF imports;
   verified by `isocast record --source screen --seconds 10` and
@@ -1361,6 +1387,21 @@ Shipped (v1): 7.1, 7.2, 7.4a, 7.5, 7.6. Next, in order:
 
 ## Log
 
+- L.1 (2026-10-15): devices, doctor and media files on Linux.
+  `isocast devices` now lists this box's 12 windows (Hyprland names a
+  window by its 64-bit `address`, not the `id` the parser read, so the
+  list was empty; `ea487ed`) and the doctor's hardware-encoder list is
+  what this box's devices can run rather than every family its ffmpeg
+  was built with — 8 names here, Intel's QSV and AMD's AMF no longer
+  among them (`81113ee`). Media-file sources decode through this
+  machine's ffmpeg (`2013992`), verified numerically on scratch
+  fixtures: a clapperboard file's five white/black and tone edges land
+  a constant 22 frames apart in the take with the sound within 1 frame
+  (33 ms) of the picture, and a variable-rate file keeps its own
+  1.000 s transition spacing where the average rate would have put them
+  1.467 s apart. Remaining under L.1: the NVENC session-cap probe, the
+  camera-dependent device polish, and the writer's G.3b graduation
+  (blocked on G.3b itself).
 - L.0 complete: the dialogs' source previews, and a hardened writer
   (2026-10-15). The Properties/Filters preview asked for Linux's refused
   `shared_frames`, so a source's picture never appeared in either dialog;
