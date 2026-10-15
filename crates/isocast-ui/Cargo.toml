@@ -15,6 +15,10 @@ path = "src/main.rs"
 [dependencies]
 isocast-diagnostics = { path = "../isocast-diagnostics" }
 anyhow = "1.0.104"
+# The daemon's JPEG frames, for the monitor path off macOS (base64 in the
+# reply; the picture decoded to the pixels Slint shows).
+base64 = "0.22.1"
+image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
 # `wgpu`: the daemon's shared frames as wgpu textures (the portable preview).
 isocast-client = { path = "../isocast-client", features = ["wgpu"] }
 isocast-protocol = { path = "../isocast-protocol" }

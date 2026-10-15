@@ -367,6 +367,8 @@ impl Canvas {
         if let Some(preview) = cell.borrow_mut().as_mut() {
             match incoming {
                 Incoming::Frame(frame) => preview.frame(frame),
+                #[cfg(not(target_os = "macos"))]
+                Incoming::Picture(picture) => preview.picture(picture),
                 Incoming::Lost(why) => preview.lost(why),
             }
         }

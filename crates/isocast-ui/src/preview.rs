@@ -264,6 +264,11 @@ pub struct Preview {
     previous: Option<SharedFrame>,
     waiting: Option<(SharedFrame, Instant)>,
     last_shown_at: Option<Instant>,
+    /// The pictures' transport without shared surfaces (off macOS): a
+    /// picture has been shown, so the "waiting for a picture" notice is
+    /// already off and isn't set again for every frame.
+    #[cfg(not(target_os = "macos"))]
+    picture_shown: bool,
     check: bool,
     last_rows: Option<u64>,
     repeat_run: u64,
@@ -320,6 +325,8 @@ impl Preview {
             previous: None,
             waiting: None,
             last_shown_at: None,
+            #[cfg(not(target_os = "macos"))]
+            picture_shown: false,
             check,
             last_rows: None,
             repeat_run: 0,
@@ -424,6 +431,11 @@ impl Preview {
         self.images.clear();
         self.previous = None;
         self.showing = None;
+        #[cfg(not(target_os = "macos"))]
+        {
+            // The next picture turns the notice off again.
+            self.picture_shown = false;
+        }
         if let Some(app) = self.app.upgrade() {
             self.set_waiting(&app, false, &format!("No picture: {why}"));
         }
@@ -607,6 +619,54 @@ impl Preview {
             .at(revision)
             .filter(|layout| layout.scene == scene.as_str())
             .and_then(|layout| layout.rects.get(selected.as_str()).copied())
+    }
+
+    /// A picture from the daemon's JPEG frames (everywhere but macOS,
+    /// which gets shared surfaces in [`Self::show`]): decode it into the
+    /// canvas and draw the selected item's box over it, at the revision
+    /// the picture was drawn from.
+    #[cfg(not(target_os = "macos"))]
+    pub fn picture(&mut self, picture: crate::frames::Picture) {
+        let Some(app) = self.app.upgrade() else {
+            return;
+        };
+        let rect = match self.role {
+            Role::Editor => self.box_rect(&app, picture.revision),
+            Role::Program => None,
+        };
+        if !self.picture_shown {
+            self.picture_shown = true;
+            self.set_waiting(&app, false, "");
+        }
+        let canvas = app.global::<CanvasArea>();
+        let image = slint::Image::from_rgba8(slint::SharedPixelBuffer::clone_from_slice(
+            &picture.rgba,
+            picture.width.max(1),
+            picture.height.max(1),
+        ));
+        match self.role {
+            Role::Editor => canvas.set_picture(image),
+            Role::Program => canvas.set_program_picture(image),
+        }
+        if self.role == Role::Editor {
+            canvas.set_shown_box_visible(rect.is_some());
+            if let Some(BoxShape {
+                rect: [x, y, w, h],
+                rotate,
+            }) = rect
+            {
+                canvas.set_shown_box_x(x);
+                canvas.set_shown_box_y(y);
+                canvas.set_shown_box_w(w);
+                canvas.set_shown_box_h(h);
+                canvas.set_shown_box_rotate(rotate);
+            }
+        }
+        self.stats.shown += 1;
+        let now = Instant::now();
+        if let Some(last) = self.last_shown_at.replace(now) {
+            self.stats.longest_gap = self.stats.longest_gap.max(now - last);
+        }
     }
 
     fn show(&mut self, frame: SharedFrame) {
