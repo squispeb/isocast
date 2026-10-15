@@ -33,3 +33,7 @@ native-tls = "0.2.18"
 wasmtime = { version = "=49.0.2", default-features = false, features = ["cranelift", "component-model", "runtime", "std"] }
 # Pinned: the frame import uses wgpu-hal APIs, which change between releases.
 wgpu = { version = "=30.0.1", default-features = false, features = ["std", "parking_lot", "metal", "wgsl"] }
+# On Linux the same pinned wgpu carries the Vulkan back end instead of
+# Metal; resolver 3 keeps the two feature sets per target.
+[target.'cfg(target_os = "linux")'.dependencies]
+wgpu = { version = "=30.0.1", default-features = false, features = ["std", "parking_lot", "vulkan", "wgsl"] }

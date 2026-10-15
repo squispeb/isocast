@@ -1,0 +1,384 @@
+//! Showing pool frames to the GPU with no engine changes: each plane
+//! of a frame becomes a Vulkan texture that the compositor samples in
+//! one pass, or renders into (the program's Y'CbCr conversion). The
+//! textures are kept on the frame's pool slot (pools recycle a few),
+//! so a recycled frame keeps its textures, and only what changed
+//! between the CPU bytes and the GPU texels is copied, through
+//! row-aligned staging buffers (the DMA-BUF zero-copy import lands
+//! with L.2/L.5 of docs/port-omarchy.md; this module's contract stays
+//! exactly as it is).
+
+use std::sync::mpsc;
+use std::time::Duration;
+
+use anyhow::{Context, Result, bail};
+use isocast_engine::gpu::{FrameImporter, Gpu, GpuFrame, GpuPixels, Matrix, YCbCr};
+
+use crate::frames::{FrameKind, LinuxFrame};
+
+/// Rows a texture copy's buffer needs: 256-byte alignment.
+const ROW_ALIGN: u64 = 256;
+
+/// The importer the compositor, snapshots and shared-frame viewers
+/// hold. One thread uses it at a time, like macOS's `MetalImporter`.
+pub struct VulkanImporter {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+}
+
+unsafe impl Send for VulkanImporter {}
+
+/// The GPU the engine handed to the first importer, kept for the
+/// writer's read-backs. One device per process.
+static GPU: std::sync::Mutex<Option<(wgpu::Device, wgpu::Queue)>> = std::sync::Mutex::new(None);
+
+pub(crate) fn gpu() -> Result<(wgpu::Device, wgpu::Queue)> {
+    let holder = GPU.lock().expect("gpu lock poisoned");
+    let Some((device, queue)) = holder.as_ref() else {
+        bail!("no GPU registered yet: an importer must be created before any thread reads frames");
+    };
+    Ok((device.clone(), queue.clone()))
+}
+
+fn extent(width: u32, height: u32) -> wgpu::Extent3d {
+    wgpu::Extent3d {
+        width,
+        height,
+        depth_or_array_layers: 1,
+    }
+}
+
+impl VulkanImporter {
+    pub fn new(gpu: &Gpu) -> Result<Self> {
+        let mut holder = GPU.lock().expect("gpu lock poisoned");
+        if holder.is_none() {
+            *holder = Some((gpu.device.clone(), gpu.queue.clone()));
+        }
+        Ok(Self {
+            device: gpu.device.clone(),
+            queue: gpu.queue.clone(),
+        })
+    }
+
+    /// The textures for `frame`'s planes, created in the pool slot the
+    /// first time (kept since). `created_for_render` says the engine
+    /// will paint every pixel (a render target), else the CPU bytes
+    /// must go in before the GPU can sample.
+    fn textures_for(
+        &self,
+        frame: &LinuxFrame,
+        created_for_render: bool,
+    ) -> Result<Vec<wgpu::Texture>> {
+        if let Some(textures) = frame.textures() {
+            return Ok(textures);
+        }
+        let (width, height) = frame.size();
+        let render_attachment = wgpu::TextureUsages::RENDER_ATTACHMENT;
+        let textures = match frame.kind() {
+            FrameKind::Bgra => vec![self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("isocast frame BGRA"),
+                size: extent(width, height),
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Bgra8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC
+                    | wgpu::TextureUsages::COPY_DST
+                    | render_attachment,
+                view_formats: &[],
+            })],
+            FrameKind::Ycbcr8 => vec![
+                self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("isocast frame luma"),
+                    size: extent(width, height),
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::R8Unorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::COPY_SRC
+                        | wgpu::TextureUsages::COPY_DST
+                        | render_attachment,
+                    view_formats: &[],
+                }),
+                self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("isocast frame chroma"),
+                    size: extent(width / 2, height / 2),
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rg8Unorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::COPY_SRC
+                        | wgpu::TextureUsages::COPY_DST
+                        | render_attachment,
+                    view_formats: &[],
+                }),
+            ],
+        };
+        frame.set_textures(textures.clone());
+        // A render target is painted before it is sampled; anything
+        // else gets the CPU bytes on its first import.
+        frame.set_gpu_synced(if created_for_render {
+            frame.cpu_version()
+        } else {
+            u64::MAX
+        });
+        Ok(textures)
+    }
+
+    /// The CPU bytes into a plane's texture, over row-aligned staging
+    /// (buffer rows take the 256 alignment; the row gaps are mapped
+    /// scratch and never read as pixels).
+    fn upload_plane(
+        &self,
+        texture: &wgpu::Texture,
+        bytes: Vec<u8>,
+        stride: usize,
+        size: wgpu::Extent3d,
+    ) -> Result<()> {
+        let row_bytes = stride as u64;
+        let aligned = row_bytes.div_ceil(ROW_ALIGN) * ROW_ALIGN;
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("isocast frame upload"),
+            size: aligned * size.height as u64,
+            usage: wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: true,
+        });
+        {
+            let mut mapped = buffer
+                .slice(..)
+                .get_mapped_range_mut()
+                .context("the GPU refused the upload map")?;
+            for row in 0..size.height as usize {
+                let (from, into_at) = (row * stride, row as u64 * aligned);
+                let Some(source) = bytes.get(from..from + stride) else {
+                    bail!("the pool's plane is shorter than its size promised");
+                };
+                let into_at = into_at as usize;
+                // A write-only view: mapped memory may be write-combining
+                // and not take ordinary reads, so wgpu hands out a slice
+                // that only copies in.
+                mapped
+                    .slice(into_at..into_at + stride)
+                    .copy_from_slice(source);
+            }
+        }
+        buffer.unmap();
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        encoder.copy_buffer_to_texture(
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(u32::try_from(aligned).unwrap_or(u32::MAX)),
+                    rows_per_image: None,
+                },
+            },
+            texture.as_image_copy(),
+            size,
+        );
+        self.queue.submit([encoder.finish()]);
+        Ok(())
+    }
+
+    /// The CPU bytes into every plane's textures (a frame is known
+    /// whole-heart): skips planes already transferred.
+    fn sync(&self, frame: &LinuxFrame, textures: &[wgpu::Texture]) -> Result<()> {
+        let cpu = frame.cpu_version();
+        if frame.gpu_synced() == cpu {
+            return Ok(());
+        }
+        let (width, height) = frame.size();
+        let plane_count = frame.plane_count();
+        for (index, texture) in textures.iter().enumerate().take(plane_count) {
+            let source_size = frame.plane(index)?;
+            let (bytes, stride) = source_size;
+            match frame.kind() {
+                FrameKind::Bgra => {
+                    self.upload_plane(texture, bytes, stride, extent(width, height))?;
+                }
+                FrameKind::Ycbcr8 => {
+                    let size = match index {
+                        0 => extent(width, height),
+                        _ => extent(width / 2, height / 2),
+                    };
+                    self.upload_plane(texture, bytes, stride, size)?;
+                }
+            }
+        }
+        frame.set_gpu_synced(cpu);
+        Ok(())
+    }
+}
+
+/// A texture's bytes out, dropping the row-alignment gap. Blocks until
+/// the GPU has finished (five seconds at most).
+fn read_plane(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    stride: usize,
+    size: wgpu::Extent3d,
+) -> Result<Vec<u8>> {
+    let row_bytes = stride as u64;
+    let aligned = row_bytes.div_ceil(ROW_ALIGN) * ROW_ALIGN;
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("isocast frame read-back"),
+        size: aligned * size.height as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    encoder.copy_texture_to_buffer(
+        texture.as_image_copy(),
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(u32::try_from(aligned).unwrap_or(u32::MAX)),
+                rows_per_image: None,
+            },
+        },
+        size,
+    );
+    let submission = queue.submit([encoder.finish()]);
+    let slice = buffer.slice(..);
+    let (tx, rx) = mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = tx.send(result);
+    });
+    device
+        .poll(wgpu::PollType::Wait {
+            submission_index: Some(submission),
+            timeout: Some(Duration::from_secs(5)),
+        })
+        .context("the GPU did not finish the read-back copy")?;
+    rx.recv()
+        .context("the GPU did not return the read-back")?
+        .context("the GPU refused the read-back map")?;
+    let mapped = slice
+        .get_mapped_range()
+        .context("the GPU refused the read-back map")?;
+    let mut out = vec![0u8; row_bytes as usize * size.height as usize];
+    for row in 0..size.height as usize {
+        let from = row as u64 * aligned;
+        let to = row * row_bytes as usize;
+        let span = (from + row_bytes) as usize;
+        let Some(source) = mapped.get(from as usize..span) else {
+            bail!("the GPU's read-back buffer is shorter than the frame");
+        };
+        out[to..to + row_bytes as usize].copy_from_slice(source);
+    }
+    drop(mapped);
+    buffer.unmap();
+    Ok(out)
+}
+
+/// A frame's newest texels, from its textures, into the pool's CPU
+/// bytes — what the writer calls before reading plane bytes. The
+/// device and queue come from the process's registered GPU: a frame
+/// only has GPU pixels because an importer made its textures, and the
+/// importer that rendered them holds its own instance the writer can't
+/// reach — but the GPU is the same one.
+pub(crate) fn read_back(frame: &LinuxFrame) -> Result<bool> {
+    let version = frame.render_version();
+    if version <= frame.written_back() {
+        return Ok(false);
+    }
+    let Some(textures) = frame.textures() else {
+        bail!("a frame with GPU pixels must have textures");
+    };
+    let (device, queue) = gpu()?;
+    let (width, height) = frame.size();
+    for (index, texture) in textures.iter().enumerate() {
+        let (size, stride) = match frame.kind() {
+            FrameKind::Bgra => (extent(width, height), width as usize * 4),
+            FrameKind::Ycbcr8 => match index {
+                0 => (extent(width, height), width as usize),
+                _ => (extent(width / 2, height / 2), width as usize),
+            },
+        };
+        let bytes = read_plane(&device, &queue, texture, stride, size)?;
+        frame.set_plane(index, bytes);
+    }
+    frame.mark_written_back(version);
+    Ok(true)
+}
+
+impl FrameImporter for VulkanImporter {
+    type Frame = LinuxFrame;
+
+    /// `frame` shown to the GPU: textures are made (their bytes
+    /// synced with the CPU's) when they don't match the CPU version.
+    fn import(&mut self, frame: &Self::Frame) -> Result<GpuFrame> {
+        let textures = self.textures_for(frame, false)?;
+        if frame.gpu_synced() != frame.cpu_version() {
+            self.sync(frame, &textures)?;
+        }
+        Ok(Self::build_gpu_frame(frame, &textures))
+    }
+
+    /// An 8-bit BGRA frame for the GPU to draw into. The compositor
+    /// paints every pixel, so nothing is copied in; the writer reads
+    /// these texels back out.
+    fn target(&mut self, frame: &Self::Frame) -> Result<wgpu::Texture> {
+        let textures = self.textures_for(frame, true)?;
+        if textures.len() != 1 {
+            bail!("the GPU render target needs a one-plane BGRA frame, not Y'CbCr");
+        }
+        frame.bump_render_version();
+        Ok(textures[0].clone())
+    }
+
+    /// The two textures of an 8-bit Y'CbCr frame the GPU draws into.
+    fn ycbcr_target(&mut self, frame: &Self::Frame) -> Result<(wgpu::Texture, wgpu::Texture)> {
+        let textures = self.textures_for(frame, true)?;
+        if let [luma, chroma] = textures.as_slice() {
+            frame.bump_render_version();
+            return Ok((luma.clone(), chroma.clone()));
+        }
+        bail!("ycbcr_target needs a two-plane Y'CbCr frame, not BGRA");
+    }
+
+    /// Linux's textures come from a pool slot they are kept in
+    /// already, so `import_cached` is [`Self::import`] exactly.
+    fn import_cached(&mut self, frame: &Self::Frame) -> Result<Option<GpuFrame>> {
+        Ok(Some(self.import(frame)?))
+    }
+
+    /// The same as [`Self::ycbcr_target`].
+    fn ycbcr_target_cached(
+        &mut self,
+        frame: &Self::Frame,
+    ) -> Result<Option<(wgpu::Texture, wgpu::Texture)>> {
+        Ok(Some(self.ycbcr_target(frame)?))
+    }
+}
+
+impl VulkanImporter {
+    fn build_gpu_frame(frame: &LinuxFrame, textures: &[wgpu::Texture]) -> GpuFrame {
+        let (width, height) = frame.size();
+        match frame.kind() {
+            FrameKind::Bgra => GpuFrame {
+                width,
+                height,
+                pixels: GpuPixels::Rgb(textures[0].clone()),
+            },
+            FrameKind::Ycbcr8 => GpuFrame {
+                width,
+                height,
+                pixels: GpuPixels::YCbCr {
+                    luma: textures[0].clone(),
+                    chroma: textures[1].clone(),
+                    coding: YCbCr {
+                        matrix: Matrix::Bt709,
+                        full_range: false,
+                        bits: 8,
+                    },
+                },
+            },
+        }
+    }
+}

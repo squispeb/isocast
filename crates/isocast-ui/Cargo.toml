@@ -38,6 +38,10 @@ slint = { version = "=1.18.1", default-features = false, features = [
 # the platform's backend (Metal on macOS, DX12 on Windows).
 wgpu = { version = "=30.0.1", default-features = false, features = ["std", "wgsl"] }
 
+# On Linux the app's own wgpu carries Vulkan.
+[target.'cfg(target_os = "linux")'.dependencies]
+wgpu = { version = "=30.0.1", default-features = false, features = ["std", "vulkan", "wgsl"] }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

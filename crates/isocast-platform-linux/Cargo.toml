@@ -1,0 +1,36 @@
+[package]
+name = "isocast-platform-linux"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The Linux back end for Isocast: capture, encode and file writing behind the engine's Platform trait."
+
+[dependencies]
+isocast-diagnostics = { path = "../isocast-diagnostics" }
+anyhow = "1.0.104"
+isocast-engine = { path = "../isocast-engine" }
+isocast-protocol = { path = "../isocast-protocol" }
+# The shared monitor surface's stand-in type lives here (other.rs) until
+# L.4 gives Linux DMA-BUF rings.
+isocast-surfaces = { path = "../isocast-surfaces" }
+# Device enumeration, ffprobe output and the secrets file all parse
+# JSON that the protocol's own dependency provides.
+serde_json = "1.0.154"
+# The engine's wgpu, pinned the same (its frame import is built on
+# wgpu-hal). Minimal features here; the Linux target's entry below
+# adds Vulkan, and no apple target ever resolves this crate's deps.
+wgpu = { version = "=30.0.1", default-features = false, features = ["std", "wgsl"] }
+# JPEG encoding for live monitors (the engine already depends on this
+# crate; matching versions keeps one copy in the graph).
+image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+# The Linux target gets the Vulkan back end; the macOS feature set in
+# the plain dependency entry above resolves for the apple targets only.
+wgpu = { version = "=30.0.1", default-features = false, features = [
+    "std",
+    "wgsl",
+    "vulkan",
+] }
