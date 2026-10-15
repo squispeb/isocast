@@ -5,6 +5,27 @@ each section. Delete entries that stop being true.
 
 ## Linux port progress (2026-10-15, delivered through M3)
 
+- **L.3's camera landed (18284dc)**: `isocast-platform-linux`'s
+  `capture_camera` opens a real V4L2 camera. `camera.rs` resolves an id,
+  name or part of a name against the machine's capture nodes (the ids
+  `isocast devices` lists), enumerates what the device offers with the
+  VIDIOC_ENUM_* ioctls (hand-rolled over libc, no new dependency),
+  chooses the offer nearest the request or the canvas (MJPEG wins ties
+  with YUYV: 720p30 and 1080p need it over USB 2; YUYV is the fallback),
+  and reads it through the system `ffmpeg` the writer already uses —
+  `-f v4l2 -input_format … -pix_fmt bgra -f rawvideo -` — into the
+  engine's own BGRA pool frames, stamped with the host clock as the
+  bytes arrive. `Capture` is a real handle now (drop kills+reaps ffmpeg
+  and joins the reader/stderr threads); screen and audio still bail
+  naming their milestones. Verified: 3 s ISO take of the C920 →
+  90/90 frames at 30 fps, 1920x1080 HEVC, 0 dropped, 0 repeated,
+  signalstats YAVG 119.6 over 22 distinct values, YMIN 12, YMAX 238
+  (checked numerically, never viewed); `isocast frame camera` reads
+  1280x720 MJPEG; the composited program's 480x270 PiP region reads
+  YAVG 17.9 with the camera item hidden and 125.2 with it visible. Two
+  costs recorded in the module: the decoder process plus one copy per
+  frame (mmap'd V4L2 buffers would cost none — the follow-up if it shows
+  in the numbers), and one `ffmpeg` process per camera source.
 - **Monitors work in the app (76c0ccf, with b0ce26c + 8348315)**: the
   daemon's JPEG `frame` method now encodes (it was handed an RGBA image
   its JPEG encoder refuses; the frame is built as RGB from either a
@@ -4620,6 +4641,13 @@ isocast-platform-linux gpu` once the modules exist.
 
 ## Gotchas
 
+- 2026-10-15 (Linux): a V4L2 camera node belongs to **one** opener. The
+  daemon's live engine keeps every source running while anything asks it
+  for frames (the app's preview does, and it starts the camera whether or
+  not its scene item is visible), so `isocast record --source camera:…`
+  from a second shell fails with "Device or resource busy" while the app
+  is open. Quit the app (or wait for the engine to go idle) first. Since
+  18284dc that failure is immediate and names the fix.
 - 2026-10-15 (Linux): **a panicking daemon thread does not stop the
   daemon**, and the panic goes to `~/.isocast/logs/<launch>-<pid>-isocastd-<n>.crash.json`
   (numbered per launch, with a full backtrace). When a daemon feature
@@ -4641,18 +4669,13 @@ isocast-platform-linux gpu` once the modules exist.
   `isocast-ui --bench 8 --check` prints per-second fps/CPU and a final
   JSON with `preview_frames`, `shown`, `lost` and `longest_gap_ms`.
 - 2026-10-15 (Linux): a scene item whose source can't be captured yet still
-  belongs in a setup. With the C920 in the scene and camera capture at L.3,
-  `isocast snapshot` (of the program) and anything else that composites the
-  program fail honestly — "camera capture is not implemented on Linux yet
-  … L.3 (V4L2)" — while an ISO-only take is unaffected (4 s take, 120/120
-  frames, ffprobe-matched, with the camera in the scene). So a camera source
-  can be prepared and shown in the app before L.3 lands, but the program
-  path comes alive only with it — or with the item hidden: the compositor
-  builds only the sources it draws, so `visible = false` on the camera's
-  item lets the program composite the rest (verified: `isocast frame
-  program` returns the pattern with the C920 item hidden). The app's
-  Sources dock lists a scene's **items**, not top-level sources: a source
-  that is in the setup but in no scene shows nowhere.
+  belongs in a setup: the compositor builds only the sources it draws, so
+  `visible = false` on the camera's item let the program composite the rest
+  while camera capture was still missing (checked at the time: `isocast
+  frame program` returned the pattern with the C920 item hidden). Obsolete
+  as of 18284dc — cameras capture now, and the item is visible again. The
+  app's Sources dock lists a scene's **items**, not top-level sources: a
+  source that is in the setup but in no scene shows nowhere.
 - 2026-10-14 (#47 fix round): building a `git archive` of main into the
   same CARGO_TARGET_DIR (for "before" screenshots) left main's
   isocast-protocol/diagnostics artifacts in place; the branch then failed

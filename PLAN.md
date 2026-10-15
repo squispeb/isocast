@@ -488,6 +488,18 @@ step live in `docs/notes.md`'s "Linux port WIP" section.
   V4L2.** Per-app audio by linking a capture stream to the app's
   stream node (the reviewer's correction: this *is* possible on
   Linux); `exclude_own` works the same way.
+  - [x] **Camera (V4L2, 18284dc).** An id, name or part of a name from
+    a setup resolves to a capture node; the device's own enumeration
+    chooses the format (MJPEG preferred over YUYV at the same size and
+    rate: it is what makes 720p30/1080p possible over USB 2), and
+    frames are read through this machine's own `ffmpeg` straight into
+    BGRA pool frames, stamped with the host clock (see docs/notes.md
+    for the copy this costs and the mmap follow-up). Verified: a 3 s
+    ISO take of the C920 stored 90/90 frames at 30 fps, 1920x1080
+    HEVC, none dropped or repeated, and the composited program carries
+    the camera (PiP region YAVG 17.9 hidden vs 125.2 visible).
+  - [ ] Microphone and system audio (PipeWire), including per-app
+    audio.
 - [ ] **L.4 Shared monitor surfaces.** DMABUF rings or memfd rings
   through `isocast-surfaces`'s Unix-socket hand-over (see
   docs/shared-frames.md's sketch); the app's live monitors work.
@@ -1301,6 +1313,18 @@ Shipped (v1): 7.1, 7.2, 7.4a, 7.5, 7.6. Next, in order:
 
 ## Log
 
+- L.3 camera (2026-10-15): Linux captures real webcams. `capture_camera`
+  resolves a setup's camera id/name to a V4L2 node, asks the device what
+  it offers, picks the nearest to what the request or canvas wants
+  (MJPEG over YUYV at the same size and rate — 720p30/1080p over USB 2),
+  and reads BGRA frames through this machine's `ffmpeg` into the
+  engine's own pool frames (18284dc). Verified: 3 s ISO take of the C920
+  → 90/90 frames, 30 fps, 1920x1080 HEVC, 0 dropped/repeated, signalstats
+  YAVG 119.6 over 22 distinct values (a live picture, checked numerically
+  and never viewed); the composited program's PiP region reads YAVG 17.9
+  with the item hidden and 125.2 with it visible, so the app's preview can
+  show the webcam. A camera another program holds now fails in 0.7 s with
+  ffmpeg's own words instead of sitting out a 4 s first-frame timeout.
 - L.0 monitors (2026-10-15): the app shows the daemon's pictures on
   Linux. Three real bugs sat on that path with no client to expose
   them — a JPEG encoder handed RGBA it refuses (`isocast frame` failed
