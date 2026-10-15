@@ -457,10 +457,22 @@ step live in `docs/notes.md`'s "Linux port WIP" section.
     MOV (commit 2b85ce3). The engine gains
     `Platform::converts_own_inputs` (Linux's FFmpeg converts the
     frames it takes itself).
+  - [x] **Monitors (portable path).** The daemon's JPEG `frame` method
+    had never had a client, and could not have had one: it handed the
+    encoder an RGBA image it refuses (`b0ce26c`), read the pool's CPU
+    bytes rather than the compositor's texels, and read frames back on
+    a stale wgpu device — which panicked the daemon on every request
+    (`8348315`). The app off macOS now polls that method, decodes the
+    JPEG and draws it in the canvas (`76c0ccf`): `isocast-ui --bench 8`
+    reports 10 preview frames shown, 0 lost, and the canvas shows the
+    program's own burnt-in frame counter. This is the interim path:
+    L.4's shared surfaces remove the per-frame encode and decode
+    (this debug build manages 1-3 pictures a second).
   - [ ] **Program (compositor) gate.** The composited-program take
     stalls past its end: writer threads starve; per-frame GPU
     conversion plus read-back plumbing needs rework before this
     gate (findings in docs/notes.md, 2026-10-15 Linux port WIP).
+    The read-back fix above may already cover it — retest first.
 - [ ] **L.1 Devices, doctor, tune, media files.** `isocast devices`
   lists this box's displays (portal), windows (Hyprland), cameras
   (V4L2) and audio (PipeWire) with stable ids (node names, not
@@ -479,6 +491,7 @@ step live in `docs/notes.md`'s "Linux port WIP" section.
 - [ ] **L.4 Shared monitor surfaces.** DMABUF rings or memfd rings
   through `isocast-surfaces`'s Unix-socket hand-over (see
   docs/shared-frames.md's sketch); the app's live monitors work.
+  (They work now through L.0's JPEG poll; this makes them cheap.)
 - [ ] **L.5 In-process encoders and joins.** LGPL libav (or NVENC
   API) for streams and monitors with the full `VideoEncoder`
   contract (per-frame keyframes, `set_rate`); timeline exports
@@ -1288,6 +1301,18 @@ Shipped (v1): 7.1, 7.2, 7.4a, 7.5, 7.6. Next, in order:
 
 ## Log
 
+- L.0 monitors (2026-10-15): the app shows the daemon's pictures on
+  Linux. Three real bugs sat on that path with no client to expose
+  them — a JPEG encoder handed RGBA it refuses (`isocast frame` failed
+  for every target), a read-back that used a stale wgpu device (the
+  daemon panicked, 54 crash reports), and an encode that read the pool's
+  CPU bytes instead of the compositor's texels (program monitors were
+  unwritten zeros). Fixed in b0ce26c, 8348315; the app's off-macOS
+  monitor feed now polls the daemon's JPEG `frame` method and decodes it
+  (76c0ccf). Verified by `isocast-ui --bench 8 --check`
+  (preview_frames 10, lost 0) and a window capture showing the
+  program's burnt-in counter. Interim path: 1-3 fps in a debug build,
+  replaced by L.4's shared surfaces.
 - A.4 / #41 (2026-10-14, fixed): the cause is VideoToolbox's placement of
   hardware sessions on the M4 Max's two encode engines, decided at each
   session's first picture; a standalone VT benchmark reproduced the slow

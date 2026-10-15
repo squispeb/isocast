@@ -5,6 +5,19 @@ each section. Delete entries that stop being true.
 
 ## Linux port progress (2026-10-15, delivered through M3)
 
+- **Monitors work in the app (76c0ccf, with b0ce26c + 8348315)**: the
+  daemon's JPEG `frame` method now encodes (it was handed an RGBA image
+  its JPEG encoder refuses; the frame is built as RGB from either a
+  BGRA slot or a two-plane Y'CbCr one), reads back the compositor's
+  texels first, and uses the frame's *own* wgpu device for that
+  read-back. Off macOS the app's monitor feed polls `frame` at up to 30
+  a second and draws the decoded picture in the canvas (macOS keeps
+  `shared_frames` untouched). Verified: `isocast-ui --bench 8 --check`
+  → `preview: "image"`, `preview_frames: 10`, `lost: 0`, and a window
+  capture shows the program's burnt-in counter (PATTERN FRAME 0000521).
+  This is the interim path: 1-3 fps in a debug build, because every
+  picture costs a read-back, a Y'CbCr→RGB convert, a JPEG encode in the
+  daemon and a decode in the app. L.4's shared surfaces replace it.
 - **M1 landed (829b422)**: `isocast-platform-linux` compiles green
   (check + clippy `-D warnings` + 3 unit tests + fmt) — writer,
   uninhabited stream stubs, systems, keychain, pacing, jpeg; macOS
@@ -25,7 +38,8 @@ each section. Delete entries that stop being true.
 - **M4 landed (e0c3638)**: the Slint app builds on Linux
   (`cargo check -p isocast-ui` clean in 4m32s, Skia's Linux build
   included) — it opens tonight; its live previews stay on the standby
-  notice until L.4's shared surfaces.
+  notice until L.4's shared surfaces. (Superseded: the notice was the
+  missing transport alone, see "Monitors work in the app" above.)
 - **First app session on Omarchy (2026-10-15, verified)**: the window
   opens on the user's Hyprland session (DP-3, 2560×1440 at 1.25) and
   renders through Skia on the RTX 3060 Ti's Vulkan; the offscreen
@@ -208,6 +222,14 @@ isocast-platform-linux gpu` once the modules exist.
 
 ## Environment
 
+- 2026-10-15: Omarchy's Hyprland config is **Lua** (`~/.config/hypr/*.lua`),
+  so `hyprctl dispatch 'movetoworkspacesilent 1,...'` fails with a Lua
+  syntax error ("'(' expected near '1'"). Dispatchers are called as Lua
+  values instead — `hyprctl eval 'hl.dsp.focus({ workspace = "5" })'`,
+  `hl.dsp.window.move({ workspace = "1", follow = false })` — see
+  `/usr/share/omarchy/default/hypr/bindings/tiling.lua` for the forms.
+  A window this agent launches lands on workspace **E** and shows there
+  without taking focus with `ISOCAST_BACKGROUND=1`.
 - 2026-10-13: OBS Studio on the test Macs (for S.1): isocast-m2-a has
   32.2.2 in /Applications from the Homebrew cask `obs`; exonbook keeps
   Ryan's own 32.0.4 in /Applications (with his profiles, NDI and other
@@ -4598,6 +4620,26 @@ isocast-platform-linux gpu` once the modules exist.
 
 ## Gotchas
 
+- 2026-10-15 (Linux): **a panicking daemon thread does not stop the
+  daemon**, and the panic goes to `~/.isocast/logs/<launch>-<pid>-isocastd-<n>.crash.json`
+  (numbered per launch, with a full backtrace). When a daemon feature
+  "silently does nothing", count that directory first: the JPEG monitor
+  work was 54 crashes in two minutes that no `isocast logs` line and no
+  client error made obvious.
+- 2026-10-15 (Linux): the engine builds a **new `Gpu` (new wgpu device)
+  per program run, snapshot and shared-frame viewer** (`Gpu::new()` in
+  program.rs, snapshot.rs, shared_frames.rs). Anything that hands a
+  frame's textures on to another thread must carry the device that made
+  them: a read-back on another device's registry panics inside wgpu
+  ("Cannot get non-existent resource TextureId(5,1)"). Pools now keep
+  it per slot (`frames::Imported`).
+- 2026-10-15 (Linux): do not `grim -g <x,y wxh>` a rectangle unless the
+  Isocast window is *itself* the active window (check
+  `hyprctl activewindow -j` first): a maximized browser sits at the same
+  geometry, and the capture is the person's own screen. Better still,
+  verify the app's picture without the screen at all —
+  `isocast-ui --bench 8 --check` prints per-second fps/CPU and a final
+  JSON with `preview_frames`, `shown`, `lost` and `longest_gap_ms`.
 - 2026-10-15 (Linux): a scene item whose source can't be captured yet still
   belongs in a setup. With the C920 in the scene and camera capture at L.3,
   `isocast snapshot` (of the program) and anything else that composites the
@@ -4605,9 +4647,12 @@ isocast-platform-linux gpu` once the modules exist.
   … L.3 (V4L2)" — while an ISO-only take is unaffected (4 s take, 120/120
   frames, ffprobe-matched, with the camera in the scene). So a camera source
   can be prepared and shown in the app before L.3 lands, but the program
-  path comes alive only with it. The app's Sources dock lists a scene's
-  **items**, not top-level sources: a source that is in the setup but in no
-  scene shows nowhere.
+  path comes alive only with it — or with the item hidden: the compositor
+  builds only the sources it draws, so `visible = false` on the camera's
+  item lets the program composite the rest (verified: `isocast frame
+  program` returns the pattern with the C920 item hidden). The app's
+  Sources dock lists a scene's **items**, not top-level sources: a source
+  that is in the setup but in no scene shows nowhere.
 - 2026-10-14 (#47 fix round): building a `git archive` of main into the
   same CARGO_TARGET_DIR (for "before" screenshots) left main's
   isocast-protocol/diagnostics artifacts in place; the branch then failed
