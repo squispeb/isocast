@@ -2620,7 +2620,13 @@ fn record<P: Platform>(inner: &Arc<Inner<P>>, options: &RecordOptions) -> Result
     // Each ISO source's frame clock, with the stage its frames go through
     // set up now if its frames need one: that takes a few frames' time.
     let iso_gpu = IsoGpu::default();
-    let ycbcr_only = matches!(iso.encoder.codec, Codec::H264 | Codec::Hevc);
+    // H.264 and HEVC hold Y'CbCr: macOS's VideoToolbox converts BGRA per
+    // frame inside its encoder service, and the engine does it on the GPU
+    // so the conversion runs outside every consumer; a platform whose
+    // encoders convert on their own (Linux's FFmpeg processes) skips the
+    // stage and hand their writers the source's frames as captured.
+    let ycbcr_only =
+        matches!(iso.encoder.codec, Codec::H264 | Codec::Hevc) && !platform.converts_own_inputs();
     let mut runners: BTreeMap<String, IsoRunner<P>> = BTreeMap::new();
     for plan in plans.iter().filter(|plan| plan.source != PROGRAM) {
         let id = plan.source.as_str();

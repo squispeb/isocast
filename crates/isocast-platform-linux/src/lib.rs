@@ -70,6 +70,13 @@ impl Platform for LinuxPlatform {
     /// L.4: DMA-BUF rings shared with the Slint app.
     type SharedSurface = isocast_surfaces::Surface;
 
+    /// FFmpeg converts its inputs itself, like VideoToolbox does on
+    /// macOS, so the engine hands BGRA frames to the writer as they
+    /// were captured and skips the per-file GPU conversion stage.
+    fn converts_own_inputs(&self) -> bool {
+        true
+    }
+
     fn now(&self) -> Time {
         system::host_time()
     }

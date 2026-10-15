@@ -2951,6 +2951,7 @@ dependencies = [
  "isocast-client",
  "isocast-diagnostics",
  "isocast-engine",
+ "isocast-platform-linux",
  "isocast-platform-macos",
  "isocast-protocol",
  "isocast-surfaces",

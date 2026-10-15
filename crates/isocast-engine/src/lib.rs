@@ -292,6 +292,14 @@ pub trait Platform: Clone + Send + Sync + 'static {
     /// was one.
     fn delete_secret(&self, service: &str, account: &str) -> anyhow::Result<bool>;
 
+    /// Whether the platform's record writers convert whatever frames
+    /// they take themselves (VideoToolbox does on macOS; Linux's FFmpeg
+    /// processes do), so the engine's per-file GPU Y'CbCr stage is
+    /// unnecessary for their ISO files. `false` default: the stage runs.
+    fn converts_own_inputs(&self) -> bool {
+        false
+    }
+
     /// Join files end to end into one (see [`JoinSpec`]), calling
     /// `progress` as it goes. On failure nothing is left at the output.
     fn join_files(&self, spec: &JoinSpec, progress: OnJoinProgress) -> anyhow::Result<Joined> {

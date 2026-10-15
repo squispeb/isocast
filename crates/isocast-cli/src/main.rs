@@ -3512,7 +3512,12 @@ fn record_with_platform(setup: &Setup, options: &RecordOptions) -> Result<Report
     isocast_engine::record::record(&isocast_platform_macos::MacPlatform, setup, options)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+fn record_with_platform(setup: &Setup, options: &RecordOptions) -> Result<Report> {
+    isocast_engine::record::record(&isocast_platform_linux::LinuxPlatform, setup, options)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn record_with_platform(_setup: &Setup, _options: &RecordOptions) -> Result<Report> {
-    bail!("recording is only supported on macOS so far")
+    bail!("recording is only supported on macOS and Linux so far")
 }
