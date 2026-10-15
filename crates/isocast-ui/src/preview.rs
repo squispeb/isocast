@@ -12,7 +12,7 @@
 //!   `Image`, and the box drawn by Slint, set in the same event so they
 //!   are drawn in the same frame. Slint then redraws the window per frame.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -24,7 +24,7 @@ use slint::wgpu_30::wgpu;
 use crate::frames::Feed;
 #[cfg(target_os = "macos")]
 pub use crate::layers::{BoxShape, BoxStyle};
-use crate::{AppWindow, CanvasArea, Theme, Ui};
+use crate::{AppWindow, CanvasArea, Ui};
 
 /// The selected item's box (see layers.rs; the same off macOS).
 #[cfg(not(target_os = "macos"))]
