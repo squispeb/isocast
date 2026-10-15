@@ -22,14 +22,50 @@ each section. Delete entries that stop being true.
   per-file Y'CbCr stage off for Linux, which unblocks the ISO path
   without touching macOS's pipeline (its own convert continues to
   run there).
+- **M4 landed (e0c3638)**: the Slint app builds on Linux
+  (`cargo check -p isocast-ui` clean in 4m32s, Skia's Linux build
+  included) — it opens tonight; its live previews stay on the standby
+  notice until L.4's shared surfaces.
+- **First app session on Omarchy (2026-10-15, verified)**: the window
+  opens on the user's Hyprland session (DP-3, 2560×1440 at 1.25) and
+  renders through Skia on the RTX 3060 Ti's Vulkan; the offscreen
+  `--snapshot` mode renders the same picture with no window. The app
+  started `isocastd` itself and connects; `isocast apply` of a scratch
+  setup showed up in the docks at once, and an `isocast start --seconds
+  8` was followed live (REC badge, timer, CPU, Start→Stop, footer
+  target). The take written through the app's daemon: HEVC 1280×720
+  30/1 + AAC, 8.02 s, `nb_read_frames=240`. So the shell, the daemon
+  link, live events and the ISO recording path all work on Linux today.
 - **Open from the gate**: the composited-program take (see the WIP
-  findings below), and the app check that this session backgrounds
-  (`cargo check -p isocast-ui`, the Skia Linux build).
+  findings below). Because the demo setup has `[recording.program]
+  enabled = false`, pressing Record in the app is safe right now; a
+  setup with a program file (any `setup init` or OBS-import setup) is
+  the one that hits the open gate and hangs the daemon.
 - The secrets file is a deliberate plaintext 0600 file (`~/.isocast/secrets.json`):
   doctor should flag it once the doctor work runs (the OS keyring is
   L.5+; never log its value; keep per-report redaction covering it).
-
-## Environment
+  The platform crate's keychain test now points `ISOCAST_SOCKET` at a
+  scratch folder: an earlier version wrote test entries into the real
+  `~/.isocast/secrets.json` (cleaned up 2026-10-15).
+- **What the app can't do on Linux yet** (launch review, 2026-10-15):
+  live previews show the standby notice until L.4's shared surfaces;
+  the file-choose and save panels, "Show in folder" and copy-to-
+  clipboard are still macOS-only no-ops in `isocast-ui/src/platform.rs`
+  (`choose`/`save` return `None`, `reveal`/`copy_text` do nothing) —
+  xdg-desktop-portal picks those up in L.1; capture devices are
+  L.2/L.3, streaming L.5, the browser source and vcam L.6.
+- **App-shell gaps found by that session** (small, for L.1/L.4):
+  the window has an **empty Wayland app id** (`hyprctl clients` shows
+  `class: ""`), so Hyprland rules, taskbar grouping and our own
+  `devices()` window list can't identify Isocast by class. Slint sets
+  it only through `i-slint-core::api::set_xdg_app_id`, which the
+  `slint` facade does not re-export in 1.18 — a Slint bump or a
+  winit-attribute hook is needed. The copy is macOS-flavoured
+  throughout `crates/isocast-ui/ui/**` ("this Mac", ⌘V, Keychain,
+  System Settings) and wants a Linux pass. And `--snapshot` (a
+  render-only mode CI uses) **launches a daemon** as a side effect,
+  because the offscreen path connects through `connect_or_launch`;
+  it should draw the standby state without starting anything.
 
 ## Linux port WIP (2026-10-14, uncommitted)
 
@@ -94,11 +130,11 @@ Decisions made (see also the doc's preamble):
   commits are L.1/L.5 (our own fMP4 muxer; reviewer findings #16/#17).
 - **Live encoders L.0 (corrected 2026-10-15 by the architect)**:
   `LiveH264Encoder`/`LiveAacEncoder` are **uninhabited**: record never
-  constructs encoders (only monitor/stream pipelines do, at
-  frame_stream.rs's viewer add), so nothing degrades from stubs; the
-  engine's `create_video_encoder`/`create_audio_encoder` bail naming
-  L.5. The CLI shells stay rejected: they could never honour
-  per-frame forced keyframes or `set_rate`.
+  constructs encoders (only the monitor/stream pipelines do, in
+  frame_stream.rs when a viewer is added), so nothing degrades from
+  stubs; the engine's `create_video_encoder`/`create_audio_encoder`
+  bail naming L.5. The CLI shells stay rejected: they could never
+  honour per-frame forced keyframes or `set_rate`.
 - **The composited-program gate is the thing to fix next
   (2026-10-15 01:43–01:49 traces, ISOCAST_L0_TRACE harness reverted
   in 2b85ce3's engine).** With the compositor take
@@ -120,10 +156,11 @@ Decisions made (see also the doc's preamble):
   moving the whole per-file Y'CbCr conversion onto the writer side
   (making Linux's writer consume its own composited picture and
   convert there) instead of every report stage touching GPU memory.
-- **Device stable ids** (thearchitect's table, goes into L.1's
+- **Device stable ids** (the architect's table, goes into L.1's
   devices.rs): mics/outputs = PipeWire `node.name` (excluding
   `*.monitor` for capture sources), cameras = `/dev/v4l/by-id`
-  (re counterparts `by-path`), displays = Hyprland connector `name`,
+  (`by-path` as the fallback when a camera has no by-id link), displays
+  = Hyprland connector `name`,
   "main" = the monitor at (0,0) else the lowest id, and windows are
   matched by app class + title, never by per-session numeric address.
   `probe()` must NOT accept a real source type whose capture doesn't
@@ -664,6 +701,18 @@ isocast-platform-linux gpu` once the modules exist.
   fade.
 
 ## Questions for Ryan
+
+- 2026-10-15: a few non-English characters (and a handful of garbled
+  words) slipped into agent-written text this week — three in
+  docs/port-omarchy.md and one commit message (all fixed, commit
+  bc50cf9). Two garbled words remain in older commit messages
+  (`2b85ce3`: "addikes", "Ryyecto", "devoced"; `a59ed86`:
+  "composisted"): offer is to rebase the two local commits to clean
+  them, only with Ryan's word (the repo rule is no rewriting without
+  asking). Proposal, needing approval because it is a new harness: a
+  CI step (or a `scripts/check-text.sh` run by it) that greps tracked
+  text files for CJK/full-width codepoints and fails, so this class of
+  slip can't land again; say the word and it goes in.
 
 - 2026-10-11: Ryan's primary camera is "Studio Video" and his mic "Studio
   Audio" (XLR, network); `examples/recording.toml` now uses them instead of
