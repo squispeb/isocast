@@ -668,10 +668,10 @@ impl FileWriter for FfmpegFileWriter {
     }
 }
 
-/// The ffmpeg this machine records through: `ISOCAST_FFMPEG` names
-/// another one (a full build with prores_ks, an NVENC-enabled one),
-/// else `ffmpeg` from the PATH.
-fn ffmpeg_binary() -> OsString {
+/// The ffmpeg this machine records and captures through:
+/// `ISOCAST_FFMPEG` names another one (a full build with prores_ks, an
+/// NVENC-enabled one), else `ffmpeg` from the PATH.
+pub(crate) fn ffmpeg_binary() -> OsString {
     std::env::var_os("ISOCAST_FFMPEG").unwrap_or_else(|| "ffmpeg".into())
 }
 

@@ -6,13 +6,13 @@
 //! into; recording is encoded by the machine's own encoder processes
 //! (NVENC hardware first, software fallbacks), fed over pipes.
 //!
-//! This is docs/port-omarchy.md's L.0 + L.1: synthetic sources, the
-//! encode/write/pacing path, devices, secrets, volumes and the
-//! doctor/tune inputs, so `isocast record`, `doctor` and the CLI/MCP
-//! surface work on Linux today with real files. Real capture (screen,
-//! camera, audio), media decoding, shared monitor surfaces, browser
-//! pages and joins bail with a message naming the milestone that
-//! delivers them.
+//! This is docs/port-omarchy.md's L.0 + L.1, and L.3's camera: synthetic
+//! sources, the encode/write/pacing path, devices, secrets, volumes, the
+//! doctor/tune inputs and V4L2 cameras, so `isocast record`, `doctor` and
+//! the CLI/MCP surface work on Linux today with real files and a real
+//! webcam. Screen and audio capture, media decoding, shared monitor
+//! surfaces, browser pages and joins bail with a message naming the
+//! milestone that delivers them.
 
 #![cfg(target_os = "linux")]
 
@@ -29,6 +29,7 @@ use isocast_protocol::api::Machine;
 use isocast_protocol::devices::{Devices, PermissionKind, PermissionsReport};
 use isocast_protocol::{Canvas, SourceKind};
 
+pub(crate) mod camera;
 pub(crate) mod frames;
 pub(crate) mod gpu;
 mod jpeg;
@@ -48,11 +49,15 @@ use crate::frames::CpuPool;
 #[derive(Clone, Copy)]
 pub struct LinuxPlatform;
 
-/// A running capture. Real capture arrives at L.2 (screen) and L.3
-/// (camera and audio) of docs/port-omarchy.md: this type stays
-/// uninhabited, and every capture method bails saying so. Dropping it
-/// stops the capture.
-pub enum Capture {}
+/// A running capture. Dropping it stops the capture and joins its
+/// threads. Only cameras have one so far (L.3's V4L2 path); screen and
+/// audio capture still bail with the milestone that delivers them, so
+/// there is no other kind yet.
+pub struct Capture {
+    /// Kept alive for the capture's lifetime: its `Drop` stops the
+    /// capture.
+    _camera: camera::CameraCapture,
+}
 
 impl Platform for LinuxPlatform {
     type Frame = LinuxFrame;
@@ -217,18 +222,17 @@ impl Platform for LinuxPlatform {
         )
     }
 
-    /// L.3: V4L2 cameras.
+    /// L.3: V4L2 cameras, read through this machine's `ffmpeg` (see
+    /// camera.rs).
     fn capture_camera(
         &self,
-        _device: &str,
-        _request: CameraRequest,
-        _canvas: &Canvas,
-        _sink: VideoSink<Self::Frame>,
+        device: &str,
+        request: CameraRequest,
+        canvas: &Canvas,
+        sink: VideoSink<Self::Frame>,
     ) -> Result<(Self::Capture, CaptureFormat)> {
-        bail!(
-            "camera capture is not implemented on Linux yet: it arrives at L.3 of \
-             docs/port-omarchy.md (V4L2)."
-        )
+        let (camera, format) = camera::capture(*self, device, request, canvas, sink)?;
+        Ok((Capture { _camera: camera }, format))
     }
 
     /// L.3: PipeWire microphone capture.
