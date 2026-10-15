@@ -330,33 +330,48 @@ fn desktops(devices: &mut Devices, notes: &mut Vec<String>) {
     }
     devices.displays = displays;
 
-    if let Ok(clients) = Command::new("hyprctl").arg("clients").arg("-j").output()
-        && let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&clients.stdout)
-    {
-        let mut windows = Vec::new();
-        for client in parsed.as_array().into_iter().flatten() {
-            let Some(id) = client["id"].as_u64() else {
-                continue;
-            };
-            let (Some(width), Some(height)) =
-                (client["size"][0].as_u64(), client["size"][1].as_u64())
-            else {
-                continue;
-            };
-            windows.push(Window {
-                id: id as u32,
-                app: client["class"].as_str().unwrap_or_default().to_string(),
-                bundle_id: client["initialClass"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_string(),
-                title: client["title"].as_str().map(|s| s.to_string()),
-                width: width as u32,
-                height: height as u32,
-            });
-        }
-        devices.windows = windows;
+    if let Ok(clients) = Command::new("hyprctl").arg("clients").arg("-j").output() {
+        devices.windows = windows(&clients.stdout);
     }
+}
+
+/// The windows Hyprland reports, from `hyprctl clients -j`. Its `address`
+/// (`0x6242fd272870`) is what a window is known by — there is no small
+/// integer id as on macOS — so a window's id is the low 32 bits of it,
+/// which the protocol documents as valid only while the window exists
+/// (setups match windows by app and title, which is what Hyprland
+/// carries: `class` and `title`, with `initialClass` standing in for a
+/// bundle id).
+fn windows(clients: &[u8]) -> Vec<Window> {
+    let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(clients) else {
+        return Vec::new();
+    };
+    let mut windows = Vec::new();
+    for client in parsed.as_array().into_iter().flatten() {
+        let Some(id) = client["address"]
+            .as_str()
+            .and_then(|address| u64::from_str_radix(address.trim_start_matches("0x"), 16).ok())
+            .map(|address| address as u32)
+        else {
+            continue;
+        };
+        let (Some(width), Some(height)) = (client["size"][0].as_u64(), client["size"][1].as_u64())
+        else {
+            continue;
+        };
+        windows.push(Window {
+            id,
+            app: client["class"].as_str().unwrap_or_default().to_string(),
+            bundle_id: client["initialClass"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            title: client["title"].as_str().map(|s| s.to_string()),
+            width: width as u32,
+            height: height as u32,
+        });
+    }
+    windows
 }
 
 /// Cameras over V4L2, by the stable `/dev/v4l/by-id` path when at
@@ -775,6 +790,34 @@ mod tests {
         assert_eq!(named(" V..... = Video"), None);
         assert_eq!(named(" ------"), None);
         assert_eq!(named("Encoders:"), None);
+    }
+
+    /// This box's own `hyprctl clients -j` shape: a window is named by
+    /// its `address`, and reading an `id` (which Hyprland doesn't send
+    /// for windows) left the doctor's window list empty.
+    #[test]
+    fn hyprland_windows_are_listed_by_address() {
+        let clients = br#"[
+            {"address": "0x6242fd272870", "mapped": true, "class": "helium",
+             "initialClass": "helium", "title": "A tab - Helium", "size": [2022, 1100]},
+            {"address": "0x55a1b2c3d4e5", "mapped": true, "class": "",
+             "initialClass": "", "title": "Isocast", "size": [1280, 800]}
+        ]"#;
+        let listed = windows(clients);
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].app, "helium");
+        assert_eq!(listed[0].bundle_id, "helium");
+        assert_eq!(listed[0].title.as_deref(), Some("A tab - Helium"));
+        assert_eq!((listed[0].width, listed[0].height), (2022, 1100));
+        assert_eq!(listed[0].id, 0xfd27_2870);
+        assert_eq!(listed[1].app, "");
+        assert_ne!(
+            listed[0].id, listed[1].id,
+            "two windows must not share an id"
+        );
+        // Anything without an address or a size is not a window to offer.
+        assert!(windows(br#"[{"class": "x", "title": "y"}]"#).is_empty());
+        assert!(windows(b"not json").is_empty());
     }
 
     /// Which families can run follows the devices: FFmpeg lists every
