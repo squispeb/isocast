@@ -143,7 +143,7 @@ are the macOS code they should roughly mirror.
 | `capture.rs` (356) | ScreenCaptureKit display/window/app modes | PipeWire screencast from the portal (`org.freedesktop.portal.ScreenCast` via `ashpd`-level D-Bus, or direct `pipewire-rs`); `source_types` gives monitors; windows through the same portal when the WM supports toplevel handles (Hyprland does for monitor now; per-window needs verification) | large |
 | `camera.rs` (465) | AVFoundation formats/negotiation | V4L2 via `v4l2r` or the `v4l` crate; UVC negotiation is simpler; capture card = V4L2 | medium |
 | `audio.rs` (487) | Core Audio mic tap + ScreenCaptureKit system audio | PulseAudio-compat capture (mic defaults), monitor-of-sink for system audio via `pipewire-rs` stream or `pactl`-level capture; per-app audio has no comfortable primitive (see §3.3) | medium |
-| `writer.rs` (946) | AVAssetWriter fragmented MOV/MP4, colour tags, ProRes | **this is the hardest fidelity piece** — replace with our own fragmented-MP4 muxer (or `libav` bindings for it) fed by NVENC/x264 output; fragment every ~2 s and fsync like AVAssetWriter does on accept; colour tags via the CX/NAL入れ boxes; ProRes via `prores_ks` (software, slower than VideoToolbox) | large |
+| `writer.rs` (946) | AVAssetWriter fragmented MOV/MP4, colour tags, ProRes | **this is the hardest fidelity piece** — replace with our own fragmented-MP4 muxer (or `libav` bindings for it) fed by NVENC/x264 output; fragment every ~2 s and fsync like AVAssetWriter does on accept; colour tags via CICP in the track's `colr` box (and the encoder's NAL SEI where it applies); ProRes via `prores_ks` (software, slower than VideoToolbox) | large |
 | `stream.rs` (849) | VT H.264 + AAC feeding our own RTMP/FLV | the RTMP/FLV half **is portable** (no OS API); swap the encoder to `h264_nvenc` in-process first (FFmpeg CLI on a pipe), AAC via `audio` encoder crate or libav AAC | medium |
 | `media.rs` (256) | AVFoundation decode for media sources | FFmpeg (`libav` bindings or CLI pipe at snapshot warm-up); the engine's `MediaReader` surface is the same | medium |
 | `join.rs` (679) | AVMutableComposition-based concat export re-encoding AAC | ffmpeg concat demuxer +AAC re-encode (it already re-encodes there); or Stream copy where it already does | small |
@@ -197,7 +197,7 @@ Ranked by fidelity-of-fit for an unaffected look:
    the mixer needs the same `audio.js`-style in-page script trick with a
    WebKitGTK `AudioContext` bridge instead of the AVFoundation capture
    context. Best open-source match; one new GTK windowing dependency.
-2. **CEF** (`cef-rs`) — Chromium 的 same engine OBS uses on every
+2. **CEF** (`cef-rs`) — Chromium, the same engine OBS uses on every
    platform; audio capture is native, dependency is heavy (a ~100 MB
    blob), and it vendors Chromium — a licensing/documentation cost the
    project's clean-room rule doesn't forbid but keeps the tree heavier.
@@ -271,7 +271,8 @@ same surface. Rebuilding that on Vulkan/NVIDIA:
   re-run S.1/S.2 to verify the drop zero remains and CPU degrades less
   than the copy path.
 - **L.6 Browser source (WebKitGTK), virtual camera (v4l2loopback),
-  OBS collection import parity checks**, same验收 each.
+  OBS collection import parity checks**, the same acceptance checks as
+  their macOS counterparts.
 
 Before L.5, *all* "performance metrics" parity is the honest claim across
 the encode/write/pacing path plus whatever capture reads; after L.5 the
