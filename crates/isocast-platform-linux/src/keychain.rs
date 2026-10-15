@@ -99,10 +99,27 @@ pub(crate) fn remove(service: &str, account: &str) -> Result<bool> {
 mod tests {
     use super::{get, path, remove, set};
 
+    /// The store lives beside the socket, and the test points the socket
+    /// at a scratch folder: a test must never touch the user's own
+    /// `~/.isocast/secrets.json` (the first version of this test wrote
+    /// there and left empty entries behind).
     #[test]
     fn secret_set_get_remove_round_trip() {
-        let support = path().unwrap().parent().unwrap().to_path_buf();
-        std::fs::create_dir_all(support).unwrap();
+        let scratch = std::env::temp_dir().join(format!(
+            "isocast-keychain-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        // SAFETY: the socket path is read from the environment, and this
+        // is the only test in the binary that reads it (the frame pool
+        // tests don't): nothing here races another thread's read.
+        unsafe { std::env::set_var("ISOCAST_SOCKET", scratch.join("isocastd.sock")) };
+        std::fs::create_dir_all(&scratch).unwrap();
+        assert!(
+            path().unwrap().starts_with(&scratch),
+            "the secrets file must land in the scratch folder"
+        );
+
         let unique = format!("isocast-test-{}", std::process::id());
         set(&unique, "round-trip", "secret-value").unwrap();
         assert_eq!(
@@ -111,5 +128,7 @@ mod tests {
         );
         assert!(remove(&unique, "round-trip").unwrap());
         assert_eq!(get(&unique, "round-trip").unwrap(), None);
+
+        std::fs::remove_dir_all(&scratch).ok();
     }
 }
