@@ -5,6 +5,34 @@ each section. Delete entries that stop being true.
 
 ## Linux port progress (2026-10-15, delivered through M3)
 
+- **L.0's program gate is green (d9dfad9)**: a take whose file carried
+  both video and audio could hang forever at 0 bytes with no error. The
+  writer fed ffmpeg's 64 KiB stdin from the engine's own packet loop;
+  ffmpeg chooses between its inputs by timestamp, so after the first
+  video packet it waits for an audio packet and stops draining video,
+  while the loop sat inside a multi-megabyte picture write and held the
+  samples behind it. The trigger is any audio that starts a beat after
+  the first picture: a program mix (the mixer computes recording audio
+  `MIX_DELAY` = 200 ms behind live, on every platform) or an ISO whose
+  tone opened just after its first frame — so this was never
+  program-specific, and it explains every "record never finishes" hang.
+  Now each stream has a writer thread, the loop only queues, a bounded
+  picture queue (64 MiB, ≤ 64 pictures) drops whole pictures past its
+  depth (the previous picture repeats their ticks, so the timeline
+  holds), and a watchdog kills a child that takes nothing for 20 s so
+  the blocked writes fail the file with its stderr tail instead of
+  hanging the take. Verified: `isocast record target/scratch/l0/
+  program-audio.toml --seconds 3` → 5 s, 90/90 frames, 0 repeated, 0
+  dropped, 0 audio dropouts, no errors, ffprobe HEVC 1280x720@30 (90
+  frames) + AAC 48 kHz stereo, 3.02 s; the combined ISO+program take
+  gives both files video *and* audio (3 runs); SIGINT on a 30 s take
+  still stops gracefully and keeps both files. gdb could only be used
+  *under* gdb (`ptrace_scope=1` blocks attaching): `gdb -batch -ex run
+  -ex 'thread apply all bt' target/debug/isocast`, interrupt from another
+  shell. The scheduler evidence was `/proc/<pid>/task/*/wchan`:
+  `anon_pipe_write` on the writer, `anon_pipe_read` in ffmpeg's
+  `dmx1:f32le`.
+
 - **L.3's camera landed (18284dc)**: `isocast-platform-linux`'s
   `capture_camera` opens a real V4L2 camera. `camera.rs` resolves an id,
   name or part of a name against the machine's capture nodes (the ids
@@ -243,6 +271,12 @@ isocast-platform-linux gpu` once the modules exist.
 
 ## Environment
 
+- 2026-10-15: the C920 is **not enumerated right now** — `/dev/video*`
+  has no matches and `fuser /dev/video0` says the file doesn't exist,
+  where it was `usb-046d_HD_Pro_Webcam_C920_31CFD3EF-video-index0`
+  earlier the same day. Camera takes need it replugged; L.3's camera
+  work is already committed and verified, and nothing after L.0's gate
+  (L.2's portal capture) needs it.
 - 2026-10-15: Omarchy's Hyprland config is **Lua** (`~/.config/hypr/*.lua`),
   so `hyprctl dispatch 'movetoworkspacesilent 1,...'` fails with a Lua
   syntax error ("'(' expected near '1'"). Dispatchers are called as Lua
@@ -4641,6 +4675,14 @@ isocast-platform-linux gpu` once the modules exist.
 
 ## Gotchas
 
+- 2026-10-15 (Linux): **ffmpeg picks between its raw inputs by timestamp**,
+  so a child with both a video and an audio pipe stops draining video
+  until it has an audio packet. Feeding such a child from one thread
+  deadlocks the moment audio starts a beat after the first picture: the
+  take sat at 0 bytes forever — no error, no CPU, and no `isocast
+  status` clue, since the engine's writer runs in the recording process.
+  One writer thread per stream, and never make the engine's packet loop
+  wait on a pipe.
 - 2026-10-15 (Linux): a V4L2 camera node belongs to **one** opener. The
   daemon's live engine keeps every source running while anything asks it
   for frames (the app's preview does, and it starts the camera whether or

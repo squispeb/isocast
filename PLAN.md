@@ -468,11 +468,23 @@ step live in `docs/notes.md`'s "Linux port WIP" section.
     program's own burnt-in frame counter. This is the interim path:
     L.4's shared surfaces remove the per-frame encode and decode
     (this debug build manages 1-3 pictures a second).
-  - [ ] **Program (compositor) gate.** The composited-program take
-    stalls past its end: writer threads starve; per-frame GPU
-    conversion plus read-back plumbing needs rework before this
-    gate (findings in docs/notes.md, 2026-10-15 Linux port WIP).
-    The read-back fix above may already cover it — retest first.
+  - [x] **Program (compositor) gate.** A program take used to hang with
+    no file and no error: the writer wrote each picture (megabytes)
+    into ffmpeg's 64 KiB stdin from the engine's packet loop, and ffmpeg
+    — which picks between its inputs by timestamp — stopped draining
+    video until it had an audio packet, which the loop was holding back
+    (gdb: the writer in `anon_pipe_write`, ffmpeg's `dmx1:f32le` in
+    `anon_pipe_read`). Every stream now has a writer thread of its own,
+    the loop only queues, a full video queue drops whole pictures (the
+    previous one repeats their ticks) and a watchdog kills a child that
+    takes nothing for 20 s (commit d9dfad9). `isocast record
+    target/scratch/l0/program-audio.toml --seconds 3` finishes in 5 s
+    with 90/90 frames, 0 repeated, 0 dropped, 0 audio dropouts and no
+    errors; ffprobe shows HEVC 1280x720@30 + AAC 48 kHz stereo, 3.02 s.
+    The combined ISO+program take finishes with both files carrying
+    video and audio; the same take hung with the old writer, and so did
+    an ISO-only take whose tone source opened a beat after its first
+    picture — the deadlock was never program-specific.
 - [ ] **L.1 Devices, doctor, tune, media files.** `isocast devices`
   lists this box's displays (portal), windows (Hyprland), cameras
   (V4L2) and audio (PipeWire) with stable ids (node names, not
@@ -1325,6 +1337,23 @@ Shipped (v1): 7.1, 7.2, 7.4a, 7.5, 7.6. Next, in order:
   with the item hidden and 125.2 with it visible, so the app's preview can
   show the webcam. A camera another program holds now fails in 0.7 s with
   ffmpeg's own words instead of sitting out a 4 s first-frame timeout.
+- L.0 gate: program recording with audio (2026-10-15). A take that mixed
+  audio into its file could hang forever at 0 bytes and no error, in the
+  CLI *and* the daemon (the engine's writer lives in the recording
+  process, so `isocast status` showed nothing). gdb (run under gdb;
+  ptrace_scope=1 forbids attaching) showed the writer thread in
+  `anon_pipe_write` and ffmpeg's `dmx1:f32le` in `anon_pipe_read`:
+  ffmpeg picks between its inputs by timestamp, so it stops draining the
+  video pipe until it has an audio packet — and our single writer thread
+  was mid-picture (1.4-8 MB through a 64 KiB pipe), holding the samples
+  behind it. Any audio arriving a beat after the first picture wedged
+  the file: a program mix (the mixer computes recording audio 200 ms
+  behind live, `MIX_DELAY`) or an ISO whose tone source opened just
+  after its first frame. Fixed in d9dfad9 (a thread per stream, a
+  bounded picture queue, a 20 s stall watchdog that kills the child).
+  Verified: program+audio 90/90 frames, 0 drops, AAC present, 3.02 s;
+  ISO+program, ISO-only+audio and program-without-audio all finish;
+  SIGINT on a 30 s take stops it gracefully keeping both files.
 - L.0 monitors (2026-10-15): the app shows the daemon's pictures on
   Linux. Three real bugs sat on that path with no client to expose
   them — a JPEG encoder handed RGBA it refuses (`isocast frame` failed
