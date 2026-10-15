@@ -7,7 +7,7 @@ use isocast_protocol::devices::{Permission, PermissionKind};
 use isocast_protocol::{Codec, FilterKind, Setup, SourceKind, TransitionKind};
 
 use crate::record::{expand_home, interrupted_note, interrupted_sessions};
-use crate::{space, AudioTrackSpec, Platform, VideoTrackSpec, WriterSpec};
+use crate::{AudioTrackSpec, Platform, VideoTrackSpec, WriterSpec, space};
 
 /// Recording time a disk should hold before it gets a warning.
 const COMFORTABLE_HOURS: f64 = 1.0;

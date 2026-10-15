@@ -34,6 +34,7 @@ pub(crate) mod frames;
 pub(crate) mod gpu;
 mod jpeg;
 mod keychain;
+pub(crate) mod media;
 pub(crate) mod pacing;
 pub(crate) mod stream;
 pub(crate) mod system;
@@ -65,7 +66,7 @@ impl Platform for LinuxPlatform {
     type Writer = FfmpegFileWriter;
     type Capture = Capture;
     type Importer = VulkanImporter;
-    type Media = system::PendingMedia;
+    type Media = crate::media::MediaReader;
     type Playback = system::NoPlayback;
     /// Real-time streaming encoders are L.5's in-process NVENC/libav:
     /// the types are uninhabited and their `new` bails naming the
@@ -118,12 +119,10 @@ impl Platform for LinuxPlatform {
         system::media_info(path)
     }
 
-    /// L.1: media-file sources decode through this machine's FFmpeg.
-    fn open_media(&self, _path: &Path, _part: MediaPart) -> Result<Self::Media> {
-        bail!(
-            "media-file sources are not implemented on Linux yet: they are planned for L.1 of \
-             docs/port-omarchy.md. Remove the media source to keep this setup valid."
-        )
+    /// Media-file sources decode through this machine's FFmpeg, one
+    /// child process per part.
+    fn open_media(&self, path: &Path, part: MediaPart) -> Result<Self::Media> {
+        crate::media::open_media(path, part)
     }
 
     fn frame_importer(&self, gpu: &isocast_engine::gpu::Gpu) -> Result<VulkanImporter> {

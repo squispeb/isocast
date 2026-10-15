@@ -435,7 +435,8 @@ fn said(tail: &str) -> String {
 
 /// Drain ffmpeg's stderr into `tail`, keeping its last [`STDERR_TAIL`]
 /// bytes: a chatty ffmpeg must not deadlock on a pipe nobody reads.
-fn read_stderr(mut stderr: ChildStderr, tail: Arc<Mutex<Vec<u8>>>) {
+/// Shared with the media-file decoding, which runs the same children.
+pub(crate) fn read_stderr(mut stderr: ChildStderr, tail: Arc<Mutex<Vec<u8>>>) {
     let mut chunk = [0u8; 4096];
     loop {
         let read = match stderr.read(&mut chunk) {

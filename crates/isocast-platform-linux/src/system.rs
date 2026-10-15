@@ -15,15 +15,13 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use isocast_engine::{MediaInfo, MediaReader, Probe, Volume};
+use isocast_engine::{MediaInfo, Probe, Volume};
 use isocast_protocol::api::Machine;
 use isocast_protocol::devices::{
     AudioOutput, Camera, CameraKind, Devices, Display, Microphone, Permission, PermissionAction,
     PermissionDetail, PermissionKind, PermissionsReport, VideoFormat, Window,
 };
 use isocast_protocol::{Canvas, SourceKind};
-
-use crate::frames::LinuxFrame;
 
 /// Audio devices and desktop state come from helpers present on every
 /// Omarchy install; their absence is a note, not an error (a daemon
@@ -39,23 +37,6 @@ const DESKTOP_HINT: &str = "install or log in to a desktop session: displays and
 /// Audio monitoring renders through PipeWire at L.3; no instance of
 /// this type is ever constructed ([`Platform::play_audio`] bails).
 pub struct NoPlayback;
-
-/// Media readers decode through this machine's FFmpeg at L.1; never
-/// constructed ([`Platform::open_media`] bails), but the associated
-/// type still exists.
-pub enum PendingMedia {}
-
-impl MediaReader for PendingMedia {
-    type Frame = LinuxFrame;
-
-    fn next_video(&mut self) -> Result<Option<(Self::Frame, Duration)>> {
-        match *self {}
-    }
-
-    fn next_audio(&mut self) -> Result<Option<(std::vec::Vec<f32>, Duration)>> {
-        match *self {}
-    }
-}
 
 // ---------------------------------------------------------------------------
 // The clock and the thread.
@@ -141,7 +122,10 @@ fn linux_name() -> String {
 /// software ones (libx264, libx265, prores_ks) are left out: a doctor
 /// that counted libx264 as an H.264 hardware encoder would tell a
 /// CPU-only box it has one. What identifies the hardware ones here is
-/// the device suffix each carries.
+/// the device suffix each carries, and which suffixes can run is decided
+/// by the devices this box actually has — FFmpeg lists every family it
+/// was built with, 29 names on this one-GPU machine, Intel's QSV and
+/// AMD's AMF among them.
 pub(crate) fn hardware_encoders() -> Vec<std::string::String> {
     static LIST: OnceLock<Vec<String>> = OnceLock::new();
     LIST.get_or_init(|| {
@@ -153,11 +137,15 @@ pub(crate) fn hardware_encoders() -> Vec<std::string::String> {
             return Vec::new();
         };
         let text = String::from_utf8_lossy(&output.stdout);
+        let hardware = video_hardware();
         let mut names = BTreeSet::new();
         for line in text.lines() {
-            let Some(name) = encoder_name(line) else {
+            let Some((name, suffix)) = encoder_name(line) else {
                 continue;
             };
+            if !hardware.runs(suffix) {
+                continue;
+            }
             // The name itself is what setups see in the engine's
             // encoder lists; nothing else about the line matters.
             names.insert(name);
@@ -165,6 +153,90 @@ pub(crate) fn hardware_encoders() -> Vec<std::string::String> {
         names.into_iter().collect()
     })
     .clone()
+}
+
+/// The video hardware this box has: what tells which of FFmpeg's
+/// hardware encoder families could run at all.
+#[derive(Default, Debug)]
+struct VideoHardware {
+    /// PCI vendor ids of the DRM render nodes: 0x10de NVIDIA, 0x8086
+    /// Intel, 0x1002 AMD.
+    vendors: BTreeSet<u32>,
+    /// Whether there is a DRM render node at all (a GPU with a KMS
+    /// driver, which is what VAAPI, Vulkan video and the rest need).
+    render_node: bool,
+    /// Whether there is a V4L2 video node (the SoC codecs the
+    /// `*_v4l2m2m` encoders drive).
+    video_node: bool,
+}
+
+impl VideoHardware {
+    /// Whether an encoder in FFmpeg's `suffix` family has what it needs
+    /// here. The families this cannot judge — a VAAPI driver that lacks
+    /// the codec, Ampere's missing AV1 encoder — are `tune`'s to find by
+    /// running them.
+    fn runs(&self, suffix: &str) -> bool {
+        const NVIDIA: u32 = 0x10de;
+        const INTEL: u32 = 0x8086;
+        const AMD: u32 = 0x1002;
+        match suffix {
+            "_nvenc" | "_cuda" => self.vendors.contains(&NVIDIA),
+            // VAAPI encoders come from Mesa, for Intel and AMD GPUs;
+            // NVIDIA's VAAPI driver is a decode shim.
+            "_vaapi" | "_opencl" => self.vendors.contains(&INTEL) || self.vendors.contains(&AMD),
+            "_qsv" => self.vendors.contains(&INTEL),
+            "_amf" => self.vendors.contains(&AMD),
+            "_vulkan" => self.render_node,
+            "_v4l2m2m" => self.video_node,
+            // Android, Apple, Rockchip and Windows/X11-only paths:
+            // nothing on a Wayland desktop drives them.
+            _ => false,
+        }
+    }
+}
+
+/// What [`VideoHardware`] reads from the machine.
+fn video_hardware() -> VideoHardware {
+    let mut hardware = VideoHardware::default();
+    // The nodes live in /dev; their PCI ids only in sysfs.
+    if let Ok(entries) = std::fs::read_dir("/dev/dri") {
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with("renderD") {
+                hardware.render_node = true;
+            }
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir("/sys/class/drm") {
+        for entry in entries.flatten() {
+            if !entry.file_name().to_string_lossy().starts_with("renderD") {
+                continue;
+            }
+            let vendor = entry.path().join("device/vendor");
+            let Ok(text) = std::fs::read_to_string(vendor) else {
+                continue;
+            };
+            if let Ok(id) = u32::from_str_radix(text.trim().trim_start_matches("0x"), 16) {
+                hardware.vendors.insert(id);
+            }
+        }
+    }
+    hardware.video_node = has_video_node();
+    hardware
+}
+
+/// Whether any `/dev/video*` node exists.
+fn has_video_node() -> bool {
+    std::fs::read_dir("/dev")
+        .map(|entries| {
+            entries.flatten().any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .strip_prefix("video")
+                    .is_some_and(|number| number.parse::<u32>().is_ok())
+            })
+        })
+        .unwrap_or(false)
 }
 
 /// The video-hardware families FFmpeg names by suffix on their encoders
@@ -187,24 +259,23 @@ const HARDWARE_SUFFIXES: [&str; 15] = [
     "_vdpau",
 ];
 
-/// The encoder's name from one `-encoders` line, when it runs on video
-/// hardware, like
+/// The encoder's name and hardware family from one `-encoders` line, like
 /// ` V....D h264_nvenc           NVIDIA NVENC H.264 encoder (codec h264)`:
 /// the first word is the six flag characters, the second the name. (The
 /// name is the word *after* the flags — reading the flags' tail `....D`
 /// as the name once left this list empty on a box with NVENC, and the
 /// doctor said encoding would fall back to the CPU.)
-pub(crate) fn encoder_name(line: &str) -> Option<String> {
+pub(crate) fn encoder_name(line: &str) -> Option<(String, &'static str)> {
     let mut words = line.split_whitespace();
     let flags = words.next()?;
     if flags.len() != 6 || !flags.starts_with('V') {
         return None;
     }
     let name = words.next()?;
-    HARDWARE_SUFFIXES
+    let suffix = HARDWARE_SUFFIXES
         .iter()
-        .any(|suffix| name.ends_with(suffix))
-        .then(|| name.to_string())
+        .find(|suffix| name.ends_with(**suffix))?;
+    Some((name.to_string(), suffix))
 }
 
 // ---------------------------------------------------------------------------
@@ -662,49 +733,84 @@ mod tests {
     /// reporting a machine with NVENC as CPU-only).
     #[test]
     fn only_video_hardware_encoders_are_named() {
+        let named = |line: &str| encoder_name(line).map(|(name, _)| name);
         assert_eq!(
-            encoder_name(" V....D h264_nvenc           NVIDIA NVENC H.264 encoder (codec h264)"),
+            named(" V....D h264_nvenc           NVIDIA NVENC H.264 encoder (codec h264)"),
             Some("h264_nvenc".into())
         );
         assert_eq!(
-            encoder_name(" V....D hevc_nvenc           NVIDIA NVENC hevc encoder (codec hevc)"),
+            named(" V....D hevc_nvenc           NVIDIA NVENC hevc encoder (codec hevc)"),
             Some("hevc_nvenc".into())
         );
         assert_eq!(
-            encoder_name(" V....D prores_ks_vulkan     ProRes Vulkan (codec prores)"),
+            named(" V....D prores_ks_vulkan     ProRes Vulkan (codec prores)"),
             Some("prores_ks_vulkan".into())
         );
         assert_eq!(
-            encoder_name(" V....D av1_vaapi            AV1 (VAAPI) (codec av1)"),
+            named(" V....D av1_vaapi            AV1 (VAAPI) (codec av1)"),
             Some("av1_vaapi".into())
         );
         // FFmpeg's software encoders are not hardware, however the
         // doctor might like them to be: a box whose ffmpeg lists only
         // libx264 has no H.264 hardware encoder to run.
         assert_eq!(
-            encoder_name(" V....D libx264               libx264 H.264 (codec h264)"),
+            named(" V....D libx264               libx264 H.264 (codec h264)"),
             None
         );
         assert_eq!(
-            encoder_name(" V....D libx265               libx265 HEVC (codec hevc)"),
+            named(" V....D libx265               libx265 HEVC (codec hevc)"),
             None
         );
         assert_eq!(
-            encoder_name(" V....D prores_ks            Apple ProRes (iCodec Pro)"),
+            named(" V....D prores_ks            Apple ProRes (iCodec Pro)"),
             None
         );
         // Audio encoders, hardware-free codecs, and the legend and rule
         // carry no video-hardware name.
         assert_eq!(
-            encoder_name(" A....D aac                  AAC (Advanced Audio Coding)"),
+            named(" A....D aac                  AAC (Advanced Audio Coding)"),
             None
         );
-        assert_eq!(
-            encoder_name(" V....D mpeg4                MPEG-4 part 2"),
-            None
-        );
-        assert_eq!(encoder_name(" V..... = Video"), None);
-        assert_eq!(encoder_name(" ------"), None);
-        assert_eq!(encoder_name("Encoders:"), None);
+        assert_eq!(named(" V....D mpeg4                MPEG-4 part 2"), None);
+        assert_eq!(named(" V..... = Video"), None);
+        assert_eq!(named(" ------"), None);
+        assert_eq!(named("Encoders:"), None);
+    }
+
+    /// Which families can run follows the devices: FFmpeg lists every
+    /// family it was built with, and this box's list has Intel's QSV and
+    /// AMD's AMF beside its NVIDIA encoders.
+    #[test]
+    fn a_family_runs_only_with_its_hardware() {
+        let nvidia = VideoHardware {
+            vendors: [0x10de].into_iter().collect(),
+            render_node: true,
+            video_node: false,
+        };
+        assert!(nvidia.runs("_nvenc"));
+        assert!(nvidia.runs("_vulkan"));
+        assert!(!nvidia.runs("_qsv"));
+        assert!(!nvidia.runs("_amf"));
+        // NVIDIA's VAAPI support is a decode shim, not an encoder.
+        assert!(!nvidia.runs("_vaapi"));
+        assert!(!nvidia.runs("_v4l2m2m"));
+
+        let amd = VideoHardware {
+            vendors: [0x1002].into_iter().collect(),
+            render_node: true,
+            video_node: true,
+        };
+        assert!(amd.runs("_amf"));
+        assert!(amd.runs("_vaapi"));
+        assert!(amd.runs("_v4l2m2m"));
+        assert!(!amd.runs("_nvenc"));
+
+        let headless = VideoHardware::default();
+        for suffix in HARDWARE_SUFFIXES {
+            assert!(
+                !headless.runs(suffix),
+                "{suffix} cannot run on a box with no video hardware"
+            );
+        }
     }
 }
