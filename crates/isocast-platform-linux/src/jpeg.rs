@@ -23,6 +23,14 @@ pub(crate) fn encode(
     quality: f32,
 ) -> Result<(Vec<u8>, u32, u32)> {
     let (width, height) = frame.size();
+    // The compositor may have rendered this slot's texels since its CPU
+    // bytes were last written (the program's frames are drawn on the
+    // GPU): they must catch up before the picture can be read, exactly
+    // as the writer does before taking plane bytes. Skipping this is
+    // what made every program monitor a picture of unwritten zeros.
+    if frame.render_version() > frame.written_back() {
+        crate::gpu::read_back(frame)?;
+    }
     let rgb = if frame.is_ycbcr() {
         ycbcr_to_rgb(frame, width, height)?
     } else {
@@ -177,6 +185,10 @@ mod tests {
         // luma row per line, one interleaved chroma row per two lines).
         frame.set_plane(0, vec![235; luma_stride * 2]);
         frame.set_plane(1, vec![128; chroma_stride]);
+        // What the pool's bytes hold is a read-back of the texels (that
+        // is what the compositor leaves behind), so no read-back is due:
+        // this test is about the conversion, not the GPU.
+        frame.mark_written_back(frame.render_version());
 
         let (jpeg, width, height) = encode(&frame, None, 0.9).expect("a JPEG");
         assert_eq!((width, height), (4, 2));

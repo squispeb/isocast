@@ -46,8 +46,19 @@ pub struct Shared {
     /// writer compares its read-backs against it.
     render_version: AtomicU64,
     written_back: AtomicU64,
-    /// One texture per plane.
-    textures: Mutex<Option<Vec<wgpu::Texture>>>,
+    /// One texture per plane, with the GPU instance that made them.
+    textures: Mutex<Option<Imported>>,
+}
+
+/// A slot's GPU twins and the instance they live in. The engine makes a
+/// new GPU (a new wgpu device) for each program run, snapshot and shared
+/// frame viewer, so a frame must remember which one its textures belong
+/// to: reading a frame back on another device looks its texture up in
+/// the wrong registry and panics ("Cannot get non-existent resource").
+pub(crate) struct Imported {
+    pub textures: Vec<wgpu::Texture>,
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
 }
 
 struct Plane {
@@ -124,13 +135,33 @@ impl Shared {
         target.bytes.extend_from_slice(&bytes);
     }
 
-    /// The slot's textures, in plane order, once the importer made them.
-    pub(crate) fn textures(&self) -> Option<Vec<wgpu::Texture>> {
-        self.textures.lock().ok()?.clone()
+    /// The slot's textures and their GPU instance, once the importer
+    /// made them.
+    pub(crate) fn imported(&self) -> Option<Imported> {
+        let imported = self.textures.lock().ok()?;
+        let Imported {
+            textures,
+            device,
+            queue,
+        } = imported.as_ref()?;
+        Some(Imported {
+            textures: textures.clone(),
+            device: device.clone(),
+            queue: queue.clone(),
+        })
     }
 
-    pub(crate) fn set_textures(&self, textures: Vec<wgpu::Texture>) {
-        *self.textures.lock().expect("frame textures poisoned") = Some(textures);
+    pub(crate) fn set_imported(
+        &self,
+        textures: Vec<wgpu::Texture>,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) {
+        *self.textures.lock().expect("frame textures poisoned") = Some(Imported {
+            textures,
+            device: device.clone(),
+            queue: queue.clone(),
+        });
     }
 }
 
@@ -175,8 +206,9 @@ impl LinuxFrame {
         self.slot.gpu_synced()
     }
 
-    pub(crate) fn textures(&self) -> Option<Vec<wgpu::Texture>> {
-        self.slot.textures()
+    /// The slot's textures and their GPU instance.
+    pub(crate) fn imported(&self) -> Option<Imported> {
+        self.slot.imported()
     }
 
     /// Which pixel layout the frame holds.
@@ -189,9 +221,15 @@ impl LinuxFrame {
         self.slot.set_plane(plane, bytes)
     }
 
-    /// Store the importer's textures on the slot.
-    pub(crate) fn set_textures(&self, textures: Vec<wgpu::Texture>) {
-        self.slot.set_textures(textures)
+    /// Store the importer's textures on the slot, with the instance that
+    /// made them.
+    pub(crate) fn set_imported(
+        &self,
+        textures: Vec<wgpu::Texture>,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) {
+        self.slot.set_imported(textures, device, queue)
     }
 
     /// Store the CPU version the textures were last written from.

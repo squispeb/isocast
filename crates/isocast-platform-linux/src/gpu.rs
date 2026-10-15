@@ -14,7 +14,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use isocast_engine::gpu::{FrameImporter, Gpu, GpuFrame, GpuPixels, Matrix, YCbCr};
 
-use crate::frames::{FrameKind, LinuxFrame};
+use crate::frames::{FrameKind, Imported, LinuxFrame};
 
 /// Rows a texture copy's buffer needs: 256-byte alignment.
 const ROW_ALIGN: u64 = 256;
@@ -28,18 +28,6 @@ pub struct VulkanImporter {
 
 unsafe impl Send for VulkanImporter {}
 
-/// The GPU the engine handed to the first importer, kept for the
-/// writer's read-backs. One device per process.
-static GPU: std::sync::Mutex<Option<(wgpu::Device, wgpu::Queue)>> = std::sync::Mutex::new(None);
-
-pub(crate) fn gpu() -> Result<(wgpu::Device, wgpu::Queue)> {
-    let holder = GPU.lock().expect("gpu lock poisoned");
-    let Some((device, queue)) = holder.as_ref() else {
-        bail!("no GPU registered yet: an importer must be created before any thread reads frames");
-    };
-    Ok((device.clone(), queue.clone()))
-}
-
 fn extent(width: u32, height: u32) -> wgpu::Extent3d {
     wgpu::Extent3d {
         width,
@@ -50,10 +38,6 @@ fn extent(width: u32, height: u32) -> wgpu::Extent3d {
 
 impl VulkanImporter {
     pub fn new(gpu: &Gpu) -> Result<Self> {
-        let mut holder = GPU.lock().expect("gpu lock poisoned");
-        if holder.is_none() {
-            *holder = Some((gpu.device.clone(), gpu.queue.clone()));
-        }
         Ok(Self {
             device: gpu.device.clone(),
             queue: gpu.queue.clone(),
@@ -69,8 +53,8 @@ impl VulkanImporter {
         frame: &LinuxFrame,
         created_for_render: bool,
     ) -> Result<Vec<wgpu::Texture>> {
-        if let Some(textures) = frame.textures() {
-            return Ok(textures);
+        if let Some(imported) = frame.imported() {
+            return Ok(imported.textures);
         }
         let (width, height) = frame.size();
         let render_attachment = wgpu::TextureUsages::RENDER_ATTACHMENT;
@@ -117,7 +101,7 @@ impl VulkanImporter {
                 }),
             ],
         };
-        frame.set_textures(textures.clone());
+        frame.set_imported(textures.clone(), &self.device, &self.queue);
         // A render target is painted before it is sampled; anything
         // else gets the CPU bytes on its first import.
         frame.set_gpu_synced(if created_for_render {
@@ -277,20 +261,25 @@ fn read_plane(
 }
 
 /// A frame's newest texels, from its textures, into the pool's CPU
-/// bytes — what the writer calls before reading plane bytes. The
-/// device and queue come from the process's registered GPU: a frame
-/// only has GPU pixels because an importer made its textures, and the
-/// importer that rendered them holds its own instance the writer can't
-/// reach — but the GPU is the same one.
+/// bytes — what the writer and the JPEG encoder call before reading
+/// plane bytes. The device and queue are the frame's own: the engine
+/// makes a new GPU per program run, snapshot and shared-frame viewer,
+/// so a frame's textures only mean anything to the instance that made
+/// them (using "the process's" GPU instead read a live texture out of a
+/// dead registry and panicked).
 pub(crate) fn read_back(frame: &LinuxFrame) -> Result<bool> {
     let version = frame.render_version();
     if version <= frame.written_back() {
         return Ok(false);
     }
-    let Some(textures) = frame.textures() else {
+    let Some(imported) = frame.imported() else {
         bail!("a frame with GPU pixels must have textures");
     };
-    let (device, queue) = gpu()?;
+    let Imported {
+        textures,
+        device,
+        queue,
+    } = imported;
     let (width, height) = frame.size();
     for (index, texture) in textures.iter().enumerate() {
         let (size, stride) = match frame.kind() {
