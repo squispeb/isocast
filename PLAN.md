@@ -442,7 +442,7 @@ claude-opus-5-5 review corrections — trust that preamble over the doc's
 body until the body is rewritten); the WIP backend and its state at each
 step live in `docs/notes.md`'s "Linux port WIP" section.
 
-- [ ] **L.0 Backend skeleton (in progress).** A
+- [x] **L.0 Backend skeleton (delivered).** A
   `isocast-platform-linux` crate behind the existing `Platform` trait:
   synthetic sources through a real FFmpeg-encoded file writer
   (fragmented MOV/MP4, NVENC first), heap pool frames with staged
@@ -485,6 +485,42 @@ step live in `docs/notes.md`'s "Linux port WIP" section.
     video and audio; the same take hung with the old writer, and so did
     an ISO-only take whose tone source opened a beat after its first
     picture — the deadlock was never program-specific.
+  - [x] **Every other monitor, and the app's own Record.** The
+    Properties and Filters source previews asked for `shared_frames`
+    as well, which Linux refuses, so a source's picture never appeared
+    there; they now take the same JPEG transport as the canvas
+    (`cf48cf7`), the source's own picture rather than the canvas's (a
+    filter's effect shows on the canvas until L.4 carries filtered
+    frames). Verified numerically, never by viewing an image: offscreen
+    snapshots of the old and new binary differ only inside the dialog's
+    preview box, which held 116 near-black colours (mean rgb 2.2, std
+    10.2) before and 229 (mean 60.3, std 87.9 — the test pattern) after.
+    Recording from the app's path (the daemon's live engine, which is
+    what its Record button drives: `isocast start`/`stop` on the live
+    setup) stores 114/114 frames, 0 dropped, 0 repeated, 0 audio
+    dropouts, HEVC 1280x720@30 + AAC, 3.82 s.
+  - [x] **Writer hardening.** An independent review of `d9dfad9`
+    (claude-opus-5-5, threading and lifecycle) found the design right
+    and four ways it could still cost a recording, fixed in `ac465a7`:
+    a block a full audio queue refused was dropped from a raw pipe that
+    carries no timestamps, so every later sample moved 10 ms earlier
+    for the rest of the take — refused bytes are now owed and go in as
+    silence ahead of the next block that fits (and `finish` pays the
+    rest); the tail at Stop was skipped when the queue was full, so a
+    file could end short of the audio the engine had padded to `end`
+    while still reporting the full duration — it now waits for room;
+    `finish` joined the audio threads before dropping the video sender,
+    which ffmpeg's muxer can hold until video catches up (a 20 s wait,
+    then the watchdog killing a healthy take) — every sender is dropped
+    before any thread is joined; and `cancel`/`pipe_died` reaped the
+    child while the watchdog ran, where a tick could SIGKILL a recycled
+    pid — every reap now follows stopping and joining it. `write`
+    retries EINTR, a watchdog that can't start fails the take, and
+    every failure path records its reason. Same gate re-run twice:
+    90/90 frames, 0 dropped, no errors, video and audio durations
+    matching to the AAC frame; SIGINT on a 30 s take exits in 0.5 s
+    keeping both files and leaving no ffmpeg behind. Three tests cover
+    the owed-silence bookkeeping (17 in the crate).
 - [ ] **L.1 Devices, doctor, tune, media files.** `isocast devices`
   lists this box's displays (portal), windows (Hyprland), cameras
   (V4L2) and audio (PipeWire) with stable ids (node names, not
@@ -1325,6 +1361,28 @@ Shipped (v1): 7.1, 7.2, 7.4a, 7.5, 7.6. Next, in order:
 
 ## Log
 
+- L.0 complete: the dialogs' source previews, and a hardened writer
+  (2026-10-15). The Properties/Filters preview asked for Linux's refused
+  `shared_frames`, so a source's picture never appeared in either dialog;
+  it now takes the canvas's JPEG transport too (`cf48cf7`) — the source's
+  own picture, unfiltered until L.4. Verified without viewing any image:
+  offscreen snapshots of the old and new binary differ only in the
+  dialog's preview box, 116 near-black colours (mean rgb 2.2, std 10.2)
+  before vs 229 (mean 60.3, std 87.9) after. The app's Record path (the
+  daemon's engine, `isocast start`/`stop`) stores 114/114 frames, 0
+  dropped, HEVC+AAC 3.82 s. An independent review of the writer fix
+  (claude-opus-5-5) found four remaining ways to lose a recording, fixed
+  in `ac465a7`: refused audio now owes silence instead of shifting every
+  later sample (10 ms per block) earlier in a pipe that carries no
+  timestamps; the tail at Stop waits for queue room instead of ending
+  the file short of its audio while reporting the full duration; every
+  sender is dropped before any stream thread is joined (ffmpeg's muxer
+  holds the stream that is ahead, so the joins could wait on each other
+  and the watchdog kill a healthy take); and every child reap now
+  follows stopping and joining the watchdog, so no tick can SIGKILL a
+  recycled pid. Re-verified: gate twice at 90/90 frames, 0 drops, no
+  errors, A/V durations matching to the AAC frame; SIGINT on a 30 s take
+  exits in 0.5 s keeping both files, no ffmpeg left behind.
 - L.3 camera (2026-10-15): Linux captures real webcams. `capture_camera`
   resolves a setup's camera id/name to a V4L2 node, asks the device what
   it offers, picks the nearest to what the request or canvas wants

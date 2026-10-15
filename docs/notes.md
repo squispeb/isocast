@@ -67,6 +67,20 @@ each section. Delete entries that stop being true.
   This is the interim path: 1-3 fps in a debug build, because every
   picture costs a read-back, a Y'CbCr→RGB convert, a JPEG encode in the
   daemon and a decode in the app. L.4's shared surfaces replace it.
+- **The dialogs' source previews take the same JPEG route (cf48cf7)**:
+  Properties and Filters asked for `shared_frames` with the source as
+  the target, which Linux refuses ("shared frames can't be handed over
+  here"), so a source's picture stayed a placeholder. Off macOS they
+  now ask `frame` with the source's id (max 1280 wide, 30 a second,
+  `after` = the last `seq`) and show the decoded picture. What that
+  picture is: the source's own slot, not the canvas's, so **a filter's
+  effect shows on the canvas but not in the Filters dialog** until L.4
+  carries filtered frames (`FrameParams` has no `filtered`). Verified
+  without viewing an image: offscreen snapshots of the old and new
+  binary, `--state dialog:filters:pattern --state wait:2500`, differ
+  only inside the dialog's preview box (x 500..900, y 110..340), which
+  holds 116 near-black colours (mean rgb 2.2, std 10.2) before and 229
+  (mean 60.3, std 87.9) after.
 - **M1 landed (829b422)**: `isocast-platform-linux` compiles green
   (check + clippy `-D warnings` + 3 unit tests + fmt) — writer,
   uninhabited stream stubs, systems, keychain, pacing, jpeg; macOS
@@ -130,7 +144,7 @@ each section. Delete entries that stop being true.
   because the offscreen path connects through `connect_or_launch`;
   it should draw the standby state without starting anything.
 
-## Linux port WIP (2026-10-14, uncommitted)
+## Linux port WIP (written 2026-10-14; M1-M5 and L.0 are committed)
 
 Ryan asked for the Omarchy port (this machine: 5800X + RTX 3060 Ti,
 Hyprland 0.56.2, PipeWire 1.6.8, FFmpeg n9.0.1; xdg-desktop-portal-hyprland
@@ -4683,6 +4697,33 @@ isocast-platform-linux gpu` once the modules exist.
   status` clue, since the engine's writer runs in the recording process.
   One writer thread per stream, and never make the engine's packet loop
   wait on a pipe.
+- 2026-10-15 (Linux): a raw f32 audio pipe **carries no timestamps**, so a
+  dropped block isn't a gap — every later sample moves up by the block's
+  length (10 ms), for the rest of the file. The engine counts a refusal as
+  a dropout but still counts those samples as delivered, so it can't
+  compensate either. `AudioPipe` owes the refused bytes and puts them in
+  as silence with the next block that fits; `finish` pays what is left
+  before the pipes close. Same for video, but there the picture the queue
+  refused is what later gaps repeat (a stale `last_bytes` froze the
+  picture whenever the encoder drained exactly one queue slot a tick).
+- 2026-10-15 (Linux): **ffmpeg's muxer holds the stream that is ahead**
+  until the other reaches it. So at Stop, when the engine has already
+  padded audio to `end` and video still sits in the encoder's lookahead,
+  dropping one stream's sender and joining its thread while the other
+  sender is alive can wait for a peer that waits for it — then the 20 s
+  watchdog kills a *healthy* take and the tail is lost. Drop every pipe's
+  sender first, then join every thread (a dropped sender keeps its
+  queue's items, which the thread drains before its pipe closes). The
+  tail's padding goes in with a blocking `send` for the same reason: a
+  skipped tail leaves the file shorter than the audio and shorter than
+  the duration the report claims.
+- 2026-10-15 (Linux): **every `wait`/`kill` of the encoder must follow
+  stopping and joining its watchdog**: otherwise a tick that lands
+  between the reap and the stop can `SIGKILL` a pid the OS has handed to
+  someone else. `pipe_died` therefore doesn't reap at all (it runs in the
+  engine's packet loop, where waiting for a live child would stall every
+  other file too) and only glances at the stderr reader (250 ms) before
+  using what it has.
 - 2026-10-15 (Linux): a V4L2 camera node belongs to **one** opener. The
   daemon's live engine keeps every source running while anything asks it
   for frames (the app's preview does, and it starts the camera whether or
