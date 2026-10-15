@@ -432,6 +432,55 @@ come later (clips already carry in/out points on their take).
   export with progress; on the same methods and events. After the console
   redesign of crates/isocast-ui lands.
 
+## Linux (Omarchy) port — L (Ryan, 2026-10-14)
+
+Ryan pulled Linux forward from "9. Later": Isocast should run great on his
+Omarchy box (Hyprland 0.56.2, PipeWire 1.6.8, RTX 3060 Ti + 5800X, FFmpeg
+n9.0.1) with the same performance measurements. researched in
+`docs/port-omarchy.md` (its preamble carries the 2026-10-14
+claude-opus-5-5 review corrections — trust that preamble over the doc's
+body until the body is rewritten); the WIP backend and its state at each
+step live in `docs/notes.md`'s "Linux port WIP" section.
+
+- [ ] **L.0 Backend skeleton (in progress, uncommitted).** A
+  `isocast-platform-linux` crate behind the existing `Platform` trait:
+  synthetic sources through a real FFmpeg-encoded file writer
+  (fragmented MOV/MP4, NVENC first), heap pool frames with staged
+  GPU copies, absolute clock waits, devices/secrets/volume/doctor
+  inputs, JPEG monitors. Done when `isocast record` writes a
+  synthetic-only take whose files `ffprobe` like the macOS ones, the
+  daemon, CLI and app build on Linux, and `cargo test` covers the
+  pool and the GPU upload/read-back cycle.
+- [ ] **L.1 Devices, doctor, tune, media files.** `isocast devices`
+  lists this box's displays (portal), windows (Hyprland), cameras
+  (V4L2) and audio (PipeWire) with stable ids (node names, not
+  indexes); `doctor`/`tune` know about NVENC session caps and libav
+  choices; `open_media` decodes through FFmpeg. The fragmented-MOV
+  writer graduates to exact timestamps and fsynced fragments
+  (G.3b's matrix).
+- [ ] **L.2 Screen capture.** The portal's ScreenCast through
+  PipeWire, with the Vulkan device-creation hook for DMA-BUF imports;
+  verified by `isocast record --source screen --seconds 10` and
+  `ffprobe`.
+- [ ] **L.3 Camera, mic and system audio through PipeWire and
+  V4L2.** Per-app audio by linking a capture stream to the app's
+  stream node (the reviewer's correction: this *is* possible on
+  Linux); `exclude_own` works the same way.
+- [ ] **L.4 Shared monitor surfaces.** DMABUF rings or memfd rings
+  through `isocast-surfaces`'s Unix-socket hand-over (see
+  docs/shared-frames.md's sketch); the app's live monitors work.
+- [ ] **L.5 In-process encoders and joins.** LGPL libav (or NVENC
+  API) for streams and monitors with the full `VideoEncoder`
+  contract (per-frame keyframes, `set_rate`); timeline exports
+  through FFmpeg's edit-list-safe concat (the join.rs findings).
+- [ ] **L.6 Browser sources (WPE WebKit or WebKitGTK), virtual
+  camera (v4l2loopback), hotkeys (GlobalShortcuts portal or Hyprland
+  binds), plugin sandboxing (SO_PEERCRED + Landlock)** and the S.1
+  benchmark rows for Linux (an obs-bench port is its own task).
+
+Continuity Camera (Ryan's iPhone) stays macOS-only; his Linux setup
+uses the UVC camera.
+
 ### S. Stress testing and performance (Ryan, 2026-10-13)
 
 - [ ] **S.1 Head-to-head with OBS.** A repeatable benchmark that runs the

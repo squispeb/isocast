@@ -3,6 +3,105 @@
 Short, dated facts a future session needs. Newest entries go at the top of
 each section. Delete entries that stop being true.
 
+## Linux port WIP (2026-10-14, uncommitted)
+
+Ryan asked for the Omarchy port (this machine: 5800X + RTX 3060 Ti,
+Hyprland 0.56.2, PipeWire 1.6.8, FFmpeg n9.0.1; xdg-desktop-portal-hyprland
+active; web C920 at /dev/video0; no v4l2loopback loaded). A review doc
+(docs/port-omarchy.md) was written and **reviewed by claude-opus-5-5 high**
+through a subagent: verdict "no-go on the doc as written, go for L.0 after
+corrections" — its 38 findings are summarised in the doc's preamble review
+block and the plan below follows them. Do not trust the doc's body where
+the preamble and this section disagree with it.
+
+State on disk (NONE of it committed; the tree's committed state is clean):
+
+- `crates/isocast-platform-linux/` — WIP L.0 backend, deliberately not in
+  daemon builds. Written and near-compiling: `Cargo.toml` (wgpu
+  std/wgsl + target-linux vulkan split), `lib.rs` (full `Platform` impl;
+  capture/media/join/browser/playback bail with their milestone number,
+  writer/streams/system/keychain/pacing/jpeg are real wiring),
+  `frames.rs` (heap pools: weak slot recycling like CVPixelBufferPool's,
+  plane Mutex<Vec<u8>>, cpu/render/written-back version atomics, slot-held
+  textures), `gpu.rs` (VulkanImporter: textures created on the slot once,
+  CPU→GPU over row-aligned staging in `import`, render targets paint all
+  pixels so targets skip the upload and bump `render_version`, the writer
+  read-back path is `VulkanImporter::read_back(frame)` →
+  `read_plane` with map_async + poll, rendered texels land back in the
+  pool's bytes), `keychain.rs` (0600 JSON + rename in `~/.isocast`, per
+  `protocol::api::socket_path().parent()`), `pacing.rs`
+  (clock_nanosleep TIMER_ABSTIME, deadline computed once, retry on
+  EINTR; SCHED_FIFO best-effort; host_time here).
+- Modified but uncommitted (untested on macOS here — CI must check that
+  macOS still builds): `crates/isocast-engine/Cargo.toml`,
+  `crates/isocast-client/Cargo.toml`, `crates/isocast-ui/Cargo.toml`
+  each split the pinned wgpu into the plain (metal) entry plus a
+  `[target.'cfg(target_os = "linux")'.dependencies]` entry with
+  `"vulkan"` (resolver 3 keeps per-target feature sets). This is
+  reviewer finding #3: without it `Gpu::new` finds no adapter on Linux.
+- Not yet written (the crate does not compile yet because `lib.rs`'s
+  `mod` list names them): `writer.rs`, `stream.rs`, `system.rs`,
+  `jpeg.rs`.
+
+Decisions made (see also the doc's preamble):
+
+- **Frame**: heap pools + slot textures + staged copies (reviewer's
+  contract gap #11). DMA-BUF later, and then `Gpu::new` needs the
+  device-creation hook (finding #12).
+- **Writer L.0**: system ffmpeg CLI over pipes, fragmented
+  (`-movflags +frag_keyframe+empty_moov+default_base_moof`,
+  `-frag_duration 3000000`), colour tags bt709, `-bf 0` and `-g 2×fps`,
+  encoder choice: hevc_nvenc/h264_nvenc when present else
+  libx264/libx265 (`-crf 51 - q*51/100`; nvenc `-rc vbr -cq
+  51 - q/2`), prores_ks (profiles 0/1/2/3/4, `-qscale:v 10 - 9q/100`).
+  **Input pixel format decided at first `append_video`** (BGRA or NV12
+  from the frame kind) by spawning the child lazily; buffered audio
+  samples flush after the spawn. Exactly-pts recording and fsync
+  commits are L.1/L.5 (our own fMP4 muxer; reviewer findings #16/#17).
+- **Live encoders L.0**: ffmpeg-CLI shells with the contract gaps
+  documented (no per-frame keyframe forcing or `set_rate`; finding
+  #17) — the real in-process NVENC/libav encoders are L.5.
+- **Licensing**: LGPL-only libav if ever linked; CLI ffmpeg is a
+  separate process (finding #16). No x264/x265/fdk in-tree.
+- `doctor`'s missing-`cfg` and the Linux daemon build are part of the
+  daemon-shim step.
+
+Remaining work, in order (each ends verified, one commit each):
+
+1. Write the four missing modules (writer.rs, stream.rs stub with the
+   contract caveats, system.rs, jpeg.rs), trim `lib.rs`'s imports to
+   match. `cargo check -p isocast-platform-linux` until clean; `cargo
+   test -p isocast-platform-linux` for the pool's draw/take cycle and
+   the gpu's upload/read-back on this machine's Vulkan.
+2. Daemon shim: `crates/isocast-daemon/Cargo.toml` gets the
+   platform-linux dep under `cfg(target_os = "linux")`; `main.rs:84`
+   aliases `LinuxPlatform as MacPlatform` under that cfg (keeps the
+   27 call sites untouched); fix `main.rs:865` (glibc's `tv_usec` is
+   i64: `f64::from(tv_usec)` → `as f64`), annotate
+   `hotkeys.rs:366`'s `registrations` as `Vec<Registration>` and
+   `recovery.rs:151-153`'s `recovered` as
+   `Vec<isocast_protocol::manifest::InterruptedRecording>` (both are
+   inference failures of the not-macOS arm). Then
+   `cargo check -p isocast-daemon` on Linux.
+3. Verify like 1.1 does: build `isocastd` + `isocast` (release not
+   needed for the check), `isocast record` a synthetic-only scratch
+   setup (test_pattern + tone, target/scratch/, NOT the recordings
+   folder), `ffprobe` every file for codec/duration/size, kill -9
+   mid-take for the fragmented-MOV behaviour, `isocast devices`,
+   `doctor`, `status`. The Slint app: `cargo check -p isocast-ui` first
+   (Skia's Linux build is long), then run it against a scratch engine —
+   live monitors show a standby notice until L.4 (shared surfaces).
+4. Update docs/port-omarchy.md's body to match what was built (it
+   still carries wrong line counts and module descriptions), add the
+   version's own §Preamble about what L.0 delivers, and commit the
+   crate + shims + docs as the L.0 task.
+
+Verify-from-scratch commands for the next session:
+`cd /home/squispeb/projects/isocast && cargo check -p
+isocast-platform-linux 2>&1 | tail -20` then follow the fix loop; the
+Vulkan import path's first real check is `cargo test -p
+isocast-platform-linux gpu` once the modules exist.
+
 ## Environment
 
 - 2026-10-13: OBS Studio on the test Macs (for S.1): isocast-m2-a has
