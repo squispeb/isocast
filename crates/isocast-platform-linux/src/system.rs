@@ -21,7 +21,7 @@ use isocast_protocol::devices::{
     AudioOutput, Camera, CameraKind, Devices, Display, Microphone, Permission, PermissionAction,
     PermissionDetail, PermissionKind, PermissionsReport, VideoFormat, Window,
 };
-use isocast_protocol::{Canvas, SourceKind};
+use isocast_protocol::{Canvas, Codec, SourceKind};
 
 /// Audio devices and desktop state come from helpers present on every
 /// Omarchy install; their absence is a note, not an error (a daemon
@@ -237,6 +237,94 @@ fn has_video_node() -> bool {
             })
         })
         .unwrap_or(false)
+}
+
+/// The NVENC encoder for a codec, when this box's ffmpeg has one: what a
+/// session probe has to start, and what the writer chooses.
+fn nvenc_for(codec: Codec) -> Option<&'static str> {
+    let name = match codec {
+        Codec::Hevc => "hevc_nvenc",
+        Codec::H264 => "h264_nvenc",
+        // ProRes encodes on the CPU (`prores_ks`), which has no sessions
+        // to run out of.
+        _ => return None,
+    };
+    hardware_encoders()
+        .iter()
+        .any(|listed| listed == name)
+        .then_some(name)
+}
+
+/// How many of `files` simultaneous encodes of `codec` this box's video
+/// hardware starts, or `None` when the question doesn't apply or can't be
+/// answered: fewer than two files (nothing to contend for), no NVENC
+/// encoder for the codec, or no ffmpeg to probe with. Only NVENC caps
+/// sessions; VAAPI, Vulkan video and the SoC codecs have nothing to find.
+///
+/// The count is measured by running that many encodes at once, so it
+/// holds sessions while it runs and must not be asked during a recording.
+/// This box's driver (610.57.4) leaves the consumer cap behind — twelve
+/// concurrent `hevc_nvenc` encodes open — but a driver that caps at three
+/// would refuse the fourth file of a program-plus-three-ISOs take.
+pub(crate) fn concurrent_encodes(
+    codec: Codec,
+    files: u32,
+) -> Option<isocast_engine::EncoderSessions> {
+    /// More than any consumer-capable driver allows, and the bound on
+    /// what this probe will start.
+    const MOST: u32 = 12;
+    /// A legal NVENC picture (64×64 is refused as too small) for few
+    /// enough frames that a session opens and closes quickly.
+    const PROBE_INPUT: &str = "color=black:s=256x256:r=30:d=0.5";
+
+    if files < 2 {
+        return None;
+    }
+    let encoder = nvenc_for(codec)?;
+    let asked = files.min(MOST);
+    let mut children = Vec::new();
+    for _ in 0..asked {
+        let Ok(child) = Command::new(ffmpeg_path())
+            .args(["-hide_banner", "-loglevel", "error", "-nostdin"])
+            .args(["-f", "lavfi", "-i", PROBE_INPUT])
+            .args(["-c:v", encoder, "-f", "null", "-"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        else {
+            // No ffmpeg, or none that can start: nothing measured.
+            break;
+        };
+        children.push(child);
+    }
+    let asked = children.len() as u32;
+    if asked < 2 {
+        return None;
+    }
+    let mut opened = 0;
+    let mut refused = None;
+    for child in children {
+        match child.wait_with_output() {
+            Ok(done) if done.status.success() => opened += 1,
+            Ok(done) => {
+                let said = String::from_utf8_lossy(&done.stderr);
+                if refused.is_none() {
+                    refused = said
+                        .lines()
+                        .rev()
+                        .find(|line| !line.trim().is_empty())
+                        .map(|line| line.trim().to_string());
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    Some(isocast_engine::EncoderSessions {
+        asked,
+        opened,
+        refused,
+    })
 }
 
 /// The video-hardware families FFmpeg names by suffix on their encoders

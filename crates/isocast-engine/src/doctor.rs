@@ -6,6 +6,7 @@ use isocast_protocol::api::{Check, CheckStatus, Doctor};
 use isocast_protocol::devices::{Permission, PermissionKind};
 use isocast_protocol::{Codec, FilterKind, Setup, SourceKind, TransitionKind};
 
+use crate::EncoderSessions;
 use crate::record::{expand_home, interrupted_note, interrupted_sessions};
 use crate::{AudioTrackSpec, Platform, VideoTrackSpec, WriterSpec, space};
 
@@ -17,16 +18,17 @@ const COMFORTABLE_HOURS: f64 = 1.0;
 type Delivers<'a> = (&'a str, Option<(u32, u32, u32)>, Option<u32>);
 
 /// Check this machine, and `setup` if given: permissions, hardware
-/// encoders, the setup's devices and the recording disk.
-pub fn doctor<P: Platform>(platform: &P, setup: Option<&Setup>, folder: Option<&Path>) -> Doctor {
+/// encoders, the setup's devices and the recording disk. `busy` says the
+/// live engine is already encoding something (a recording, a stream, a
+/// `tune` run), so the encoder-session probe stays out of its way.
+pub fn doctor<P: Platform>(
+    platform: &P,
+    setup: Option<&Setup>,
+    folder: Option<&Path>,
+    busy: bool,
+) -> Doctor {
     let machine = platform.machine();
     let mut checks = Vec::new();
-    let check = |name: &str, status, detail: String, fix: Option<&str>| Check {
-        name: name.into(),
-        status,
-        detail,
-        fix: fix.map(Into::into),
-    };
 
     // Permissions, and which ones the setup needs.
     let kinds: Vec<&SourceKind> = setup
@@ -309,6 +311,35 @@ pub fn doctor<P: Platform>(platform: &P, setup: Option<&Setup>, folder: Option<&
         };
         rate += file((width, height, setup.canvas.fps), &program.encoder, mix);
     }
+    // The video hardware's own limit: a consumer NVENC driver caps how
+    // many encodes run at once, and this take holds one session per file
+    // with video. Only Linux can be asked (see `concurrent_encodes`), and
+    // only when nothing else is encoding — the probe needs the session
+    // slots itself.
+    if !busy {
+        let iso_files = if iso_on {
+            iso.sources
+                .iter()
+                .filter(|id| {
+                    formats
+                        .iter()
+                        .any(|(format, video, _)| *format == id.as_str() && video.is_some())
+                })
+                .count() as u32
+        } else {
+            0
+        };
+        let files = iso_files + u32::from(program.enabled);
+        // The driver's cap is per GPU, not per codec, so the codec the
+        // program uses answers for the ISO files too.
+        let codec = match program.enabled {
+            true => program.encoder.codec,
+            false => iso.encoder.codec,
+        };
+        if let Some(sessions) = platform.concurrent_encodes(codec, files) {
+            checks.push(session_check(files, &sessions));
+        }
+    }
     let name = format!("disk: {}", folder.display());
     match platform.volume(&existing) {
         Ok(volume) => {
@@ -455,4 +486,83 @@ fn nearest_existing(folder: &Path) -> PathBuf {
         .find(|path| path.exists())
         .unwrap_or(Path::new("/"))
         .to_path_buf()
+}
+
+/// One line of the report.
+fn check(name: &str, status: CheckStatus, detail: String, fix: Option<&str>) -> Check {
+    Check {
+        name: name.into(),
+        status,
+        detail,
+        fix: fix.map(Into::into),
+    }
+}
+
+/// The check for the hardware encode-session probe: a take that holds more
+/// files at once than the video hardware opens sessions for is one to fix
+/// before recording, not to discover when the file is missing.
+fn session_check(files: u32, sessions: &EncoderSessions) -> Check {
+    if sessions.opened == sessions.asked {
+        return check(
+            "encoder sessions",
+            CheckStatus::Ok,
+            format!("{} started at once for {files} file(s)", sessions.opened),
+            None,
+        );
+    }
+    check(
+        "encoder sessions",
+        CheckStatus::Problem,
+        format!(
+            "this recording holds {files} file(s) at once and only {} of {} encode sessions \
+             started{}",
+            sessions.opened,
+            sessions.asked,
+            match &sessions.refused {
+                Some(said) => format!(": {said}"),
+                None => String::new(),
+            }
+        ),
+        Some(
+            "the driver caps how many encodes run together: record fewer ISO sources, or turn \
+             the program off",
+        ),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A card that opens fewer sessions than the take holds is a problem
+    /// worth the user's attention; one that opens them all is not.
+    #[test]
+    fn a_short_session_count_is_a_problem() {
+        let short = session_check(
+            4,
+            &EncoderSessions {
+                asked: 4,
+                opened: 3,
+                refused: Some("OpenEncodeSessionEx failed: out of memory (10)".into()),
+            },
+        );
+        assert_eq!(short.status, CheckStatus::Problem);
+        assert_eq!(short.name, "encoder sessions");
+        assert!(short.detail.contains("4 file(s)"), "{}", short.detail);
+        assert!(short.detail.contains("3 of 4"), "{}", short.detail);
+        assert!(short.detail.contains("out of memory"), "{}", short.detail);
+        assert!(short.fix.is_some());
+
+        let all = session_check(
+            4,
+            &EncoderSessions {
+                asked: 4,
+                opened: 4,
+                refused: None,
+            },
+        );
+        assert_eq!(all.status, CheckStatus::Ok);
+        assert!(all.detail.contains("4 started"), "{}", all.detail);
+        assert_eq!(all.fix, None);
+    }
 }

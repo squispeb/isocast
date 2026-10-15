@@ -21,13 +21,13 @@ use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use isocast_engine::{
-    AudioRender, AudioSink, CameraRequest, CaptureFormat, JoinSpec, Joined, LiveAudioSpec,
-    LiveVideoSpec, MediaInfo, MediaPart, OnJoinProgress, Platform, Probe, Time, VideoSink, Volume,
-    WriterSpec,
+    AudioRender, AudioSink, CameraRequest, CaptureFormat, EncoderSessions, JoinSpec, Joined,
+    LiveAudioSpec, LiveVideoSpec, MediaInfo, MediaPart, OnJoinProgress, Platform, Probe, Time,
+    VideoSink, Volume, WriterSpec,
 };
 use isocast_protocol::api::Machine;
 use isocast_protocol::devices::{Devices, PermissionKind, PermissionsReport};
-use isocast_protocol::{Canvas, SourceKind};
+use isocast_protocol::{Canvas, Codec, SourceKind};
 
 pub(crate) mod camera;
 pub(crate) mod frames;
@@ -131,6 +131,13 @@ impl Platform for LinuxPlatform {
 
     fn machine(&self) -> Machine {
         system::machine()
+    }
+
+    /// NVENC is the one family here that caps how many encodes run at
+    /// once, so it is the one worth asking: the probe starts the encodes
+    /// and counts the sessions that open.
+    fn concurrent_encodes(&self, codec: Codec, files: u32) -> Option<EncoderSessions> {
+        system::concurrent_encodes(codec, files)
     }
 
     /// Which device a source would record, or an error naming the valid

@@ -1305,10 +1305,17 @@ impl Daemon {
             Method::ImportObs(params) => import_obs(*params).and_then(to_json),
             Method::InitSetup(params) => self.init_setup(*params).and_then(to_json),
             Method::Doctor(params) => check_folder(params.folder.as_deref()).and_then(|()| {
-                let setup = params
-                    .setup
-                    .or_else(|| self.state.lock().unwrap().setup.clone());
-                let mut report = doctor(setup.as_ref(), params.folder.as_deref());
+                let (setup, busy) = {
+                    let state = self.state.lock().unwrap();
+                    (
+                        params.setup.clone().or_else(|| state.setup.clone()),
+                        // The session probe starts its own encodes, so it
+                        // stays out of the way of anything already
+                        // encoding.
+                        state.session.is_some() || state.tuning || state.stream.is_some(),
+                    )
+                };
+                let mut report = doctor(setup.as_ref(), params.folder.as_deref(), busy);
                 report.checks.extend(self.plugins.doctor_check());
                 to_json(report)
             }),
@@ -3930,8 +3937,12 @@ fn free_bytes(_folder: &Path) -> Option<u64> {
     None
 }
 
-fn doctor(setup: Option<&Setup>, folder: Option<&Path>) -> isocast_protocol::api::Doctor {
-    isocast_engine::doctor::doctor(&HostPlatform, setup, folder)
+fn doctor(
+    setup: Option<&Setup>,
+    folder: Option<&Path>,
+    busy: bool,
+) -> isocast_protocol::api::Doctor {
+    isocast_engine::doctor::doctor(&HostPlatform, setup, folder, busy)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]

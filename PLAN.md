@@ -543,9 +543,16 @@ step live in `docs/notes.md`'s "Linux port WIP" section.
     an `id` Hyprland never sends for windows; a window's id is now the
     low 32 bits of its `address`, and all 12 of this box's windows
     list with app, title and size.
-  - [ ] **Doctor/tune: NVENC session caps.** A consumer driver caps how
+  - [x] **Doctor/tune: NVENC session caps.** A consumer driver caps how
     many encodes run at once, and the flagship records the program plus
-    three ISO files; the doctor should warn before a take, not after.
+    three ISO files; `doctor` now starts that many encodes at once and
+    reports what opened, so a take that holds more files than the card
+    opens a session for is a problem before recording rather than a
+    missing file after. Verified: a four-file setup reports "4 started
+    at once for 4 file(s)" here; a stand-in ffmpeg that lets only two
+    concurrent probes through makes the doctor report `problem` with
+    ffmpeg's own refusal quoted; while a recording runs the probe stays
+    away (no session check, no probe invocations).
   - [ ] **Devices polish.** Camera formats and audio ids on a box with
     the camera plugged in (needs the C920 back); `permissions` still
     reports macOS's three grants as granted — L.2's portal is the real
@@ -1387,6 +1394,18 @@ Shipped (v1): 7.1, 7.2, 7.4a, 7.5, 7.6. Next, in order:
 
 ## Log
 
+- L.1 (2026-10-15): the doctor measures the video hardware's
+  encode-session limit. `Platform::concurrent_encodes` (default: the
+  machine can't be asked — macOS's media engines cap nothing) is
+  answered on Linux by starting exactly as many NVENC encodes at once as
+  the setup holds files with video and counting the sessions that open,
+  and the doctor reports the shortfall as a problem, quoting ffmpeg's
+  refusal. Verified: a program-plus-three-ISOs setup reports "4 started
+  at once for 4 file(s)"; a stand-in ffmpeg that lets two probes hold
+  their slot (ISOCAST_FFMPEG) turns it into `problem` with
+  "only 2 of 4 encode sessions started: OpenEncodeSessionEx failed: out
+  of memory (10)"; with a recording live the doctor adds no session
+  check and the probe never ran.
 - L.1 (2026-10-15): devices, doctor and media files on Linux.
   `isocast devices` now lists this box's 12 windows (Hyprland names a
   window by its 64-bit `address`, not the `id` the parser read, so the

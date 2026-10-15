@@ -192,7 +192,11 @@ each section. Delete entries that stop being true.
   System Settings) and wants a Linux pass. And `--snapshot` (a
   render-only mode CI uses) **launches a daemon** as a side effect,
   because the offscreen path connects through `connect_or_launch`;
-  it should draw the standby state without starting anything.
+  it should draw the standby state without starting anything. The
+  app's keyboard hotkeys are macOS-only for now (`keys.rs`'s winit
+  key-event path, which is also why `cargo clippy -D warnings` on the
+  workspace reports those functions as dead on Linux, like the other
+  UI dead-code warnings); the Linux app is mouse-only.
 
 ## Linux port WIP (written 2026-10-14; M1-M5 and L.0 are committed)
 

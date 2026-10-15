@@ -40,7 +40,7 @@ use std::sync::Arc;
 
 use isocast_protocol::api::Machine;
 use isocast_protocol::devices::{Devices, PermissionKind, PermissionsReport};
-use isocast_protocol::{Canvas, Container, Encoder, SourceKind};
+use isocast_protocol::{Canvas, Codec, Container, Encoder, SourceKind};
 
 pub use time::Time;
 
@@ -132,6 +132,20 @@ pub trait Platform: Clone + Send + Sync + 'static {
 
     /// The chip, memory, OS and hardware encoders.
     fn machine(&self) -> Machine;
+
+    /// Whether this machine's video hardware can start `files` encodes of
+    /// `codec` at the same time, when it can be asked: consumer NVENC
+    /// drivers cap how many sessions run at once, and a take holds one
+    /// session per file (the program plus every ISO source), so a setup
+    /// can hold more files than the card will open. `None` when the
+    /// machine cannot be asked — macOS's media engines impose no such cap
+    /// — or when the question doesn't apply (fewer than two files, or no
+    /// encoder of the hardware's for the codec). Starting encodes to find
+    /// out fills the session slots while it runs, so this is for a
+    /// pre-flight check, not for a recording in progress.
+    fn concurrent_encodes(&self, _codec: Codec, _files: u32) -> Option<EncoderSessions> {
+        None
+    }
 
     /// Find the device a source would record, and the format it would
     /// record in, without opening it. `None` for synthetic sources; an
@@ -502,6 +516,20 @@ pub struct MediaInfo {
     pub video: Option<(u32, u32)>,
     pub audio: bool,
     pub duration: std::time::Duration,
+}
+
+/// What a machine's video hardware does when several encodes are asked
+/// for at once ([`Platform::concurrent_encodes`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncoderSessions {
+    /// How many encodes were asked for at once.
+    pub asked: u32,
+    /// How many of them started.
+    pub opened: u32,
+    /// What the machine said about the ones that did not, when it said
+    /// anything: ffmpeg's words for a refused NVENC session, for the
+    /// doctor to quote.
+    pub refused: Option<String>,
 }
 
 /// The size of a source's picture when it comes from a file or its text
