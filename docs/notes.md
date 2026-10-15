@@ -4598,6 +4598,16 @@ isocast-platform-linux gpu` once the modules exist.
 
 ## Gotchas
 
+- 2026-10-15 (Linux): a scene item whose source can't be captured yet still
+  belongs in a setup. With the C920 in the scene and camera capture at L.3,
+  `isocast snapshot` (of the program) and anything else that composites the
+  program fail honestly — "camera capture is not implemented on Linux yet
+  … L.3 (V4L2)" — while an ISO-only take is unaffected (4 s take, 120/120
+  frames, ffprobe-matched, with the camera in the scene). So a camera source
+  can be prepared and shown in the app before L.3 lands, but the program
+  path comes alive only with it. The app's Sources dock lists a scene's
+  **items**, not top-level sources: a source that is in the setup but in no
+  scene shows nowhere.
 - 2026-10-14 (#47 fix round): building a `git archive` of main into the
   same CARGO_TARGET_DIR (for "before" screenshots) left main's
   isocast-protocol/diagnostics artifacts in place; the branch then failed
