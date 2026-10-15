@@ -7,7 +7,7 @@ use isocast_protocol::devices::{Permission, PermissionKind};
 use isocast_protocol::{Codec, FilterKind, Setup, SourceKind, TransitionKind};
 
 use crate::record::{expand_home, interrupted_note, interrupted_sessions};
-use crate::{AudioTrackSpec, Platform, VideoTrackSpec, WriterSpec, space};
+use crate::{space, AudioTrackSpec, Platform, VideoTrackSpec, WriterSpec};
 
 /// Recording time a disk should hold before it gets a warning.
 const COMFORTABLE_HOURS: f64 = 1.0;
@@ -88,11 +88,25 @@ pub fn doctor<P: Platform>(platform: &P, setup: Option<&Setup>, folder: Option<&
         )),
     }
 
-    // Hardware encoders.
-    let has = |name: &str| machine.hardware_encoders.iter().any(|e| e.contains(name));
+    // Hardware encoders. The names are the platform's own — macOS lists
+    // VideoToolbox's display names ("HEVC", "H.264", "Apple ProRes 422"),
+    // Linux ffmpeg's encoder names ("hevc_nvenc", "h264_nvenc",
+    // "prores_ks_vulkan") — so a codec counts as hardware-backed when any
+    // of the names it goes by appears, whatever the case.
+    let has = |codec: Codec| {
+        let aliases: &[&str] = match codec {
+            Codec::Hevc => &["hevc", "h265", "h.265"],
+            Codec::H264 => &["h264", "h.264", "avc"],
+            _ => &["prores"],
+        };
+        machine.hardware_encoders.iter().any(|encoder| {
+            let encoder = encoder.to_lowercase();
+            aliases.iter().any(|alias| encoder.contains(alias))
+        })
+    };
     checks.push(check(
         "hardware encoders",
-        if has("HEVC") {
+        if has(Codec::Hevc) {
             CheckStatus::Ok
         } else {
             CheckStatus::Warning
@@ -147,11 +161,7 @@ pub fn doctor<P: Platform>(platform: &P, setup: Option<&Setup>, folder: Option<&
         ));
     }
     let codec = setup.recording.iso.encoder.codec;
-    let hardware = match codec {
-        Codec::Hevc => has("HEVC"),
-        Codec::H264 => has("H.264"),
-        _ => has("ProRes"),
-    };
+    let hardware = has(codec);
     if !hardware {
         checks.push(check(
             "encoder",

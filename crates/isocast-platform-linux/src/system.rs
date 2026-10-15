@@ -132,10 +132,16 @@ fn linux_name() -> String {
         .unwrap_or_else(|| "Linux".to_string())
 }
 
-/// Encoder names that FFmpeg lists, once per process. Whether one
-/// really runs here is `tune`'s job (it benchmarks); Ampere-family
-/// GPUs, like this box's RTX 3060 Ti, cannot run `av1_nvenc` even when
-/// FFmpeg built with it.
+/// Encoder names that FFmpeg lists for this machine's video hardware,
+/// once per process. Whether one really runs here is `tune`'s job (it
+/// benchmarks); Ampere-family GPUs, like this box's RTX 3060 Ti, cannot
+/// run `av1_nvenc` even when FFmpeg built with it.
+///
+/// This is the doctor's list of *hardware* encoders, so FFmpeg's
+/// software ones (libx264, libx265, prores_ks) are left out: a doctor
+/// that counted libx264 as an H.264 hardware encoder would tell a
+/// CPU-only box it has one. What identifies the hardware ones here is
+/// the device suffix each carries.
 pub(crate) fn hardware_encoders() -> Vec<std::string::String> {
     static LIST: OnceLock<Vec<String>> = OnceLock::new();
     LIST.get_or_init(|| {
@@ -161,11 +167,43 @@ pub(crate) fn hardware_encoders() -> Vec<std::string::String> {
     .clone()
 }
 
-/// The encoder's name from one `-encoders` line.
+/// The video-hardware families FFmpeg names by suffix on their encoders
+/// (`hevc_nvenc`, `h264_vaapi`, `prores_ks_vulkan`, …).
+const HARDWARE_SUFFIXES: [&str; 15] = [
+    "_nvenc",
+    "_vaapi",
+    "_qsv",
+    "_v4l2m2m",
+    "_amf",
+    "_mediacodec",
+    "_vulkan",
+    "_opencl",
+    "_videotoolbox",
+    "_cuda",
+    "_omx",
+    "_rkmpp",
+    "_d3d12va",
+    "_dxva2",
+    "_vdpau",
+];
+
+/// The encoder's name from one `-encoders` line, when it runs on video
+/// hardware, like
+/// ` V....D h264_nvenc           NVIDIA NVENC H.264 encoder (codec h264)`:
+/// the first word is the six flag characters, the second the name. (The
+/// name is the word *after* the flags — reading the flags' tail `....D`
+/// as the name once left this list empty on a box with NVENC, and the
+/// doctor said encoding would fall back to the CPU.)
 pub(crate) fn encoder_name(line: &str) -> Option<String> {
-    let rest = line.trim().strip_prefix("V")?.trim();
-    let name = rest.split_whitespace().next()?;
-    (name.contains("nvenc") || name.starts_with("prores") || name.starts_with("libx2"))
+    let mut words = line.split_whitespace();
+    let flags = words.next()?;
+    if flags.len() != 6 || !flags.starts_with('V') {
+        return None;
+    }
+    let name = words.next()?;
+    HARDWARE_SUFFIXES
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
         .then(|| name.to_string())
 }
 
@@ -612,4 +650,61 @@ pub(crate) fn ffmpeg_path() -> String {
 
 pub(crate) fn ffprobe_path() -> String {
     std::env::var("ISOCAST_FFPROBE").unwrap_or_else(|_| "ffprobe".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The real `-encoders` lines this box prints, as they are spaced:
+    /// the name is the word after the six flag characters, never the
+    /// flags themselves (reading `....D` as the name left the doctor
+    /// reporting a machine with NVENC as CPU-only).
+    #[test]
+    fn only_video_hardware_encoders_are_named() {
+        assert_eq!(
+            encoder_name(" V....D h264_nvenc           NVIDIA NVENC H.264 encoder (codec h264)"),
+            Some("h264_nvenc".into())
+        );
+        assert_eq!(
+            encoder_name(" V....D hevc_nvenc           NVIDIA NVENC hevc encoder (codec hevc)"),
+            Some("hevc_nvenc".into())
+        );
+        assert_eq!(
+            encoder_name(" V....D prores_ks_vulkan     ProRes Vulkan (codec prores)"),
+            Some("prores_ks_vulkan".into())
+        );
+        assert_eq!(
+            encoder_name(" V....D av1_vaapi            AV1 (VAAPI) (codec av1)"),
+            Some("av1_vaapi".into())
+        );
+        // FFmpeg's software encoders are not hardware, however the
+        // doctor might like them to be: a box whose ffmpeg lists only
+        // libx264 has no H.264 hardware encoder to run.
+        assert_eq!(
+            encoder_name(" V....D libx264               libx264 H.264 (codec h264)"),
+            None
+        );
+        assert_eq!(
+            encoder_name(" V....D libx265               libx265 HEVC (codec hevc)"),
+            None
+        );
+        assert_eq!(
+            encoder_name(" V....D prores_ks            Apple ProRes (iCodec Pro)"),
+            None
+        );
+        // Audio encoders, hardware-free codecs, and the legend and rule
+        // carry no video-hardware name.
+        assert_eq!(
+            encoder_name(" A....D aac                  AAC (Advanced Audio Coding)"),
+            None
+        );
+        assert_eq!(
+            encoder_name(" V....D mpeg4                MPEG-4 part 2"),
+            None
+        );
+        assert_eq!(encoder_name(" V..... = Video"), None);
+        assert_eq!(encoder_name(" ------"), None);
+        assert_eq!(encoder_name("Encoders:"), None);
+    }
 }
