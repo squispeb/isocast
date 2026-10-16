@@ -29,6 +29,7 @@ use isocast_protocol::api::Machine;
 use isocast_protocol::devices::{Devices, PermissionKind, PermissionsReport};
 use isocast_protocol::{Canvas, Codec, SourceKind};
 
+pub(crate) mod audio;
 pub(crate) mod camera;
 pub(crate) mod frames;
 pub(crate) mod gpu;
@@ -67,6 +68,9 @@ enum Running {
     Camera { _camera: camera::CameraCapture },
     /// A screen shared through the desktop's portal (screencast.rs).
     Screen { _screen: screencast::ScreenCapture },
+    /// A microphone, an output's monitor or an app's own streams
+    /// (audio.rs).
+    Audio { _audio: audio::AudioCapture },
 }
 
 impl Platform for LinuxPlatform {
@@ -317,24 +321,66 @@ impl Platform for LinuxPlatform {
         ))
     }
 
-    /// L.3: PipeWire microphone capture.
-    fn capture_microphone(&self, _device: &str, _sink: AudioSink) -> Result<(Self::Capture, u32)> {
-        bail!(
-            "microphone capture is not implemented on Linux yet: it arrives at L.3 of \
-             docs/port-omarchy.md (PipeWire)."
+    /// L.3: a microphone through PipeWire (see audio.rs). The stream
+    /// asks for the device's own channel count, which is what the samples
+    /// are interleaved in.
+    fn capture_microphone(&self, device: &str, sink: AudioSink) -> Result<(Self::Capture, u32)> {
+        let microphone = system::find_microphone(device)?;
+        let (audio, channels) = audio::capture(
+            *self,
+            audio::Target::Microphone(microphone.id.clone()),
+            microphone.channels,
+            sink,
         )
+        .with_context(|| {
+            format!(
+                "capturing microphone {} (id {})",
+                microphone.name, microphone.id
+            )
+        })?;
+        isocast_diagnostics::debug!(
+            "microphone: {} ({}): {channels} channel(s)",
+            microphone.name,
+            microphone.id
+        );
+        Ok((
+            Capture {
+                _running: Running::Audio { _audio: audio },
+            },
+            channels,
+        ))
     }
 
-    /// L.3: PipeWire's monitor of the default sink for system audio.
+    /// L.3: what the machine plays, from the default output's *monitor*
+    /// ports (audio.rs), as stereo.
     fn capture_system_audio(
         &self,
-        _sink: AudioSink,
-        _exclude_own: bool,
+        sink: AudioSink,
+        exclude_own: bool,
     ) -> Result<(Self::Capture, u32)> {
-        bail!(
-            "system-audio capture is not implemented on Linux yet: it arrives at L.3 of \
-             docs/port-omarchy.md (PipeWire monitor of the default sink)."
-        )
+        let output = system::default_output()?;
+        if exclude_own {
+            // What this process plays (monitoring) goes through the same
+            // sink, and a sink's monitor carries everything played on it.
+            // Exclusion is what the per-app step (linking a capture to
+            // every stream but ours) can do and this cannot; macOS gets
+            // it from ScreenCaptureKit.
+            isocast_diagnostics::diagnostic!(
+                "warn"; "system audio: monitoring is on, and what the machine plays is captured \
+                from {output}'s monitor, which carries Isocast's own monitoring too; the monitor \
+                is not filtered (docs/notes.md)"
+            );
+        }
+        let (audio, channels) =
+            audio::capture(*self, audio::Target::Output(output.clone()), 2, sink)
+                .with_context(|| format!("capturing what {output} plays"))?;
+        isocast_diagnostics::debug!("system audio: {output}: {channels} channel(s)");
+        Ok((
+            Capture {
+                _running: Running::Audio { _audio: audio },
+            },
+            channels,
+        ))
     }
 
     /// Audio playback on an output device, L.3.

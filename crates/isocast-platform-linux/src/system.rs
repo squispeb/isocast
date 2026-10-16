@@ -472,93 +472,141 @@ fn cameras(out: &mut Vec<Camera>) {
 
 /// Microphones and outputs from PipeWire's PulseAudio compatibility.
 fn audio(devices: &mut Devices, notes: &mut Vec<String>) {
-    let Ok(sources) = Command::new("pactl")
-        .arg("list")
-        .arg("short")
-        .arg("sources")
-        .output()
-    else {
-        notes.push(DESKTOP_HINT.to_string());
-        return;
-    };
-    let Ok(sinks) = Command::new("pactl")
-        .arg("list")
-        .arg("short")
-        .arg("sinks")
-        .output()
-    else {
-        notes.push(DESKTOP_HINT.to_string());
-        return;
-    };
-    let default_source = default_of(&String::from_utf8_lossy(&sources.stdout), "Default Source:");
-    let default_sink = default_of(&String::from_utf8_lossy(&sinks.stdout), "Default Sink:");
-    devices.microphones =
-        microphone_rows(&String::from_utf8_lossy(&sources.stdout), &default_source);
-    devices.audio_outputs = output_rows(&String::from_utf8_lossy(&sinks.stdout), &default_sink);
+    match microphones() {
+        Ok(sources) => devices.microphones = sources,
+        Err(err) => {
+            notes.push(DESKTOP_HINT.to_string());
+            isocast_diagnostics::debug!("devices: listing microphones: {err:#}");
+        }
+    }
+    match outputs() {
+        Ok(sinks) => devices.audio_outputs = sinks,
+        Err(err) => {
+            notes.push(DESKTOP_HINT.to_string());
+            isocast_diagnostics::debug!("devices: listing outputs: {err:#}");
+        }
+    }
 }
 
-/// `pactl list short` line form: index \t name \t driver \t spec \t
-/// state (the spec column holds the sample spec, like
-/// `s32le 2ch 48000Hz`).
-fn microphone_rows(text: &str, default_id: &str) -> Vec<Microphone> {
-    let mut out = Vec::new();
-    for line in text.lines() {
-        let parts: Vec<&str> = line.split('\t').collect();
-        let Some(name) = parts.get(1).map(|part| part.trim()) else {
-            continue;
-        };
-        let spec = parts.get(3).copied().unwrap_or_default();
-        let channels = spec.split_whitespace().nth(1).unwrap_or("2");
-        let channels = channels.trim_start_matches("ch").parse().unwrap_or(2);
-        let sample_rate = spec
-            .split_whitespace()
-            .nth(2)
-            .and_then(|rate| rate.trim_end_matches("Hz").parse().ok())
-            .unwrap_or(0.0);
-        out.push(Microphone {
-            id: name.to_string(),
-            name: name.to_string(),
+/// Every input PipeWire has, read from `pactl`'s JSON: a microphone is
+/// named by PipeWire's own `node.name` (which is also what a capture
+/// stream targets) and shown by the description an audio panel shows,
+/// and a sink's monitor is one of them too (its description says
+/// "Monitor of ..."), which is how a setup can name one output's sound.
+pub(crate) fn microphones() -> Result<Vec<Microphone>> {
+    let json = pactl_list("sources")?;
+    let default = pactl_default("Default Source:");
+    Ok(parsed_rows(&json, |source| {
+        let id = source["name"].as_str()?;
+        let spec = source["sample_specification"].as_str().unwrap_or_default();
+        Some(Microphone {
+            name: source["description"].as_str().unwrap_or(id).to_string(),
             model: String::new(),
             manufacturer: String::new(),
-            default: name == default_id.trim(),
-            sample_rates: vec![sample_rate],
-            channels,
-        });
-    }
-    out
-}
-
-fn output_rows(text: &str, default_id: &str) -> Vec<AudioOutput> {
-    text.lines()
-        .filter_map(|line| {
-            let parts: Vec<&str> = line.split('\t').collect();
-            let name = parts.get(1)?.trim();
-            let spec = parts.get(3).copied().unwrap_or_default();
-            let channels = spec
-                .split_whitespace()
-                .nth(1)
-                .unwrap_or("2")
-                .trim_end_matches("ch")
-                .parse()
-                .unwrap_or(2);
-            let sample_rate = spec
-                .split_whitespace()
-                .nth(2)
-                .and_then(|rate| rate.trim_end_matches("Hz").parse().ok())
-                .unwrap_or(0.0);
-            Some(AudioOutput {
-                id: name.to_string(),
-                name: name.to_string(),
-                default: name == default_id.trim(),
-                sample_rate,
-                channels,
-            })
+            default: id == default,
+            sample_rates: vec![sample_rate_of(spec)],
+            channels: channels_of(spec),
+            id: id.to_string(),
         })
-        .collect()
+    }))
 }
 
-/// From `pactl info`'s two-column plain output, find "key: value".
-fn default_of(_pactl_short_text: &str, key: &str) -> String {
+/// Every sink PipeWire has, in the same shape.
+pub(crate) fn outputs() -> Result<Vec<AudioOutput>> {
+    let json = pactl_list("sinks")?;
+    let default = pactl_default("Default Sink:");
+    Ok(parsed_rows(&json, |sink| {
+        let id = sink["name"].as_str()?;
+        let spec = sink["sample_specification"].as_str().unwrap_or_default();
+        Some(AudioOutput {
+            name: sink["description"].as_str().unwrap_or(id).to_string(),
+            default: id == default,
+            sample_rate: sample_rate_of(spec),
+            channels: channels_of(spec),
+            id: id.to_string(),
+        })
+    }))
+}
+
+/// The default output's id, which is what a system-audio capture takes
+/// its monitor from and what "default" plays through.
+pub(crate) fn default_output() -> Result<String> {
+    let default = pactl_default("Default Sink:");
+    if default.is_empty() {
+        bail!(
+            "PipeWire has no default output to play through; set one in the desktop's sound \
+             settings (or with `pactl set-default-sink`)"
+        );
+    }
+    Ok(default)
+}
+
+/// The microphone a setup names: "default", an id, a name, or part of a
+/// name, matched the way macOS matches its own devices (an exact id or
+/// name, then the same ignoring case, then the shortest name containing
+/// the query).
+pub(crate) fn find_microphone(query: &str) -> Result<Microphone> {
+    let sources = microphones().context("listing microphones")?;
+    if query == "default" {
+        if let Some(source) = sources.iter().find(|source| source.default) {
+            return Ok(source.clone());
+        }
+        return sources
+            .into_iter()
+            .next()
+            .context("PipeWire has no microphone at all");
+    }
+    let lower = query.to_lowercase();
+    sources
+        .iter()
+        .find(|source| source.id == query || source.name == query)
+        .or_else(|| {
+            sources
+                .iter()
+                .find(|source| source.name.to_lowercase() == lower)
+        })
+        .or_else(|| {
+            sources
+                .iter()
+                .filter(|source| source.name.to_lowercase().contains(&lower))
+                .min_by_key(|source| source.name.len())
+        })
+        .cloned()
+        .with_context(|| {
+            let names: Vec<String> = sources
+                .iter()
+                .map(|source| format!("{} ({})", source.name, source.id))
+                .collect();
+            format!(
+                "no microphone matches {query:?}; microphones: {}",
+                if names.is_empty() {
+                    "none".to_string()
+                } else {
+                    names.join(", ")
+                }
+            )
+        })
+}
+
+/// One of `pactl`'s lists as JSON (`pactl -f json list <what>`).
+fn pactl_list(what: &str) -> Result<Vec<u8>> {
+    let output = Command::new("pactl")
+        .args(["-f", "json", "list", what])
+        .output()
+        .with_context(|| {
+            format!("running `pactl -f json list {what}` (PipeWire's PulseAudio compatibility)")
+        })?;
+    if !output.status.success() {
+        bail!(
+            "`pactl -f json list {what}` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(output.stdout)
+}
+
+/// From `pactl info`'s two-column plain output, the value of "key:".
+fn pactl_default(key: &str) -> String {
     match Command::new("pactl").arg("info").output() {
         Ok(output) => String::from_utf8_lossy(&output.stdout)
             .lines()
@@ -568,6 +616,35 @@ fn default_of(_pactl_short_text: &str, key: &str) -> String {
             .to_string(),
         Err(_) => String::new(),
     }
+}
+
+/// `pactl`'s JSON arrays, each entry through `row`.
+fn parsed_rows<T>(json: &[u8], row: impl Fn(&serde_json::Value) -> Option<T>) -> Vec<T> {
+    let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    parsed
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(row)
+        .collect()
+}
+
+/// A sample spec like `s16le 2ch 48000Hz`, whose middle word is the
+/// channel count and whose last is the rate.
+fn channels_of(spec: &str) -> u32 {
+    spec.split_whitespace()
+        .nth(1)
+        .and_then(|word| word.trim_end_matches("ch").parse().ok())
+        .unwrap_or(2)
+}
+
+fn sample_rate_of(spec: &str) -> f64 {
+    spec.split_whitespace()
+        .nth(2)
+        .and_then(|word| word.trim_end_matches("Hz").parse().ok())
+        .unwrap_or(0.0)
 }
 
 // ---------------------------------------------------------------------------
@@ -658,10 +735,32 @@ pub(crate) fn probe(source: &SourceKind, canvas: &Canvas) -> Result<Option<Probe
                 channels: None,
             }))
         }
-        SourceKind::Microphone(_)
-        | SourceKind::SystemAudio(_)
-        | SourceKind::ApplicationAudio(_) => {
-            bail!("audio capture arrives at L.3 of docs/port-omarchy.md")
+        SourceKind::Microphone(microphone) => {
+            let found = find_microphone(&microphone.device)?;
+            Ok(Some(Probe {
+                device: format!("{} (id {})", found.name, found.id),
+                video: None,
+                channels: Some(found.channels),
+            }))
+        }
+        // What the machine plays comes from the default output's monitor,
+        // whose channel count is what a capture of it delivers.
+        SourceKind::SystemAudio(_) => {
+            let output = default_output()?;
+            let monitor = outputs()?
+                .into_iter()
+                .find(|candidate| candidate.id == output);
+            Ok(Some(Probe {
+                device: format!("the monitor of {output}"),
+                video: None,
+                channels: Some(monitor.map_or(2, |output| output.channels)),
+            }))
+        }
+        SourceKind::ApplicationAudio(_) => {
+            bail!(
+                "per-application audio capture arrives at L.3's next step (the machine's own \
+                 output through PipeWire works now)"
+            )
         }
         SourceKind::Browser(_) => bail!("browser capture arrives at L.6 of docs/port-omarchy.md"),
         SourceKind::Color(_)

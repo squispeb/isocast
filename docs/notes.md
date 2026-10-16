@@ -3,6 +3,99 @@
 Short, dated facts a future session needs. Newest entries go at the top of
 each section. Delete entries that stop being true.
 
+## Linux port progress (2026-10-16, L.3 microphone and system audio)
+
+- **Audio capture is one in-process PipeWire module (`audio.rs`), not a
+  subprocess per source.** Per-app capture (the next L.3 row) needs the
+  graph to link our stream to a named app's stream, and a graph the
+  process owns is the only way to do that. `Target::Microphone(node.name)`
+  asks for the source node; `Target::Output(sink)` asks for the sink
+  *itself* plus `STREAM_CAPTURE_SINK=true` (without it the stream links to
+  the sink's *inputs*): what a sink's monitor ports carry is what the
+  machine plays — that is `capture_system_audio`, the default sink unless
+  the setup names one.
+- **Negotiation: the engine's own format (48 kHz F32LE) always; the
+  channels are the device's.** A microphone's channel count comes from
+  PipeWire's own enumeration (`pactl`'s `sample_specification`), so a
+  stereo C920 stays stereo and a mono Astro MixAmp stays mono; an output
+  or an app is stereo with FL/FR positions. **A negotiated rate that is
+  not 48000 fails the open** (it was a warning): the engine writes the
+  take's audio at 48 kHz, so any other rate would make the sound drift
+  against the picture. The C920's own 32 kHz is fine — PipeWire's
+  resampler delivers 48 kHz to us.
+- **Each buffer's stamp comes from the stream's own sample count, and
+  this is not a detail.** `AudioTrack::append` (engine, record/file.rs)
+  places samples back to back and counts a gap of more than 2 ms
+  (`AUDIO_JITTER = SAMPLE_RATE/500`) as a *dropped buffer*, filling it
+  with silence. Stamping every buffer at `platform.now() - its length`
+  therefore produced exactly one dropout per take on both the C920 and
+  the Astro: **PipeWire's `pw_time.now` advances ~0.8 % faster than the
+  samples while its graph settles for the first second or two** (measured
+  +1032 frames of clock per 1024 samples of audio, then ~200 ppm
+  steady — a cheap USB device's clock), so `now`-based stamps walked ahead
+  of the content and crossed the 2 ms tolerance every ~13 buffers.
+  `Clock` (audio.rs) instead anchors the first buffer at the stream's own
+  reading and advances by the samples delivered, so stamps are frame-exact
+  and the track is gapless. macOS has the same shape: its audio stamps come
+  from the sample buffer's presentation timestamp, which is a sample
+  count on the capture clock.
+- **The stream clock is still watched, for two things.** A *step* between
+  buffers (more than 100 ms) is samples the graph never handed over: the
+  count jumps, the gap stays where it happened, and the engine fills and
+  counts it. A slow *creep* past 250 ms is a device whose clock is off its
+  nominal rate by enough to say so (with the ppm): worth one warning, not a
+  jump, because a jump would cut a hole in the sound where nothing was
+  lost.
+- **PipeWire's `delay` is not subtracted.** It is the device's own capture
+  latency (1408 ticks = 29 ms on the C920, 1536 on the Astro, **0 for a
+  sink's monitor**), and macOS bakes the equivalent in (its PTS is the
+  device's capture time). On Linux the video side is stamped at *arrival*
+  (a camera frame when `ffmpeg`'s pipe hands it over, a screen buffer when
+  the portal delivers it), and a C920's video already arrives tens of ms
+  after the moment it depicts, so subtracting the mic's device latency too
+  would push the sound further ahead of the picture. If the camera path
+  ever moves to a device-time stamp, subtract `delay` with it.
+- **Device rows come from `pactl -f json list sources|sinks`**, not from
+  the registry: `id` is `node.name` (which is *also* the capture target),
+  `name` is the `description` a sound panel shows, `channels`/
+  `sample_rates` are parsed out of `sample_specification` (`s16le 2ch
+  48000Hz`), and a **monitor is detected by the `.monitor` name suffix**:
+  this JSON has `monitor_of_sink: null` in it, and monitors appear in
+  `sources` as microphones (description "Monitor of …"). `find_microphone`
+  mirrors macOS `match_device`: exact id, exact name, name ignoring case,
+  else the shortest name containing the text; `"default"` takes the
+  default source. A miss names every microphone as `name (id)`:
+  `no microphone matches "no-such-mic"; microphones: Asterisk Mono (id
+  alsa_input.usb-…), HD Pro Webcam C920 Analog Stereo (id alsa_input.…)`.
+  `default_output()` is `pactl info`'s `Default Sink:`; with no default it
+  says to set one.
+- **`exclude_own` cannot work for a sink's monitor, and says so.** The
+  monitor carries everything the machine plays *including our own
+  monitoring output*, and PipeWire has no way to exclude one writer's
+  contribution (macOS gets it from ScreenCaptureKit). The flag warns at
+  open and names per-app capture as the fix; it has no effect today
+  because monitoring/`play_audio` is not implemented on Linux yet, so
+  nothing of ours is playing.
+- **Verified numerically** (`isocast doctor` on a scratch setup, takes
+  with ffprobe/ffmpeg only, never listening): `isocast devices --json`
+  lists microphones and outputs with the panel's descriptions; the doctor
+  reports `ok source: mic: HD Pro Webcam C920 Analog Stereo (id
+  alsa_input.usb-046d_…): 2 channel(s)`, `ok source: system: the monitor
+  of bluez_output.C4_30_18_A3_17_D2.1: 2 channel(s)`, and `PROBLEM source:
+  typo: no microphone matches "no-such-mic"; microphones: …`; six 7–10 s
+  `--source 'test-pattern:640x360@30' --source 'mic:C920'` takes all
+  report **0 audio dropouts** with `aac 48000 2ch` whose duration matches
+  the video's to 21 µs (one sample), peak ~0.012/rms ~0.0018 of room
+  tone and **no all-zero frames** (no inserted silence); the Astro MixAmp
+  stores `1ch` (its own count) at peak 0.00006; a system-audio take
+  through the null-sink fixture has tones exactly 1.000 s apart with
+  0.493 s silences between them.
+- Two unit tests in `audio.rs` pin the clock: `samples_are_dated_by_their_
+  count_not_the_callback` (a 200 ppm-fast, jittery, ramping stream never
+  moves a stamp off its count) and `samples_a_stalled_stream_lost_are_a_
+  gap` (a 2 s loss is a gap in the stamps, and the buffer after it is one
+  buffer later, not another gap).
+
 ## Linux port progress (2026-10-16, L.3 device rows)
 
 - **L.3's device rows: what a camera source is written from
@@ -6581,6 +6674,25 @@ isocast-platform-linux gpu` once the modules exist.
 
 ## Verification recipes
 
+- **System audio without making a sound on Ryan's desk (L.3).** A null
+  sink is a sink like any other, and its monitor captures it:
+  ```sh
+  pactl load-module module-null-sink sink_name=isocast_l3
+  pactl set-default-sink isocast_l3          # system-audio opens the default
+  pw-play --target isocast_l3 gate.wav &     # 440 Hz, 0.5 s on / 0.5 s off
+  isocast record --source 'test-pattern:640x360@30' --source system-audio \
+    --seconds 5 --folder target/scratch/l3/recordings
+  pactl set-default-sink <the old one>; pactl unload-module <the id>
+  ```
+  The file's audio then has exact zeros where the fixture is silent, so
+  `ffmpeg -i take.mov -f f32le -ac 2 -ar 48000 -` piped into numpy gives
+  the gate's edges sample-exactly: tone starts 1.000 s apart, silence
+  0.493 s, and no hole anywhere. **Always restore the default sink and
+  unload the module** (this box's default is a Bluetooth speaker; leaving
+  it on the null sink makes the machine silent). A tone's *absolute* place
+  cannot be checked this way: `pw-play`'s own start (stream appears in the
+  graph within ~6 ms, but its first sample reaches the sink later) is the
+  unknown, and it is a player's latency, not the capture's.
 - **A screen stream without the picker (L.2).** The portal's own node
   needs a person to choose a screen, but the consumer does not care where
   the node comes from: start a GStreamer producer of the same shape and

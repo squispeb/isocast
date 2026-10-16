@@ -650,8 +650,38 @@ step live in `docs/notes.md`'s "Linux port WIP" section.
     ISO take of the C920 stored 90/90 frames at 30 fps, 1920x1080
     HEVC, none dropped or repeated, and the composited program carries
     the camera (PiP region YAVG 17.9 hidden vs 125.2 visible).
-  - [ ] Microphone and system audio (PipeWire), including per-app
-    audio.
+  - [x] **Microphone and system audio (PipeWire).** One in-process
+    PipeWire module (`audio.rs`) rather than a subprocess per source,
+    because per-app capture needs the graph to link to the app's node.
+    `Target::Microphone(node.name)` and `Target::Output(sink)` (a
+    sink's monitor ports, `STREAM_CAPTURE_SINK=true`) are what
+    `capture_microphone` and `capture_system_audio` open; the engine's
+    format (48 kHz float) is always asked for, at the device's own
+    channel count for a microphone and stereo for an output, and a
+    negotiated rate that is not 48000 fails the open (the take's sound
+    would not line up). Device rows come from `pactl -f json list
+    sources|sinks` (id is the node name `pactl` shows — also the
+    capture target — and the name is the description a sound panel
+    shows; monitors appear as microphones), matching is macOS's
+    exact-id/name/ignoring-case/containing order, and a typo names
+    every microphone. `exclude_own` warns that a sink's monitor
+    carries our own monitoring and that per-app capture is the fix
+    (see docs/notes.md). Each buffer is dated by the stream's own
+    sample count, which is what keeps the engine's track gapless: its
+    wall clock runs ~0.8 % fast while PipeWire's graph settles, so
+    stamping each callback left exactly one dropped buffer per take.
+    Verified: six 7–10 s `mic:C920` takes, 0 audio dropouts, `aac
+    48000 2ch` whose duration matches the video's to one sample, no
+    all-zero frames; `mic:Astro` stores 1ch as the device does; a
+    system-audio take of a null sink's monitor with a gated 440 Hz
+    tone has tones exactly 1.000 s apart, 0.493 s of silence between
+    them, 0 dropouts; `isocast devices`/`doctor` name devices,
+    channels and the monitor, and a typo'd microphone is a PROBLEM
+    naming every one.
+  - [ ] Per-app audio: enumerate the registry for an app's own output
+    streams (matched by `application.name`/`process.binary`/
+    `node.name`) and link the capture to them, which is also what
+    `exclude_own` needs.
 - [ ] **L.4 Shared monitor surfaces.** DMABUF rings or memfd rings
   through `isocast-surfaces`'s Unix-socket hand-over (see
   docs/shared-frames.md's sketch); the app's live monitors work.
@@ -1465,6 +1495,43 @@ Shipped (v1): 7.1, 7.2, 7.4a, 7.5, 7.6. Next, in order:
 
 ## Log
 
+- L.3 microphone and system audio (2026-10-16): Linux can hear the
+  machine and the person in front of it. `audio.rs` is one in-process
+  PipeWire module — the engine's format (48 kHz float) at the device's
+  own channel count for a microphone, stereo for an output — and it
+  copies each mapped SHM buffer into a plain `Vec<f32>` for the engine,
+  the shape the camera and screen already have. `Target::Microphone` is
+  a source node by the `node.name` `pactl` shows; `Target::Output` is a
+  sink's *monitor* ports (`STREAM_CAPTURE_SINK=true`, without which the
+  stream links to the sink's inputs), which is `capture_system_audio`
+  against the default sink, or the one the setup names. `exclude_own`
+  now says what it cannot do on Linux: a monitor carries everything the
+  machine plays, including our own monitoring, and only per-app capture
+  (next row) can exclude it; nothing of ours plays yet, so the flag is
+  inert. Device rows come from `pactl -f json list sources|sinks` — id
+  is `node.name` (also the capture target), name is the description a
+  sound panel shows, a monitor is the `.monitor` suffix (this JSON's
+  `monitor_of_sink` is null) — with macOS's matching order, `"default"`
+  for the default source, and an error that names every microphone as
+  `name (id)`. What took the work was the stamp: the engine places
+  audio back to back and counts any gap over 2 ms as a dropped buffer
+  (`AUDIO_JITTER`), and PipeWire's `pw_time.now` advances ~0.8 % faster
+  than the samples while its graph settles (~200 ppm after), so
+  `now`-based stamps walked ahead of the content and every take
+  reported one dropout. Buffers are now dated from the stream's own
+  sample count, anchored once at its own host time; the stream clock is
+  watched only to keep a real loss (a >100 ms step: the samples are
+  gone, and the gap stays where it happened) apart from a device whose
+  rate is off (a slow creep: said once, never a jump). Verified: six
+  7–10 s `--source mic:C920` takes all at 0 audio dropouts, `aac 48000
+  2ch` matching the video's duration to 21 µs, room tone (peak 0.012)
+  with no all-zero frames; `mic:Astro` stores 1ch as its device is; a
+  system-audio take of a temporary null sink's monitor playing a gated
+  440 Hz tone has tone starts exactly 1.000 s apart and 0.493 s of
+  silence between them; the doctor reports the mic with its channel
+  count, the monitor, and a typo naming every microphone. Two new
+  unit tests pin the clock against a fast, jittery, ramping stream and
+  against a stall.
 - L.3 device rows (2026-10-16): `isocast devices` had been lying about
   cameras since L.0 — every camera was `built_in`, named `video0`, with
   no formats — because `system.rs` read `/dev/v4l` and sysfs itself
