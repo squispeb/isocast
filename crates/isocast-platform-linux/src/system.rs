@@ -42,6 +42,7 @@ pub struct NoPlayback;
 // The clock and the thread.
 // ---------------------------------------------------------------------------
 
+use crate::audio;
 use crate::camera;
 pub(crate) use crate::pacing::host_time;
 
@@ -756,11 +757,22 @@ pub(crate) fn probe(source: &SourceKind, canvas: &Canvas) -> Result<Option<Probe
                 channels: Some(monitor.map_or(2, |output| output.channels)),
             }))
         }
-        SourceKind::ApplicationAudio(_) => {
-            bail!(
-                "per-application audio capture arrives at L.3's next step (the machine's own \
-                 output through PipeWire works now)"
-            )
+        // An app's own streams are what there is to link to: an app that
+        // is playing nothing has none, so a setup naming one is told what
+        // is playing instead.
+        SourceKind::ApplicationAudio(application) => {
+            let (name, streams) = audio::find_app(&application.app)?;
+            let playing: Vec<String> = streams.iter().map(audio::AppStream::describe).collect();
+            let detail = playing.join(", ");
+            Ok(Some(Probe {
+                device: if detail == name {
+                    format!("the sound of {name}")
+                } else {
+                    format!("the sound of {name} ({detail})")
+                },
+                video: None,
+                channels: Some(2),
+            }))
         }
         SourceKind::Browser(_) => bail!("browser capture arrives at L.6 of docs/port-omarchy.md"),
         SourceKind::Color(_)

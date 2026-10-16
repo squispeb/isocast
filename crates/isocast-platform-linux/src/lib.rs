@@ -408,16 +408,49 @@ impl Platform for LinuxPlatform {
         )
     }
 
-    /// Per-app audio by linking to the app's stream node, L.3.
+    /// L.3: one app's own sound, by linking a capture to the streams the
+    /// app plays through (audio.rs) — an app has no node of its own, and
+    /// the session manager will not link a capture to a playback stream.
+    /// An app is captured as stereo, the way macOS captures one.
     fn capture_application_audio(
         &self,
-        _app: &str,
-        _sink: AudioSink,
+        app: &str,
+        sink: AudioSink,
     ) -> Result<(Self::Capture, u32)> {
-        bail!(
-            "per-application audio capture is not implemented on Linux yet: it arrives at \
-             L.3 of docs/port-omarchy.md"
+        // Resolved before the capture opens, so a setup naming an app that
+        // is playing nothing gets the list of what is (the capture itself
+        // would only sit there with no format, which is a worse message).
+        let (name, streams) = audio::find_app(app)?;
+        let (audio, channels) = audio::capture(
+            *self,
+            audio::Target::Application {
+                query: app.to_string(),
+                name: name.clone(),
+            },
+            2,
+            sink,
         )
+        .with_context(|| {
+            format!(
+                "capturing the sound of {name} ({} stream(s) playing: {})",
+                streams.len(),
+                streams
+                    .iter()
+                    .map(audio::AppStream::describe)
+                    .collect::<Vec<String>>()
+                    .join(", ")
+            )
+        })?;
+        isocast_diagnostics::debug!(
+            "app audio: {name}: {channels} channel(s), {} stream(s)",
+            streams.len()
+        );
+        Ok((
+            Capture {
+                _running: Running::Audio { _audio: audio },
+            },
+            channels,
+        ))
     }
 
     fn create_video_encoder(&self, spec: &LiveVideoSpec) -> Result<LiveH264Encoder> {

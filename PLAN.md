@@ -618,10 +618,11 @@ step live in `docs/notes.md`'s "Linux port WIP" section.
     device-creation hook: L.4's shared surfaces want it too. Until
     then a node that hands over an unmappable DMA-BUF fails the
     capture with a message naming xdph's `force_shm`.
-- [ ] **L.3 Camera, mic and system audio through PipeWire and
+- [x] **L.3 Camera, mic and system audio through PipeWire and
   V4L2.** Per-app audio by linking a capture stream to the app's
   stream node (the reviewer's correction: this *is* possible on
-  Linux); `exclude_own` works the same way.
+  Linux — the link has to be made, not asked for); `exclude_own`
+  works the same way, once something of ours plays to exclude.
   - [x] **The device rows a camera source is written from.** `isocast
     devices` listed every camera as `built_in` named `video0` with no
     formats (the `usb-` test read the symlink's target, which never
@@ -678,10 +679,37 @@ step live in `docs/notes.md`'s "Linux port WIP" section.
     them, 0 dropouts; `isocast devices`/`doctor` name devices,
     channels and the monitor, and a typo'd microphone is a PROBLEM
     naming every one.
-  - [ ] Per-app audio: enumerate the registry for an app's own output
-    streams (matched by `application.name`/`process.binary`/
-    `node.name`) and link the capture to them, which is also what
-    `exclude_own` needs.
+  - [x] **Per-app audio.** `Target::Application` is a capture stream
+    that asks for nothing to link to and links itself to one app's own
+    output streams: WirePlumber refuses to connect a capture stream to
+    a playback node (`target.object=<node>` and `pw-record --target
+    <node>` both land on the default source and record the microphone),
+    so `Links` watches the registry while the take runs and creates
+    each port pair on the link-factory itself, which is what `pw-link`
+    does — by channel name where the graph names channels, a mono
+    stream into both of our channels, unnamed ports in order, pairs
+    never created twice, and an app that starts playing mid-take gets
+    linked too. An app is found by `application.name`,
+    `application.process.binary` or `node.name`, exactly or as part of
+    the name (macOS's matching), and only among nodes that really play
+    (`media.class` = `Stream/Output/Audio`); nothing matching is an
+    error before the open, and the doctor's message names what is
+    playing. `exclude_own` is still a warning, not a filter: a sink's
+    monitor carries our own monitoring, and per-app capture excludes it
+    by never linking our node — nothing of ours plays on Linux yet
+    (`play_audio`), so the flag has nothing to exclude today. Verified:
+    6 s takes of a gated 440 Hz tone through a null sink record app
+    audio at peak 0.051/rms 0.022, tone dominant at 440 Hz, nothing
+    above 0.15 (no garbage in the take); killing the app mid-take is
+    said (`stopped playing; the take goes on without its sound`) and the
+    take is kept, 0 dropouts; a second app starting mid-take is linked
+    and heard (peak 0.188 with both playing, 440 Hz); `isocast doctor`
+    prints "ok source: app: the sound of pw-play" and a typo as a
+    PROBLEM naming Limusic, omacut and pw-play; microphone (peak 0.007)
+    and system-audio (440 Hz) takes still pass with 0 dropouts. A buffer
+    that is not sound loses a whole take (`aac` refuses "near
+    NaN/+-Inf"), so one is recorded as silence whole, once — the values
+    caught were a played file's own corrupt opening samples.
 - [ ] **L.4 Shared monitor surfaces.** DMABUF rings or memfd rings
   through `isocast-surfaces`'s Unix-socket hand-over (see
   docs/shared-frames.md's sketch); the app's live monitors work.
@@ -1494,6 +1522,48 @@ Shipped (v1): 7.1, 7.2, 7.4a, 7.5, 7.6. Next, in order:
 - FilmCraft reads `session.json` to line up ISO files without audio sync.
 
 ## Log
+
+- L.3 per-app audio (2026-10-16): a take can record one app's sound and
+  leave the rest of the machine out. `Target::Application { query, name }`
+  opens a capture stream that asks for nothing to link to
+  (`target.object=0`) and links itself to the app's own output streams:
+  the graph will not do it — WirePlumber refuses to connect a capture
+  stream to a playback node, and both `target.object=<node>` and
+  `pw-record --target <node>` quietly fell back to the default source
+  and recorded the microphone instead — so `Links` watches the registry
+  for the life of the take and creates each port pair on the
+  link-factory, which is exactly what `pw-link` does. Pairs are matched
+  by channel name where the graph names channels, a mono stream feeds
+  both of our channels, unnamed ports go in order, the same pair is
+  never created twice, and an app that starts playing mid-take is linked
+  when its node appears — and one that stops is said (`stopped playing;
+  the take goes on without its sound`), because the take is not
+  sacrificed to it. The app is matched on `application.name`, its
+  binary or its stream's `node.name`, exactly or as part of the name
+  (macOS's matching), only among nodes that really play
+  (`Stream/Output/Audio`); nothing matching fails before the open, and
+  the doctor's PROBLEM names what is playing. Two things were worth the
+  work: our stream's node id is `SPA_ID_INVALID` until the proxy's
+  `bound` event (reading it once right after `connect` linked ports to
+  nothing), and a buffer that is not sound loses the *whole* take —
+  `aac` refuses its input over one such value ("Input contains (near)
+  NaN/+-Inf") — so a buffer holding anything a thousand times full scale
+  is recorded as silence whole and said once (a value in the middle of a
+  quantum is heard; 20 ms of silence is not). The values caught that way
+  turned out to be the first six samples of the file the test played: an
+  app's own data reaches the buffer unchanged, and a buffer nobody has
+  written looks the same, so the same guard answers both (the fixture
+  was rebuilt clean; nothing trips it now). Verified: 6 s takes of a
+  gated 440 Hz tone played through a null sink record app audio at peak
+  0.051/rms 0.022, tone dominant at 440 Hz, no sample above 0.15;
+  killing the app mid-take is
+  said (`stopped playing; the take goes on without its sound`) and the
+  take is kept, 0 dropouts; a second pw-play starting ~3 s into a 6 s
+  take is linked and heard (peak 0.188, 440 Hz, nothing above 0.2); the
+  doctor reports the app and a typo as a PROBLEM naming Limusic, omacut
+  and pw-play; microphone (peak 0.007) and system-audio (440 Hz) takes
+  still pass with 0 dropouts. Three unit tests pin the app matching, the
+  port pairing and the guard (32 in the crate).
 
 - L.3 microphone and system audio (2026-10-16): Linux can hear the
   machine and the person in front of it. `audio.rs` is one in-process

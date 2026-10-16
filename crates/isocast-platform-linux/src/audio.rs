@@ -12,7 +12,16 @@
 //! microphone by the `node.name` `pactl` shows (which is the name
 //! PipeWire knows the node by), the machine's output by its sink, whose
 //! *monitor* ports carry what is played on it ([`Target::Output`]), and
-//! an app by its own output streams (L.3's per-app step).
+//! an app by the streams it plays through ([`Target::Application`]).
+//!
+//! An app is the odd one: the graph has no node for "what Spotify
+//! plays". Its *streams* are what there is, they come and go as the app
+//! starts and stops playing, and the session manager will not link a
+//! capture to a playback stream (asked to, it links the capture to its
+//! default *source* — the microphone). So a capture of an app watches
+//! the graph's registry itself and links every stream that matches to
+//! its own input ports ([`Links`]), at open and for each one that
+//! appears later in the take.
 //!
 //! PipeWire hands a capture buffers of the graph's quantum (10-25 ms of
 //! samples by default) with no capture timestamp of their own, so a
@@ -20,6 +29,9 @@
 //! run back to back — with the host time that position goes with (see
 //! [`Clock`]).
 
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
@@ -41,6 +53,10 @@ const FORMAT_WAIT: Duration = Duration::from_secs(5);
 /// this often, so a stalled consumer shows in the log without flooding
 /// it.
 const DROP_REPORT: Duration = Duration::from_secs(5);
+/// The loudest sample an audio graph produces: full scale is ±1, a mix may
+/// pass it, and a thousand times it is not sound but a value the graph or
+/// an app's own data put there (see [`silence_memory`]).
+const MAX_SAMPLE: f32 = 1.0e3;
 
 /// Where an audio capture takes its samples from.
 #[derive(Clone, Debug)]
@@ -49,6 +65,9 @@ pub(crate) enum Target {
     Microphone(String),
     /// What the machine plays on a sink, from that sink's monitor ports.
     Output(String),
+    /// One app's own playback streams, the ones `query` matches (`name`
+    /// is what the app is called in messages).
+    Application { query: String, name: String },
 }
 
 impl Target {
@@ -57,16 +76,423 @@ impl Target {
         match self {
             Self::Microphone(name) => format!("microphone {name}"),
             Self::Output(name) => format!("the monitor of {name}"),
+            Self::Application { name, .. } => format!("the sound of {name}"),
         }
     }
 
     /// The node the stream asks for, and whether it is a sink's monitor.
-    fn node(&self) -> (&str, bool) {
+    /// An app has no one node: its streams are linked to the capture
+    /// instead ([`Links`]).
+    fn node(&self) -> Option<(&str, bool)> {
         match self {
-            Self::Microphone(name) => (name, false),
-            Self::Output(name) => (name, true),
+            Self::Microphone(name) => Some((name, false)),
+            Self::Output(name) => Some((name, true)),
+            Self::Application { .. } => None,
         }
     }
+
+    /// The app whose streams this capture links to, if it is one of those.
+    fn app(&self) -> Option<&str> {
+        match self {
+            Self::Application { query, .. } => Some(query),
+            _ => None,
+        }
+    }
+}
+
+/// One app's own playback stream, as the graph has it.
+///
+/// An app is capturable only by its streams, so these are what a setup
+/// naming an app is told about, and what a capture matches against.
+#[derive(Clone, Debug)]
+pub(crate) struct AppStream {
+    /// What the app calls itself (`application.name`), or the stream
+    /// node's own name when the app does not say.
+    app: String,
+    /// The app's binary (`application.process.binary`), which a setup can
+    /// name instead of the display name.
+    binary: String,
+    /// The node's own name (`node.name`).
+    node: String,
+}
+
+impl AppStream {
+    /// The app stream a graph node is, if it is one at all: what an app
+    /// plays is a *playback* stream, and an app that is not playing has
+    /// none to link to.
+    fn from_node(props: &spa::utils::dict::DictRef) -> Option<Self> {
+        if props.get(*pw::keys::MEDIA_CLASS)? != "Stream/Output/Audio" {
+            return None;
+        }
+        let node = props.get(*pw::keys::NODE_NAME)?.to_string();
+        Some(Self {
+            app: props.get(*pw::keys::APP_NAME).unwrap_or(&node).to_string(),
+            binary: props
+                .get(*pw::keys::APP_PROCESS_BINARY)
+                .unwrap_or_default()
+                .to_string(),
+            node,
+        })
+    }
+
+    /// Whether `query` names this stream's app: its own name, its binary
+    /// or the stream node's name, exactly — or, as macOS matches a
+    /// running app, as part of the app's name.
+    fn matches(&self, query: &str) -> bool {
+        let query = query.to_lowercase();
+        let app = self.app.to_lowercase();
+        app == query
+            || self.binary.to_lowercase() == query
+            || self.node.to_lowercase() == query
+            || app.contains(&query)
+    }
+
+    /// How this stream is said in a message: the app, and the node it
+    /// plays through when that says anything more.
+    pub(crate) fn describe(&self) -> String {
+        if self.app == self.node {
+            self.app.clone()
+        } else {
+            format!("{} (node {})", self.app, self.node)
+        }
+    }
+}
+
+/// The app a setup names, and the streams it has right now, matched by
+/// name, binary or node name. A miss is an error that says what *is*
+/// playing, because an app that is playing nothing cannot be captured at
+/// all — there is no stream to link to.
+pub(crate) fn find_app(query: &str) -> Result<(String, Vec<AppStream>)> {
+    let streams = app_streams().context("asking PipeWire what is playing")?;
+    let matched: Vec<AppStream> = streams
+        .iter()
+        .filter(|it| it.matches(query))
+        .cloned()
+        .collect();
+    let Some(first) = matched.first() else {
+        let playing: Vec<String> = if streams.is_empty() {
+            vec!["none".to_string()]
+        } else {
+            streams.iter().map(AppStream::describe).collect()
+        };
+        bail!(
+            "no app is playing sound that matches {query:?}; apps playing now: {}",
+            playing.join(", ")
+        );
+    };
+    Ok((first.app.clone(), matched))
+}
+
+/// Every app stream the graph has right now. This is what makes an app
+/// capturable, so the doctor and the error messages are built from it.
+pub(crate) fn app_streams() -> Result<Vec<AppStream>> {
+    pw::init();
+    let mainloop = pw::main_loop::MainLoopRc::new(None).context("creating a PipeWire loop")?;
+    let context =
+        pw::context::ContextRc::new(&mainloop, None).context("creating a PipeWire context")?;
+    let core = context
+        .connect_rc(None)
+        .context("connecting to PipeWire (is the session's PipeWire running?)")?;
+    let registry = core
+        .get_registry()
+        .context("asking PipeWire for the graph's objects")?;
+    let found = Rc::new(RefCell::new(Vec::new()));
+    let _objects = registry
+        .add_listener_local()
+        .global({
+            let found = found.clone();
+            move |object| {
+                if object.type_ != pw::types::ObjectType::Node {
+                    return;
+                }
+                if let Some(stream) = object.props.and_then(AppStream::from_node) {
+                    found.borrow_mut().push(stream);
+                }
+            }
+        })
+        .register();
+    // The registry's first burst of objects ends with the answer to a
+    // sync: there is nothing to wait for after that.
+    let _done = core
+        .add_listener_local()
+        .done({
+            let mainloop = mainloop.clone();
+            move |_, _| mainloop.quit()
+        })
+        .register();
+    core.sync(0).context("asking PipeWire which nodes exist")?;
+    mainloop.run();
+    let streams = found.borrow().clone();
+    Ok(streams)
+}
+
+/// The id the server knows our own stream's node by, or `None` until it
+/// has told us: `pw_stream_get_node_id` is the *server's* id for the node,
+/// which arrives as the proxy's `bound` event after the stream is
+/// connected, not when the stream is built.
+fn our_node(node: &pw::stream::Stream) -> Option<u32> {
+    let id = node.node_id();
+    (id != spa::sys::SPA_ID_INVALID).then_some(id)
+}
+
+/// What a per-app capture drains: its own input ports, the ports of every
+/// stream that matches the app, and the links between them.
+///
+/// The graph is watched rather than asked once, because an app's streams
+/// appear and disappear as it plays; a stream that opens mid-take is
+/// linked like the ones already there. Ports are matched by their channel
+/// (`audio.channel`), so a stereo app's left channel feeds ours.
+#[derive(Default)]
+struct Links {
+    /// Our own node's id, which the graph knows it by; the app's streams
+    /// are linked to its ports.
+    ours: Option<u32>,
+    /// Every port the graph has told us about, by the port's own id. Which
+    /// side a port is on is worked out when a link is made rather than
+    /// when the port is seen: the id our node is known by arrives after
+    /// ports can, too ([`our_node`]).
+    ports: BTreeMap<u32, Port>,
+    /// The app's streams, by node id: the nodes `query` has matched so
+    /// far, including ones that appear mid-take.
+    app: BTreeSet<u32>,
+    /// Output and input port pairs already linked, so a second `global`
+    /// event for one of them does not link it twice.
+    linked: BTreeSet<(u32, u32)>,
+    /// The links themselves, kept so they live: dropping one destroys it
+    /// (as does the app's stream going away, which ends the take's sound
+    /// with it).
+    links: Vec<pw::link::Link>,
+    /// Set once the app's last stream has gone and the log has said so,
+    /// cleared when the app plays again (a second stop is worth saying
+    /// too).
+    silent: bool,
+}
+
+/// A port the graph has, and the node it hangs off.
+struct Port {
+    node: u32,
+    /// The channel it carries (`audio.channel`: "FL", "FR", "MONO"), or
+    /// the port's own name when it carries no channel.
+    channel: String,
+    input: bool,
+}
+
+impl Links {
+    /// A `global` event: note what it is, then link whatever is now on
+    /// both sides of a pair of ports.
+    fn event(
+        core: &pw::core::CoreRc,
+        links: &Rc<RefCell<Self>>,
+        node: &pw::stream::Stream,
+        query: &str,
+        object: &pw::registry::GlobalObject<&spa::utils::dict::DictRef>,
+    ) {
+        let mut known = links.borrow_mut();
+        // Our own node's id is not known when the stream is connected: it
+        // is what the server calls it, which arrives with the proxy's
+        // `bound` event, so it is read again on every event until it has.
+        known.ours = known.ours.or_else(|| our_node(node));
+        match object.type_ {
+            pw::types::ObjectType::Node => {
+                if let Some(stream) = object.props.and_then(AppStream::from_node)
+                    && stream.matches(query)
+                    && known.app.insert(object.id)
+                {
+                    // Playing again: a later stop is worth saying, too.
+                    known.silent = false;
+                }
+            }
+            pw::types::ObjectType::Port => {
+                if let Some(props) = object.props {
+                    known.port(object.id, props);
+                }
+            }
+            _ => {}
+        }
+        known.relink(core);
+    }
+
+    /// An object is gone: forget its ports (PipeWire has already dropped
+    /// the links between them).
+    ///
+    /// An app's stream is gone when it stops playing — or quits. What is
+    /// already recorded is the take's, so the capture goes on and delivers
+    /// silence where that stream's sound was; the last stream going away
+    /// is said once, because otherwise a take quietly has no sound from
+    /// that moment.
+    fn removed(links: &Rc<RefCell<Self>>, described: &str, id: u32) {
+        let mut known = links.borrow_mut();
+        let was_playing = known.app.remove(&id);
+        known.ports.remove(&id);
+        // A link with a port that is gone went with it; the pair is
+        // forgotten, so a port that does come back is linked again.
+        known
+            .linked
+            .retain(|(output, input)| *output != id && *input != id);
+        if was_playing && known.app.is_empty() && !known.silent {
+            known.silent = true;
+            isocast_diagnostics::diagnostic!(
+                "warn"; "audio: {described}: stopped playing; the take goes on without its sound"
+            );
+        }
+    }
+
+    /// A port the graph has, ours or the app's, kept until a link can be
+    /// made.
+    fn port(&mut self, id: u32, props: &spa::utils::dict::DictRef) {
+        let Some(node) = props
+            .get(*pw::keys::NODE_ID)
+            .and_then(|node| node.parse::<u32>().ok())
+        else {
+            return;
+        };
+        let channel = props
+            .get(*pw::keys::AUDIO_CHANNEL)
+            .or_else(|| props.get(*pw::keys::PORT_NAME))
+            .unwrap_or_default()
+            .to_string();
+        let input = props.get(*pw::keys::PORT_DIRECTION) == Some("in");
+        self.ports.insert(
+            id,
+            Port {
+                node,
+                channel,
+                input,
+            },
+        );
+    }
+
+    /// Link every pair of ports that has no link yet.
+    ///
+    /// Channels are matched by name where the graph names them; a stream
+    /// that says nothing about its channels feeds ours in order, and one
+    /// with a single port feeds every channel we have (what the graph
+    /// itself does with a mono stream).
+    fn relink(&mut self, core: &pw::core::CoreRc) {
+        let Some(ours) = self.ours else {
+            return;
+        };
+        let inputs: Vec<(String, u32)> = self
+            .ports
+            .iter()
+            .filter(|(_, port)| port.node == ours && port.input)
+            .map(|(id, port)| (port.channel.clone(), *id))
+            .collect();
+        // The pairs to make, before any are made: a link is an object of
+        // its own, and making one must not disturb the reading of the
+        // ports it goes between.
+        let mut pairs: Vec<(u32, u32, u32)> = Vec::new();
+        for node in &self.app {
+            let ports: Vec<(String, u32)> = self
+                .ports
+                .iter()
+                .filter(|(_, port)| port.node == *node && !port.input)
+                .map(|(id, port)| (port.channel.clone(), *id))
+                .collect();
+            for (index, (channel, output)) in ports.iter().enumerate() {
+                for input in feeds(&inputs, &ports, channel, index) {
+                    pairs.push((*node, *output, input));
+                }
+            }
+        }
+        for (node, output, input) in pairs {
+            if !self.linked.insert((output, input)) {
+                continue;
+            }
+            if let Some(link) = Self::link(core, node, output, ours, input) {
+                isocast_diagnostics::debug!(
+                    "audio: linked port {output} of node {node} to port {input} of node {ours}"
+                );
+                self.links.push(link);
+            }
+        }
+    }
+
+    /// One link, from an output port of the app's stream to an input port
+    /// of ours. A link that cannot be made is said once (the pair stays in
+    /// `linked`, so a busy graph is not asked over and over).
+    fn link(
+        core: &pw::core::CoreRc,
+        output_node: u32,
+        output_port: u32,
+        input_node: u32,
+        input_port: u32,
+    ) -> Option<pw::link::Link> {
+        let props = pw::properties::properties! {
+            *pw::keys::LINK_OUTPUT_NODE => output_node.to_string(),
+            *pw::keys::LINK_OUTPUT_PORT => output_port.to_string(),
+            *pw::keys::LINK_INPUT_NODE => input_node.to_string(),
+            *pw::keys::LINK_INPUT_PORT => input_port.to_string(),
+        };
+        match core.create_object::<pw::link::Link>("link-factory", &props) {
+            Ok(link) => Some(link),
+            Err(err) => {
+                isocast_diagnostics::diagnostic!(
+                    "warn"; "audio: could not link port {output_port} of node {output_node} to \
+                    port {input_port}: {err}"
+                );
+                None
+            }
+        }
+    }
+}
+
+/// Silence a buffer that is not sound, answering its loudest value (`None`
+/// when the buffer is sound).
+///
+/// A capture's buffer is whatever the graph handed over, and values no
+/// audio graph produces do turn up in one: a buffer nobody has written
+/// yet (a stream whose inputs were just relinked, a graph renegotiated
+/// when another stream was linked to it) holds whatever its memory did,
+/// and an app's own data is not sound either when a decoder or a file it
+/// plays is not — the first buffer caught here held 3.777893e22 and
+/// 8.355842e8, which turned out to be the first six *samples* of the file
+/// being played. It is not only a wrong sample: `aac` refuses the whole
+/// take over one value that is not a number ("Input contains (near)
+/// NaN/+-Inf"), so a recording is lost to it. Anything a thousand times
+/// full scale is not sound, and a buffer holding one of them is not
+/// half-right, so the whole buffer goes (20 ms of silence is not heard; a
+/// value in the middle of a quantum is).
+fn silence_memory(samples: &mut [f32]) -> Option<f32> {
+    let worst = samples.iter().fold(0.0f32, |worst, sample| {
+        let magnitude = if sample.is_finite() {
+            sample.abs()
+        } else {
+            f32::INFINITY
+        };
+        worst.max(magnitude)
+    });
+    if worst <= MAX_SAMPLE {
+        return None;
+    }
+    samples.fill(0.0);
+    Some(worst)
+}
+
+/// Which of our input ports an app stream's output port feeds.
+///
+/// Channels are matched by name where the graph names them, so a stereo
+/// app's left channel feeds ours; a stream with a single port feeds every
+/// channel we have (what the graph itself does with a mono stream); and
+/// one whose channels are not named feeds ours in order. Ports the app has
+/// and we do not (a 5.1 stream's centre, say) are left alone: the capture
+/// is stereo, like macOS's.
+fn feeds(
+    inputs: &[(String, u32)],
+    ports: &[(String, u32)],
+    channel: &str,
+    index: usize,
+) -> Vec<u32> {
+    if let Some((_, input)) = inputs.iter().find(|(ours, _)| ours == channel) {
+        return vec![*input];
+    }
+    if ports.len() == 1 {
+        return inputs.iter().map(|(_, input)| *input).collect();
+    }
+    inputs
+        .get(index)
+        .map(|(_, input)| vec![*input])
+        .unwrap_or_default()
 }
 
 /// A running audio capture. Dropping it quits the stream's loop and
@@ -188,7 +614,6 @@ fn watch(
     let core = context
         .connect_rc(None)
         .context("connecting to PipeWire (is the session's PipeWire running?)")?;
-    let (node_name, monitor) = target.node();
     let mut props = pw::properties::properties! {
         *pw::keys::MEDIA_TYPE => "Audio",
         *pw::keys::MEDIA_CATEGORY => "Capture",
@@ -196,11 +621,24 @@ fn watch(
         *pw::keys::APP_NAME => "Isocast",
         *pw::keys::NODE_NAME => "isocast capture",
     };
-    props.insert(*pw::keys::TARGET_OBJECT, node_name);
-    if monitor {
-        // A sink's *monitor* ports are what its name alone would not
-        // give: without this the stream would link to the sink's inputs.
-        props.insert(*pw::keys::STREAM_CAPTURE_SINK, "true");
+    match target.node() {
+        Some((node_name, monitor)) => {
+            props.insert(*pw::keys::TARGET_OBJECT, node_name);
+            if monitor {
+                // A sink's *monitor* ports are what its name alone would
+                // not give: without this the stream would link to the
+                // sink's inputs.
+                props.insert(*pw::keys::STREAM_CAPTURE_SINK, "true");
+            }
+        }
+        // An app's streams are linked to us by `Links` and never by the
+        // session manager: asked for a playback stream it links the
+        // capture to its default *source* (the microphone) instead, which
+        // is the opposite of the app's sound. "0" is how a stream says it
+        // has no target of its own.
+        None => {
+            props.insert(*pw::keys::TARGET_OBJECT, "0");
+        }
     }
     let node = pw::stream::StreamRc::new(core.clone(), "isocast capture", props)
         .context("creating the audio stream")?;
@@ -216,6 +654,7 @@ fn watch(
         format: Default::default(),
         target: target.clone(),
         drops: DropReport::default(),
+        repaired: false,
         clock: Clock::default(),
     };
     let _listener = node
@@ -225,6 +664,36 @@ fn watch(
         .process(process)
         .register()
         .context("watching the audio stream")?;
+
+    // An app's sound is linked rather than asked for, so the capture
+    // follows the graph: the streams the app plays through now, and the
+    // ones it opens later in the take. The registry reports both (and our
+    // own ports, which are what they are linked to).
+    let links = Rc::new(RefCell::new(Links::default()));
+    let _registry_watch = target
+        .app()
+        .map(|query| {
+            let query = query.to_string();
+            let registry = core
+                .get_registry()
+                .context("asking PipeWire for the graph's objects")?;
+            let listener = registry
+                .add_listener_local()
+                .global({
+                    let core = core.clone();
+                    let links = links.clone();
+                    let node = node.clone();
+                    move |object| Links::event(&core, &links, &node, &query, object)
+                })
+                .global_remove({
+                    let links = links.clone();
+                    let described = target.describe();
+                    move |id| Links::removed(&links, &described, id)
+                })
+                .register();
+            Ok::<_, anyhow::Error>((registry, listener))
+        })
+        .transpose()?;
 
     // Drop tells this loop to quit; the channel is the only way into a
     // PipeWire loop from another thread.
@@ -243,6 +712,14 @@ fn watch(
         &mut params,
     )
     .context("connecting to the audio node")?;
+    if target.app().is_some() {
+        // The app's streams are linked *to* our node, so the graph's id
+        // for it is what a link needs. It is read here and on every
+        // registry event (see [`Links::event`]) because the server's id
+        // for the node arrives as the proxy's `bound` event, not with
+        // `connect`.
+        links.borrow_mut().ours = our_node(&node);
+    }
     mainloop.run();
     Ok(())
 }
@@ -262,6 +739,9 @@ struct Samples {
     format: spa::param::audio::AudioInfoRaw,
     target: Target,
     drops: DropReport,
+    /// Set once a buffer's unsound samples have been said, so a
+    /// renegotiation does not fill the log.
+    repaired: bool,
     /// Dates each buffer's samples on the host clock.
     clock: Clock,
 }
@@ -416,12 +896,13 @@ fn process(stream: &pw::stream::Stream, data: &mut Samples) {
         data.dropped("a buffer's chunk was outside its own memory");
         return;
     };
-    let samples: Vec<f32> = raw
+    let mut samples: Vec<f32> = raw
         .as_chunks::<4>()
         .0
         .iter()
         .map(|four| f32::from_le_bytes(*four))
         .collect();
+    data.sound(&mut samples);
     let channels = data.format.channels().max(1) as usize;
     let frames = samples.len() / channels;
     if frames == 0 {
@@ -539,6 +1020,22 @@ impl Clock {
 }
 
 impl Samples {
+    /// Say a buffer that is not sound, once, and record it as silence
+    /// (see [`silence_memory`]).
+    fn sound(&mut self, samples: &mut [f32]) {
+        let Some(worst) = silence_memory(samples) else {
+            return;
+        };
+        if !self.repaired {
+            self.repaired = true;
+            isocast_diagnostics::diagnostic!(
+                "warn"; "audio: {}: a buffer held {worst:.3e}, which no audio graph produces; it \
+                was recorded as silence",
+                self.target.describe()
+            );
+        }
+    }
+
     /// A buffer the sink's queue was too busy to take.
     fn dropped(&mut self, why: &str) {
         self.drops.count(&self.target, why);
@@ -633,6 +1130,93 @@ mod tests {
     /// whole nanoseconds per buffer would show up as a wrong count.
     fn counted(base: i64, frames: i64) -> i64 {
         base + (frames as i128 * 1_000_000_000 / SAMPLE_RATE as i128) as i64
+    }
+
+    /// An app is named the way macOS names one: what it calls itself, its
+    /// binary or its stream's node, exactly or as part of the name.
+    #[test]
+    fn an_app_is_matched_by_name_binary_or_node() {
+        let stream = |app: &str, binary: &str, node: &str| AppStream {
+            app: app.to_string(),
+            binary: binary.to_string(),
+            node: node.to_string(),
+        };
+        let spotify = stream("Spotify", "spotify", "Spotify");
+        assert!(spotify.matches("Spotify"));
+        assert!(spotify.matches("spotify")); // case does not matter
+        assert!(spotify.matches("pot")); // part of the name, as macOS does
+        assert!(spotify.matches("spotify")); // the binary
+        assert!(!spotify.matches("Chromium"));
+        // An app that names no binary is still matched by its node name.
+        let limusic = stream("Limusic", "", "Limusic");
+        assert!(limusic.matches("Limusic"));
+        assert!(!limusic.matches("Limusic2"));
+    }
+
+    /// A capture is stereo: an app's own channels line up, a mono stream
+    /// feeds both, unnamed ones go in order, and channels we do not have
+    /// (a 5.1 stream's centre) are not linked at all.
+    #[test]
+    fn app_ports_feed_ours_by_channel() {
+        let ours = vec![("FL".to_string(), 10u32), ("FR".to_string(), 11)];
+        // Stereo, named: left to left.
+        let stereo = vec![("FL".to_string(), 20u32), ("FR".to_string(), 21)];
+        assert_eq!(feeds(&ours, &stereo, "FL", 0), vec![10]);
+        assert_eq!(feeds(&ours, &stereo, "FR", 1), vec![11]);
+        // Mono: every channel of ours, as the graph does with a mono
+        // stream.
+        let mono = vec![("MONO".to_string(), 30u32)];
+        assert_eq!(feeds(&ours, &mono, "MONO", 0), vec![10, 11]);
+        // Unnamed: ours in order.
+        let unnamed = vec![
+            ("playback_1".to_string(), 40u32),
+            ("playback_2".to_string(), 41),
+        ];
+        assert_eq!(feeds(&ours, &unnamed, "playback_1", 0), vec![10]);
+        assert_eq!(feeds(&ours, &unnamed, "playback_2", 1), vec![11]);
+        // More than we have: nothing to link the rest to.
+        let surround = vec![
+            ("FL".to_string(), 50u32),
+            ("FR".to_string(), 51),
+            ("FC".to_string(), 52),
+            ("LFE".to_string(), 53),
+        ];
+        assert_eq!(feeds(&ours, &surround, "FC", 2), Vec::<u32>::new());
+        assert_eq!(feeds(&ours, &surround, "LFE", 3), Vec::<u32>::new());
+    }
+
+    /// A buffer that is not sound becomes silence whole (a value in the
+    /// middle of a quantum is heard), while ordinary samples — including
+    /// a mix that went past full scale — are left alone.
+    #[test]
+    fn buffers_that_are_not_sound_become_silence() {
+        let mut tone = vec![0.05f32; 4096];
+        assert_eq!(silence_memory(&mut tone), None);
+        assert!(tone.iter().all(|sample| *sample == 0.05));
+        // Silence is sound: an unlinked stream's buffers are zeros, which
+        // is exactly what a take wants while an app is not playing.
+        let mut quiet = vec![0.0f32; 4096];
+        assert_eq!(silence_memory(&mut quiet), None);
+        let mut loud = vec![1.5f32; 4096];
+        assert_eq!(silence_memory(&mut loud), None);
+        // The values a played file's own corrupt start put in a buffer,
+        // and what a buffer nobody wrote holds.
+        for garbage in [
+            f32::NAN,
+            f32::INFINITY,
+            -3.777893e22,
+            8.355842e8,
+            -8.430551e8,
+        ] {
+            let mut memory = vec![0.05f32; 4096];
+            memory[1] = garbage;
+            let worst = silence_memory(&mut memory).expect("garbage was taken for sound");
+            assert!(worst.is_infinite() || worst > MAX_SAMPLE);
+            assert!(
+                memory.iter().all(|sample| *sample == 0.0),
+                "{garbage} left samples behind"
+            );
+        }
     }
 
     /// A stream delivers 1024-frame buffers whose own clock runs `ppm`

@@ -3,6 +3,81 @@
 Short, dated facts a future session needs. Newest entries go at the top of
 each section. Delete entries that stop being true.
 
+## Linux port progress (2026-10-16, L.3 per-app audio)
+
+- **Per-app capture links itself; the graph will not do it for a capture
+  stream.** WirePlumber refuses to connect a capture stream to a playback
+  node: opening with `target.object=<playback node id>` (and `pw-record
+  --target <id>`, same thing) silently lands the stream on the *default
+  source* — a take of `app-audio` recorded the microphone and looked like
+  it worked. `Links` (audio.rs) therefore opens with `target.object=0`
+  (nothing autolinks us) and, from a registry listener that runs until
+  the take ends, creates each port pair itself with
+  `Core::create_object::<pw::link::Link>("link-factory", …)` — the same
+  thing `pw-link` does. Props: `link.output.node`/`link.output.port`,
+  `link.input.node`/`link.input.port`, `object.linger=false` (the take
+  must not leave links behind). **The link proxies are kept alive in
+  `Links::links`; dropping one destroys its link.**
+- **Our stream's node id is `SPA_ID_INVALID` until the proxy's `bound`
+  event.** Reading it once after `connect` (as the first version did) gave
+  a wild id and links that connected nothing. `our_node()` reads it
+  lazily on every registry event instead, and `Links::relink` bails while
+  it is unset.
+- **An app is a node whose `media.class` is `Stream/Output/Audio`**, and it
+  is named by `application.name`, `application.process.binary` or
+  `node.name` — matched exactly (case-insensitive) or as *part* of
+  `application.name`, which is macOS's `match_device` order. A name that
+  matches nothing fails **before the open** with everything that is
+  playing (`no app is playing sound that matches "…"; apps playing now:
+  Limusic, omacut, pw-play`), which is what the doctor prints. A stream
+  that appears mid-take is matched and linked by the same listener.
+- **Ports pair by channel, and nothing is linked twice.** `FL`↔`FL`,
+  `FR`↔`FR` where the graph names channels; a stream with a single port
+  (mono) feeds **all** of our channels; unnamed ports (keys that are not
+  `audio.channel`) feed ours in order; ports we have no channel for (a 5.1
+  stream's `FC`/`LFE`) are left alone, because the capture is stereo, as
+  macOS's is. `linked: BTreeSet<(output port, our port)>` is what makes a
+  second registry event (there are many: every proxy's `bound`, every
+  `global`) not create the pair again — the first version created
+  duplicates, which renegotiated our stream's buffers mid-take.
+- **A buffer that is not sound loses the whole take, so it is recorded as
+  silence.** `aac` refuses its input over a single value that is not a
+  number ("Input contains (near) NaN/+-Inf") and the take is gone. The
+  values caught here — 3.777893e22 among them — turned out to be the
+  first six **samples of the file the test played**: `gate.wav` was
+  corrupt at its start, and an app's own data reaches our buffer
+  unchanged, which is why the fixture was rebuilt clean (nothing trips the
+  guard with it now). A buffer *nobody* has written looks the same, and
+  the same guard covers it: anything past `MAX_SAMPLE = 1.0e3` (a thousand
+  times full scale — no audio graph produces it) means the buffer is not
+  sound, and **the whole buffer becomes silence**, because one such value
+  is not half-right and 20 ms of silence is not heard while a value in the
+  middle of a quantum is. Said once per capture (`Samples.repaired`), with
+  the loudest value, so a renegotiation cannot flood the log.
+- **Verified numerically** (a temporary null sink as the default, a gated
+  440 Hz tone played with `pw-play`, ffprobe/ffmpeg on the take, never
+  listening): app audio takes at peak 0.051/rms 0.022 (0.188 with two
+  streams playing), tone dominant at 440 Hz, no sample above 0.15 for one
+  stream; the tone's 200 ms peak profile keeps the fixture's gate (0.005
+  silence / 0.048 tone); killing the app mid-take is
+  said (`audio: the sound of pw-play: stopped playing; the take goes on
+  without its sound`) and the take is kept, 0 dropouts; a second `pw-play`
+  starting ~3 s into a 6 s take is linked and heard (peak 0.188 with both
+  playing, 440 Hz, nothing above 0.2); `isocast doctor` on a setup with an
+  app source and a typo prints `ok source: app: the sound of pw-play` and
+  `PROBLEM source: typo: no app is playing sound that matches
+  "no-such-app"; apps playing now: Limusic, omacut, pw-play`; the
+  microphone (peak 0.007) and system-audio (440 Hz, rms 0.022) takes still
+  pass with 0 dropouts. Three unit tests: the app matching order, the port
+  pairing (`feeds`), and `silence_memory` (32 in the crate).
+- **The tone fixture is `target/scratch/l3/raw/gate.wav`**: 6 s of 440 Hz
+  at 0.05, 48 kHz stereo float, 0.6 s on and 0.4 s off — regenerated on
+  2026-10-16 because the first one had six corrupt samples at its start.
+- `exclude_own` stays a warning on Linux: a sink's monitor carries our own
+  monitoring and per-app capture is the fix — it excludes us by never
+  linking our node, which is structural here. Nothing of ours plays yet
+  (`play_audio` is unimplemented), so the flag has nothing to exclude.
+
 ## Linux port progress (2026-10-16, L.3 microphone and system audio)
 
 - **Audio capture is one in-process PipeWire module (`audio.rs`), not a
@@ -785,8 +860,8 @@ isocast-platform-linux gpu` once the modules exist.
   screen now. After the click, verify with
   `ffprobe -v error -show_entries stream=codec_name,width,height,r_frame_rate,duration
   -of csv=p=0 target/scratch/l2/recordings/*.mov` (expect 2560x1440) and a
-  frame-count check. Blocks only L.2's last row and L.3's per-app audio
-  (which links to the same portal stream), nothing else.
+  frame-count check. Blocks only L.2's last row (a real desktop take),
+  nothing else; L.3's per-app audio does not use the portal.
 - 2026-10-14 (8.2h auto-update, #40): the Sparkle update key. Until
   `scripts/sparkle/public-ed-key.txt` holds the real public key, every
   Developer ID `release.sh` build (and the Release workflow's source check)
