@@ -3,6 +3,57 @@
 Short, dated facts a future session needs. Newest entries go at the top of
 each section. Delete entries that stop being true.
 
+## Linux port progress (2026-10-16, L.3 device rows)
+
+- **L.3's device rows: what a camera source is written from
+  (camera.rs)**. `isocast devices` had three bugs in one function, all
+  from `system.rs` doing its own V4L2/sysfs reading instead of asking
+  `camera.rs`, which already had it right for capture:
+  - **Every camera was `built_in`**: the test read the *target* of the
+    `/dev/v4l/by-id/usb-…` symlink (`../../video0`) and looked for
+    `usb-` in it, which is never there. Kinds now decide from sysfs:
+    the node's device (canonicalized `/sys/class/video4linux/videoN`)
+    walks up to the nearest ancestor with `idVendor` — a USB camera is
+    `External`, which is what the protocol's own doc calls USB and
+    Thunderbolt cameras; what is left is `BuiltIn`. **A laptop's
+    internal camera is on its internal USB bus and so reads as
+    external**, which no kernel signal distinguishes (`removable` is
+    `unknown` for devices behind a hub, checked).
+  - **Every camera was named `video0`**: the code split the target on
+    `/dev/video`, which never matched, so the sysfs name lookup asked
+    for `/sys/class/video4linux//name`. Names now come from the
+    kernel (`HD Pro Webcam C920`) through `camera.rs`'s `name_of`.
+  - **No formats, no USB identity**: `formats` was always empty though
+    `offers()` had been written for capture; the device rows now carry
+    one `VideoFormat` per pixel format and size, **largest first, with
+    every rate the device names** (V4L2 names discrete rates — and the
+    ends of a stepwise range — which is exactly what a capture can be
+    asked for, so no `frame_rate_ranges` are claimed), and
+    `manufacturer`/`model` come from the USB device's own sysfs files
+    (the C920's manufacturer is empty, its product is the model).
+    A camera whose formats cannot be read (the node is busy) is still
+    listed, without them: `devices` must not hide a camera because
+    something else holds it. `open_capture_node` uses `O_NONBLOCK`, so
+    listing never blocks on a device in use.
+  - **`probe` for a camera** now resolves the device and the format
+    `capture`'s own `choose` would pick (rate before size, the
+    documented rule), so the doctor reports a working camera instead of
+    `bail!("camera and audio capture arrive at L.3")` — that stale bail
+    is what made every camera source a PROBLEM on this box.
+  - Verified: `isocast devices` → `HD Pro Webcam C920 [external] id
+    usb-046d_HD_Pro_Webcam_C920_31CFD3EF-video-index0` with 36 format
+    rows (2304×1536 YUYV 2 fps … 1280×720 MJPG 5–30 fps); doctor on a
+    scratch setup → "source: webcam: HD Pro Webcam C920: 1280×720 @
+    30 fps" (a `width`/`height`/`fps` request), "source: auto … 1920×
+    1080 @ 30 fps" (a bare device), a 4096×4096 request → 1920×1080 @
+    30 (rate first, documented), and a typo'd device → `no camera
+    matches "typo-cam"; cameras: usb-… (HD Pro Webcam C920)`; a 3 s
+    `isocast record --source camera:C920` still stored 90/90 frames at
+    1920x1080 hevc 30 fps, 0 dropped, with the picture changing
+    (signalstats YAVG 116.4/120.0 across frames). A new unit test
+    (`devices_lists_every_size_largest_first_with_its_rates`) pins the
+    row shape from the C920 fixtures already in camera.rs's tests.
+
 ## Linux port progress (2026-10-16, L.2 code complete)
 
 - **L.2: the desktop's screen through the portal (portal.rs +
@@ -103,13 +154,9 @@ each section. Delete entries that stop being true.
     line is just the state.
   - **The C920 is plugged in again** (`/dev/video0`, `/dev/video1`, and
     its `alsa_input.usb-046d_HD_Pro_Webcam_C920_31CFD3EF-02.analog-stereo`
-    node in PipeWire), so L.1's
-    camera-format device polish and a real camera re-verification are
-    unblocked. **Found while probing**: `probe` still bails for
-    `SourceKind::Camera` ("camera and audio capture arrive at L.3")
-    even though `capture_camera` is real, so `doctor` reports a working
-    camera setup as a PROBLEM; camera probe resolution is its own small
-    task.
+    node in PipeWire), which unblocked the camera half of L.1's device
+    polish — done in the entry above (the camera's device row, formats
+    and `probe`), including a fresh 3 s take.
 
 ## Linux port progress (2026-10-15, delivered through M3)
 

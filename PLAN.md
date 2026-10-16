@@ -553,10 +553,14 @@ step live in `docs/notes.md`'s "Linux port WIP" section.
     concurrent probes through makes the doctor report `problem` with
     ffmpeg's own refusal quoted; while a recording runs the probe stays
     away (no session check, no probe invocations).
-  - [ ] **Devices polish.** Camera formats and audio ids on a box with
-    the camera plugged in (needs the C920 back); `permissions` still
-    reports macOS's three grants as granted — L.2's portal is the real
-    answer.
+  - [x] **Devices polish: the cameras.** Camera rows on a box with the
+    camera attached (the formats half of this row), done with L.3's
+    device rows below. Audio ids still wait on L.3: their sample rates
+    and channels come from the same PipeWire listing. Screen recording
+    no longer reports macOS's "granted" — L.2's portal token answers
+    it; camera and microphone are granted, which is what Linux's
+    portals ask (L.3 settles whether the microphone's own report
+    should differ).
   - [ ] **Writer: exact timestamps and fsynced fragments.** Waits on
     G.3b's engine work (still unchecked, macOS-owned); the Linux writer
     keeps its fragmented-MOV output and the kill-9 gate it passed
@@ -618,6 +622,24 @@ step live in `docs/notes.md`'s "Linux port WIP" section.
   V4L2.** Per-app audio by linking a capture stream to the app's
   stream node (the reviewer's correction: this *is* possible on
   Linux); `exclude_own` works the same way.
+  - [x] **The device rows a camera source is written from.** `isocast
+    devices` listed every camera as `built_in` named `video0` with no
+    formats (the `usb-` test read the symlink's target, which never
+    carries it, and the name lookup went through a `/dev/video` split
+    that never matched): `camera.rs` now owns that listing, so a camera
+    is named by the kernel (`HD Pro Webcam C920`), carries its USB id,
+    is `external` when it hangs off a USB bus (a laptop's internal
+    camera reads as external too; no kernel signal distinguishes it),
+    and lists the formats a setup can ask for, largest first. `probe`
+    for a camera resolves the device and the format `capture` would
+    choose, so the doctor reports a working camera instead of bailing
+    "camera and audio capture arrive at L.3". Verified: `isocast
+    devices` lists the C920 as `external` with 36 format rows
+    (2304×1536 YUYV … 1280×720 MJPG); the doctor reports "source:
+    webcam: HD Pro Webcam C920: 1280×720 @ 30 fps" for a requested
+    size, "1920×1080 @ 30 fps" for a bare device, and a typo'd device
+    as a problem naming the real cameras; a 3 s `camera:C920` take
+    still stores 90/90 frames at 1920x1080 30 fps with 0 dropped.
   - [x] **Camera (V4L2, 18284dc).** An id, name or part of a name from
     a setup resolves to a capture node; the device's own enumeration
     chooses the format (MJPEG preferred over YUYV at the same size and
@@ -1443,6 +1465,29 @@ Shipped (v1): 7.1, 7.2, 7.4a, 7.5, 7.6. Next, in order:
 
 ## Log
 
+- L.3 device rows (2026-10-16): `isocast devices` had been lying about
+  cameras since L.0 — every camera was `built_in`, named `video0`, with
+  no formats — because `system.rs` read `/dev/v4l` and sysfs itself
+  instead of asking `camera.rs`, whose capture path had all of it right:
+  the kind test looked for `usb-` in the *target* of the by-id symlink
+  (`../../video0`), and the name lookup split on `/dev/video`, a string
+  the target never contains. Listing now lives beside the ioctls: the
+  kernel's name, the USB product/manufacturer from the device's own
+  sysfs files, `external` for anything on a USB bus (a laptop's
+  internal camera reads as external too; `removable` is `unknown`
+  behind a hub, so no kernel signal tells them apart), and one
+  `VideoFormat` per pixel format and size, largest first, with every
+  rate the device names. `probe` for a camera resolves the device and
+  the format `capture` would choose, which is what the doctor needed:
+  it used to bail "camera and audio capture arrive at L.3" and report
+  every working camera as a problem. Verified: `isocast devices` gives
+  "HD Pro Webcam C920 [external] … 2304×1536 YUYV 2 fps … 1280×720
+  MJPG 5–30 fps" (36 rows); the doctor reports "source: webcam: HD Pro
+  Webcam C920: 1280×720 @ 30 fps", "1920×1080 @ 30 fps" for a bare
+  device, "1920×1080 @ 30" for an impossible 4096×4096 request, and a
+  typo'd device as a problem naming the real cameras; a 3 s
+  `record --source camera:C920` still stored 90/90 frames at 1920x1080
+  hevc 30 fps with none dropped. New unit test pins the row shape.
 - L.2 (2026-10-16): the desktop's screen arrives through the portal
   (code complete, one click short of a real take). A new
   `isocast-platform-linux` pair of modules shares a monitor through

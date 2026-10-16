@@ -35,6 +35,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use isocast_engine::{CameraRequest, CaptureFormat, FramePool, Platform, VideoSink};
 use isocast_protocol::Canvas;
+use isocast_protocol::devices::{Camera, CameraKind, VideoFormat};
 
 use crate::LinuxPlatform;
 use crate::frames::{CpuPool, LinuxFrame};
@@ -84,7 +85,7 @@ pub fn capture(
     canvas: &Canvas,
     sink: VideoSink<LinuxFrame>,
 ) -> Result<(CameraCapture, CaptureFormat)> {
-    let camera = Camera::resolve(query)?;
+    let camera = Attached::resolve(query)?;
     let offers = camera
         .offers()
         .with_context(|| format!("camera {} ({})", camera.name, camera.node.display()))?;
@@ -226,7 +227,7 @@ pub fn capture(
 /// ffmpeg's idea of the rate (a raw pipe carries no timestamps, so
 /// ffmpeg's default conversion to a constant rate would repeat and drop
 /// frames the capture never sees).
-fn spawn_ffmpeg(camera: &Camera, chosen: &Chosen) -> Result<Child> {
+fn spawn_ffmpeg(camera: &Attached, chosen: &Chosen) -> Result<Child> {
     let program = crate::writer::ffmpeg_binary();
     let mut command = Command::new(&program);
     command
@@ -495,10 +496,10 @@ fn kill_and_wait(child: &Mutex<Option<Child>>) {
     *guard = None;
 }
 
-/// A camera: the stable id `/dev/v4l/by-id` gives it, the node that
-/// captures, and the name the kernel gives it.
+/// A camera this machine has: the stable id `/dev/v4l/by-id` gives it,
+/// the node that captures, and the name the kernel gives it.
 #[derive(Clone)]
-struct Camera {
+struct Attached {
     /// The id a setup names it by, like
     /// `usb-046d_HD_Pro_Webcam_C920_31CFD3EF-video-index0`.
     id: String,
@@ -508,7 +509,7 @@ struct Camera {
     name: String,
 }
 
-impl Camera {
+impl Attached {
     /// The camera `query` names: an id, a name or part of one, or a
     /// `/dev/videoN` node. An error names the cameras this machine has.
     fn resolve(query: &str) -> Result<Self> {
@@ -532,7 +533,7 @@ impl Camera {
                 node: node.to_path_buf(),
             });
         }
-        let matching: Vec<&Camera> = cameras
+        let matching: Vec<&Attached> = cameras
             .iter()
             .filter(|camera| camera.matches(&wanted))
             .collect();
@@ -662,7 +663,7 @@ impl Camera {
 /// The cameras this machine has, from `/dev/v4l/by-id`: each device's
 /// `-video-index0` link is the node that captures (its other index is
 /// that device's metadata node), and its name comes from sysfs.
-fn attached() -> Vec<Camera> {
+fn attached() -> Vec<Attached> {
     let mut cameras = Vec::new();
     let Ok(entries) = std::fs::read_dir("/dev/v4l/by-id") else {
         return cameras;
@@ -677,7 +678,7 @@ fn attached() -> Vec<Camera> {
         let Ok(node) = std::fs::canonicalize(entry.path()) else {
             continue;
         };
-        cameras.push(Camera {
+        cameras.push(Attached {
             id,
             name: name_of(&node),
             node,
@@ -701,7 +702,7 @@ fn name_of(node: &Path) -> String {
 }
 
 /// The cameras as one line for an error, so a wrong id can be corrected.
-fn describe(cameras: &[Camera]) -> String {
+fn describe(cameras: &[Attached]) -> String {
     if cameras.is_empty() {
         return "none are attached (no /dev/v4l/by-id/*-video-index0 nodes); plug a camera in and \
                 run `isocast devices`"
@@ -712,6 +713,137 @@ fn describe(cameras: &[Camera]) -> String {
         .map(|camera| format!("{} ({})", camera.id, camera.name))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// The cameras this machine has, as `devices` lists them: the by-id id a
+/// setup names, the kernel's name, the USB identity when there is one,
+/// and the formats a setup may ask for, largest first.
+///
+/// A camera whose formats cannot be read (something else holds the node,
+/// the driver refuses an ioctl) is still listed, without them: `devices`
+/// must not hide a camera because it is busy right now.
+pub(crate) fn devices() -> Vec<Camera> {
+    attached()
+        .into_iter()
+        .map(|attached| {
+            let formats = attached
+                .offers()
+                .map(|offers| formats_of(&offers))
+                .unwrap_or_default();
+            let (manufacturer, model) = usb_identity(&attached.node);
+            Camera {
+                kind: kind_of(&attached.node),
+                model: model.unwrap_or_else(|| attached.name.clone()),
+                manufacturer,
+                formats,
+                suspended: false,
+                id: attached.id,
+                name: attached.name,
+            }
+        })
+        .collect()
+}
+
+/// The device and format a camera source would capture: the device
+/// `query` resolves to, and the format [`choose`] picks for the request
+/// and the canvas, so the doctor reports what a take would really use.
+pub(crate) fn probe(
+    query: &str,
+    request: CameraRequest,
+    canvas: &Canvas,
+) -> Result<(String, CaptureFormat)> {
+    let camera = Attached::resolve(query)?;
+    let where_ = format!("camera {} ({})", camera.name, camera.node.display());
+    let offers = camera.offers().with_context(|| where_.clone())?;
+    let chosen = choose(&offers, request, canvas).with_context(|| where_)?;
+    Ok((
+        camera.name.clone(),
+        CaptureFormat {
+            width: chosen.width,
+            height: chosen.height,
+            fps: chosen.rate.rounded(),
+        },
+    ))
+}
+
+/// What `devices` lists a camera as offering: one row per pixel format
+/// and size, with every rate the device names there. V4L2 names discrete
+/// rates (and the ends of a stepwise range), which is exactly what a
+/// capture can be asked for, so no rate ranges are claimed.
+fn formats_of(offers: &Offers) -> Vec<VideoFormat> {
+    let mut formats: Vec<VideoFormat> = offers
+        .list
+        .iter()
+        .map(|offer| {
+            let mut frame_rates: Vec<f64> = offer.rates.iter().map(|rate| rate.fps()).collect();
+            frame_rates.sort_by(f64::total_cmp);
+            frame_rates.dedup();
+            VideoFormat {
+                width: offer.width,
+                height: offer.height,
+                pixel_format: offer.pixel.fourcc().to_string(),
+                frame_rates,
+                frame_rate_ranges: Vec::new(),
+            }
+        })
+        .collect();
+    formats.sort_by_key(|format| std::cmp::Reverse((format.width * format.height, format.width)));
+    formats
+}
+
+/// Whether a V4L2 node is an external camera. The protocol calls USB and
+/// Thunderbolt cameras `External`, so anything hanging off a USB bus is
+/// one; what is left (a platform, PCI or MIPI camera) is the machine's
+/// own. A laptop's internal camera sits on its internal USB bus and so
+/// reads as external, which no kernel signal distinguishes.
+fn kind_of(node: &Path) -> CameraKind {
+    if usb_device(node).is_some() {
+        CameraKind::External
+    } else {
+        CameraKind::BuiltIn
+    }
+}
+
+/// The manufacturer and product udev reports for a USB camera (the
+/// C920's own `manufacturer` is empty, its `product` is `HD Pro Webcam
+/// C920`).
+fn usb_identity(node: &Path) -> (String, Option<String>) {
+    let Some(device) = usb_device(node) else {
+        return (String::new(), None);
+    };
+    (
+        read_trimmed(&device.join("manufacturer")).unwrap_or_default(),
+        read_trimmed(&device.join("product")),
+    )
+}
+
+/// The USB device behind a video node: the node's sysfs device is
+/// usually one of its interfaces, so the nearest ancestor that knows its
+/// vendor answers (`…/1-3.1.1:1.0` → `…/1-3.1.1`).
+fn usb_device(node: &Path) -> Option<PathBuf> {
+    let mut dir = sysfs_of(node)?;
+    for _ in 0..4 {
+        if dir.join("idVendor").exists() {
+            return Some(dir);
+        }
+        dir = dir.parent()?.to_path_buf();
+    }
+    None
+}
+
+/// The sysfs directory behind a video node, `/sys/class/video4linux/video0`
+/// resolving to the device itself (`…/1-3.1.1:1.0`).
+fn sysfs_of(node: &Path) -> Option<PathBuf> {
+    let name = node.file_name()?;
+    std::fs::canonicalize(Path::new("/sys/class/video4linux").join(name)).ok()
+}
+
+/// One sysfs file, trimmed, when it holds anything.
+fn read_trimmed(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
 }
 
 /// What a camera offers: the pixel formats Isocast captures, at the sizes
@@ -897,6 +1029,15 @@ impl Pixel {
         match self {
             Self::Mjpeg => "mjpeg",
             Self::Yuyv => "yuyv422",
+        }
+    }
+
+    /// The four-character code the kernel names the format by, which is
+    /// what `devices` lists it as (macOS lists `420v`, `2vuy`).
+    fn fourcc(self) -> &'static str {
+        match self {
+            Self::Mjpeg => "MJPG",
+            Self::Yuyv => "YUYV",
         }
     }
 
@@ -1315,5 +1456,29 @@ mod tests {
         );
         assert!(matches!(end, End::Stopped));
         assert_eq!(*seen.lock().expect("frames"), 0);
+    }
+
+    #[test]
+    fn devices_lists_every_size_largest_first_with_its_rates() {
+        // The device rows: one per pixel format and size, biggest first,
+        // every rate the device names (ascending, once each), and the
+        // fourcc `isocast devices` prints.
+        let formats = formats_of(&offers());
+        let listed: Vec<(u32, u32, &str)> = formats
+            .iter()
+            .map(|f| (f.width, f.height, f.pixel_format.as_str()))
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                (1920, 1080, "MJPG"),
+                (1280, 720, "MJPG"),
+                (1280, 720, "YUYV"),
+                (640, 480, "MJPG"),
+            ]
+        );
+        assert_eq!(formats[1].frame_rates, [15.0, 24.0, 30.0]);
+        assert_eq!(formats[2].frame_rates, [10.0]);
+        assert!(formats.iter().all(|f| f.frame_rate_ranges.is_empty()));
     }
 }

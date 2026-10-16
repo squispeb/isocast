@@ -9,17 +9,17 @@
 //! displays — what a setup file's `device` field stores.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use isocast_engine::{CaptureFormat, MediaInfo, Probe, Volume};
+use isocast_engine::{CameraRequest, CaptureFormat, MediaInfo, Probe, Volume};
 use isocast_protocol::api::Machine;
 use isocast_protocol::devices::{
-    AudioOutput, Camera, CameraKind, Devices, Display, Microphone, Permission, PermissionAction,
-    PermissionDetail, PermissionKind, PermissionsReport, VideoFormat, Window,
+    AudioOutput, Camera, Devices, Display, Microphone, Permission, PermissionAction,
+    PermissionDetail, PermissionKind, PermissionsReport, Window,
 };
 use isocast_protocol::{Canvas, Codec, SourceKind};
 
@@ -42,6 +42,7 @@ pub struct NoPlayback;
 // The clock and the thread.
 // ---------------------------------------------------------------------------
 
+use crate::camera;
 pub(crate) use crate::pacing::host_time;
 
 /// The calling thread's own CPU time (`CLOCK_THREAD_CPUTIME_ID`).
@@ -462,61 +463,11 @@ fn windows(clients: &[u8]) -> Vec<Window> {
     windows
 }
 
-/// Cameras over V4L2, by the stable `/dev/v4l/by-id` path when at
-/// hand, and their name from sysfs. Formats come from L.3's capture.
+/// Cameras over V4L2: camera.rs owns the ioctls and sysfs, so this is
+/// the device list it builds (ids from `/dev/v4l/by-id`, names, USB
+/// identity and the formats a setup can ask for).
 fn cameras(out: &mut Vec<Camera>) {
-    let reading = match std::fs::read_dir("/dev/v4l/by-id") {
-        Ok(reading) => reading,
-        Err(_) => return,
-    };
-    let mut by_id: Vec<(String, PathBuf)> = Vec::new();
-    for entry in reading.filter_map(|entry| entry.ok()) {
-        let Some(target) = std::fs::read_link(entry.path())
-            .ok()
-            .and_then(|link| Some(entry.path().parent()?.join(link)))
-        else {
-            continue;
-        };
-        // The -video-index0 node is the one that captures; others are
-        // metadata nodes of the same device.
-        if entry
-            .file_name()
-            .to_string_lossy()
-            .ends_with("-video-index0")
-        {
-            by_id.push((entry.file_name().to_string_lossy().to_string(), target));
-        }
-    }
-    for (id, target) in by_id {
-        let Some(sys_name) = target.file_name() else {
-            continue;
-        };
-        let device_number = target
-            .to_string_lossy()
-            .rsplit_once("/dev/video")
-            .map(|(_, tail)| tail.to_string())
-            .unwrap_or_default();
-        let name = std::fs::read_to_string(
-            PathBuf::from("/sys/class/video4linux")
-                .join(&device_number)
-                .join("name"),
-        )
-        .unwrap_or_else(|_| sys_name.to_string_lossy().to_string());
-        let usb = target.to_string_lossy().contains("usb-");
-        out.push(Camera {
-            id,
-            name: name.trim().to_string(),
-            model: name.clone(),
-            manufacturer: String::new(),
-            kind: if usb {
-                CameraKind::External
-            } else {
-                CameraKind::BuiltIn
-            },
-            formats: Vec::<VideoFormat>::new(),
-            suspended: false,
-        });
-    }
+    out.extend(camera::devices());
 }
 
 /// Microphones and outputs from PipeWire's PulseAudio compatibility.
@@ -695,11 +646,22 @@ pub(crate) fn probe(source: &SourceKind, canvas: &Canvas) -> Result<Option<Probe
             "window and app capture arrive at L.2's follow-up (a monitor through the portal is \
              what L.2 delivers)"
         ),
-        SourceKind::Camera(_)
-        | SourceKind::Microphone(_)
+        SourceKind::Camera(settings) => {
+            let request = CameraRequest {
+                size: settings.width.zip(settings.height),
+                fps: settings.fps,
+            };
+            let (device, format) = camera::probe(&settings.device, request, canvas)?;
+            Ok(Some(Probe {
+                device,
+                video: Some(format),
+                channels: None,
+            }))
+        }
+        SourceKind::Microphone(_)
         | SourceKind::SystemAudio(_)
         | SourceKind::ApplicationAudio(_) => {
-            bail!("camera and audio capture arrive at L.3 of docs/port-omarchy.md")
+            bail!("audio capture arrives at L.3 of docs/port-omarchy.md")
         }
         SourceKind::Browser(_) => bail!("browser capture arrives at L.6 of docs/port-omarchy.md"),
         SourceKind::Color(_)
