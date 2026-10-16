@@ -3,6 +3,53 @@
 Short, dated facts a future session needs. Newest entries go at the top of
 each section. Delete entries that stop being true.
 
+## Linux port progress (2026-10-16, L.4.1 shared surfaces: the ring and its hand-over)
+
+- **Linux hands surfaces over with `SCM_RIGHTS`, not Mach ports.** A Unix
+  socket *can* carry file descriptors, so `isocast-surfaces`'s Linux
+  module binds a socket of the daemon's own and sends the ring's
+  descriptors to whoever holds the ring's one-use token. Chosen over
+  DMA-BUF for this step because DMA-BUF needs raw Vulkan (an exportable
+  `VkImage` with `VK_EXT_external_memory_dma_buf` on the daemon's side and
+  a matching import on the client's); wgpu exposes neither, so that is
+  L.4.6 and only if L.4.5's measurements say the copy costs too much.
+- **The copy path, both halves.** The daemon's GPU draws into a texture
+  (`shared_surface` hands the engine the texture plus the surface), the
+  daemon copies the texture back into the shared memory, the client
+  uploads the memory into a texture of its own. Two copies per frame, no
+  zero-copy claim: the S.1 rows must say what it costs.
+- **Rows are padded to 256 bytes and that is what both copies use.**
+  `copy_texture_to_buffer` (read-back) and `Queue::write_texture`
+  (upload) both refuse a row pitch that is not a multiple of 256, so
+  `Surface::stride()` is `align(width*4, 256)` and `bytes()` is
+  `stride*height`; neither side repacks a row, and `row(y)` cuts the
+  padding off for reading. (1600×900 is exactly 6400 bytes a row, so the
+  padding is invisible at real monitor sizes.)
+- **The socket is in `$XDG_RUNTIME_DIR/isocast/surfaces-<pid>.sock`** (a
+  0700 directory; `/tmp/isocast-<uid>/` if the variable is unset), named
+  by pid so two daemons never fight over it. Binding takes over a socket a
+  killed daemon left behind, but refuses a path that answers a connect
+  ("another Isocast daemon is handing surfaces over at …"). The socket
+  files of dead test processes accumulate in that directory; delete them
+  freely.
+- **A refused fetch is a text line, not an empty message**: the daemon
+  answers `error: the token is unknown or was used already`, which `fetch`
+  turns into its own error, so a client that is out of order says
+  something a person can read instead of "protocol error".
+- **`host_now()` on Linux is `CLOCK_MONOTONIC`**, the clock
+  `isocast-platform-linux`'s `host_time()` stamps frames with; the client
+  subtracts it from a frame's `time` to measure lateness, so a wall clock
+  (`SystemTime`) here would report every frame as days late. macOS's is
+  `mach_absolute_time`; the two functions are separate on purpose.
+- **The cross-process test runs the test binary again.** `cargo test`
+  cannot hand a test an fd, so the test spawns
+  `std::env::current_exe()` with `--exact <its own name>` and
+  `ISOCAST_FETCH_SERVICE`/`ISOCAST_FETCH_TOKEN` set; the child branch of
+  the same test fetches the ring and checks the pixels. No new file,
+  binary or harness — Ryan's approval is not needed for it — and it proves
+  the descriptor crossing a process boundary, which a thread in the same
+  process does not.
+
 ## Linux port progress (2026-10-16, L.3 per-app audio)
 
 - **Per-app capture links itself; the graph will not do it for a capture

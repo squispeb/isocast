@@ -714,6 +714,50 @@ step live in `docs/notes.md`'s "Linux port WIP" section.
   through `isocast-surfaces`'s Unix-socket hand-over (see
   docs/shared-frames.md's sketch); the app's live monitors work.
   (They work now through L.0's JPEG poll; this makes them cheap.)
+  - [x] **L.4.1 The ring and its hand-over on Linux**
+    (`isocast-surfaces`). A `Surface` is shared memory (`memfd_create`)
+    of 8-bit RGBA whose rows are padded to 256 bytes, so the daemon's
+    read-back and the client's upload can use them as they are
+    (`copy_texture_to_buffer` and `Queue::write_texture` both refuse a
+    row pitch that is not a multiple of 256); the `Exporter` listens on
+    a Unix socket of its own under the user's runtime directory
+    (`$XDG_RUNTIME_DIR/isocast/surfaces-<pid>.sock`, in a 0700
+    directory) and hands a ring over as file descriptors (`SCM_RIGHTS`
+    is what Linux has instead of Mach ports) to the holder of a one-use
+    token: `offer` gives one, `fetch` spends it, `withdraw` drops it.
+    A stale socket (a daemon that was killed) is taken over; a live one
+    that is not ours is refused. `host_now()` is now the crate's own
+    per-system clock and on Linux is `CLOCK_MONOTONIC`, which is the
+    clock `isocast-platform-linux` stamps frames with — a wall clock
+    would make every frame look days late to the client measuring its
+    latency. Verified: two in-crate tests hand a ring over, publish
+    into it and read it back from another holder, refuse a spent token
+    and an unknown one, and a third re-runs the test binary as a **real
+    second process** to read what the first published (no new files or
+    harnesses); nothing draws into a ring yet.
+  - [ ] **L.4.2 The daemon draws a ring.** `shared_surface` gives the
+    engine a texture to draw into and the surface it goes with, and one
+    new platform hook (defaulted, so macOS is untouched) copies the
+    finished texture back into the shared memory after the GPU wait;
+    the daemon names the real transport. Done when a take with a
+    `shared_frames` viewer shows frames arriving (`isocast frames
+    program --shared` on this machine), with the daemon's read-back
+    cost measured.
+  - [ ] **L.4.3 The client shows a ring.** `SharedFrame::texture` takes
+    the queue the upload needs, `isocast frames --shared --check`
+    passes on Linux (the same 64-pixel grid, revisions and `--touch`),
+    and the client's copy is measured against the H.264 path.
+  - [ ] **L.4.4 The app's live monitors on Linux** (Slint preview
+    without the JPEG poll), with the daemon's CPU per viewer in the
+    notes.
+  - [ ] **L.4.5 S.1 rows on this machine** (shared frames against
+    H.264), the values that decide whether DMA-BUF (below) is needed.
+  - [ ] **L.4.6 (later) Zero copy: DMA-BUF rings.** The daemon's
+    texture exported (`VK_EXT_external_memory_dma_buf`) and the
+    client's GPU sampling it in place, which needs raw Vulkan around
+    wgpu on both sides; also what L.2's screen capture wants for
+    DMA-BUF frames. Only worth it if L.4.5 says the copy costs too
+    much.
 - [ ] **L.5 In-process encoders and joins.** LGPL libav (or NVENC
   API) for streams and monitors with the full `VideoEncoder`
   contract (per-frame keyframes, `set_rate`); timeline exports
@@ -1522,6 +1566,30 @@ Shipped (v1): 7.1, 7.2, 7.4a, 7.5, 7.6. Next, in order:
 - FilmCraft reads `session.json` to line up ISO files without audio sync.
 
 ## Log
+
+- L.4.1 shared surfaces (2026-10-16): a ring of surfaces now hands over on
+  Linux. `isocast-surfaces` has a Linux module: a surface is 8-bit RGBA in
+  a `memfd` whose rows are padded to 256 bytes, which is exactly what both
+  GPU copies want (`copy_texture_to_buffer` for the daemon's read-back,
+  `Queue::write_texture` for the client's upload), so neither side repacks
+  a row; the `Exporter` binds a Unix socket of its own in the user's
+  runtime directory (0700, named by pid) on first use and hands a ring
+  over as file descriptors — `SCM_RIGHTS`, which is what Linux has instead
+  of Mach ports — to the holder of the ring's one-use token, and `fetch`
+  spends that token, refusing one that was spent or withdrawn with a line
+  the client reports as its error. A socket a killed daemon left behind is
+  taken over; a live one that is not ours is refused by name.
+  `host_now()` is now per system and on Linux is `CLOCK_MONOTONIC`: the
+  clock `isocast-platform-linux` stamps frames with, so a client can
+  measure how late a frame is (a wall clock would put every frame days
+  away from its own time). Verified by the crate's own tests: a ring is
+  offered, fetched by another holder and read back after `publish`, a
+  spent and an unknown token are refused, a withdrawn ring is refused, and
+  the fourth test runs the test binary a **second time** — a real separate
+  process, no new program or harness — which maps the received descriptor
+  and reads the pixels the first process published. Nothing draws into a
+  ring yet: that is L.4.2, where the daemon gets a texture to draw into
+  and one hook to copy it back.
 
 - L.3 per-app audio (2026-10-16): a take can record one app's sound and
   leave the rest of the machine out. `Target::Application { query, name }`

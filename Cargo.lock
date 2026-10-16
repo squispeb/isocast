@@ -3132,6 +3132,7 @@ name = "isocast-surfaces"
 version = "0.0.3"
 dependencies = [
  "anyhow",
+ "libc",
  "mach2",
  "objc2-core-foundation",
  "objc2-io-surface",

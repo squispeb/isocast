@@ -11,6 +11,13 @@
 //! (see `isocast_protocol::api::shared`). docs/shared-frames.md explains
 //! the choice and the Windows design.
 //!
+//! On Linux a surface is shared memory (`memfd_create`, rows padded to 256
+//! bytes) and the hand-over rides a Unix socket of the daemon's own, which
+//! carries the descriptors (`SCM_RIGHTS`); the same token guards it. This
+//! is the copying path for now — the daemon reads the drawn picture back
+//! into the shared memory and the client uploads it into a texture — with
+//! DMA-BUF as L.4's later step.
+//!
 //! On other systems everything here returns an error saying so.
 
 use std::fmt;
@@ -21,11 +28,34 @@ mod mac;
 #[cfg(target_os = "macos")]
 pub use mac::{Exporter, Surface, fetch, host_now};
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+mod linux;
+
+#[cfg(target_os = "linux")]
+pub use linux::{Exporter, Surface, fetch, host_now};
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 mod other;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub use other::{Exporter, Surface, fetch, host_now};
+
+/// How a ring is carried, as the daemon's `shared_frames` reply says it:
+/// clients use it to tell a transport they know from one they don't.
+pub const TRANSPORT: &str = {
+    #[cfg(target_os = "macos")]
+    {
+        "iosurface-mach"
+    }
+    #[cfg(target_os = "linux")]
+    {
+        "memfd"
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        "none"
+    }
+};
 
 /// The most surfaces a ring may have.
 pub const MAX_SLOTS: usize = 8;
