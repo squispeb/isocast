@@ -15,7 +15,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use isocast_engine::{MediaInfo, Probe, Volume};
+use isocast_engine::{CaptureFormat, MediaInfo, Probe, Volume};
 use isocast_protocol::api::Machine;
 use isocast_protocol::devices::{
     AudioOutput, Camera, CameraKind, Devices, Display, Microphone, Permission, PermissionAction,
@@ -620,25 +620,48 @@ fn default_of(_pactl_short_text: &str, key: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Permissions: Linux gates nothing per-app here (portals arrive L.2).
+// Permissions: Linux gates nothing per-app, but the screen comes from the
+// desktop's portal, and whether its picker has been answered is knowable.
 // ---------------------------------------------------------------------------
 
 pub(crate) fn permissions_report() -> Result<PermissionsReport> {
-    let mut details = Vec::new();
-    for kind in PermissionKind::ALL {
-        details.push(PermissionDetail {
-            permission: kind,
-            state: Permission::Granted,
-            needed_for: kind.label().to_string(),
-            action: PermissionAction::None,
-            settings_url: "isocast://linux/portal".to_string(),
-            next_step: None,
-            restart_after_granting: false,
-        });
-    }
+    // The portal remembers a screen choice as a restore token; without
+    // one, the next screen capture is what shows the picker.
+    let screen = if crate::portal::has_token() {
+        Permission::Granted
+    } else {
+        Permission::NotDetermined
+    };
+    let details = PermissionKind::ALL
+        .into_iter()
+        .map(|kind| {
+            let (state, action, next_step) = match kind {
+                PermissionKind::ScreenRecording if screen != Permission::Granted => (
+                    screen,
+                    PermissionAction::Request,
+                    Some(
+                        "run `isocast permissions --request` and choose a screen in the \
+                         desktop's picker; every later capture follows that choice (or let the \
+                         first screen recording ask, within its 8 s open)"
+                            .to_string(),
+                    ),
+                ),
+                _ => (Permission::Granted, PermissionAction::None, None),
+            };
+            PermissionDetail {
+                permission: kind,
+                state,
+                needed_for: kind.label().to_string(),
+                action,
+                settings_url: "isocast://linux/portal".to_string(),
+                next_step,
+                restart_after_granting: false,
+            }
+        })
+        .collect();
     Ok(PermissionsReport {
         permissions: isocast_protocol::devices::Permissions {
-            screen_recording: Permission::Granted,
+            screen_recording: screen,
             camera: Permission::Granted,
             microphone: Permission::Granted,
         },
@@ -651,11 +674,27 @@ pub(crate) fn permissions_report() -> Result<PermissionsReport> {
 // Probe: which device a source would use, or what L.2/L.3 has to give.
 // ---------------------------------------------------------------------------
 
-pub(crate) fn probe(source: &SourceKind, _canvas: &Canvas) -> Result<Option<Probe>> {
+pub(crate) fn probe(source: &SourceKind, canvas: &Canvas) -> Result<Option<Probe>> {
     match source {
-        SourceKind::Display(_) | SourceKind::Window(_) | SourceKind::Application(_) => {
-            bail!("screen, window and app capture arrive at L.2 of docs/port-omarchy.md")
+        // The portal's picker decides which monitor is shared, so a
+        // display's size here is what the desktop reports for it, not a
+        // promise about the stream (see portal.rs).
+        SourceKind::Display(display) => {
+            let found = find_display(&display.display)?;
+            Ok(Some(Probe {
+                device: format!("{} (id {})", found.name, found.id),
+                video: Some(CaptureFormat {
+                    width: found.width,
+                    height: found.height,
+                    fps: canvas.fps,
+                }),
+                channels: None,
+            }))
         }
+        SourceKind::Window(_) | SourceKind::Application(_) => bail!(
+            "window and app capture arrive at L.2's follow-up (a monitor through the portal is \
+             what L.2 delivers)"
+        ),
         SourceKind::Camera(_)
         | SourceKind::Microphone(_)
         | SourceKind::SystemAudio(_)
@@ -670,6 +709,31 @@ pub(crate) fn probe(source: &SourceKind, _canvas: &Canvas) -> Result<Option<Prob
         | SourceKind::Media(_)
         | SourceKind::TestPattern(_)
         | SourceKind::Tone(_) => Ok(None),
+    }
+}
+
+/// The display a setup names: "main", or a name or id (`devices` lists
+/// both), matched the way macOS matches them. An unknown name is an
+/// error listing what exists, so a typo is a message and not a take of
+/// the wrong screen.
+pub(crate) fn find_display(query: &str) -> Result<Display> {
+    let displays = devices()?.displays;
+    let found = displays
+        .iter()
+        .find(|d| (query == "main" && d.main) || d.id == query || d.name == query)
+        .or_else(|| displays.iter().find(|d| d.name.eq_ignore_ascii_case(query)));
+    match found {
+        Some(found) => Ok(found.clone()),
+        None => {
+            let valid: Vec<String> = displays
+                .iter()
+                .map(|d| format!("{:?} (id {})", d.name, d.id))
+                .collect();
+            bail!(
+                "no display matches {query:?}; valid: \"main\", {}",
+                valid.join(", ")
+            )
+        }
     }
 }
 

@@ -64,7 +64,16 @@ pub fn doctor<P: Platform>(
                     (Permission::NotDetermined, _) => check(
                         &name,
                         CheckStatus::Warning,
-                        "not asked yet; macOS asks the first time it is needed".into(),
+                        match fix.is_some() {
+                            // The platform's own next step says who asks
+                            // and how, so this line only names the state:
+                            // on Linux the asker is the desktop's portal,
+                            // not macOS.
+                            true => detail.state.label().to_string(),
+                            false => {
+                                "not asked yet; the system asks the first time it is needed".into()
+                            }
+                        },
                         fix,
                     ),
                     (other, true) => check(

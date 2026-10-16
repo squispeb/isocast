@@ -27,6 +27,13 @@ image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+# The desktop's portals over the session bus: the screen-capture picker and
+# the PipeWire node it hands back (L.2). zbus's blocking API needs no async
+# runtime here; its version is the one the workspace already carries.
+zbus = { version = "5.19.0", features = ["blocking"] }
+# The screen node the portal's ScreenCast creates: this process is the
+# stream's client, so capture is a copy, not another encoder process.
+pipewire = { version = "0.10.1", features = ["v1_2_0"] }
 # The Linux target gets the Vulkan back end; the macOS feature set in
 # the plain dependency entry above resolves for the apple targets only.
 wgpu = { version = "=30.0.1", default-features = false, features = [

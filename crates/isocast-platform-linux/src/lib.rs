@@ -19,7 +19,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use isocast_engine::{
     AudioRender, AudioSink, CameraRequest, CaptureFormat, EncoderSessions, JoinSpec, Joined,
     LiveAudioSpec, LiveVideoSpec, MediaInfo, MediaPart, OnJoinProgress, Platform, Probe, Time,
@@ -36,6 +36,8 @@ mod jpeg;
 mod keychain;
 pub(crate) mod media;
 pub(crate) mod pacing;
+mod portal;
+mod screencast;
 pub(crate) mod stream;
 pub(crate) mod system;
 pub(crate) mod writer;
@@ -51,13 +53,20 @@ use crate::frames::CpuPool;
 pub struct LinuxPlatform;
 
 /// A running capture. Dropping it stops the capture and joins its
-/// threads. Only cameras have one so far (L.3's V4L2 path); screen and
-/// audio capture still bail with the milestone that delivers them, so
-/// there is no other kind yet.
+/// threads: a camera's ffmpeg child (L.3), or the portal's PipeWire
+/// stream (L.2).
 pub struct Capture {
-    /// Kept alive for the capture's lifetime: its `Drop` stops the
-    /// capture.
-    _camera: camera::CameraCapture,
+    /// Kept alive for the capture's lifetime: its `Drop` stops it.
+    _running: Running,
+}
+
+/// What a handle is holding open. One variant per kind of capture a
+/// source can have.
+enum Running {
+    /// A camera read through this machine's ffmpeg (camera.rs).
+    Camera { _camera: camera::CameraCapture },
+    /// A screen shared through the desktop's portal (screencast.rs).
+    Screen { _screen: screencast::ScreenCapture },
 }
 
 impl Platform for LinuxPlatform {
@@ -101,9 +110,35 @@ impl Platform for LinuxPlatform {
         system::permissions_report()
     }
 
+    /// The screen comes from the desktop's portal, and its picker is what
+    /// a screen source's open waits on until this machine has answered one
+    /// (L.2). A capture that runs past the engine's 8 s bound is
+    /// described by that, not by "check its file/device".
+    fn source_permission(&self, source: &SourceKind) -> Option<String> {
+        // Window and app capture follow the same picker when they land.
+        let screen = matches!(
+            source,
+            SourceKind::Display(_) | SourceKind::Window(_) | SourceKind::Application(_)
+        );
+        (screen && !portal::has_token()).then(|| {
+            "the desktop's screen-sharing picker is waiting for a choice: run `isocast \
+             permissions --request` and pick a screen (the choice is remembered, so later \
+             captures open silently)"
+                .to_string()
+        })
+    }
+
     /// On Linux there is no TCC; a source gets its access when it is
-    /// first captured, through the desktop's portals (L.2).
+    /// first captured, through the desktop's portals (L.2). The
+    /// screen-capture portal is the one that asks a person, so this
+    /// answers its picker now and keeps the restore token: a take's own
+    /// open is bounded to 8 s, which is not long enough to choose a
+    /// screen in.
     fn request_permissions(&self) -> Result<PermissionsReport> {
+        portal::prepare(true).context(
+            "asking the desktop to share a screen (its picker chooses the monitor once; later \
+             captures need no prompt)",
+        )?;
         system::permissions_report()
     }
 
@@ -213,19 +248,55 @@ impl Platform for LinuxPlatform {
         FfmpegFileWriter::spawn(spec)
     }
 
-    /// L.2: the desktop's screen-capture portal (PipeWire ScreenCast).
+    /// L.2: a monitor, shared by the desktop's ScreenCast portal. The
+    /// portal's picker chooses which monitor once per machine; the
+    /// restore token it hands back makes every later capture silent (see
+    /// portal.rs and docs/notes.md).
     fn capture_screen(
         &self,
-        _target: isocast_engine::ScreenTarget<'_>,
-        _fps: u32,
-        _ten_bit: bool,
-        _cursor: bool,
-        _sink: VideoSink<Self::Frame>,
+        target: isocast_engine::ScreenTarget<'_>,
+        fps: u32,
+        ten_bit: bool,
+        cursor: bool,
+        sink: VideoSink<Self::Frame>,
     ) -> Result<(Self::Capture, CaptureFormat)> {
-        bail!(
-            "screen capture is not implemented on Linux yet: it arrives at L.2 of \
-             docs/port-omarchy.md (the portal's ScreenCast)."
-        )
+        if ten_bit {
+            bail!(
+                "10-bit screen capture is not available on Linux yet: the portal's ScreenCast \
+                 shares 8-bit pictures, so a 10-bit encoder has nothing to take here (L.5)"
+            );
+        }
+        let display = match target {
+            isocast_engine::ScreenTarget::Display(display) => display,
+            isocast_engine::ScreenTarget::Window { .. }
+            | isocast_engine::ScreenTarget::Application { .. } => bail!(
+                "capturing a window or an app is not available on Linux yet: L.2 captures a \
+                 monitor through the desktop's portal, so point the source at a display"
+            ),
+        };
+        // The portal's own picker decides which monitor is shared, so the
+        // name is a check, not an instruction: a name that matches no
+        // display is a typo worth failing on (macOS fails on one too, and
+        // this way the picker is never shown for it), and a picture whose
+        // size disagrees with the named display is worth a word.
+        let wanted = system::find_display(display)?;
+        let (screen, format) = screencast::capture(*self, fps, cursor, sink)?;
+        if (wanted.width, wanted.height) != (format.width, format.height) {
+            isocast_diagnostics::diagnostic!(
+                "warn"; "screen: the desktop shared a {}x{} picture, but {display:?} is \
+                {}x{}; the portal's picker decides which monitor is shared (docs/notes.md)",
+                format.width,
+                format.height,
+                wanted.width,
+                wanted.height
+            );
+        }
+        Ok((
+            Capture {
+                _running: Running::Screen { _screen: screen },
+            },
+            format,
+        ))
     }
 
     /// L.3: V4L2 cameras, read through this machine's `ffmpeg` (see
@@ -238,7 +309,12 @@ impl Platform for LinuxPlatform {
         sink: VideoSink<Self::Frame>,
     ) -> Result<(Self::Capture, CaptureFormat)> {
         let (camera, format) = camera::capture(*self, device, request, canvas, sink)?;
-        Ok((Capture { _camera: camera }, format))
+        Ok((
+            Capture {
+                _running: Running::Camera { _camera: camera },
+            },
+            format,
+        ))
     }
 
     /// L.3: PipeWire microphone capture.

@@ -43,7 +43,7 @@ sais-lite (MIT, Yuta Mori) and orlp/ed25519 (zlib, Orson Peters). The full
 texts ship in the app as Contents/Resources/LICENSE-Sparkle and are at
 https://github.com/sparkle-project/Sparkle/blob/2.10.0/LICENSE.
 
-Rust crates (496)
+Rust crates (497)
 =================
 
 Crate, version, licence, link.
@@ -72,6 +72,9 @@ aho-corasick 1.1.5
 allocator-api2 0.2.21
   MIT OR Apache-2.0
   https://github.com/zakarumych/allocator-api2
+annotate-snippets 0.11.5
+  MIT OR Apache-2.0
+  https://github.com/rust-lang/annotate-snippets-rs
 annotate-snippets 0.12.16
   MIT OR Apache-2.0
   https://github.com/rust-lang/annotate-snippets-rs

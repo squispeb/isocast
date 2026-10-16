@@ -392,8 +392,10 @@ fn bounded_open<T: Send + 'static>(
 ) -> Result<T> {
     static PENDING: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     let pending = PENDING.get_or_init(Default::default);
-    let context = permission.map(|p| format!("waiting for permission: {p}; check the macOS permission prompt or Privacy & Security"))
-        .unwrap_or_else(|| "source is still opening; check its file/device".into());
+    // The platform says what may be waiting (its own prompt, picker or
+    // folder); this fallback is for everything that just opens slowly.
+    let context =
+        permission.unwrap_or_else(|| "source is still opening; check its file/device".into());
     {
         let mut slots = pending.lock().unwrap();
         if slots.contains(&key) {

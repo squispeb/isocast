@@ -561,10 +561,59 @@ step live in `docs/notes.md`'s "Linux port WIP" section.
     G.3b's engine work (still unchecked, macOS-owned); the Linux writer
     keeps its fragmented-MOV output and the kill-9 gate it passed
     meanwhile.
-- [ ] **L.2 Screen capture.** The portal's ScreenCast through
-  PipeWire, with the Vulkan device-creation hook for DMA-BUF imports;
-  verified by `isocast record --source screen --seconds 10` and
-  `ffprobe`.
+- [ ] **L.2 Screen capture.** A monitor through the desktop's
+  ScreenCast portal, consumed in-process over PipeWire (no ffmpeg: this
+  machine's ffmpeg has no `pipewire` input). Verified by
+  `isocast record --source screen --seconds 10` and `ffprobe`; that one
+  take still needs a person's click in the picker (see "Waiting on
+  Ryan").
+  - [x] **The portal handshake (`portal.rs`).** zbus on the session
+    bus: `CreateSession`, `SelectSources` (or, when the token exists,
+    no picker), `Start`, `OpenPipeWireRemote` — the last hands back the
+    fd the node lives on. The restore token is kept in the same 0600
+    secrets file as the keychain stand-in, so the picker is answered
+    once per machine. Verified live: `CreateSession` against the real
+    xdg-desktop-portal-hyprland returns a session on the path the code
+    predicts from its minted token (`/org/freedesktop/portal/desktop/
+    session/1_73094/isocast_1368854_2`), and `Session.Close` is
+    accepted.
+  - [x] **The PipeWire consumer (`screencast.rs`).** A stream with
+    `AUTOCONNECT|MAP_BUFFERS` on the portal's fd, an EnumFormat asking
+    for a 4-byte BGRA order at the compositor's own size and the take's
+    rate, and a Buffers param naming memfd/memptr (a DMA-BUF is L.4's
+    import, not a copy). Mapped buffers are copied into BGRA pool
+    frames and handed to the sink stamped with the host clock, with
+    pictures arriving inside the ask's interval dropped. Verified
+    headlessly against a GStreamer `pipewiresink mode=provide`
+    producer: a 320x240 BGRx 10 fps node negotiates as 320x240 at
+    `fps: 10`, 12 pictures reach the sink in 2 s (the ask's ten a
+    second plus the two during setup), none of them blank, and a node
+    whose only pixel order is RGBA fails the open in 0.0 s with the
+    node's own words ("no more input formats") instead of waiting out
+    the 5 s format wait.
+  - [x] **Wiring: the source, the probe and the permission.**
+    `capture_screen` takes a display (window and app capture name
+    their own follow-up), refuses 10-bit with the reason, fails on a
+    name no display matches (macOS's behavior, and the picker is never
+    shown for a typo), warns when the shared picture's size is not the
+    display the setup names (the picker decides the monitor), `probe`
+    resolves a display's size and
+    rate, `request_permissions` answers the picker and
+    `source_permission` explains an open that is waiting on it.
+    Verified: `doctor` on a scratch setup reports "source: screen:
+    Samsung Electric Company LS27AG55x H1AK500000 (id DP-3):
+    2560×1440 @ 30 fps" and a typo'd display fails with the valid list
+    ("no display matches \"DP-99\"; valid: \"main\", …"); `isocast
+    permissions` reports screen recording as not asked yet with the
+    request action.
+  - [ ] **A real take of the desktop** (the row above): needs one picker
+    click, then a 10 s take checked with `ffprobe` (size 2560x1440,
+    pictures that change) and a channel-order check against a scratch
+    `grim` capture of the same screen.
+  - [ ] **DMA-BUF import**, the zero-copy path, with the Vulkan
+    device-creation hook: L.4's shared surfaces want it too. Until
+    then a node that hands over an unmappable DMA-BUF fails the
+    capture with a message naming xdph's `force_shm`.
 - [ ] **L.3 Camera, mic and system audio through PipeWire and
   V4L2.** Per-app audio by linking a capture stream to the app's
   stream node (the reviewer's correction: this *is* possible on
@@ -1394,6 +1443,36 @@ Shipped (v1): 7.1, 7.2, 7.4a, 7.5, 7.6. Next, in order:
 
 ## Log
 
+- L.2 (2026-10-16): the desktop's screen arrives through the portal
+  (code complete, one click short of a real take). A new
+  `isocast-platform-linux` pair of modules shares a monitor through
+  xdg-desktop-portal's ScreenCast and consumes its PipeWire node
+  in-process: `portal.rs` does the blocking handshake on the session
+  bus (zbus; CreateSession → SelectSources → Start →
+  OpenPipeWireRemote) and keeps the restore token in the 0600 secrets
+  file, `screencast.rs` negotiates a 4-byte BGRA order of the
+  compositor's own size at the take's rate, copies each mapped buffer
+  into a BGRA pool frame and hands it to the sink; pictures inside the
+  ask's interval are dropped, and the portal session's connection
+  lives exactly as long as the capture (xdg-desktop-portal closes a
+  session with its client, which stops the compositor's node).
+  `capture_screen`, `probe` for a display,
+  `request_permissions`/`source_permission` and the permissions
+  report are wired. Verified: `CreateSession` against the running
+  xdg-desktop-portal-hyprland returns a session at the predicted
+  path; a GStreamer `pipewiresink mode=provide` node (320x240 BGRx
+  10 fps) negotiates as 320x240 `fps: 10` and delivers 12 pictures in
+  2 s with none blank, and an RGBA-only node fails the open in 0.0 s
+  with the node's reason; `doctor` names the display ("DP-3,
+  2560×1440 @ 30 fps") and rejects a typo'd one with the valid list;
+  `permissions` reports screen recording as not asked yet. Not yet
+  verified: the real portal stream (the picker needs one click — a
+  take's open is engine-bounded to 8 s, and the earlier attempt timed
+  out with exactly that message), and a DMA-BUF node (L.4's import;
+  the capture asks for memfd/memptr and errors clearly otherwise).
+  Also in this commit: the doctor's not-granted permission line no
+  longer says "macOS asks the first time it is needed" (the platform
+  supplies the sentence now, so Linux points at the picker).
 - L.1 (2026-10-15): the doctor measures the video hardware's
   encode-session limit. `Platform::concurrent_encodes` (default: the
   machine can't be asked — macOS's media engines cap nothing) is

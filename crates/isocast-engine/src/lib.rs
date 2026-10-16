@@ -105,8 +105,11 @@ pub trait Platform: Clone + Send + Sync + 'static {
     /// next step for each that isn't granted. Never prompts.
     fn permissions(&self) -> anyhow::Result<PermissionsReport>;
 
-    /// Permission a pending source open may be waiting for. Must not prompt
-    /// or perform protected I/O; a successful open clears this provisional state.
+    /// Why a pending source open may be waiting, in a sentence: the
+    /// permission prompt, picker or path that has to be answered outside
+    /// isocast. Shown when an open runs past its 8 s bound, so it has to
+    /// name the thing to do (`Some`) or say nothing (`None`). Must not
+    /// prompt or perform protected I/O.
     fn source_permission(&self, _source: &SourceKind) -> Option<String> {
         None
     }

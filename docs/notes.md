@@ -3,6 +3,114 @@
 Short, dated facts a future session needs. Newest entries go at the top of
 each section. Delete entries that stop being true.
 
+## Linux port progress (2026-10-16, L.2 code complete)
+
+- **L.2: the desktop's screen through the portal (portal.rs +
+  screencast.rs)**, code complete and verified everywhere except the one
+  take that needs a picker click ("Waiting on Ryan"):
+  - **The site is the portal, not `/dev/dri`.** Hyprland's screencopy is
+    reachable only through `org.freedesktop.portal.ScreenCast`, and its
+    node lives on the *portal's* PipeWire remote, so the client is two
+    halves: `portal.rs` (D-Bus handshake, blocking) and `screencast.rs`
+    (the node's consumer). **Why zbus and not tokio/ashpd**: zbus 5.19
+    blocking is already in the lock (Slint needs it), so the daemon
+    gains no async runtime; the handshake is 4 calls and a signal, all
+    of which want to be sequential anyway.
+  - **Handshake**: `CreateSession` → `SelectSources` → `Start` →
+    `OpenPipeWireRemote`. Request and session object paths are
+    *predicted* from a minted token (`isocast_<pid>_<n>`), which is what
+    lets the request path be subscribed to *before* the call (the
+    portal's `Response` signal arrives on it); `sender` is the
+    connection's unique name with `:` → `_` and `.` → `_`. Confirmed
+    live against xdg-desktop-portal-hyprland 1.4.1: `CreateSession`
+    returns a session at the predicted path
+    (`/org/freedesktop/portal/desktop/session/1_73094/isocast_1368854_2`),
+    `Response` parses as `(u32, a{sv})` (0 = picked, 1 = dismissed, 2 =
+    the session ended), and `Session.Close` is accepted. Only
+    `SelectSources`/`Start` show the picker; `CreateSession` and
+    `OpenPipeWireRemote` do not.
+  - **The token is the whole UX story.** `SelectSources` gets a
+    `restore_token` when the 0600 secrets file has one (the same
+    keychain stand-in file as elsewhere) and keeps the one the portal
+    returns; with `allow_token_by_default = true` (already set in
+    `~/.config/hypr/xdph.conf`) an accepted token means **no picker at
+    all**, so later takes open silently. One token covers every screen
+    source for now; per-monitor choices are the documented follow-up.
+    `~/.local/share/xdg-desktop-portal/` did not exist on this box
+    before the first answer.
+  - **A take's own open cannot show the picker**: the engine bounds a
+    source's open to 8 s, which is not enough for a person to choose a
+    screen, so `request_permissions` runs the picker (`portal::prepare`)
+    and keeps the token; `has_token()` is what
+    `permissions_report`/`source_permission` answer with. The first
+    attempt on 2026-10-16 failed exactly that way ("timed out opening
+    after 8 s").
+  - **The session must outlive the open** (a bug found by reading the
+    spec, not by a test): xdg-desktop-portal closes a session as soon as
+    the bus connection that created it goes away, and the compositor
+    then stops sharing. `portal::Stream` therefore holds the
+    `Connection`, and one connection per capture makes the session's
+    life exactly the capture's.
+  - **Buffers: ask for mapped memory.** The stream sends a
+    SPA_PARAM_Buffers param whose `dataType` choice is memfd + memptr,
+    so the compositor hands over SHM (xdph logs "DMA-BUF fixation
+    failed … falling back to SHM" when a client cannot take a DMA-BUF).
+    A DMA-BUF is an fd whose bytes want importing into the GPU (L.4) and
+    a tiled one mmaps as garbage, so L.2 does not ask for one; a node
+    that hands one over anyway ends the capture with a message naming
+    xdph's `force_shm` workaround. The payload is built by hand
+    (`spa::pod::Object` + `Choice<i32>`): libspa 0.10 has no
+    `param::buffers` module and the `property!` macro cannot express a
+    `Flags` choice on `Int`.
+  - **Consumer shape**: `AUTOCONNECT|MAP_BUFFERS` on the portal's fd,
+    EnumFormat = 4-byte BGRA order (BGRx default, BGRA alternate),
+    size a 16..16384 range (the compositor fixes its own), rate a
+    `1..4×ask` range at denom 1. A picture is copied row by row from
+    `chunk.offset` with `chunk.stride` (not `data().size()`) into a
+    BGRA `CpuPool` frame and handed to the sink stamped with the host
+    clock — the camera's shape minus ffmpeg, which is why the writer
+    needs no new path. Pictures inside `1/ask` are dropped (a screen
+    repaints on change, so the stream's rate is a ceiling);
+    `fps: 0` means the compositor names no rate and the take's own
+    stands. A non-BGRA order, a stream that describes no picture within
+    5 s, a node error and an unmappable buffer each fail the open with
+    a message naming the cause.
+  - **Verified headlessly** (the picker is not needed for any of this):
+    a GStreamer producer
+    (`gst-launch-1.0 -q videotestsrc is-live=true !
+    video/x-raw,format=BGRx,width=320,height=240,framerate=10/1 !
+    pipewiresink mode=provide
+    stream-properties=props,node.name=<name>`, node id from `pw-dump`;
+    the consumer connects to `/run/user/1000/pipewire-0` instead of the
+    portal's fd) negotiates as `320x240 fps: 10`, delivers 12 pictures
+    in 2 s with **none blank** (sampled luma per picture) and stops
+    cleanly; an RGBA-only producer fails the open in **0.0 s** with
+    "the desktop's screen stream failed: no more input formats" (the
+    node's own words, from the `state_changed` path, faster than the
+    5 s wait). The harness is not committed — see "Questions for Ryan".
+  - **`probe` for a display** resolves the setup's name through
+    `devices()` (`main`, id, name, then case-insensitive name) and
+    reports the desktop's size at the canvas rate; `doctor` on a scratch
+    setup prints "source: screen: Samsung Electric Company LS27AG55x
+    H1AK500000 (id DP-3): 2560×1440 @ 30 fps" and a typo arrives as a
+    problem listing what exists ("no display matches \"DP-99\"; valid:
+    \"main\", …"), the same message macOS gives.
+  - **The doctor's permission line is platform-neutral now**: it used to
+    read "not asked yet; macOS asks the first time it is needed" for any
+    `NotDetermined` permission, which a Linux user can now reach. The
+    platform supplies the sentence (`Platform::source_permission`'s
+    string is used whole, macOS keeps its exact wording), and the state
+    line is just the state.
+  - **The C920 is plugged in again** (`/dev/video0`, `/dev/video1`, and
+    its `alsa_input.usb-046d_HD_Pro_Webcam_C920_31CFD3EF-02.analog-stereo`
+    node in PipeWire), so L.1's
+    camera-format device polish and a real camera re-verification are
+    unblocked. **Found while probing**: `probe` still bails for
+    `SourceKind::Camera` ("camera and audio capture arrive at L.3")
+    even though `capture_camera` is real, so `doctor` reports a working
+    camera setup as a PROBLEM; camera probe resolution is its own small
+    task.
+
 ## Linux port progress (2026-10-15, delivered through M3)
 
 - **L.1: media files, the doctor's encoder list, windows (2013992,
@@ -339,6 +447,27 @@ isocast-platform-linux gpu` once the modules exist.
 
 ## Environment
 
+- 2026-10-16: the C920 is **plugged in again** (`/dev/video0` and
+  `/dev/video1`, plus its
+  `alsa_input.usb-046d_HD_Pro_Webcam_C920_31CFD3EF-02.analog-stereo` node
+  in PipeWire), so L.1's camera-format device polish and a real camera
+  re-verification are unblocked. This supersedes the 2026-10-15 entry
+  below.
+- 2026-10-16: **building the Linux back end needs more than Rust**:
+  `pipewire` brings `libspa-sys`, which runs `bindgen` at build time, so
+  the box needs libclang/`clang`, `pkg-config` and `libpipewire-0.3-dev`
+  (all present here; PipeWire 1.6.8). Side effect worth knowing: that
+  build-dependency makes `cargo metadata --filter-platform
+  aarch64-apple-darwin` list `bindgen`'s own dependency
+  `annotate-snippets 0.11.5` even though nothing Apple-side builds it, so
+  **`scripts/third-party-notices.sh` had to be re-run** (the file gains
+  that one row; the check would otherwise fail CI). No crate from the
+  Linux-only group ships in an Apple build.
+- 2026-10-16: nothing in CI compiles `isocast-platform-linux`: the
+  `ci.yml` check job runs on macos-15, where the crate is
+  `#![cfg(target_os = "linux")]` and therefore empty, so the whole Linux
+  back end so far is compiled only on this box (see "Questions for
+  Ryan").
 - 2026-10-15: the C920 is **not enumerated right now** — `/dev/video*`
   has no matches and `fuser /dev/video0` says the file doesn't exist,
   where it was `usb-046d_HD_Pro_Webcam_C920_31CFD3EF-video-index0`
@@ -500,6 +629,24 @@ isocast-platform-linux gpu` once the modules exist.
 
 ## Waiting on Ryan
 
+- 2026-10-16 (L.2's one real take): the desktop's screen-sharing picker
+  needs one click from Ryan, and that is the last step of L.2. A
+  source's open is engine-bounded to 8 s (`bounded_open`), which is not
+  long enough to choose a screen, so a take must have the picker
+  answered *before* it starts: run
+  `./target/debug/isocast permissions --request` (or just
+  `./target/debug/isocast record --source screen --seconds 10 --folder
+  target/scratch/l2/recordings` and click within 8 s), pick "DP-3"; the
+  restore token is then kept in `~/.isocast/secrets.json`, and every
+  later capture opens silently (`allow_token_by_default = true` in
+  `~/.config/hypr/xdph.conf` is what makes the stored token skip the
+  picker). An earlier attempt on 2026-10-16 left the picker waiting; it
+  was killed (pids 1498215) and its daemon stopped, so nothing is on
+  screen now. After the click, verify with
+  `ffprobe -v error -show_entries stream=codec_name,width,height,r_frame_rate,duration
+  -of csv=p=0 target/scratch/l2/recordings/*.mov` (expect 2560x1440) and a
+  frame-count check. Blocks only L.2's last row and L.3's per-app audio
+  (which links to the same portal stream), nothing else.
 - 2026-10-14 (8.2h auto-update, #40): the Sparkle update key. Until
   `scripts/sparkle/public-ed-key.txt` holds the real public key, every
   Developer ID `release.sh` build (and the Release workflow's source check)
@@ -847,6 +994,28 @@ isocast-platform-linux gpu` once the modules exist.
 
 ## Questions for Ryan
 
+- 2026-10-16: **nothing in CI compiles the Linux back end.** `ci.yml`'s
+  check job is macos-15 only, and `isocast-platform-linux` is an empty
+  crate there (`#![cfg(target_os = "linux")]`), so every line of L.0–L.5
+  is fmt/clippy/test-checked only on this machine — the crate has grown
+  to portal, screencast, camera, writer, gpu and system modules. Proposal:
+  a second `check` job on `ubuntu-24.04` that installs `clang
+  libpipewire-0.3-dev pkg-config libudev-dev` and runs `cargo clippy
+  --locked -p isocast-platform-linux --all-targets -- -D warnings` and
+  `cargo test --locked -p isocast-platform-linux`. It needs a new CI job
+  (and a runner package list), so it waits for a word; until then a
+  Linux-only regression is caught by whoever next builds here.
+- 2026-10-16: the L.2 verification harness (a GStreamer
+  `pipewiresink mode=provide` producer started from a test, with the
+  consumer pointed at `/run/user/1000/pipewire-0` instead of the
+  portal's fd) is how the screen consumer was checked without a picker
+  click, and it is the only headless way to exercise any PipeWire
+  capture. It was run and then removed rather than committed, because
+  it is a new harness and needs `gst-launch-1.0`, a running PipeWire
+  and `pw-dump`: in CI it would have to skip and pass. Proposal: keep
+  it in `screencast.rs`'s tests behind that skip, so the copy path can
+  be re-checked after any change to it. Say the word and it goes in.
+  (The same recipe is recorded under "Verification recipes".)
 - 2026-10-15: a few non-English characters (and a handful of garbled
   words) slipped into agent-written text this week — three in
   docs/port-omarchy.md and one commit message (all fixed, commit
@@ -6365,6 +6534,39 @@ isocast-platform-linux gpu` once the modules exist.
 
 ## Verification recipes
 
+- **A screen stream without the picker (L.2).** The portal's own node
+  needs a person to choose a screen, but the consumer does not care where
+  the node comes from: start a GStreamer producer of the same shape and
+  point the capture at it.
+  ```sh
+  gst-launch-1.0 -q videotestsrc is-live=true ! \
+    video/x-raw,format=BGRx,width=320,height=240,framerate=10/1 ! \
+    pipewiresink mode=provide \
+    stream-properties="props,node.name=isocast-test-$$" &
+  pw-dump | python3 -c 'import json,sys; d=json.load(sys.stdin);
+  print([o["id"] for o in d if o.get("info",{}).get("props",{})
+  .get("node.name")=="isocast-test-<pid>"])'
+  ```
+  then run a scratch test whose `watch`/`start` gets
+  `portal::Stream { fd: UnixStream::connect("/run/user/1000/pipewire-0")?,
+  node: <id> }` instead of `portal::open(...)`'s result. `mode=provide`
+  makes GStreamer hand the buffers over (as the compositor does);
+  `node.name` cannot be given as a bare property to `gst-launch` (its
+  parser reads `node.name` as an element reference) — it goes in
+  `stream-properties="props,node.name=…"`. An `format=RGBA` producer is
+  the negative case: the consumer asks for a BGRA order and the open
+  must fail quickly with "no more input formats".
+- **The portal handshake without the picker.** `CreateSession` and
+  `Session.Close` show nothing: a scratch test calling
+  `Portal::connect()` → `new_session()` → `close()` proves the bus
+  connection, the minted token, the predicted request path, the
+  `(u32, a{sv})` response parse and the session path against the running
+  xdg-desktop-portal-hyprland. `SelectSources`/`Start` always show the
+  picker (see "Waiting on Ryan").
+- **A display source without recording.** `isocast doctor <scratch
+  setup>` with a `kind = "display"` source: it names the monitor the
+  setup resolves to and its size/rate, and a typo'd display name reports
+  the valid list. Costs no permission and shows no picker.
 - The sheets against Paper's Screens boards (N.5.1b): in
   /Volumes/IsocastBuild/console-dialogs, `scripts/boards.sh` snapshots
   Properties, Settings and Welcome at 1x and 2x (Welcome from a second

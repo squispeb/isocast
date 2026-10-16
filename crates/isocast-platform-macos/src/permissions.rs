@@ -7,10 +7,25 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use isocast_protocol::SourceKind;
 
-/// A non-prompting hint before native opening. macOS has no public TCC
+/// Why a pending open of `source` may be waiting: the permission prompt
+/// it needs, or a protected folder it reads from. macOS has no public TCC
 /// preflight for files/folders: protected file opens carry a provisional
 /// waiting state until access succeeds (or an actual I/O error is returned).
 pub(crate) fn source_permission(
+    source: &SourceKind,
+    permissions: impl FnOnce() -> Option<PermissionsReport>,
+) -> Option<String> {
+    waiting_for(source, permissions).map(|what| {
+        format!(
+            "waiting for permission: {what}; check the macOS permission prompt or Privacy & \
+             Security"
+        )
+    })
+}
+
+/// What macOS would name the wait: a permission's settings pane, or the
+/// folder or volume a protected path lives in.
+fn waiting_for(
     source: &SourceKind,
     permissions: impl FnOnce() -> Option<PermissionsReport>,
 ) -> Option<String> {
