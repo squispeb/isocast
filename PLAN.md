@@ -1581,6 +1581,16 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
   at 1080p60 and 4K60 with ISOs: launch-to-first-preview, ready-to-record,
   start-record latency, CPU/GPU/memory and dropped frames. Install isolated
   OBS as a permitted test dependency, never use Ryan's OBS profile.
+  - [ ] **W.5a Native capture substrate (agent/windows-capture).** Native
+    qualification ready for CI: WGC display/HWND capture into bounded,
+    fenced D3D11 BGRA textures; QPC stamps, cursor switch, resize, pressure
+    counts and joined teardown. Six 1080p60/4K60 runs at 59.997–59.998 fps,
+    zero observable pool/rate drops; 32 retained frames force counted drops
+    and resume correctly, retained pixels survive resize. Two simultaneous
+    captures share a device, window-close fallback verified on Windows 19045.
+    ~230 ms device-open-to-first frame; not UI/record readiness. One GPU copy,
+    no CPU readback; wgpu import, encoding and Platform selection still pending.
+    OBS portable installed, matched record/ISO comparisons not yet possible.
 - [ ] **W.6 App, IPC and shared surfaces.** Slint Windows window and native
   integration, same-user named pipes with isolated engines, D3D11/D3D12
   surface hand-over/fences with adapter identity and bounded per-viewer
@@ -1617,6 +1627,14 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
 - FilmCraft reads `session.json` to line up ISO files without audio sync.
 
 ## Log
+
+- W.5a (2026-10-17, #105, native qualification): separate Windows capture
+  lane/root and shared GPU lock; new crate's WGC/QPC/D3D11 pool works on RTX
+  5070. Real frames, known pixels, bounded retention/resize, simultaneous
+  capture and closed-window callbacks checked. Windows strict clippy and
+  release build pass; full remote Mac gates pass. Work remains uncommitted
+  for coordinator CI. No daemon platform switch, writer edits, CPU capture
+  fallback or recording/OBS-parity claim; W.4/W.5 remain open.
 
 - W.1e (2026-10-17, #105 #28): Windows UI builds alongside daemon/CLI;
   fixed the observed Slint build-script 1 MiB stack overflow using an 8 MiB

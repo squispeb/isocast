@@ -5,6 +5,17 @@ each section. Delete entries that stop being true.
 
 ## Environment
 
+- 2026-10-17 (#105 W.5a): capture lane uses
+  `ISOCAST_WINDOWS_ROOT=C:/isocast-dev/lanes/capture` and
+  `ISOCAST_WINDOWS_OUT=/Volumes/IsocastBuild/windows-capture/scratch/native`
+  with windows-remote.sh. `ISOCAST_WINDOWS_GPU_LOCK=1` takes the shared
+  `C:\isocast-dev\gpu.lock`; source/target/cache/home/IPC remain lane-local.
+  Cua's existing Session 1 daemon launches native probes without activation;
+  SSH is Session 0, unsuitable for real desktop capture. OBS 32.1.2 binaries
+  copied into the lane's `scratch/obs-portable` (portable_mode.txt), not
+  Ryan's profile. No OBS recording comparison yet. Evidence in capture
+  lane REPORT.md. The daemon still selects StubPlatform on Windows.
+
 - 2026-10-17 (#105 W.1e): Windows UI now builds with Slint 1.18.1/Skia
   and renders offscreen through RTX 5070/DX12. First native release build
   of daemon/CLI/UI took 14m11s; relinking generated UI after a client change
@@ -6180,6 +6191,17 @@ each section. Delete entries that stop being true.
   starts at 900 because the window's minimum width is 900.
 
 ## Gotchas
+
+- 2026-10-17 (#105 W.5a): WGC `TryGetNextFrame` returns S_OK + null when
+  empty; windows-rs 0.62.2 represents this as Error::empty(), not E_POINTER.
+  On Win10 build19045, Item.Closed did not fire when the target exited;
+  HWND capture checks liveness with an idle wait bounded at250ms. QPC is
+  10MHz on exon-desk. Real WGC presentation stamps arrive13–16ms ahead of
+  callback time (same QPC domain): preserve them, report signed offsets,
+  never call a saturating zero difference measured capture latency. Synthetic
+  WinForms windows need explicit DPI awareness: otherwise1920x1080 becomes
+  3840x2160 at the desktop's200% scale. WGC's own pre-delivery losses are
+  not exposed; our pool/rate/resize counters do not claim to count those.
 
 - 2026-10-17 (#105 W.1e): NPFS refuses WAIT→NOWAIT with ERROR_PIPE_BUSY
   while this endpoint has buffered outgoing bytes (even an 8-byte release),

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Native Windows loop on exon-desk; everything generated lives in C:\isocast-dev.
+# Native Windows loop on exon-desk; everything generated lives in its lane root.
 #
 #   scripts/windows-remote.sh status
 #   scripts/windows-remote.sh sync
@@ -17,12 +17,26 @@
 # EXON_DESK_HOST: exon-desk-lan (default) or exon-desk.
 # ISOCAST_WINDOWS_OUT: local results root (default lane scratch/native).
 # ISOCAST_WINDOWS_TIMEOUT: command seconds (default 1800).
+# ISOCAST_WINDOWS_ROOT: C:/isocast-dev or a lane below it (default unchanged).
+# ISOCAST_WINDOWS_GPU_LOCK: 1 takes the shared GPU lock for a hardware run.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")/.." && pwd)"
 host="${EXON_DESK_HOST:-exon-desk-lan}"
 out="${ISOCAST_WINDOWS_OUT:-/Volumes/IsocastBuild/windows/scratch/native}"
 seconds="${ISOCAST_WINDOWS_TIMEOUT:-1800}"
+gpu_lock="${ISOCAST_WINDOWS_GPU_LOCK:-0}"
+case "$gpu_lock" in 0|1) ;; *) echo "windows-remote: GPU lock must be 0 or 1" >&2; exit 2 ;; esac
+# Restricted to this development tree, with shell/PowerShell-safe components.
+# Normalize once: every staging, cancellation, fetch and worker path uses it.
+root="$(python3 - "${ISOCAST_WINDOWS_ROOT:-C:/isocast-dev}" <<'PY'
+import re, sys
+path = sys.argv[1].replace('\\', '/').rstrip('/')
+if not re.fullmatch(r'C:/isocast-dev(?:/lanes/[A-Za-z0-9_-]+)?', path, re.IGNORECASE):
+    sys.exit('windows-remote: root must be C:/isocast-dev or C:/isocast-dev/lanes/NAME')
+print(path)
+PY
+)"
 case "$host" in exon-desk|exon-desk-lan) ;; *) echo "windows-remote: unsupported host" >&2; exit 2 ;; esac
 case "$seconds" in ''|*[!0-9]*) echo "windows-remote: timeout must be positive seconds" >&2; exit 2 ;; esac
 [ "$seconds" -gt 0 ] || exit 2
@@ -54,7 +68,7 @@ cancel() {
     # Only our own child, with the original creation time (never a reused PID).
     remote_ps <<PS || true
 \$ErrorActionPreference = 'Stop'
-\$path = 'C:/isocast-dev/scratch/remote/$job/active.json'
+\$path = '$root/scratch/remote/$job/active.json'
 if (Test-Path -LiteralPath \$path) {
     \$active = Get-Content -Raw -LiteralPath \$path | ConvertFrom-Json
     \$process = Get-Process -Id \$active.pid -ErrorAction SilentlyContinue
@@ -80,23 +94,29 @@ if [ "$op" != status ] && [ "$op" != fetch ]; then
     tree="$(GIT_INDEX_FILE="$work/index" git -C "$here" write-tree)"
     remote_ps <<PS
 \$ErrorActionPreference = 'Stop'
-foreach (\$path in @('C:\isocast-dev', 'C:\isocast-dev\staging')) {
+\$paths = @()
+\$parent = [IO.DirectoryInfo]'$root/staging'
+while (\$parent -and \$parent.FullName -ne \$parent.Root.FullName) {
+    \$paths = @(\$parent.FullName) + \$paths
+    \$parent = \$parent.Parent
+}
+foreach (\$path in \$paths) {
     if (Test-Path -LiteralPath \$path) {
         if ((Get-Item -LiteralPath \$path).Attributes -band [IO.FileAttributes]::ReparsePoint) {
             throw "Refusing reparse point: \$path"
         }
     } else { New-Item -ItemType Directory -Path \$path | Out-Null }
 }
-New-Item -ItemType Directory -Path 'C:/isocast-dev/staging/$job' | Out-Null
+New-Item -ItemType Directory -Path '$root/staging/$job' | Out-Null
 PS
-    git -C "$here" archive "$tree" | /usr/bin/ssh -T "$host" "tar.exe -xf - -C C:/isocast-dev/staging/$job"
+    git -C "$here" archive "$tree" | /usr/bin/ssh -T "$host" "tar.exe -xf - -C $root/staging/$job"
 fi
 
-request="$(python3 - "$op" "$job" "$tree" "$head" "$seconds" "$@" <<'PY'
+request="$(python3 - "$op" "$job" "$tree" "$head" "$seconds" "$root" "$gpu_lock" "$@" <<'PY'
 import base64, json, sys
-op, job, tree, head, seconds, *args = sys.argv[1:]
+op, job, tree, head, seconds, root, gpu_lock, *args = sys.argv[1:]
 print(base64.b64encode(json.dumps(dict(op=op, job=job, tree=tree, head=head,
-    seconds=int(seconds), args=args)).encode()).decode())
+    seconds=int(seconds), root=root, gpu_lock=bool(int(gpu_lock)), args=args)).encode()).decode())
 PY
 )"
 
@@ -114,15 +134,16 @@ import base64, codecs, ctypes, ctypes.wintypes, hashlib, json, msvcrt, os, pathl
 import shutil, stat, subprocess, sys, threading, time, traceback
 
 r = json.loads(base64.b64decode(os.environ.pop('ISOCAST_REMOTE_REQUEST')))
-root = pathlib.Path(r'C:\isocast-dev')
+root = pathlib.Path(r['root'])
 src = root / 'src'
 stage = root / 'staging' / r['job']
 job = root / 'scratch' / 'remote' / r['job']
 marker = src / '.windows-remote.json'
 
 def safe_dir(path):
-    if os.path.lexists(path) and path.lstat().st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:
-        raise RuntimeError(f'refusing reparse point: {path}')
+    for parent in (path, *path.parents):
+        if os.path.lexists(parent) and parent.lstat().st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+            raise RuntimeError(f'refusing reparse point: {parent}')
     path.mkdir(parents=True, exist_ok=True)
 
 def files(folder):
@@ -253,6 +274,7 @@ def execute(command, env, input_bytes=None, low=False):
 code = 1
 started = time.time()
 lock = None
+gpu_lock = None
 try:
     for path in [root, root/'staging', root/'scratch', root/'scratch'/'remote', root/'target',
                  root/'cargo', root/'tmp', root/'home', root/'appdata', root/'localappdata']:
@@ -275,6 +297,16 @@ try:
                 time.sleep(1)
         if shutil.disk_usage(root).free < 20 * 2**30:
             raise RuntimeError('less than 20 GiB free on the Windows build drive')
+        if r['gpu_lock']:
+            gpu_lock = pathlib.Path('C:/isocast-dev/gpu.lock').open('a+b')
+            if gpu_lock.tell() == 0: gpu_lock.write(b'0'); gpu_lock.flush()
+            deadline = time.monotonic() + r['seconds']
+            while True:
+                gpu_lock.seek(0)
+                try: msvcrt.locking(gpu_lock.fileno(), msvcrt.LK_NBLCK, 1); break
+                except OSError:
+                    if time.monotonic() >= deadline: raise TimeoutError('shared GPU lock timed out')
+                    time.sleep(1)
         if r['op'] != 'fetch':
             sync()
             shutil.rmtree(stage)
@@ -348,6 +380,7 @@ finally:
         save(job/'result.json', dict(operation=r['op'], head=r['head'], tree=r['tree'],
             exit_code=code, seconds=round(time.time()-started,2)))
     if lock is not None: lock.close()
+    if gpu_lock is not None: gpu_lock.close()
     if stage.exists() and not stage.is_symlink(): shutil.rmtree(stage)
 sys.exit(code if 0 <= code <= 255 else 1)
 '@
@@ -359,7 +392,7 @@ PS
 # Raw tar over SSH, never through PowerShell's text pipeline. Even failed
 # cargo commands keep result.json and run.log for diagnosis.
 fetch_status=0
-/usr/bin/ssh -T "$host" "tar.exe -cf - --exclude=output.log --exclude=./output.log -C C:/isocast-dev/scratch/remote/$job ." |
+/usr/bin/ssh -T "$host" "tar.exe -cf - --exclude=output.log --exclude=./output.log -C $root/scratch/remote/$job ." |
     tar -xf - -C "$result" || fetch_status=$?
 if [ "$status" = 0 ] && [ "$fetch_status" != 0 ]; then status=$fetch_status; fi
 if [ -d "$result/bin" ]; then
@@ -379,7 +412,7 @@ PY
     # Keep only one local copy and no remote per-job binary duplicate.
     rm -rf "${result:?}/bin"
     remote_ps <<PS
-\$path = 'C:/isocast-dev/scratch/remote/$job/bin'
+\$path = '$root/scratch/remote/$job/bin'
 if (Test-Path -LiteralPath \$path) { Remove-Item -LiteralPath \$path -Recurse }
 PS
 fi

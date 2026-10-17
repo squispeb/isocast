@@ -1,0 +1,30 @@
+[package]
+name = "isocast-platform-windows"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Windows native media back end for Isocast."
+
+[target.'cfg(windows)'.dependencies]
+anyhow = "1.0.104"
+isocast-engine = { path = "../isocast-engine" }
+parking_lot = "0.12"
+# Already locked by wgpu's DX12 backend. WinRT capture and native D3D11
+# interfaces must use the same bindings as the eventual DX12 importer.
+windows = { version = "0.62.2", features = [
+    "Foundation",
+    "Graphics_Capture",
+    "Graphics_DirectX_Direct3D11",
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_System_Performance",
+    "Win32_System_Threading",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
+    "Win32_UI_WindowsAndMessaging",
+] }
