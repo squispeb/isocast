@@ -93,4 +93,4 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/ci/windows' }}
 
       - name: Build native services and test binaries (do not run)
-        run: cargo build --locked --all-targets -p isocast-engine -p isocast-platform-stub -p isocast-ipc -p isocast-client -p isocast-daemon -p isocast-cli -p isocast-ui
+        run: cargo build --locked --all-targets -p isocast-engine -p isocast-platform-stub -p isocast-platform-windows -p isocast-ipc -p isocast-client -p isocast-daemon -p isocast-cli -p isocast-ui

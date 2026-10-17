@@ -5,6 +5,17 @@ each section. Delete entries that stop being true.
 
 ## Environment
 
+- 2026-10-17 (#105 W.5a): capture lane uses
+  `ISOCAST_WINDOWS_ROOT=C:/isocast-dev/lanes/capture` and
+  `ISOCAST_WINDOWS_OUT=/Volumes/IsocastBuild/windows-capture/scratch/native`
+  with windows-remote.sh. `ISOCAST_WINDOWS_GPU_LOCK=1` takes the shared
+  `C:\isocast-dev\gpu.lock`; source/target/cache/home/IPC remain lane-local.
+  Cua's existing Session 1 daemon launches native probes without activation;
+  SSH is Session 0, unsuitable for real desktop capture. OBS 32.1.2 binaries
+  copied into the lane's `scratch/obs-portable` (portable_mode.txt), not
+  Ryan's profile. No OBS recording comparison yet. Evidence in capture
+  lane REPORT.md. The daemon still selects StubPlatform on Windows.
+
 - 2026-10-17 (#105 W.1e): Windows UI now builds with Slint 1.18.1/Skia
   and renders offscreen through RTX 5070/DX12. First native release build
   of daemon/CLI/UI took 14m11s; relinking generated UI after a client change
@@ -6208,6 +6219,42 @@ each section. Delete entries that stop being true.
   starts at 900 because the window's minimum width is 900.
 
 ## Gotchas
+
+- 2026-10-17 (#105 W.5b): DX12 import must wait on
+  `gpu.queue.as_hal::<Dx12>().as_raw()`, NOT `Device::raw_queue()` (that is
+  wgpu's separate presentation queue). D3D11 CreateSharedHandle is once per
+  texture; the slot owns its unnamed NT handle. OpenSharedHandle maps the
+  same GPU allocation into a distinct DX12 resource/private-data store.
+  Noncached imports attach an IUnknown frame lease there until wgpu releases
+  the resource after completion. Cached imports keep only native texture
+  references; the existing engine contract retains frames through GPU work.
+  BGRA input imports are read-only and REQUIRE ALLOW_SIMULTANEOUS_ACCESS;
+  on RTX5070/617.42 Win10, flags=33, COMMON promotion/decay validates. If
+  another driver omits that flag, refuse it; the future alternative is
+  explicit release-to-COMMON barriers, never weakening the flag check.
+
+- 2026-10-17 (#105 W.5b): destroying the last MTA after capture invalidates
+  windows-rs's process-cached WinRT activation factories on Win10. A real
+  reopen crashed in GraphicsCaptureSession::IsSupported (unmapped vtable).
+  One process-lifetime CoIncrementMTAUsage reference, matching those cached
+  factories' lifetime, fixes the crash (120 real reopen/render cycles).
+  Individual capture workers still balance RoInitialize/RoUninitialize.
+  Handle-type measurement also found two ALPC ports retained per fresh
+  capture worker, with capture only AND with DX12 import, even after3s idle
+  and dropping the D3D11 device; this is NOT a leak-free reopen claim.
+  Qualify RPC scavenging or reuse long-lived MTA workers before selecting
+  WindowsPlatform. GPU cache references are bounded separately at64 surfaces.
+
+- 2026-10-17 (#105 W.5a): WGC `TryGetNextFrame` returns S_OK + null when
+  empty; windows-rs 0.62.2 represents this as Error::empty(), not E_POINTER.
+  On Win10 build19045, Item.Closed did not fire when the target exited;
+  HWND capture checks liveness with an idle wait bounded at250ms. QPC is
+  10MHz on exon-desk. Real WGC presentation stamps arrive13–16ms ahead of
+  callback time (same QPC domain): preserve them, report signed offsets,
+  never call a saturating zero difference measured capture latency. Synthetic
+  WinForms windows need explicit DPI awareness: otherwise1920x1080 becomes
+  3840x2160 at the desktop's200% scale. WGC's own pre-delivery losses are
+  not exposed; our pool/rate/resize counters do not claim to count those.
 
 - 2026-10-17 (#105 W.1e): NPFS refuses WAIT→NOWAIT with ERROR_PIPE_BUSY
   while this endpoint has buffered outgoing bytes (even an 8-byte release),

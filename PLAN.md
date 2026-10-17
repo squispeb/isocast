@@ -1586,6 +1586,11 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
   hosted recording; fail clearly
   for unsupported devices/codecs. A synthetic program and ISOs produce
   decodable, aligned files on windows-latest, with honest loss counters.
+  - [ ] **W.4 platform-selection gate:** resolve/qualify Windows10 RPC port
+    retention before switching the daemon to WindowsPlatform. Fresh capture
+    workers retain two ALPC ports per open/close, even without DX12 import.
+    Check long-idle RPC scavenging and isolate apartment/device/item/pool
+    creation; reuse MTA workers if needed. W.5b evidence has the repro.
 - [ ] **W.5 Capture, audio and encoders.** Windows.Graphics.Capture for
   screens/windows, Media Foundation cameras, WASAPI input/loopback/output,
   NVENC-first, hardware MF (NVENC/QSV/AMF) fallback, software last;
@@ -1600,6 +1605,28 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
   at 1080p60 and 4K60 with ISOs: launch-to-first-preview, ready-to-record,
   start-record latency, CPU/GPU/memory and dropped frames. Install isolated
   OBS as a permitted test dependency, never use Ryan's OBS profile.
+  - [x] **W.5a Native capture substrate (agent/windows-capture).** Commit
+    8619c20, Actions39074561618 green. WGC display/HWND capture into bounded,
+    fenced D3D11 BGRA textures; QPC stamps, cursor switch, resize, pressure
+    counts and joined teardown. Six 1080p60/4K60 runs at 59.997–59.998 fps,
+    zero observable pool/rate drops; 32 retained frames force counted drops
+    and resume correctly, retained pixels survive resize. Two simultaneous
+    captures share a device, window-close fallback verified on Windows 19045.
+    ~230 ms device-open-to-first frame; not UI/record readiness. One GPU copy,
+    no CPU readback; wgpu import, encoding and Platform selection still pending.
+    OBS portable installed, matched record/ISO comparisons not yet possible.
+  - [ ] **W.5b Zero-copy DX12 input (agent/windows-capture).** Same-adapter
+    NT-handle imports and GPU-side waits on wgpu's rendering queue; no extra
+    pixel copy/upload/readback. Cached surfaces and native frame leases keep
+    the pool bounded through GPU work. Real renderer, held-texture pressure,
+    blocked-GPU retention, resize and simultaneous imports verified under
+    D3D12 GPU validation; native build/strict clippy,81 engine tests and full
+    remote Mac gates pass. Final six10s runs:3606 completed renders at1080p/4K,
+    no counted drops; callback→GPU completion0.575/0.878ms median.
+    Reopening also exposed a WinRT factory lifetime crash, fixed by retaining
+    the process MTA; Windows10 RPC handle retention across fresh capture
+    workers remains a measured follow-up before Platform integration.
+    Output pools/NVENC/writer/daemon selection remain separate work.
 - [ ] **W.6 App, IPC and shared surfaces.** Slint Windows window and native
   integration, same-user named pipes with isolated engines, D3D11/D3D12
   surface hand-over/fences with adapter identity and bounded per-viewer
@@ -1641,6 +1668,25 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
 - FilmCraft reads `session.json` to line up ISO files without audio sync.
 
 ## Log
+
+- W.5b (2026-10-17, #105, ready for CI): native read-only
+  D3D11→wgpu DX12 import now renders captured textures in place. Shared
+  handle/fence lifetime, GPU completion retention and cache reuse verified
+  on RTX5070; no shared engine/macOS edits. W.5a Actions39074561618 confirmed
+  green. Native build, strict clippy and81 engine tests pass; full remote
+  Mac gates232 unit tests+1 doctest pass. Independent review/re-review clear
+  for this unselected substrate; RPC handle retention gates later Platform
+  selection. Coordinator commits/CI next, no commits made by this lane.
+  Writer e38160a integrated without commit, staged separately; combined
+  capture/mux Windows clippy and full remote Mac gates also pass.
+
+- W.5a (2026-10-17, #105, native qualification): separate Windows capture
+  lane/root and shared GPU lock; new crate's WGC/QPC/D3D11 pool works on RTX
+  5070. Real frames, known pixels, bounded retention/resize, simultaneous
+  capture and closed-window callbacks checked. Windows strict clippy and
+  release build pass; full remote Mac gates pass. Work remains uncommitted
+  for coordinator CI. No daemon platform switch, writer edits, CPU capture
+  fallback or recording/OBS-parity claim; W.4/W.5 remain open.
 
 - W.2a (2026-10-17, #105 #28): new encoder-neutral isocast-mux accepts
   compressed access units, not CPU pixels. Native H.264/HEVC MOV/MP4 and
