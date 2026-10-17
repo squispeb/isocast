@@ -3303,6 +3303,7 @@ dependencies = [
  "slint-build",
  "toml",
  "wgpu",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -5,6 +5,16 @@ each section. Delete entries that stop being true.
 
 ## Environment
 
+- 2026-10-17 (#105 W.1e): Windows UI now builds with Slint 1.18.1/Skia
+  and renders offscreen through RTX 5070/DX12. First native release build
+  of daemon/CLI/UI took 14m11s; relinking generated UI after a client change
+  still took 12m17s (warm dependencies, not a fast-edit-loop claim). MSVC
+  build-script main stack is 1 MiB; build.rs uses a Windows-host 8 MiB compiler
+  worker. Runtime app main did not need a stack override for the smoke.
+  Native panels/key hooks, editor decode/audio, shared surfaces and capture
+  are still stubs; W.6 owns real-window/DPI/font parity. Snapshot evidence:
+  windows/scratch/w1e/windows-main.png. Isolated smoke daemon was stopped.
+
 - 2026-10-17 (#105 W.1c): `scripts/windows-remote.sh status|sync|cargo|build|run|fetch`
   uses exon-desk-lan, the PowerShell wrapper and binary git-archive over SSH.
   Managed source is `C:\isocast-dev\src`; warm target/cache, isolated home,
@@ -1741,6 +1751,33 @@ each section. Delete entries that stop being true.
   point), not an unchecked create/truncate. File/folder sync failures still
   propagate; this is compile groundwork, not a claim of qualified Windows
   durability. Security-103 is integrated; no daemon plugin policy changes.
+
+- 2026-10-17 (#111 F1–F4): **A recent publication isn't evidence that a
+  scene is still on air.** Keeping tile compositors avoided pipeline churn
+  but left the 100 ms reuse lease's cut hitch. Track program and preview
+  publishers separately; a cut replaces that publisher's scene at completed
+  hand-off, transitions/idle clear it. Reuse is time-only, pixel publication
+  still rejects old versions/timestamps. Keep pools across reuse and rate-
+  limit raster rebuilds to one/second. One-off scene JPEGs skip stale small
+  rasters. Repeated ISO GPU losses also back off one/second, preserving
+  expected-minus-written drop accounting; developer `lost:2:6` exercises
+  six losses without resetting hardware. Main 215db9e integrated; fix-only
+  re-review evidence in `/Volumes/IsocastBuild/perf-2/scratch/REPORT.md`.
+
+- 2026-10-17 (perf-2 split): **Ship multiview/#111; park #27** (delegator).
+  `perf-2/scratch/issue27-draft.patch` preserves the full frame-permit,
+  native retention, capture-copy and diagnostics draft, removed from the
+  source tree. It counted shared recording/live buffers twice and refused
+  protected frames in overload; future work needs distinct-buffer accounting
+  or independent output pools, not further cap tuning. Main a9b661ff is
+  integrated. Tile-size composition, unmixed completed-scene reuse, GPU
+  poll containment, snapshot/ISO loss recovery and camera pacing remain.
+  Reduced-tree full ISO stress (18 files) has zero program/stream/audio
+  losses; strict e2e 18/18, recovery/camera checks and workspace gates pass.
+  An initial stress loss also reproduced on baseline in an unchanged-code
+  paired control; retain both results, not just the pass. Multiview A/B
+  confirms GPU/memory savings, with a smaller one-pair CPU improvement.
+  Evidence: `/Volumes/IsocastBuild/perf-2/scratch/REPORT.md`.
 
 - 2026-10-17 (#104): **NLE export (`timeline_export_nle`) writes stacked
   tracks, not a multicam clip**: one video track per ISO source with the
@@ -6144,6 +6181,23 @@ each section. Delete entries that stop being true.
 
 ## Gotchas
 
+- 2026-10-17 (#105 W.1e): NPFS refuses WAIT→NOWAIT with ERROR_PIPE_BUSY
+  while this endpoint has buffered outgoing bytes (even an 8-byte release),
+  or a blocking operation is pending. Stream keeps its previous mode and
+  exposes WouldBlock. On Windows only, SharedFrames::next(ZERO) defers that
+  poll instead of disconnecting; the next call retries. Native probes cover
+  buffered control, split JSON lines and peer-close-with-unread-ack at both
+  endpoints (mode change then succeeds, read EOF, no perpetual deferral).
+  A mode switch is not cancellation of old I/O. Pre-existing release writes
+  discard errors in Drop; full-control-buffer backpressure remains W.6 work.
+- 2026-10-17 (#105 W.1e): Pipe namespace v2 hashes binary owner SID plus
+  normalized path with domain/length separation. Stop old Windows engines
+  with their old client/API before replacing binaries; there is no insecure
+  legacy-name fallback. SID is public: namespacing prevents accidental
+  cross-user sharing, not targeted squatting. First-instance reservation,
+  protected owner-only DACL, kernel PID/token/pipe-owner checks and remote
+  refusal remain required. Cross-account negative testing remains unqualified.
+
 - 2026-10-17 (#105 W.1d): Do not build a baseline source tree into the same
   Cargo target and then trust unchanged candidate fingerprints: source paths
   and archive mtimes reused a baseline protocol artifact, which was caught by
@@ -6155,19 +6209,6 @@ each section. Delete entries that stop being true.
   zero processes). New NLE XML exporters use Unix file URL assumptions;
   Windows explicitly refuses XML until that seam is ported, not malformed
   successful exports. OTIO plain-path behavior is unchanged.
-
-- 2026-10-17 (#105 W.1c): Windows `std::process::Command` with redirected
-  stdio still inherited other caller handles: detached isocastd kept a
-  PowerShell capture pipe open after the CLI exited. Native launcher uses
-  STARTUPINFOEX/HANDLE_LIST (only NUL and its log) and job breakaway, failing
-  explicitly when a containing job forbids breakaway. Runner output is
-  file-backed and follows the requested process, never grandchild-held EOF.
-  Pipes keep a first-instance reservation and same-user kernel identity;
-  mixed elevated/non-elevated launches remain unqualified, not bypassed.
-  `hung_up` stays nonblocking during reads; shutdown wakes both directions
-  and gives the peer EOF even while a Stream clone remains alive (native
-  probes). Unsupported recording startup briefly creates then asynchronously
-  removes its empty project; the root `.isocast.lock` is intentionally kept.
 
 - 2026-10-17 (#104): **Driving DaVinci Resolve (free) on a test Mac**:
   only Studio takes external scripts, its Scripts menu lists Lua only
@@ -6181,6 +6222,19 @@ each section. Delete entries that stop being true.
   (drive.py, nle_test.lua, run.sh; run with `hw-batch.py now cmd --gui
   --mac m2-b --command 'bash ~/nle-export/resolve/run.sh 420'`). Resolve
   21.1.1 needed Rosetta (installed on m2-b).
+- 2026-10-17 (#105 W.1c): Windows `std::process::Command` with redirected
+  stdio still inherited other caller handles: detached isocastd kept a
+  PowerShell capture pipe open after the CLI exited. Native launcher uses
+  STARTUPINFOEX/HANDLE_LIST (only NUL and its log) and job breakaway, failing
+  explicitly when a containing job forbids breakaway. Runner output is
+  file-backed and follows the requested process, never grandchild-held EOF.
+  Pipes keep a first-instance reservation and same-user kernel identity;
+  mixed elevated/non-elevated launches remain unqualified, not bypassed.
+  `hung_up` stays nonblocking during reads; shutdown wakes both directions
+  and gives the peer EOF even while a Stream clone remains alive (native
+  probes). Unsupported recording startup briefly creates then asynchronously
+  removes its empty project; the root `.isocast.lock` is intentionally kept.
+
 - 2026-10-17 (#85): **take.sh on isocast-m2-a: a wedged Terminal.** The
   Terminal there had run since 2026-10-12 with one stale window ("Grant
   Isocast permissions.command", its shell gone) and answered neither

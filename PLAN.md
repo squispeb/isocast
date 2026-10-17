@@ -560,6 +560,14 @@ come later (clips already carry in/out points on their take).
 - [ ] **S.3 Astra optimization rounds.** GPT-6 Astra (opencode, xhigh)
   sessions with S.1/S.2 as their measuring stick, one hot path at a time,
   until Isocast beats OBS on every measure we can control.
+  - [x] **S.3 #111 multiview and GPU follow-ups (perf-2), implementation.** Tile-sized
+    scene rasters and completed program/preview reuse; contained GPU poll
+    panics, snapshot/ISO loss recovery, virtual-camera pacing. #27's frame
+    permit draft is removed and parked outside the tree (it double-counted
+    shared deliveries). Reduced-tree ISO stress has zero protected losses;
+    e2e 18/18, GPU/camera recovery checks and workspace gates pass. Tier-1
+    review/merge remains the coordinator's; handoff
+    `/Volumes/IsocastBuild/perf-2/scratch/REPORT.md`, "Split for merge".
   - [ ] **S.3 #26/#29 Shared GPU and upstream ISO admission.** One device
     per process, bounded asynchronous GPU hand-offs, BGRA native monitors,
     and ISO admission before conversion.
@@ -1502,7 +1510,7 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
   only**, waits for the exact snapshot's run and saves results/failed logs.
   Done when both real hosted jobs pass and their URLs are in the report;
   no main/tag/release writes. Add main to the workflow after qualification.
-- [ ] **W.1 Platform seams (#28).** Mechanical daemon generic over
+- [x] **W.1 Platform seams (#28).** Mechanical daemon generic over
   `Platform`; plugin, hotkey and diagnostics hooks through the trait;
   `isocast record` drives an isolated daemon; UI platform seam and
   target-specific wgpu backends. Extend portable CI to the engine once
@@ -1529,12 +1537,18 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
     reaping and old-daemon handshake; same API/MCP. Mac lifecycle/edge probes,
     strict e2e, gates and measured foreground A/B pass; Windows control path
     and owned-child lifetime pass (recording still refused by the stub).
-    Actions remains build-only; coordinator commit/CI next. Extra process
+    Actions 39065225187 passes portable jobs and the native build gate. Extra process
     costs about 44 ms warm startup and 45 MiB RSS on M2-a; no memory/timing
     equivalence claim. W.6 must port Windows XML NLE file URLs (OTIO works
     through its existing plain-path seam; XML is explicitly refused).
-  - [ ] **W.1e UI platform seam.** Keep macOS window/media integration
-    behind its native seam; explicit Windows stubs and a Windows UI build.
+  - [x] **W.1e UI platform seam.** Mac window/media paths unchanged;
+    Windows UI/daemon/CLI build, strict scoped clippy and UI tests pass.
+    Slint compiles on an 8 MiB Windows build worker (main stack was 1 MiB).
+    Real first-launch UI renders offscreen on RTX 5070/DX12; media, native
+    panels, focused key hooks and editor playback remain explicit stubs.
+    Pipe names include owner SID; native nonblocking I/O and shared-client
+    deferred polling preserve buffered control bytes. Windows UI CI gate
+    added; coordinator commit/clean-machine run next, not media qualification.
 - [ ] **W.2 Cross-platform writer.** Prefer extracting the existing
   crash-safe BMFF muxer without changing its bytes; qualify against the
   macOS writer before choosing it over ffmpeg. Windows file ownership,
@@ -1604,6 +1618,19 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
 
 ## Log
 
+- W.1e (2026-10-17, #105 #28): Windows UI builds alongside daemon/CLI;
+  fixed the observed Slint build-script 1 MiB stack overflow using an 8 MiB
+  Windows-only worker. Mac compiler/rendering paths remain unchanged.
+  Native release build, strict UI/client/IPC clippy, 12 UI tests + 1 doctest
+  pass; Mac full gates 232 unit + 1 doc pass (1 existing hardware ignore).
+  RTX 5070/DX12 renders real first-launch UI to 1280x800 PNG. Actual process
+  counters replace Windows zero stubs. SID namespaces and 2000 empty polls,
+  full 64 KiB/partial writes, busy mode transitions, EOF and actual shared
+  parser deferral/partial-line recovery pass on both pipe endpoints.
+  Main 24bea09 RC merge is separately staged; feature uncommitted for
+  coordinator. W.2 writer next; no Windows capture/recording/shared-surface
+  or full visual/DPI parity claim.
+
 - W.1d (2026-10-17, #105 #28): `record` now uses a private, parent-owned
   daemon; the CLI no longer depends on MacPlatform. Same report/exit behavior,
   killed-owner finalization, concurrent isolated runs and untouched default
@@ -1618,6 +1645,34 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
   155->70ms (base40ms), capacity JSON identical. Main a9b661f merge staged
   separately; feature unstaged for coordinator. W.1c Actions39060641784 green.
 
+- S.3 #111 fix round 1 (2026-10-17): keep scene compositors across reuse,
+  clear an old scene's reuse when its publisher switches, debounce raster
+  rebuilds, skip undersized one-off scene pictures, and back off lost ISO
+  replacements. Reviewer's cut probe max/p99: 176/149 ms → 65/61 ms (main
+  67/63); on-air edits 41/40 ms (main 66/60). Six injected device losses:
+  ISO stage opens spaced 1.001–1.015 s, every tick counted, next take whole.
+  Main 215db9e merged without committing; strict e2e 18/18 and full gates
+  pass. One-pair multiview GPU 545→262 ms/s, footprint 363→217 MiB, zero
+  losses. Fix-only re-review: perf-2/scratch/REPORT.md, "Fix round 1".
+
+- S.3 #111 split (2026-10-17): removed and preserved #27's entire draft;
+  integrated main a9b661ff. Reduced-tree full ISO stress passes with zero
+  program/stream/audio losses (18 files), strict e2e 18/18 and workspace
+  gates pass. GPU loss/poll panic, cached snapshots, ISO recovery and camera
+  pacing rechecked. One M2-a multiview A/B pair: GPU 536.3→302.9 ms/s,
+  footprint 416.3→204.1 MiB, CPU 65.8→64.8%, zero recording losses.
+  Initial stress noise also reproduced on baseline; both preserved.
+  Uncommitted for coordinator Tier-1 review: perf-2/scratch/REPORT.md.
+
+- #108/#109 (2026-10-17): the first layout audit's 11 issues fixed (narrow
+  Controls/source toolbar/mixer/vertical head adapt, source child names
+  use the empty ISO lane, ruler labels skip the playhead chip and the
+  edge, wider encoder popup, middle-elided paths, multiview outer margin);
+  re-audit of 482 pictures: none of the 11 left except an ellipsised child
+  name at the 900px minimum; visual diff changes only at 900 wide and the
+  encoder row. A scene without a vertical arrangement is now letterboxed
+  (fitted, centred): real M2-a recording, cropdetect 1080:608:0:656 on all
+  three vertical takes; e2e vertical PASS, 0/578 drops.
 - W.1c (2026-10-17, #105 #28): native Windows loop syncs tracked worktree
   bytes to exon-desk with warm caches and returns exit codes/logs/binaries.
   Owner-only local pipes, kernel peer identity, overlapped cancellation and
@@ -1654,16 +1709,6 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
   After integration, remote daemon/CLI/UI build and fmt/clippy/228 unit
   tests + 1 doctest pass (1 existing hardware test ignored). Windows engine
   build-only qualification remains the next Actions run.
-
-- #108/#109 (2026-10-17): the first layout audit's 11 issues fixed (narrow
-  Controls/source toolbar/mixer/vertical head adapt, source child names
-  use the empty ISO lane, ruler labels skip the playhead chip and the
-  edge, wider encoder popup, middle-elided paths, multiview outer margin);
-  re-audit of 482 pictures: none of the 11 left except an ellipsised child
-  name at the 900px minimum; visual diff changes only at 900 wide and the
-  encoder row. A scene without a vertical arrangement is now letterboxed
-  (fitted, centred): real M2-a recording, cropdetect 1080:608:0:656 on all
-  three vertical takes; e2e vertical PASS, 0/578 drops.
 
 - 8.2l / #106 (2026-10-17): release notes from docs/releases/X.Y.Z.md
   (0.0.5 and 0.0.6 added; body + Full Changelog reproduces both published
