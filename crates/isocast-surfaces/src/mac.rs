@@ -199,6 +199,13 @@ impl Surface {
             )
         })
     }
+
+    /// Nothing to copy: the texture *is* the surface's memory, so the
+    /// picture is already where a draw of the texture reads it.
+    #[cfg(feature = "wgpu")]
+    pub fn upload(&self, _queue: &wgpu::Queue, _texture: &wgpu::Texture) -> Result<()> {
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for Surface {

@@ -754,10 +754,19 @@ step live in `docs/notes.md`'s "Linux port WIP" section.
     transport `memfd` — with the snapshot, the recording (2.02 s
     HEVC + AAC) and the snapshot's JPEG all still right after the
     importer change; the cost rows are L.4.5's.
-  - [ ] **L.4.3 The client shows a ring.** `SharedFrame::texture` takes
-    the queue the upload needs, `isocast frames --shared --check`
-    passes on Linux (the same 64-pixel grid, revisions and `--touch`),
-    and the client's copy is measured against the H.264 path.
+  - [x] **L.4.3 The client shows a ring.** `SharedFrame::texture` takes
+    the queue the upload needs, `isocast frames --shared --check` passes
+    on Linux (the 64-pixel grid: every frame read back through the
+    client's GPU, 0 black and 0 the daemon never drew; revisions; and
+    `--touch`, which now applies a change the picture doesn't show —
+    the collection's own name gains a `(frames check)` marker for a
+    moment, then goes back: the daemon deliberately keeps the revision
+    when an apply changes nothing, so the old empty patch could never
+    pass anywhere), with frames showing the touched revision ~26 ms
+    later; `--touch` refuses source targets with why. The client's copy
+    measured against the H.264 path waits for L.5's real-time encoder
+    on Linux; the shared path's own numbers: program ~38 ms late
+    (read-back of another device's canvas), a source ~6 ms.
   - [ ] **L.4.4 The app's live monitors on Linux** (Slint preview
     without the JPEG poll), with the daemon's CPU per viewer in the
     notes.
@@ -1577,6 +1586,30 @@ Shipped (v1): 7.1, 7.2, 7.4a, 7.5, 7.6. Next, in order:
 - FilmCraft reads `session.json` to line up ISO files without audio sync.
 
 ## Log
+
+- L.4.3 the client shows a ring (2026-10-16): `SharedFrame::texture`
+  now takes the queue the frame's picture needs on its way into the
+  texture: on Linux the shared memory is copied into the client's
+  texture (a `queue.write_texture` of the whole padded surface) every
+  time the texture is asked for, cached per slot and device as before,
+  and on macOS it is the no-op it should be, because there the texture
+  *is* the shared surface's memory. With that, `isocast frames
+  --shared --check` passes on Linux for the program and a source: 89–90
+  frames read back through the client's GPU at 64 expected pixels each
+  with nothing black and nothing undrawn (centre pixels `#bf00c0` and
+  `#bfbfbf`, the pattern's colours). `--touch` had a bug every platform
+  carried since the first commit: it applied *no* change and expected a
+  new revision, while the daemon — correctly — keeps the revision when
+  an apply touches nothing, so the check could only ever fail. The touch
+  now marks the scene collection's own name for a moment (a real apply,
+  nothing the picture shows: "Linux app smoke test (frames check)"),
+  checks frames show the new revision (they did, ~26 ms later), and
+  gives the name back afterwards (skipping the restore if another
+  client renamed it meanwhile). For a source target it now refuses
+  instead of failing at the end, since only program and preview frames
+  stamp the setup revision. Clippy, fmt and the three crates' tests
+  clean; `--check` runs measured the shared path for the H.264
+  comparison rows of S.1, which wait for L.5's encoder on Linux.
 
 - L.4.2 shared surfaces (2026-10-16): the daemon now draws into a ring on
   Linux. `Platform::shared_surface` gives the engine a shared-memory surface

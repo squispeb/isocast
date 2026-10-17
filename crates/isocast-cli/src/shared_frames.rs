@@ -64,6 +64,16 @@ pub fn run(options: Options) -> Result<ExitCode> {
         filtered: options.filtered,
     };
     let mut frames = Client::connect_or_launch()?.shared_frames(params)?;
+    // Only the program's and the preview's frames stamp the setup
+    // revision they were drawn from (a source's picture has no setup to
+    // come from), so a touch there has nothing to show.
+    if options.touch && !matches!(options.target.as_str(), "program" | "preview") {
+        bail!(
+            "--touch needs a target whose frames stamp the setup revision: program or \
+             preview; \"{}\" was asked, whose frames carry no setup revision",
+            options.target
+        );
+    }
     let gpu = if options.check {
         Some(Gpu::new().context("this process could not open the GPU to read frames back")?)
     } else {
@@ -72,15 +82,15 @@ pub fn run(options: Options) -> Result<ExitCode> {
     let started = Instant::now();
     let length = Duration::try_from_secs_f64(options.seconds.max(0.0)).unwrap_or(Duration::ZERO);
     let mut stats = Stats::default();
-    let mut touched: Option<(u64, f64)> = None;
+    let mut touched: Option<(u64, String, f64)> = None;
     let mut ended = None;
     // The frame shown last, kept until the next has been read, as a
     // monitor keeps it until the next is on screen.
     let mut showing: Option<SharedFrame> = None;
     while started.elapsed() < length {
         if options.touch && touched.is_none() && started.elapsed() >= length / 2 {
-            let revision = touch()?;
-            touched = Some((revision, started.elapsed().as_secs_f64()));
+            let (revision, name) = touch()?;
+            touched = Some((revision, name, started.elapsed().as_secs_f64()));
         }
         let left = length.saturating_sub(started.elapsed());
         let frame = match frames.next(Some(left.min(Duration::from_millis(250)))) {
@@ -95,30 +105,76 @@ pub fn run(options: Options) -> Result<ExitCode> {
         stats.frame(&frame, at);
         if let Some(gpu) = &gpu {
             let points = grid_points(frame.width(), frame.height(), &expected);
-            let texture = frame.texture(&gpu.device)?;
+            let texture = frame.texture(&gpu.device, &gpu.queue)?;
             let pixels = read_pixels(gpu, &texture, &points)?;
             stats.check(&frame, &pixels, &expected, at);
         }
         showing = Some(frame);
     }
     drop(showing);
+    if let Some((_, name, _)) = &touched {
+        untouch(name);
+    }
     let elapsed = started.elapsed().as_secs_f64().max(0.001);
     report(
-        &options, &frames, &stats, &expected, touched, ended, elapsed,
+        &options,
+        &frames,
+        &stats,
+        &expected,
+        touched.map(|(revision, _, at)| (revision, at)),
+        ended,
+        elapsed,
     )
 }
 
-/// Apply an empty live change: the setup stays as it is and its revision
-/// goes up. Returns the new revision.
-fn touch() -> Result<u64> {
+/// Apply a live change that leaves the picture as it is: the collection's
+/// own name gains a marker, so every watcher of the live setup — frames
+/// and the app — has a new revision to show. No-op applies can't do this:
+/// the daemon deliberately keeps the revision when a change touches
+/// nothing (so other clients' plans stay valid). Returns the new revision
+/// and the name to give back later ([`untouch`], once the revision has
+/// shown).
+fn touch() -> Result<(u64, String)> {
     let mut client = Client::connect_or_launch()?;
     let live: Live = client.call(Method::Get(None))?;
+    let name = live
+        .setup
+        .as_ref()
+        .map(|setup| setup.name.clone())
+        .unwrap_or_else(|| "Isocast".into());
     let applied: Applied = client.call(Method::Apply(Box::new(ApplyParams {
         revision: live.revision,
-        change: Change::Patch(json!({})),
+        change: Change::Patch(json!({ "name": marker(&name) })),
         live: true,
     })))?;
-    Ok(applied.revision)
+    Ok((applied.revision, name))
+}
+
+/// The name the collection wears while the touch is out.
+fn marker(name: &str) -> String {
+    format!("{name} (frames check)")
+}
+
+/// Give the collection's name back. Best effort: if another client
+/// renamed it in the meantime, its name stays theirs.
+fn untouch(name: &str) {
+    let Ok(mut client) = Client::connect_or_launch() else {
+        return;
+    };
+    let Ok(live) = client.call::<Live>(Method::Get(None)) else {
+        return;
+    };
+    if live
+        .setup
+        .as_ref()
+        .is_some_and(|setup| setup.name == marker(name))
+    {
+        let _ = client.call::<Applied>(Method::Apply(Box::new(ApplyParams {
+            revision: live.revision,
+            change: Change::Patch(json!({ "name": name })),
+            live: true,
+        })));
+    }
 }
 
 #[derive(Default)]

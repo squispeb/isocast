@@ -38,6 +38,11 @@ impl Surface {
     ) -> Result<wgpu::Texture> {
         bail!(UNSUPPORTED)
     }
+
+    #[cfg(feature = "wgpu")]
+    pub fn upload(&self, _queue: &wgpu::Queue, _texture: &wgpu::Texture) -> Result<()> {
+        bail!(UNSUPPORTED)
+    }
 }
 
 /// The host clock now, in nanoseconds.

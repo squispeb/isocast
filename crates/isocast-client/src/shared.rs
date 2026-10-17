@@ -6,6 +6,7 @@
 //! # fn show(_: &wgpu::Texture, _: Option<u64>) {}
 //! # fn main() -> anyhow::Result<()> {
 //! # let device: wgpu::Device = todo!();
+//! # let queue: wgpu::Queue = todo!();
 //! use isocast_client::Client;
 //! use isocast_protocol::api::SharedFramesParams;
 //!
@@ -21,7 +22,7 @@
 //! // it: dropping hands its slot back to the daemon.
 //! let mut showing = None;
 //! while let Some(frame) = frames.next(None)? {
-//!     let texture = frame.texture(&device)?; // cached per slot
+//!     let texture = frame.texture(&device, &queue)?; // cached per slot
 //!     show(&texture, frame.revision);
 //!     showing = Some(frame);
 //! }
@@ -284,23 +285,34 @@ impl SharedFrame {
     /// The picture as an `Rgba8Unorm` texture of `device` (made once per
     /// slot and device, then reused), with the usages Slint's
     /// `Image::try_from(wgpu::Texture)` asks for (`TEXTURE_BINDING |
-    /// RENDER_ATTACHMENT`) and `COPY_SRC`. Don't draw into it.
+    /// RENDER_ATTACHMENT`) and `COPY_SRC`. Don't draw into it. `queue`
+    /// is what fills the picture in, so ask for the texture again each
+    /// frame you show: where the shared surface is memory the device
+    /// reads through (macOS), the picture is already the texture's, and
+    /// where it is shared memory copied out of `[gpu](crate::gpu)`
+    /// (Linux), the texture gets the frame's picture now.
     #[cfg(feature = "wgpu")]
-    pub fn texture(&self, device: &wgpu::Device) -> Result<wgpu::Texture> {
+    pub fn texture(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Result<wgpu::Texture> {
         let mut textures = self.ring.textures.lock().unwrap();
         let cached = &mut textures[self.slot as usize];
-        if let Some((made_for, texture)) = cached.as_ref()
+        let texture = if let Some((made_for, texture)) = cached.as_ref()
+            // wgpu devices compare by id and ids start over with every
+            // instance (docs/notes.md), so this says "same device" only
+            // while one Gpu makes all the textures here.
             && made_for == device
         {
-            return Ok(texture.clone());
-        }
-        let texture = self.surface().texture(
-            device,
-            wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::COPY_SRC,
-        )?;
-        *cached = Some((device.clone(), texture.clone()));
+            texture.clone()
+        } else {
+            let texture = self.surface().texture(
+                device,
+                wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::COPY_SRC,
+            )?;
+            *cached = Some((device.clone(), texture.clone()));
+            texture
+        };
+        self.surface().upload(queue, &texture)?;
         Ok(texture)
     }
 }

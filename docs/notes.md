@@ -3,6 +3,40 @@
 Short, dated facts a future session needs. Newest entries go at the top of
 each section. Delete entries that stop being true.
 
+## Linux port progress (2026-10-16, L.4.3 the client shows a ring)
+
+- **`SharedFrame::texture(&device, &queue)` uploads on ask.** The client's
+  texture is cached per slot and device as before, and after every call
+  the frame's picture is written into it (`queue.write_texture` over the
+  whole surface, padding rows included). Call it once per frame shown —
+  macOS's is a deliberate no-op (the texture is the shared memory
+  itself). The texture carries `TEXTURE_BINDING | RENDER_ATTACHMENT |
+  COPY_SRC`.
+- **`--touch` never worked on any platform, and now does.** It applied an
+  empty patch and expected frames to show a new revision — but the
+  daemon *deliberately* keeps the revision when an apply changes
+  nothing (`apply` in isocastd: "no new revision, so other clients'
+  plans stay valid"; `data.rs` also skips keys whose value and persist
+  flag are unchanged). An apply that changes nothing can never bump the
+  revision. The touch now applies a picture-invisible change: the
+  collection's own `name` gains the marker `(frames check)`, and the
+  check restores the name afterwards (`untouch`, skipped if another
+  client has renamed the collection meanwhile). Program frames showed
+  the touched revision ~26 ms after the touch. Only program and preview
+  frames stamp a setup revision (`Source` in frame_stream.rs carries
+  `Drawn` only for canvas-drawn targets), so `--touch` now refuses
+  source targets with that explanation instead of failing at the end.
+- **Shared-path lateness on this machine, for the S.1 rows:** the
+  program (frame read back out of the compositor's device and re-uploaded
+  into the viewer's) arrives ~38 ms after its time (median, 30.4 fps);
+  a source (the viewer's own slots after its import) ~6 ms. L.5's
+  real-time encoder doesn't exist on Linux yet, so the H.264 side of
+  rows has nothing to compare against here until then.
+- **The Gpu::new-per-check in the CLI** is one device per process, so the
+  client's `made_for == device` texture cache stays truthful — see the
+  wgpu id-restart trap above before ever creating a second Gpu in one
+  process.
+
 ## Linux port progress (2026-10-16, L.4.2 the daemon draws a ring)
 
 - **`wgpu::Device` equality is a trap: ids start over per instance.**
