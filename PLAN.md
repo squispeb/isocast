@@ -770,8 +770,23 @@ step live in `docs/notes.md`'s "Linux port WIP" section.
   - [x] **L.4.4 The app's live monitors on Linux** (Slint preview
     without the JPEG poll), with the daemon's CPU per viewer in the
     notes.
-  - [ ] **L.4.5 S.1 rows on this machine** (shared frames against
+  - [x] **L.4.5 S.1 rows on this machine** (shared frames against
     H.264), the values that decide whether DMA-BUF (below) is needed.
+    The rows that this machine can hold now are the shared path's
+    against the JPEG path it replaced (docs/notes.md, 2026-10-16, in
+    release builds): a program viewer ~30 fps, ~38 ms after its draw
+    time, at ~26% of a core; a source viewer ~30 fps, ~3 ms, ~22%; two
+    program viewers of one ring at no more CPU than one (the copy runs
+    once per frame per target, not per viewer) but ~52 ms; and the JPEG
+    `frame` poll it replaces, 30 fps at ~80% of a core. Against these,
+    one extra frame of lateness on the program target and a few % of a
+    core is not the copy costing too much: **L.4.6's DMA-BUF stays
+    deferred** — its real driver is L.2's capture import, and the rows
+    may be revisited after L.5. The H.264 leg of the rows waits for
+    L.5's encoder (there is none on Linux yet), as does the on-screen
+    tail beyond arrival at the client (the client's own upload, the
+    app, the compositor's vsync) — measured pieces of it exist in the
+    app rows.
   - [ ] **L.4.6 (later) Zero copy: DMA-BUF rings.** The daemon's
     texture exported (`VK_EXT_external_memory_dma_buf`) and the
     client's GPU sampling it in place, which needs raw Vulkan around
@@ -1586,6 +1601,28 @@ Shipped (v1): 7.1, 7.2, 7.4a, 7.5, 7.6. Next, in order:
 - FilmCraft reads `session.json` to line up ISO files without audio sync.
 
 ## Log
+
+- L.4.5 the rows on this machine (2026-10-16): measured with a release
+  daemon and release CLI viewers (the earlier debug-build numbers would
+  have biased the copy decision), 1280×720 at 30 through the panel
+  daemon's Vulkan: a program viewer (the compositor's canvas, whose
+  publish copies the finished picture out of the drawing device) runs
+  30.0–30.1 fps, its frames 37.4–38.0 ms after their draw time (max
+  65–85 ms), for 24–29% of one core on the daemon pair; a source viewer
+  (own grid, no canvas copy-out) 30.0–30.1 fps, 2.9–3.9 ms (max
+  18–38 ms), 21–23%. Two program viewers of one ring cost no more CPU
+  than one (~32%) but both read ~52 ms — the ring belongs to the target
+  and `publish_shared_surface` runs once a frame per target, not per
+  viewer. The JPEG `frame` poll these monitors replaced, measured the
+  same way against the release daemon, holds the same 30.1 fps only by
+  spending ~80% of a core (and it decodes outside the daemon besides).
+  The app (debug build) shows the program at 30 fps, 750–793 frames in
+  20–25 s, 0 lost, longest gap ~43 ms, for ~10–13% of a core. Verdict
+  written into L.4.5's box: one frame of extra lateness plus a few
+  percent of core once per target is not the copy costing too much, so
+  the DMA-BUF ring stays deferred as L.4.6 already says; the H.264 leg
+  of an honest S.1b row cannot exist here until L.5's encoder, and the
+  on-screen tail beyond the client is only measured in pieces.
 
 - L.4.4 the app's live monitors on Linux (2026-10-16): the app's monitor
   feed and the Properties/Filters dialogs' source previews follow their

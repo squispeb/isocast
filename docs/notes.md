@@ -3,6 +3,47 @@
 Short, dated facts a future session needs. Newest entries go at the top of
 each section. Delete entries that stop being true.
 
+## Linux port progress (2026-10-16, L.4.5 the machine's rows)
+
+- **All rows below are release builds** (`cargo build --release -p
+  isocast-daemon` then `ISOCAST_DAEMON=target/release/isocastd isocast
+  restart`; the CLI viewer built with `--release` too). The measurements
+  here so far had all been debug builds; a copy-cost decision needs the
+  daemon not paying the debug premium. Restored the debug daemon
+  afterwards (the repo's normal flow).
+- **The rows (1280×720@30, daemon pair = isocastd + its
+  `--native-log-relay` child, CPU from `/proc/<pid>/stat` utime+stime
+  deltas over ≥4 s windows, medians of 3 interleaved rounds):**
+  | viewer | fps | lateness after draw time | daemon pair |
+  |---|---|---|---|
+  | `frames program --shared` (canvas, copy-out once a frame) | 30.0–30.1 | median 37.4–38.0 ms, max 65–85 ms | 24–29% |
+  | `frames pattern --shared` (source's own grid, no canvas copy) | 30.0–30.1 | median 2.9–3.9 ms, max 18–38 ms | 21–23% (first round 9%) |
+  | two program viewers, one ring | 30.1 each | median 52.1 ms both | ~32% |
+  | JPEG `frame` poll, one client | 30.1 | (unmeasurable: no frame time in the reply) | ~80% |
+  | app monitor (debug app, release daemon) | 30.0 | reached client as above; on screen unmeasured | app ~10–13% |
+  | idle daemon pair | — | — | ~0–1% |
+- **What the rows say for L.4.6:** the canvas copy costs one extra
+  frame of lateness (the 30 fps budget is 33.3 ms) and — measured
+  against a source viewer, whose remaining work differs, so taken as an
+  upper bound — single-digit percent of a core, *per target* (the ring
+  is the target's; `publish_shared_surface` runs in the shared renderer
+  loop once per frame, then every viewer gets the same event). The
+  copy's cost does not push L.4.6's "only worth it if L.4.5 says the
+  copy costs too much" lever: monitors are one extra frame behind, and
+  vsync on the drawing side swallows more than that. DMA-BUF's real
+  driver remains L.2's capture import; revisit these rows after L.5.
+- **Lateness grows with viewers** (+14 ms for a second program viewer,
+  CPU unchanged): the hand-over path serializes somewhere per viewer
+  (event sends, or scheduling of N waiting processes). If a
+  many-monitors setup ever complains, this is the row to dig into.
+- **JPEG-poll cost note:** with the release daemon the poll keeps up at
+  30 fps (80% of a core in the daemon alone) — the debug daemon measured
+  earlier held only ~4.8 fps at 122%. Either way the shared path is far
+  cheaper.
+- **Where the mystery extra `isocastd` process went:** it did not
+  appear in four later bench runs; the pair-only numbers above are
+  pinned to the pair for that reason.
+
 ## Linux port progress (2026-10-16, L.4.4 the app's live monitors)
 
 - **The app's monitors show shared surfaces on Linux** (`isocast-ui/src/
