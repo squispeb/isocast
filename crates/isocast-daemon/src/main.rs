@@ -3193,7 +3193,7 @@ impl Daemon {
             })?;
         let reply = SharedFrameStream {
             target: params.target.clone(),
-            transport: "iosurface-mach".into(),
+            transport: isocast_surfaces::TRANSPORT.into(),
             service: exporter.service().to_string(),
             format: "rgba8unorm".into(),
             fps,

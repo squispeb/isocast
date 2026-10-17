@@ -55,10 +55,16 @@ pub struct Shared {
 /// frame viewer, so a frame must remember which one its textures belong
 /// to: reading a frame back on another device looks its texture up in
 /// the wrong registry and panics ("Cannot get non-existent resource").
+#[derive(Clone)]
 pub(crate) struct Imported {
     pub textures: Vec<wgpu::Texture>,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
+    /// The importer instance that made them. Never compare the devices
+    /// (`wgpu::Device` compares by id, and ids start over every
+    /// instance, so two devices in a process all look like `DeviceId(0,1)`
+    /// and compare equal — docs/notes.md); only the maker gets to reuse.
+    pub maker: u64,
 }
 
 struct Plane {
@@ -139,29 +145,11 @@ impl Shared {
     /// made them.
     pub(crate) fn imported(&self) -> Option<Imported> {
         let imported = self.textures.lock().ok()?;
-        let Imported {
-            textures,
-            device,
-            queue,
-        } = imported.as_ref()?;
-        Some(Imported {
-            textures: textures.clone(),
-            device: device.clone(),
-            queue: queue.clone(),
-        })
+        imported.clone()
     }
 
-    pub(crate) fn set_imported(
-        &self,
-        textures: Vec<wgpu::Texture>,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-    ) {
-        *self.textures.lock().expect("frame textures poisoned") = Some(Imported {
-            textures,
-            device: device.clone(),
-            queue: queue.clone(),
-        });
+    pub(crate) fn set_imported(&self, imported: Imported) {
+        *self.textures.lock().expect("frame textures poisoned") = Some(imported);
     }
 }
 
@@ -187,6 +175,12 @@ impl LinuxFrame {
 
     pub(crate) fn cpu_version(&self) -> u64 {
         self.slot.cpu_version()
+    }
+
+    /// The pool slot this frame is, for telling slots apart: a pool
+    /// recycles a few, and two clones are the same slot.
+    pub(crate) fn slot(&self) -> &Arc<Shared> {
+        &self.slot
     }
 
     pub(crate) fn render_version(&self) -> u64 {
@@ -223,13 +217,8 @@ impl LinuxFrame {
 
     /// Store the importer's textures on the slot, with the instance that
     /// made them.
-    pub(crate) fn set_imported(
-        &self,
-        textures: Vec<wgpu::Texture>,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-    ) {
-        self.slot.set_imported(textures, device, queue)
+    pub(crate) fn set_imported(&self, imported: Imported) {
+        self.slot.set_imported(imported)
     }
 
     /// Store the CPU version the textures were last written from.

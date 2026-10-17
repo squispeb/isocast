@@ -735,14 +735,25 @@ step live in `docs/notes.md`'s "Linux port WIP" section.
     and an unknown one, and a third re-runs the test binary as a **real
     second process** to read what the first published (no new files or
     harnesses); nothing draws into a ring yet.
-  - [ ] **L.4.2 The daemon draws a ring.** `shared_surface` gives the
+  - [x] **L.4.2 The daemon draws a ring.** `shared_surface` gives the
     engine a texture to draw into and the surface it goes with, and one
-    new platform hook (defaulted, so macOS is untouched) copies the
-    finished texture back into the shared memory after the GPU wait;
-    the daemon names the real transport. Done when a take with a
-    `shared_frames` viewer shows frames arriving (`isocast frames
-    program --shared` on this machine), with the daemon's read-back
-    cost measured.
+    new platform hook (`publish_shared_surface`, defaulted, so macOS is
+    untouched) copies the finished texture back into the shared memory
+    after the GPU wait; the daemon names the real transport and the
+    `--shared` CLI opens on Linux. This surfaced a wgpu trap the
+    importer now avoids: every `Gpu::new()` in a process gets the same
+    `DeviceId(0,1)` (ids start over per instance), so `Device == Device`
+    says "same device" across machines of the same process and a
+    viewer reusing the program compositor's textures panicked on a view
+    that never existed ("Cannot get non-existent resource"); frames now
+    remember which importer made their textures, and a second device
+    samples a foreign frame through textures of its own, filled from
+    the pixels read back out of the drawing device. Done when frames
+    arrive for a source *and* for the program at the rate asked —
+    54–83 frames at ~30.5 fps for both, the ring 1280×720 with the
+    transport `memfd` — with the snapshot, the recording (2.02 s
+    HEVC + AAC) and the snapshot's JPEG all still right after the
+    importer change; the cost rows are L.4.5's.
   - [ ] **L.4.3 The client shows a ring.** `SharedFrame::texture` takes
     the queue the upload needs, `isocast frames --shared --check`
     passes on Linux (the same 64-pixel grid, revisions and `--touch`),
@@ -1566,6 +1577,33 @@ Shipped (v1): 7.1, 7.2, 7.4a, 7.5, 7.6. Next, in order:
 - FilmCraft reads `session.json` to line up ISO files without audio sync.
 
 ## Log
+
+- L.4.2 shared surfaces (2026-10-16): the daemon now draws into a ring on
+  Linux. `Platform::shared_surface` gives the engine a shared-memory surface
+  of 8-bit RGBA and an `Rgba8Unorm` texture drawn into it, and a new
+  defaulted `Platform::publish_shared_surface(&gpu, texture, surface)` — a
+  no-op on macOS, where the drawn surface *is* the share — copies the
+  drawn picture back into that memory once the GPU has finished, before
+  the viewer is told a frame is ready; the client's copy of the picture
+  (the upload) is L.4.3's, `--check` includes. The daemon's `shared_frames`
+  reply names the crate's own transport (`memfd`) instead of a macOS
+  constant, and `isocast frames --shared` opens on Linux.
+  Getting the *program* viewer to work needed an importer fix the run
+  itself proved: every `Gpu::new()` in a process gets its own wgpu
+  instance, whose ids start over, so the compositor's and the viewer's
+  devices both carry id `DeviceId(0,1)` and compare equal — a viewer
+  therefore sampled the compositor's canvas textures, whose views live in
+  another registry, and died with "Cannot get non-existent resource
+  TextureViewId(5,4)" the moment it drew. Frames now remember the importer
+  token that made their textures; a foreign frame is sampled through
+  textures of the viewer's own, filled from the pixels read back out of
+  the drawing device first (`isocast frames pattern --shared` and
+  `frames program --shared` both stream ~30.5 fps at 1280×720 with the
+  transport `memfd`; the program viewer's frames arrive ~38 ms late to
+  the pattern's ~4 ms, the copy evidence, and the S.1 rows measure this
+  properly). The snapshot (`isocast frame program`), the snapshot's JPEG
+  and a 2.02 s HEVC + AAC recording all still come out right, since the
+  same importer change touches the compositor.
 
 - L.4.1 shared surfaces (2026-10-16): a ring of surfaces now hands over on
   Linux. `isocast-surfaces` has a Linux module: a surface is 8-bit RGBA in

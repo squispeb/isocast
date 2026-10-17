@@ -202,6 +202,22 @@ pub trait Platform: Clone + Send + Sync + 'static {
         height: u32,
     ) -> anyhow::Result<(Self::SharedSurface, wgpu::Texture)>;
 
+    /// The picture drawn into a shared surface's texture is finished:
+    /// put it where other processes read it. Where the texture *is* the
+    /// surface — macOS draws into the IOSurface itself — there is nothing
+    /// to do; where the surface is shared memory (Linux) this copies the
+    /// texels out, and a client that wants no copy is L.4's DMA-BUF step.
+    /// Called once per drawn frame, before the viewer is told there is
+    /// one.
+    fn publish_shared_surface(
+        &self,
+        _gpu: &gpu::Gpu,
+        _texture: &wgpu::Texture,
+        _surface: &Self::SharedSurface,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// `frame` as a JPEG of `quality` (0 to 1), scaled down to at most
     /// `max_width` wide, for clients' live monitors: the bytes, width and
     /// height.

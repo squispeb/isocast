@@ -36,5 +36,7 @@ wgpu = { version = "=30.0.1", default-features = false, features = ["std", "park
 # The CLI's engine paths (like the daemon's) carry the platform backend:
 # `isocast record` without a running daemon runs the engine in-process.
 [target.'cfg(target_os = "linux")'.dependencies]
+isocast-client = { path = "../isocast-client", features = ["wgpu"] }
 isocast-platform-linux = { path = "../isocast-platform-linux" }
+isocast-surfaces = { path = "../isocast-surfaces" }
 wgpu = { version = "=30.0.1", default-features = false, features = ["std", "parking_lot", "vulkan", "wgsl"] }

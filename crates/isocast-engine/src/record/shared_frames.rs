@@ -339,6 +339,13 @@ fn run<P: Platform>(
                 timeout: Some(DRAW_TIMEOUT),
             })
             .map_err(|err| format!("the GPU did not finish drawing a frame: {err}"))?;
+        // A surface that is not the texture itself is filled now, while
+        // the GPU's picture is the newest one there is: the viewer is told
+        // the frame is ready only afterwards, so what it reads is a
+        // finished picture, never a half-written one.
+        platform
+            .publish_shared_surface(&gpu, target, &ring.surfaces[index].0)
+            .map_err(failed)?;
         drop(picture);
         ring.held[index] = true;
         ring.fresh = false;

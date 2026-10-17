@@ -3,6 +3,52 @@
 Short, dated facts a future session needs. Newest entries go at the top of
 each section. Delete entries that stop being true.
 
+## Linux port progress (2026-10-16, L.4.2 the daemon draws a ring)
+
+- **`wgpu::Device` equality is a trap: ids start over per instance.**
+  Every `Gpu::new()` makes its own `wgpu::Instance`, and each instance
+  counts ids from 0 — so the compositor's and a viewer's devices both
+  carry `DeviceId(0,1)` and `device == device` is *true between two
+  different devices*. `impl_eq_ord_hash_proxy!(Device => .id)` compares
+  the id pair, not which instance owns it. A viewer that reused the
+  program compositor's canvas textures on that "equality" panicked with
+  "Cannot get non-existent resource TextureViewId(5,4)" the moment the
+  bind group was made (wgpu's `Storage::get` asserts on a foreign
+  registry). The fix: each `VulkanImporter` gets a one-up token and
+  frames' `Imported` textures remember their maker; only the maker
+  reuses. Same trap lurks in the client's per-slot texture cache
+  (`SharedFrame::texture` compares `made_for == device`) — one Gpu per
+  client process today, but change that before adding a second.
+- **A second device samples a foreign frame by copying, twice.** There
+  is no way to hand a Vulkan texture across wgpu devices in a process
+  (that is what DMA-BUF would buy), so `VulkanImporter` builds its own
+  textures for a frame drawn elsewhere: `read_back` out of the drawing
+  device first (that is where the picture lives), then a plain upload.
+  The frame's `gpu_synced` is *not* touched on the way — a viewer's fill
+  must not tell the compositor its canvas is synced. Measured as
+  lateness: a program viewer's frames arrive ~38 ms late versus a
+  source's ~4 ms; L.4.5's rows measure properly.
+- **`publish_shared_surface` runs before the viewer hears a frame, after
+  the GPU wait.** Copy order in `shared_frames.rs`: draw → poll → copy
+  into the surface → hand the slot to the client. The `copy_out` helper
+  (padded rows, `isocast-platform-linux/src/gpu.rs`) returns
+  `[Vec<u8>, stride]`, which `surface.publish` takes as-is; `read_plane`
+  de-pads its own copy afterwards.
+- **The `--shared` CLI gate is `any(target_os = "macos",
+  target_os = "linux")` in `isocast-cli/src/main.rs`** plus a Linux
+  target in its Cargo.toml enabling `isocast-client/wgpu` (Vulkan). The
+  client's transport check now reads `isocast_surfaces::TRANSPORT`.
+- **Verification that worked this step:** `isocast frames pattern
+  --shared` and `frames program --shared --seconds N` (rates and
+  lateness from the report), a restart of the daemon after every
+  rebuild, `isocast frame program` decoded numerically (mean 65.7,
+  std 92.2, ~936k non-black pixels), a 2.02 s `isocast start` take
+  ffprobe'd (HEVC 1280×720 30 fps + AAC, YAVG ≈ 71–73 on the pattern),
+  and the daemon log (`~/.isocast/logs/*isocastd-0000.jsonl`, grep
+  `level` warn/error) for panics. Reading a wgpu panic's view/texture
+  ids out of `Debug` on a texture (probe lines in the daemon log) is
+  what pinned the id-restart trap.
+
 ## Linux port progress (2026-10-16, L.4.1 shared surfaces: the ring and its hand-over)
 
 - **Linux hands surfaces over with `SCM_RIGHTS`, not Mach ports.** A Unix

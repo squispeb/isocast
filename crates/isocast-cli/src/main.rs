@@ -30,18 +30,18 @@ mod library;
 mod mcp;
 mod plugin;
 mod project;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod shared_frames;
 mod timeline;
 mod virtual_camera;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn shared_frames(options: shared_frames::Options) -> Result<ExitCode> {
     shared_frames::run(options)
 }
 
-#[cfg(not(target_os = "macos"))]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 mod shared_frames {
     pub struct Options {
         pub target: String,
@@ -58,7 +58,7 @@ mod shared_frames {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn shared_frames(_options: shared_frames::Options) -> Result<ExitCode> {
     bail!("--shared is only available on macOS so far; leave it out to watch H.264")
 }

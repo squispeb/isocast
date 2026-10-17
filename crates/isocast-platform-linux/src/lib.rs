@@ -223,17 +223,50 @@ impl Platform for LinuxPlatform {
         frame.is_ycbcr()
     }
 
-    /// L.4: DMA-BUF rings and the client side of native monitors.
+    /// L.4: a monitor's picture for clients on this machine, through a
+    /// ring of shared surfaces. The surface is shared memory the client
+    /// maps; the texture is what the compositor draws into, and
+    /// [`Self::publish_shared_surface`] copies it back into that memory
+    /// once the frame is drawn — Linux has no way to let another
+    /// process's GPU sample this texture in place yet (that is DMA-BUF,
+    /// L.4.6 in docs/port-omarchy.md), so the first version copies.
     fn shared_surface(
         &self,
-        _gpu: &isocast_engine::gpu::Gpu,
-        _width: u32,
-        _height: u32,
+        gpu: &isocast_engine::gpu::Gpu,
+        width: u32,
+        height: u32,
     ) -> Result<(Self::SharedSurface, wgpu::Texture)> {
-        bail!(
-            "shared GPU surfaces are only available on macOS so far; the native app's live \
-             monitors arrive on Linux at L.4 of docs/port-omarchy.md"
-        )
+        let surface = isocast_surfaces::Surface::rgba(width, height)?;
+        let texture = surface.texture(
+            &gpu.device,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        )?;
+        Ok((surface, texture))
+    }
+
+    /// L.4: the drawn picture out to the shared memory the client reads.
+    /// The rows come back with the padding a 256-byte-aligned read-back
+    /// needs, which is exactly the surface's own stride, so the picture
+    /// goes into it without repacking a row.
+    fn publish_shared_surface(
+        &self,
+        gpu: &isocast_engine::gpu::Gpu,
+        texture: &wgpu::Texture,
+        surface: &isocast_surfaces::Surface,
+    ) -> Result<()> {
+        let size = wgpu::Extent3d {
+            width: surface.width(),
+            height: surface.height(),
+            depth_or_array_layers: 1,
+        };
+        let (pixels, _) = gpu::copy_out(
+            &gpu.device,
+            &gpu.queue,
+            texture,
+            u64::from(surface.width()) * 4,
+            size,
+        )?;
+        surface.publish(&pixels)
     }
 
     fn encode_jpeg(

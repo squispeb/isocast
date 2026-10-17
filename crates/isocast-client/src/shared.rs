@@ -48,7 +48,7 @@ impl Client {
     /// (`shared_frames`). Dropping the result stops watching.
     pub fn shared_frames(mut self, params: SharedFramesParams) -> Result<SharedFrames> {
         let info: SharedFrameStream = self.call(Method::SharedFrames(params))?;
-        if info.transport != "iosurface-mach" {
+        if info.transport != isocast_surfaces::TRANSPORT {
             bail!(
                 "isocastd hands surfaces over by {:?}, which this client can't take",
                 info.transport
