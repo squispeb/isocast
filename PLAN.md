@@ -1556,6 +1556,25 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
   preserve 500 ms fragments, actual commit watermarks, every complete
   track, true timestamp gaps, drop accounting and torn-finalize recovery.
   macOS encoders, admission/pressure and startup order stay unchanged.
+  - [x] **W.2a Encoded-packet mux and ownership.** Qualify a separate
+    portable BMFF writer accepting NVENC/MF compressed access units and
+    AAC (explicit encoder priming, no raw pixels). Reuse our box/index
+    algorithms without switching either Mac writer or its selection.
+    Windows handle-anchored ownership/locks, 500 ms fragments, exact sample
+    accounting, commit watermarks, safe finish and standalone repair.
+    Native NVENC H.264/HEVC 8/10-bit input proof; 14 process-kill cases,
+    exact paused commitments, torn publication/header and interrupted-repair
+    regressions, aliases and rational packet timing pass. Mac production
+    writers untouched; new APFS layer repairs Windows fragments identically.
+    Standalone library only: W.2b/W.2c still gate whole W.2 and W.3.
+  - [ ] **W.2b Launch recovery and manifests.** Integrate Windows recovery
+    under the same pinned folder lease as manifest I/O; atomic replacement
+    and honest recovered counts/durations. Preserve the Unix paths.
+  - [ ] **W.2c Native kill qualification.** On exon-desk, NVENC H.264/HEVC
+    and AAC inputs, MP4/MOV, kill/commit/gap/empty-track/torn-finish/alias
+    matrices, full decode and A/V checks, plus next-launch repair/idempotence.
+    Distinguish encoded-packet writer proof from W.4/W.5 capture/encoder
+    integration; no power-cut guarantee inferred from process kills.
 - [ ] **W.3 Platform contract tests.** Shared executable contracts for
   clock/timestamp mapping, bounded frame pools and retention, GPU completion,
   capture teardown, encoder pressure/loss, A/V timing, commit/finalize,
@@ -1581,16 +1600,6 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
   at 1080p60 and 4K60 with ISOs: launch-to-first-preview, ready-to-record,
   start-record latency, CPU/GPU/memory and dropped frames. Install isolated
   OBS as a permitted test dependency, never use Ryan's OBS profile.
-  - [ ] **W.5a Native capture substrate (agent/windows-capture).** Native
-    qualification ready for CI: WGC display/HWND capture into bounded,
-    fenced D3D11 BGRA textures; QPC stamps, cursor switch, resize, pressure
-    counts and joined teardown. Six 1080p60/4K60 runs at 59.997–59.998 fps,
-    zero observable pool/rate drops; 32 retained frames force counted drops
-    and resume correctly, retained pixels survive resize. Two simultaneous
-    captures share a device, window-close fallback verified on Windows 19045.
-    ~230 ms device-open-to-first frame; not UI/record readiness. One GPU copy,
-    no CPU readback; wgpu import, encoding and Platform selection still pending.
-    OBS portable installed, matched record/ISO comparisons not yet possible.
 - [ ] **W.6 App, IPC and shared surfaces.** Slint Windows window and native
   integration, same-user named pipes with isolated engines, D3D11/D3D12
   surface hand-over/fences with adapter identity and bounded per-viewer
@@ -1600,6 +1609,11 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
   lazy initialization, parallel device opens and pre-warm must keep blocking
   work off the UI thread. Performance is a design requirement, not a later
   optimization pass.
+  Platform-aware wording pass: preserve Mac copy, but Windows says "this PC",
+  "Credential Manager" and "Explorer", uses Ctrl shortcuts, and names the
+  real Windows executable/privacy controls instead of Mac/Keychain/Finder/
+  Command glyphs or "Isocast Engine" macOS privacy instructions. Cover
+  onboarding, capacity/admission, settings, errors and shortcut labels.
 - [ ] **W.7 Packaging and updates.** Choose MSIX or installer; reproducible
   install/upgrade/uninstall, correct paths and per-user state, verified
   update authenticity and rollback. Build/test packages on runners; signing
@@ -1628,13 +1642,18 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
 
 ## Log
 
-- W.5a (2026-10-17, #105, native qualification): separate Windows capture
-  lane/root and shared GPU lock; new crate's WGC/QPC/D3D11 pool works on RTX
-  5070. Real frames, known pixels, bounded retention/resize, simultaneous
-  capture and closed-window callbacks checked. Windows strict clippy and
-  release build pass; full remote Mac gates pass. Work remains uncommitted
-  for coordinator CI. No daemon platform switch, writer edits, CPU capture
-  fallback or recording/OBS-parity claim; W.4/W.5 remain open.
+- W.2a (2026-10-17, #105 #28): new encoder-neutral isocast-mux accepts
+  compressed access units, not CPU pixels. Native H.264/HEVC MOV/MP4 and
+  Annex B/length-prefix outputs preserve packet payloads and timing; Main10
+  also decodes. 14 process kills: 13 recoverable movies plus one explicit
+  no-media early start; active loss at most 0.495 s, four pauses recover
+  their exact 3.2 s promise. Fixed a reproduced interrupted-repair bug where
+  an appended zero byte completed a torn commit; one-byte tail sealing makes
+  retries stable. Alias/pinned-directory, 1.5M-sample admission, jitter/gap,
+  empty/unequal-track and torn-header checks pass. Windows-created fragments
+  repair on APFS byte-identically to normal finish. Full Mac gates 232 unit
+  + 1 doctest pass (1 existing hardware ignore); Mac writer paths unchanged.
+  New crate added to portable CI; W.2b next-launch manifests remain next.
 
 - W.1e (2026-10-17, #105 #28): Windows UI builds alongside daemon/CLI;
   fixed the observed Slint build-script 1 MiB stack overflow using an 8 MiB

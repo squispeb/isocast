@@ -54,14 +54,14 @@ jobs:
       # Native service builds live below; recording qualification needs W.2+.
       - name: Build portable crates
         id: build
-        run: cargo build --locked -p isocast-protocol -p isocast-diagnostics -p isocast-obsws
+        run: cargo build --locked -p isocast-protocol -p isocast-diagnostics -p isocast-obsws -p isocast-mux
 
       - name: Clippy portable crates
-        run: cargo clippy --locked --keep-going --all-targets -p isocast-protocol -p isocast-diagnostics -p isocast-obsws -- -D warnings
+        run: cargo clippy --locked --keep-going --all-targets -p isocast-protocol -p isocast-diagnostics -p isocast-obsws -p isocast-mux -- -D warnings
 
       - name: Test portable crates
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: cargo test --locked --no-fail-fast -p isocast-protocol -p isocast-diagnostics -p isocast-obsws
+        run: cargo test --locked --no-fail-fast -p isocast-protocol -p isocast-diagnostics -p isocast-obsws -p isocast-mux
 
   engine:
     # W.1e: UI/native services compile with explicit platform stubs, not a
@@ -93,4 +93,4 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/ci/windows' }}
 
       - name: Build native services and test binaries (do not run)
-        run: cargo build --locked --all-targets -p isocast-engine -p isocast-platform-stub -p isocast-platform-windows -p isocast-ipc -p isocast-client -p isocast-daemon -p isocast-cli -p isocast-ui
+        run: cargo build --locked --all-targets -p isocast-engine -p isocast-platform-stub -p isocast-ipc -p isocast-client -p isocast-daemon -p isocast-cli -p isocast-ui

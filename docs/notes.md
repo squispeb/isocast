@@ -5,17 +5,6 @@ each section. Delete entries that stop being true.
 
 ## Environment
 
-- 2026-10-17 (#105 W.5a): capture lane uses
-  `ISOCAST_WINDOWS_ROOT=C:/isocast-dev/lanes/capture` and
-  `ISOCAST_WINDOWS_OUT=/Volumes/IsocastBuild/windows-capture/scratch/native`
-  with windows-remote.sh. `ISOCAST_WINDOWS_GPU_LOCK=1` takes the shared
-  `C:\isocast-dev\gpu.lock`; source/target/cache/home/IPC remain lane-local.
-  Cua's existing Session 1 daemon launches native probes without activation;
-  SSH is Session 0, unsuitable for real desktop capture. OBS 32.1.2 binaries
-  copied into the lane's `scratch/obs-portable` (portable_mode.txt), not
-  Ryan's profile. No OBS recording comparison yet. Evidence in capture
-  lane REPORT.md. The daemon still selects StubPlatform on Windows.
-
 - 2026-10-17 (#105 W.1e): Windows UI now builds with Slint 1.18.1/Skia
   and renders offscreen through RTX 5070/DX12. First native release build
   of daemon/CLI/UI took 14m11s; relinking generated UI after a client change
@@ -1720,6 +1709,34 @@ each section. Delete entries that stop being true.
   `{exonbook,m2-a}/` and `combined/`.
 
 ## Decisions
+
+- 2026-10-17 (#105 W.2a): `isocast-mux` is a separately qualified packet
+  writer, not a switch of Mac recording backends. Both Mac crash-safe VT/AAC
+  and legacy AVAssetWriter paths stay untouched. Inputs are NVENC/MF-compatible
+  compressed access units + avcC/hvcC, no raw pixels; 48 kHz mono/stereo AAC-LC
+  with explicit encoder priming. New identifying brand `isw2` prevents old
+  Mac recovery from guessing Apple's 2112-sample priming for Windows files.
+  B-frames/config changes are refused; adapters must drain encoders before
+  commit, preserve time origin and split before the 1.5M total-sample budget
+  (headroom includes pending/held outputs). Whole W.2 remains incomplete:
+  W.2b must wire anchored recovery/atomic truthful manifests into the daemon.
+- 2026-10-17 (#105 W.2a): a fragment's index is initially `free`, followed
+  by mdat and a metadata-hashed `icmt` trailer; only then is its kind patched
+  to moof. Recovery validates complete records, keeps all populated tracks,
+  and seals an abandoned tail with one `!` byte before appending its final
+  index. Necessary, not cosmetic: a missing final hash byte equal to zero
+  was completed by recovery's next moov-size byte, promoting an uncommitted
+  fragment on retry. Native repro and regression live in windows/scratch
+  REPORT.md. The seal never touches verified media; no truncation, no payload
+  reread/hash of hours of media. `unverified_tail` explains omitted bytes.
+- 2026-10-17 (#105 W.2a): pinned-directory leases bind creation/repair and
+  `.isocast.lock` to one object, including through a rebound folder junction.
+  Windows share-read-only writable media allows compatible live readers but
+  refuses competing writers/deletes; all reparse children (including cloud
+  placeholders) and hard links are refused. Use local non-synced folders;
+  OneDrive/network volumes are not qualified. Read inspections retain shared
+  leases, so keep them short before exclusive recovery. This is process-kill
+  and explicit file-flush qualification, not a power-cut/directory-fsync claim.
 
 - 2026-10-17 (#105 W.1d): `isocast record` is now a private daemon client,
   not in-process MacPlatform. IsolatedDaemon overrides only child storage
@@ -6191,17 +6208,6 @@ each section. Delete entries that stop being true.
   starts at 900 because the window's minimum width is 900.
 
 ## Gotchas
-
-- 2026-10-17 (#105 W.5a): WGC `TryGetNextFrame` returns S_OK + null when
-  empty; windows-rs 0.62.2 represents this as Error::empty(), not E_POINTER.
-  On Win10 build19045, Item.Closed did not fire when the target exited;
-  HWND capture checks liveness with an idle wait bounded at250ms. QPC is
-  10MHz on exon-desk. Real WGC presentation stamps arrive13–16ms ahead of
-  callback time (same QPC domain): preserve them, report signed offsets,
-  never call a saturating zero difference measured capture latency. Synthetic
-  WinForms windows need explicit DPI awareness: otherwise1920x1080 becomes
-  3840x2160 at the desktop's200% scale. WGC's own pre-delivery losses are
-  not exposed; our pool/rate/resize counters do not claim to count those.
 
 - 2026-10-17 (#105 W.1e): NPFS refuses WAIT→NOWAIT with ERROR_PIPE_BUSY
   while this endpoint has buffered outgoing bytes (even an 8-byte release),

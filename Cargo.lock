@@ -3189,6 +3189,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "isocast-mux"
+version = "0.0.6"
+dependencies = [
+ "anyhow",
+ "isocast-protocol",
+ "libc",
+ "sha2",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "isocast-obsws"
 version = "0.0.6"
 dependencies = [
@@ -3252,16 +3263,6 @@ dependencies = [
  "isocast-surfaces",
  "wgpu",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "isocast-platform-windows"
-version = "0.0.6"
-dependencies = [
- "anyhow",
- "isocast-engine",
- "parking_lot",
- "windows",
 ]
 
 [[package]]
