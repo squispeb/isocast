@@ -136,7 +136,8 @@ pub fn run(options: &Options) -> Result<()> {
     let clock: Box<dyn Fn() -> f32> = Box::new(move || clock_now.get().as_secs_f32());
     let canvas = areas::canvas::Canvas::new(&gpu, clock, true);
     let hub = App::new(&app, commands, Mode { offscreen: true }, canvas);
-    hub.sources.set_device(gpu.device.clone());
+    hub.sources
+        .set_device(gpu.device.clone(), gpu.queue.clone());
 
     let mut offscreen = Offscreen {
         gpu,

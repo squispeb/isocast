@@ -4,27 +4,28 @@
 //! `preview` in Studio Mode, `program` otherwise).
 //!
 //! Two transports, chosen by platform:
-//! - macOS: `shared_frames`, a GPU surface the daemon has finished drawing —
-//!   the picture without copying it.
+//! - macOS and Linux: `shared_frames`, a GPU surface the daemon has finished
+//!   drawing — the picture without a JPEG detour.
 //! - Everywhere else: the daemon's JPEG `frame` method, asked again for
 //!   each new frame (`after` is the last `seq`, so the daemon waits for a
 //!   newer one and this is live video rather than a poll of a stale
-//!   picture), decoded to pixels Slint shows. The no-copy path is what
-//!   `docs/port-omarchy.md`'s L.4 brings to Linux; until then this is the
-//!   picture, at the cost of one encode and one decode a frame.
+//!   picture), decoded to pixels Slint shows. On Linux shared surfaces
+//!   replaced this (docs/port-omarchy.md's L.4); the JPEG path stays for
+//!   other platforms.
 
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use isocast_client::shared::{SharedController, SharedFrame};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use isocast_protocol::api::SharedFramesParams;
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 use isocast_protocol::api::{Frame, FrameParams, Method};
 
 /// A JPEG picture from the daemon, decoded: the portable monitor path.
 /// (macOS gets [`SharedFrame`]s instead, which never copy the pixels.)
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 #[derive(Clone)]
 pub struct Picture {
     pub width: u32,
@@ -38,9 +39,11 @@ pub struct Picture {
 
 /// What the window gets.
 pub enum Incoming {
-    /// macOS: a shared GPU surface (never constructed elsewhere).
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    /// A shared GPU surface (macOS and Linux).
+    #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
     Frame(SharedFrame),
+    /// The decoded JPEG picture (other platforms).
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     Picture(Picture),
     /// No picture: why (the daemon can't be reached, or refused).
     Lost(String),
@@ -127,14 +130,14 @@ impl Feed {
     }
 
     fn receive(&self, deliver: impl Fn(Incoming)) {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         self.receive_shared(deliver);
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         self.receive_jpeg(deliver);
     }
 
-    /// macOS: the daemon's shared GPU surfaces.
-    #[cfg(target_os = "macos")]
+    /// macOS and Linux: the daemon's shared GPU surfaces.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn receive_shared(&self, deliver: impl Fn(Incoming)) {
         let mut delay = Duration::from_millis(250);
         loop {
@@ -185,10 +188,10 @@ impl Feed {
         }
     }
 
-    /// Everywhere but macOS: the daemon's JPEG frames, asked for again as
+    /// Other platforms: the daemon's JPEG frames, asked for again as
     /// each arrives. The daemon waits for one newer than `after`, so the
     /// rate is the program's own (up to what this monitor asks for).
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     fn receive_jpeg(&self, deliver: impl Fn(Incoming)) {
         let mut delay = Duration::from_millis(250);
         loop {
@@ -209,7 +212,7 @@ impl Feed {
     }
 
     /// One target's frames until it changes (`Ok`) or the stream fails.
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     fn stream_jpeg(&self, target: &str, deliver: &dyn Fn(Incoming)) -> anyhow::Result<()> {
         use base64::Engine;
 

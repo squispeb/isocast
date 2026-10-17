@@ -194,8 +194,12 @@ impl Sources {
     }
 
     /// The GPU device the window draws with (for the dialogs' pictures).
-    pub fn set_device(&self, device: slint::wgpu_30::wgpu::Device) {
-        self.dialogs.preview.set_device(device);
+    pub fn set_device(
+        &self,
+        device: slint::wgpu_30::wgpu::Device,
+        queue: slint::wgpu_30::wgpu::Queue,
+    ) {
+        self.dialogs.preview.set_device(device, queue);
     }
 }
 

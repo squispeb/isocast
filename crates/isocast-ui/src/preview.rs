@@ -165,7 +165,9 @@ pub enum Role {
 pub enum Output {
     #[cfg(target_os = "macos")]
     Layers(Rc<RefCell<crate::layers::Layers>>),
-    Image(wgpu::Device),
+    /// The frames' textures in Slint: made on `device`, their picture
+    /// filled in by `queue`.
+    Image(wgpu::Device, wgpu::Queue),
 }
 
 impl Output {
@@ -174,6 +176,7 @@ impl Output {
         app: &AppWindow,
         mode: Mode,
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         test_outline: bool,
     ) -> anyhow::Result<Self> {
         app.global::<CanvasArea>().set_test_outline(test_outline);
@@ -191,7 +194,7 @@ impl Output {
             Mode::Layers => anyhow::bail!("--preview layers is macOS only; use --preview image"),
             Mode::Image => {
                 app.global::<CanvasArea>().set_native_picture(false);
-                Output::Image(device.clone())
+                Output::Image(device.clone(), queue.clone())
             }
         })
     }
@@ -418,7 +421,7 @@ impl Preview {
         match &mut self.output {
             #[cfg(target_os = "macos")]
             Output::Layers(layers) => layers.borrow_mut().clear(self.role == Role::Program),
-            Output::Image(_) => {
+            Output::Image(..) => {
                 if let Some(app) = self.app.upgrade() {
                     let canvas = app.global::<CanvasArea>();
                     match self.role {
@@ -621,11 +624,11 @@ impl Preview {
             .and_then(|layout| layout.rects.get(selected.as_str()).copied())
     }
 
-    /// A picture from the daemon's JPEG frames (everywhere but macOS,
-    /// which gets shared surfaces in [`Self::show`]): decode it into the
-    /// canvas and draw the selected item's box over it, at the revision
-    /// the picture was drawn from.
-    #[cfg(not(target_os = "macos"))]
+    /// A picture from the daemon's JPEG frames (other platforms; macOS
+    /// and Linux get shared surfaces in [`Self::show`]): decode it into
+    /// the canvas and draw the selected item's box over it, at the
+    /// revision the picture was drawn from.
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     pub fn picture(&mut self, picture: crate::frames::Picture) {
         let Some(app) = self.app.upgrade() else {
             return;
@@ -703,18 +706,28 @@ impl Preview {
                     (Role::Editor, _) => layers.show(frame, rect, self.style, geometry(app)),
                 }
             }
-            Output::Image(device) => {
+            Output::Image(device, queue) => {
                 let canvas = app.global::<CanvasArea>();
                 if let Some(frame) = frame {
+                    // Every frame: on Linux the picture reaches the GPU
+                    // inside this call, so asking again is what updates a
+                    // slot's texture (macOS asks for nothing there). The
+                    // image over it is made once per slot.
+                    let texture = match frame.texture(device, queue) {
+                        Ok(texture) => texture,
+                        Err(error) => {
+                            isocast_diagnostics::diagnostic!("warn";
+                                "preview: can't show a shared frame: {error:#}"
+                            );
+                            return;
+                        }
+                    };
                     let key = frame.slot();
                     if !self.images.contains_key(&key) {
                         // A new ring: the old one's images go.
                         self.images
                             .retain(|(generation, _), _| *generation == key.0);
-                        match frame
-                            .texture(device)
-                            .and_then(|t| slint::Image::try_from(t).map_err(Into::into))
-                        {
+                        match slint::Image::try_from(texture) {
                             Ok(image) => {
                                 self.images.insert(key, image);
                             }

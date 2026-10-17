@@ -3,6 +3,49 @@
 Short, dated facts a future session needs. Newest entries go at the top of
 each section. Delete entries that stop being true.
 
+## Linux port progress (2026-10-16, L.4.4 the app's live monitors)
+
+- **The app's monitors show shared surfaces on Linux** (`isocast-ui/src/
+  frames.rs`): the two-transport split is `shared_frames` for macOS *and
+  Linux*, the JPEG `Picture` path keeps to other platforms. The
+  Properties/Filters dialogs' source previews (`areas/sources/
+  preview.rs`) follow the same split and now pass the source id with
+  `filtered: true`, so a filter's effect shows in the dialog like on the
+  canvas. The window's Gpu *is* Slint's renderer device
+  (`WGPUConfiguration::Manual` in gpu.rs), so the frames' textures are
+  Slint's to draw; the queue travels with the device (`Output::Image`
+  and `SourcePreview::set_device` now take both).
+- **The per-frame texture call is the update.** The old preview code
+  cached the Slint image per slot and only asked `frame.texture(device)`
+  again for a *new* slot — fine on macOS, where the texture is the
+  shared memory; on Linux the picture reaches the GPU inside that call,
+  so the image must be asked again each frame (and re-set each frame;
+  Slint samples the same GPU texture live). Skipped in an early draft,
+  caught by reasoning before any run — worth keeping in mind for
+  anything that shows frames through cached images.
+- **CPU per viewer, debug builds (10–25 s samples, /proc `<t> +stimes`
+  deltas over the daemon pair, CLK_TCK 100):** one shared-frames viewer
+  streaming the program at 30 fps costs the daemon ~34–35% of one core;
+  the old JPEG `frame` poll (a Python JSON-RPC client, program, 1280
+  wide) cost ~122% and delivered ~4.8 frames a second. The app process
+  sits at ~10–13% showing the stream (`--bench 20 --check`: 750–793
+  frames shown, 0 lost, longest gap ~43 ms). The baseline daemon (no
+  viewer) is ~0–1%. These are debug-build numbers — the release rows
+  are L.4.5's S.1 comparison, which still waits for L.5's encoder on
+  Linux for the H.264 side.
+- **Idle-daemon ghost pids:** two bench runs briefly showed a third
+  `isocastd`-matching process (~4 pids below the app's) that vanished
+  after; `--bench 6` didn't reproduce it and the daemon log shows no
+  warn/error. If it reappears, check which pid number it is relative to
+  the app's before blaming the daemon.
+- **isocast-ui on Linux: `cargo check` clean, 12 tests pass, clippy not
+  yet `-D warnings` on this box** — `keys.rs` (8), `platform.rs` (2),
+  `preview.rs::meter_rect` and `update.rs` carry pre-existing dead-code
+  warnings from macOS-only helpers that nothing in the port's steps so
+  far was asked to fix; the workspace clippy sweep before the merge
+  will either allow them (the `cfg_attr` pattern, named with a
+  milestone) or delete the helpers.
+
 ## Linux port progress (2026-10-16, L.4.3 the client shows a ring)
 
 - **`SharedFrame::texture(&device, &queue)` uploads on ask.** The client's

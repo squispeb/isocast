@@ -767,7 +767,7 @@ step live in `docs/notes.md`'s "Linux port WIP" section.
     measured against the H.264 path waits for L.5's real-time encoder
     on Linux; the shared path's own numbers: program ~38 ms late
     (read-back of another device's canvas), a source ~6 ms.
-  - [ ] **L.4.4 The app's live monitors on Linux** (Slint preview
+  - [x] **L.4.4 The app's live monitors on Linux** (Slint preview
     without the JPEG poll), with the daemon's CPU per viewer in the
     notes.
   - [ ] **L.4.5 S.1 rows on this machine** (shared frames against
@@ -1586,6 +1586,34 @@ Shipped (v1): 7.1, 7.2, 7.4a, 7.5, 7.6. Next, in order:
 - FilmCraft reads `session.json` to line up ISO files without audio sync.
 
 ## Log
+
+- L.4.4 the app's live monitors on Linux (2026-10-16): the app's monitor
+  feed and the Properties/Filters dialogs' source previews follow their
+  sources through the daemon's shared surfaces on Linux like they do on
+  macOS, instead of one `frame` round-trip (a read-back, a Y'CbCr→RGB
+  convert, a JPEG encode, a base64 hop, a decode) a picture. The feed is
+  the same two cfg'd transports with Linux in the `shared_frames` one;
+  the JPEG `Picture` path stays for other platforms. The preview code
+  had one stale habit the flip exposed: it asked for a slot's texture
+  only the first time it saw the slot, so on Linux, where the picture
+  reaches the GPU inside that call, every frame after the first would
+  have shown an old picture — both preview paths now ask for the texture
+  every frame (the image over it is still made once per slot) and
+  `Output::Image`/`SourcePreview` carry the queue the fill needs along
+  the device (`isocast-ui/src/gpu.rs` gives Slint *this* app's device, so
+  the frames' textures are Slint's own).
+  Measured on this machine, debug builds: the daemon draws one stream
+  into the app for ~34–35% of one core at 30 fps, and the old JPEG poll
+  needed ~122% for 4.8 frames a second; the app itself sits at ~10–13%
+  of a core showing 750–793 frames over 20–25 s with 0 lost. The
+  filters dialog's preview box holds real pattern colours again (153
+  distinct, mean 54, std 85 over its 290×340 box, offscreen snapshot
+  `--state dialog:filters:pattern`), against the placeholder's ~2 mean
+  the JPEG standby path left. 12 app tests pass and `cargo check -p
+  isocast-ui` is clean; the dead-code warnings `keys.rs`,
+  `platform.rs` and `preview.rs`'s `meter_rect` carry (macOS-only
+  helpers) predate this step and belong to the workspace clippy sweep
+  at merge time.
 
 - L.4.3 the client shows a ring (2026-10-16): `SharedFrame::texture`
   now takes the queue the frame's picture needs on its way into the

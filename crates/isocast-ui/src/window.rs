@@ -77,7 +77,9 @@ pub fn run(options: &Options) -> Result<()> {
     let started = Instant::now();
     let canvas = Canvas::new(&gpu, Box::new(|| 0.0), false);
     let shell = App::new(&app, commands, Mode { offscreen: false }, canvas);
-    shell.sources.set_device(gpu.device.clone());
+    shell
+        .sources
+        .set_device(gpu.device.clone(), gpu.queue.clone());
     APP.with(|s| *s.borrow_mut() = Some(shell.clone()));
 
     // macOS reports a window covered by others as occluded and Slint then
@@ -121,6 +123,7 @@ pub fn run(options: &Options) -> Result<()> {
         shell.clone(),
         Setup {
             device: gpu.device.clone(),
+            queue: gpu.queue.clone(),
             mode: options.preview,
             fps: options.fps,
             check: options.frame_check,
@@ -251,6 +254,9 @@ pub fn run(options: &Options) -> Result<()> {
 #[derive(Clone)]
 struct Setup {
     device: slint::wgpu_30::wgpu::Device,
+    /// Fills the frames' pictures into the device's textures (the frames'
+    /// shared surfaces are memory first).
+    queue: slint::wgpu_30::wgpu::Queue,
     mode: crate::preview::Mode,
     fps: u32,
     check: bool,
@@ -279,8 +285,13 @@ fn setup_when_ready(weak: slint::Weak<AppWindow>, shell: Rc<App>, setup: Setup) 
         }
         crate::quit::install_terminate_question();
         crate::update::start(&shell);
-        let output =
-            crate::preview::Output::new(&app, setup.mode, &setup.device, setup.test_outline);
+        let output = crate::preview::Output::new(
+            &app,
+            setup.mode,
+            &setup.device,
+            &setup.queue,
+            setup.test_outline,
+        );
         match output {
             Ok(output) => {
                 #[cfg(target_os = "macos")]
