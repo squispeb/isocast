@@ -73,6 +73,14 @@ pub enum Method {
     /// Stop recording and finish the files. Returns the session's
     /// [`Report`].
     Stop,
+    /// Ask the running session to stop (or cancel one still starting) and
+    /// answer at once, without waiting for its files to be finished.
+    /// Returns [`StopAccepted`]: an acknowledgement, not a finished
+    /// recording. Until the files are done, `status` says `finalizing`
+    /// and a new `start` is refused; the [`Event::Stopped`] event (and
+    /// `status`'s `last` or `last_error`) then gives the outcome. Asking
+    /// again while finalizing answers the same way; refused when idle.
+    RequestStop,
     /// Split the running recording into a new take at the next whole
     /// second, without stopping any device: the current files end there and
     /// new ones (with their own manifest) begin. Returns the new take's
@@ -1616,6 +1624,21 @@ impl Notification {
     }
 }
 
+/// [`Method::RequestStop`]'s answer: the stop was asked for, nothing more.
+/// The files are still being finished; wait for [`Event::Stopped`] (or a
+/// `status` no longer `finalizing`) to learn whether they were.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct StopAccepted {
+    /// The session asked to stop (this isocastd's own count).
+    pub session_id: u64,
+    /// The session was finishing its files when the request was taken (a
+    /// snapshot: it may have finished since).
+    pub finalizing: bool,
+    /// The files it was writing, as known then (empty while still
+    /// starting); provisional until it has stopped.
+    pub files: Vec<PathBuf>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Started {
     pub files: Vec<PathBuf>,
@@ -1650,6 +1673,14 @@ pub struct LoadWarning {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Status {
     pub state: EngineState,
+    /// A stop has been requested for the running session (or its start
+    /// cancelled) and it hasn't ended yet. This says the request was
+    /// accepted, not where the files were cut or that they are on disk.
+    /// Until it ends, `start`, `pause`, `resume` and `split` are refused;
+    /// then `last` (or `last_error`) and the `stopped` event give the
+    /// outcome.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub finalizing: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub governor: Option<crate::governor::GovernorStatus>,
     /// A compact calibration summary; machine_profile returns the measurements.
@@ -2828,6 +2859,12 @@ pub struct ChannelLevel {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct LiveFile {
     pub source: String,
+    /// Codec of this take, not the editable setup's next-take settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codec: Option<crate::Codec>,
+    /// The native encoder's actual selection; unknown is not hardware.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hardware_accelerated: Option<bool>,
     pub frames: u64,
     /// Frames due so far that never reached the file. Approximate while
     /// recording; the final report has the exact count.
@@ -3122,7 +3159,8 @@ pub struct CapacityEstimate {
     /// This Mac's chip, as macOS names it.
     pub chip: String,
     /// H.264/HEVC encode engines on the chip. Each file's encoder runs on
-    /// one of them for its whole life (ProRes has engines of its own).
+    /// one of them for its whole life. ProRes uses separate resource estimates,
+    /// including native hardware/software selection where observed.
     pub encode_engines: u32,
     /// Pixels a second one engine encodes in real time (8-bit HEVC at
     /// Isocast's settings) before files drop frames.
@@ -3132,14 +3170,19 @@ pub struct CapacityEstimate {
     pub basis: String,
     /// The video encodes the setup asks for.
     pub outputs: Vec<EstimatedOutput>,
-    /// The busiest engine's work over what it manages in real time: up to
+    /// Separate ProRes/native, CPU, graphics and disk observations. Empty
+    /// for the legacy H.26x-only estimate; unknown capacity is never zero.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resources: Vec<ResourceEstimate>,
+    /// The largest qualified resource load (legacy: busiest H.26x engine): up to
     /// 0.85 fits, up to 1 keeps up with no margin, over 1 drops frames.
     pub load: f64,
     pub capacity: Capacity,
     /// Whether the stream's encode is counted.
     pub streaming: bool,
-    /// At least this share of ISO pictures can't be encoded, in percent
-    /// (the program and stream are served first; 0 when it keeps up).
+    /// H.26x-only loss model in percent. ProRes resource estimates do not
+    /// supply a numeric loss forecast (0; see resources and summary), which
+    /// must not be interpreted as a promise of zero loss.
     pub iso_drop_percent: f64,
     /// The verdict in words.
     pub summary: String,
@@ -3158,6 +3201,17 @@ pub struct CapacityEstimate {
     /// sizes, rates and codecs, and the stream): what a client remembers
     /// for "don't show again for this setup".
     pub workload_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ResourceEstimate {
+    pub resource: String,
+    pub unit: String,
+    pub demand: f64,
+    /// None means unqualified/unknown, not unlimited capacity.
+    pub capacity: Option<f64>,
+    pub load: Option<f64>,
+    pub basis: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -3182,7 +3236,8 @@ pub struct EstimatedOutput {
     /// drop pictures first.
     pub protected: bool,
     /// Its work on the H.264/HEVC engines, in HEVC-equivalent pixels a
-    /// second; 0 for ProRes, which has engines of its own.
+    /// second; 0 for ProRes in this H.26x field, not zero overall work (see
+    /// the estimate's separate resources).
     pub pixels_per_second: f64,
     /// The size or rate wasn't known (the source isn't running), so the
     /// canvas's was assumed.

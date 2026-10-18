@@ -96,8 +96,7 @@ pub struct Initialized {
 }
 
 /// Recording folder when none is given.
-pub const DEFAULT_FOLDER: &str =
-    crate::platform_text::select("~/Movies/Isocast", "~/Videos/Isocast");
+pub const DEFAULT_FOLDER: &str = "~/Movies/Isocast";
 
 /// Conservative starting cadence for a new setup/profile, never an edit to
 /// an existing one. Memory and CPU counts are portable; they don't pretend
@@ -150,7 +149,11 @@ pub fn init(devices: &Devices, options: &InitOptions) -> Result<Initialized, Str
             Some((found, found.id.clone()))
         }
     };
-    let screen_allowed = permissions.screen_recording == Permission::Granted;
+    // Unknown can't be checked without trying, so capture is attempted.
+    let screen_allowed = matches!(
+        permissions.screen_recording,
+        Permission::Granted | Permission::Unknown
+    );
     let fps = options.fps.unwrap_or_else(|| {
         // A display that refreshes more slowly than 60 Hz sets the pace.
         match display.as_ref().map(|(d, _)| d.refresh_rate.round() as u32) {
@@ -239,12 +242,20 @@ pub fn init(devices: &Devices, options: &InitOptions) -> Result<Initialized, Str
             }
         ));
         let kind = match permissions.camera {
-            Permission::Granted | Permission::NotDetermined => {
+            Permission::Granted | Permission::NotDetermined | Permission::Unknown => {
                 iso.push("camera".to_string());
                 if permissions.camera == Permission::NotDetermined {
                     notes.push(
-                        crate::platform_text::select("macOS asks for camera access the first time the camera is used; \
-                         `isocast permissions --request` asks now.", "Windows Camera privacy settings must allow desktop apps. isocastd.exe is the recording engine; `isocast permissions` reports access.")
+                        "macOS asks for camera access the first time the camera is used; \
+                         `isocast permissions --request` asks now."
+                            .into(),
+                    );
+                }
+                if permissions.camera == Permission::Unknown {
+                    notes.push(
+                        "Camera access can't be checked without using the camera, so it is \
+                         tried when recording starts; if it shows no picture, allow camera \
+                         access in the system's privacy settings."
                             .into(),
                     );
                 }
@@ -299,7 +310,10 @@ pub fn init(devices: &Devices, options: &InitOptions) -> Result<Initialized, Str
     match (microphone, permissions.microphone) {
         (None, _) if options.microphone.as_deref() == Some("none") => {}
         (None, _) => notes.push("No microphone was found, so there is none in the setup.".into()),
-        (Some((found, device)), Permission::Granted | Permission::NotDetermined) => {
+        (
+            Some((found, device)),
+            Permission::Granted | Permission::NotDetermined | Permission::Unknown,
+        ) => {
             notes.push(if device == "default" {
                 format!(
                     "Microphone: the system's default input, now {:?}.",
@@ -310,8 +324,16 @@ pub fn init(devices: &Devices, options: &InitOptions) -> Result<Initialized, Str
             });
             if permissions.microphone == Permission::NotDetermined {
                 notes.push(
-                    crate::platform_text::select("macOS asks for microphone access the first time it is used; `isocast \
-                     permissions --request` asks now.", "Windows Microphone privacy settings must allow desktop apps. isocastd.exe is the recording engine; `isocast permissions` reports access.")
+                    "macOS asks for microphone access the first time it is used; `isocast \
+                     permissions --request` asks now."
+                        .into(),
+                );
+            }
+            if permissions.microphone == Permission::Unknown {
+                notes.push(
+                    "Microphone access can't be checked without using it, so it is tried \
+                     when recording starts; if it records silence, allow microphone access \
+                     in the system's privacy settings."
                         .into(),
                 );
             }
@@ -334,10 +356,7 @@ pub fn init(devices: &Devices, options: &InitOptions) -> Result<Initialized, Str
             "Desktop Audio",
             SourceKind::SystemAudio(SystemAudioSource::default()),
         ));
-        notes.push(format!(
-            "Desktop audio: what this {} plays, in the program.",
-            crate::platform_text::MACHINE
-        ));
+        notes.push("Desktop audio: what this Mac plays, in the program.".into());
     }
     let program_audio: Vec<String> = sources
         .iter()

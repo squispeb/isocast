@@ -755,7 +755,7 @@ impl Create {
             let s = app.session.borrow();
             (
                 s.status.as_ref().map(|x| x.state),
-                s.busy_record,
+                s.record_busy(),
                 s.setup.is_some(),
             )
         };
@@ -905,7 +905,7 @@ impl Create {
     }
 
     fn retake(&self, app: &Rc<App>) {
-        if self.retake_since.get().is_some() {
+        if self.retake_since.get().is_some() || app.session.borrow().record_busy() {
             return;
         }
         self.retake_since.set(Some(crate::clock::now()));
@@ -1085,7 +1085,7 @@ impl Create {
                             format!("Exported for {}", exported.app.title()),
                             detail,
                         )
-                        .action(isocast_protocol::platform_text::SHOW_IN_FILES, move |_| {
+                        .action("Show in Finder", move |_| {
                             crate::platform::reveal(&shown.display().to_string())
                         }),
                     );
@@ -1132,7 +1132,7 @@ impl Create {
         let menu = MenuBuilder::new()
             .item("editor", "Open in Editor")
             .separator()
-            .item("reveal", isocast_protocol::platform_text::SHOW_IN_FILES)
+            .item("reveal", "Show in Finder")
             .disabled(!file);
         let menu = match offline {
             true => menu.item("relink", "Relink…"),
@@ -2538,7 +2538,7 @@ impl Create {
                             mm_ss(seconds)
                         ),
                     )
-                    .action(isocast_protocol::platform_text::SHOW_IN_FILES, move |_| {
+                    .action("Show in Finder", move |_| {
                         crate::platform::reveal(&shown.display().to_string())
                     }),
                 );

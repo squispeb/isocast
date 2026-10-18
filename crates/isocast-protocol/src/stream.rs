@@ -569,9 +569,8 @@ impl StreamSettings {
                         &field,
                         format!(
                             "this looks like it has the stream key after /{app}/; give the server \
-                             alone ({alone}) and keep the key in the {} with `isocast \
-                             stream key set`",
-                            crate::platform_text::CREDENTIAL_STORE
+                             alone ({alone}) and keep the key in the Keychain with `isocast \
+                             stream key set`"
                         ),
                     );
                 }

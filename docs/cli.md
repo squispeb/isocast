@@ -179,7 +179,7 @@ Commands:
   record         Record a setup's ISO sources, each to its own file, until --seconds runs out or Ctrl-C. Without a setup file, record --source specs
   start          Start recording in the background (in isocastd, launched if needed) and return once every file is created. Same options as `record`; with neither a setup nor --source, records the live setup. A setup or --source given here becomes the live setup
   record-target  Where the next recording goes, or choose it: `new` (each recording starts a new project with its own timeline; the default) or a timeline's id (its next take). Kept across restarts; a recording running keeps its own
-  stop           Stop the background recording and print its report
+  stop           Ask the background recording to stop and return at once, while isocastd finishes its files (`status` says finalizing until it has; the files aren't done yet). With --wait, wait until they are and print the report
   pause          Pause this take without closing its files; streaming continues
   resume         Resume the paused take into the same files
   status         Show whether isocastd is recording, with live counters
@@ -1452,11 +1452,12 @@ Options:
 ## isocast stop
 
 ```text
-Stop the background recording and print its report
+Ask the background recording to stop and return at once, while isocastd finishes its files (`status` says finalizing until it has; the files aren't done yet). With --wait, wait until they are and print the report
 
 Usage: isocast stop [OPTIONS]
 
 Options:
+      --wait  Wait for the files to be finished and print the report; exits with failure if the recording had errors
       --json  
   -h, --help  Print help
 ```

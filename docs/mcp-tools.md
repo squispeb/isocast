@@ -10,7 +10,7 @@ a client, for example:
 claude mcp add isocast -- isocast mcp
 ```
 
-108 tools. Arguments marked required must be given; ids, not names,
+109 tools. Arguments marked required must be given; ids, not names,
 address sources, scenes and clips. Errors name the field and list the
 valid options.
 
@@ -658,6 +658,10 @@ Ask macOS for screen recording, camera and microphone access where it hasn't bee
 | Argument | Type | Description |
 |---|---|---|
 | `permission` | PermissionKind | Only this one: screen_recording, camera, microphone or system_audio (all not decided yet if left out). |
+
+## request_stop_recording
+
+Ask the recording to stop and return at once, while the files are still being finished. Returns the session id, `finalizing` and the files known so far (provisional): not a finished recording. get_status says `finalizing` until the files are done (a new recording is refused until then); then `last` (or `last_error`) and the `stopped` event give the report. Asking again while finalizing returns the same; use stop_recording to wait for the report instead.
 
 ## restart_isocastd
 

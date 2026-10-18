@@ -131,8 +131,8 @@ impl Area for PermissionsStep {
             let missing = report
                 .details
                 .iter()
-                .any(|d| needed[index(d.permission)] && d.state != Permission::Granted);
-            *app.permissions.report.borrow_mut() = Some(report);
+                .any(|d| needed[index(d.permission)] && !settled(d.state));
+            app.permissions.take(app, report);
             if missing {
                 app.permissions.open(app, first);
             }
@@ -255,14 +255,7 @@ impl PermissionsStep {
             match answer {
                 Ok(report) => self.take(app, report),
                 Err(error) => {
-                    app.toast(
-                        ToastKind::Error,
-                        isocast_protocol::platform_text::select(
-                            "Couldn’t ask macOS",
-                            "Couldn’t check Windows access",
-                        ),
-                        error,
-                    );
+                    app.toast(ToastKind::Error, "Couldn’t ask macOS", error);
                 }
             }
             self.show(app);
@@ -380,13 +373,7 @@ impl PermissionsStep {
                 let step = &app.permissions;
                 step.busy.set(None);
                 if let Err(error) = result {
-                    app.failed(
-                        isocast_protocol::platform_text::select(
-                            "Couldn’t open System Settings",
-                            "Couldn’t open Windows Settings",
-                        ),
-                        &error,
-                    );
+                    app.failed("Couldn’t open System Settings", &error);
                     step.show(app);
                     return;
                 }
@@ -395,9 +382,7 @@ impl PermissionsStep {
                     .borrow()
                     .as_ref()
                     .and_then(|r| r.details.iter().find(|d| d.permission == kind).cloned());
-                if !cfg!(windows)
-                    && let Some(path) = detail.as_ref().and_then(|d| d.app_path.clone())
-                {
+                if let Some(path) = detail.as_ref().and_then(|d| d.app_path.clone()) {
                     let detail = detail.expect("checked above");
                     // A screen recording grant (or a denied one) is turned on
                     // by hand; drag it in if it isn't listed.
@@ -506,6 +491,12 @@ impl PermissionsStep {
             needed(app, report.as_ref())
         };
         area.set_checked(report.is_some());
+        area.set_unknown_access(report.as_ref().is_some_and(|report| {
+            report
+                .details
+                .iter()
+                .any(|d| d.state == Permission::Unknown)
+        }));
         area.set_first_launch(self.first_launch.get());
         area.set_helper_shown(helper);
         let Some(report) = report.as_ref() else {
@@ -513,7 +504,7 @@ impl PermissionsStep {
             return;
         };
         area.set_app_name(
-            if cfg!(windows) || report.app == "isocastd" {
+            if report.app == "isocastd" {
                 "Isocast"
             } else {
                 report.app.as_str()
@@ -524,7 +515,7 @@ impl PermissionsStep {
             report
                 .details
                 .iter()
-                .all(|d| !needed[index(d.permission)] || d.state == Permission::Granted),
+                .all(|d| !needed[index(d.permission)] || settled(d.state)),
         );
         let busy = self.busy.get();
         area.set_items(model(report.details.iter().map(|d| {
@@ -539,7 +530,6 @@ impl PermissionsStep {
 
 /// One permission's row: its status in words, what happened in plain
 /// words, and the one action.
-#[cfg(not(windows))]
 fn row(d: &PermissionDetail, needed: bool, busy: Option<&str>) -> PermissionItem {
     let (icon, title, purpose, pane) = match d.permission {
         PermissionKind::ScreenRecording => (
@@ -601,6 +591,23 @@ fn row(d: &PermissionDetail, needed: bool, busy: Option<&str>) -> PermissionItem
             Permission::NotDetermined => {
                 ("not-asked", "Not asked yet", String::new(), "ask", "Allow…")
             }
+            // Neutral: neither allowed nor refused, and nothing to ask.
+            Permission::Unknown => {
+                let (action, label) = if d.action == PermissionAction::OpenSettings {
+                    ("open", "Open Settings")
+                } else {
+                    ("", "")
+                };
+                (
+                    "not-asked",
+                    "Unknown",
+                    d.next_step.clone().unwrap_or_else(|| {
+                        "It can’t be checked without using it, so recording tries it.".into()
+                    }),
+                    action,
+                    label,
+                )
+            }
             Permission::Restricted => (
                 "blocked",
                 "Blocked",
@@ -628,7 +635,9 @@ fn row(d: &PermissionDetail, needed: bool, busy: Option<&str>) -> PermissionItem
         }
     };
     // System audio is never required (screen recording records it too).
-    let purpose = if needed || d.permission == PermissionKind::SystemAudio {
+    let purpose = if d.state == Permission::Unknown {
+        d.needed_for.clone()
+    } else if needed || d.permission == PermissionKind::SystemAudio {
         purpose.to_string()
     } else {
         format!("{purpose} This setup doesn’t use it.")
@@ -650,80 +659,6 @@ fn row(d: &PermissionDetail, needed: bool, busy: Option<&str>) -> PermissionItem
     }
 }
 
-#[cfg(windows)]
-fn row(d: &PermissionDetail, needed: bool, busy: Option<&str>) -> PermissionItem {
-    let (icon, title, purpose, instructions) = match d.permission {
-        PermissionKind::ScreenRecording => (
-            "display",
-            "Screen Recording",
-            "Displays and windows on this PC.",
-            "Choose a display or window in Isocast. Windows capture policies or protected content may prevent capture; check Settings › Privacy & security › Screenshots and screen recording where that page is available.",
-        ),
-        PermissionKind::Camera => (
-            "camera",
-            "Camera",
-            "Cameras and capture cards.",
-            "Open Settings › Privacy & security (Privacy on Windows 10) › Camera. Turn on Camera access and Let desktop apps access your camera. isocastd.exe is the recording engine; desktop apps do not have individual access switches.",
-        ),
-        PermissionKind::Microphone => (
-            "mic",
-            "Microphone",
-            "Microphones and audio interfaces.",
-            "Open Settings › Privacy & security (Privacy on Windows 10) › Microphone. Turn on Microphone access and Let desktop apps access your microphone. isocastd.exe is the recording engine; desktop apps do not have individual access switches.",
-        ),
-        PermissionKind::SystemAudio => (
-            "speaker",
-            "System Audio",
-            "Optional: what this PC and its apps play.",
-            "Output audio uses Windows loopback capture, not a separate microphone grant. Check the output device in Settings › System › Sound; device policy or protected content may prevent capture.",
-        ),
-    };
-    // Follow the engine's action/capability, not a Mac-specific prompt or
-    // signing failure inferred from a denied status. Its native next step wins.
-    let (status, label, action, action_label) = if d.state == Permission::Granted {
-        ("allowed", "Allowed", "", "")
-    } else if d.state == Permission::Restricted || d.action == PermissionAction::AskAdministrator {
-        ("blocked", "Blocked", "", "")
-    } else {
-        match d.action {
-            PermissionAction::Restart => {
-                ("relaunch", "Needs restart", "relaunch", "Restart Engine")
-            }
-            PermissionAction::Request => ("not-asked", "Not checked", "ask", "Check Access"),
-            PermissionAction::OpenSettings => ("denied", "Not allowed", "open", "Open Settings"),
-            _ => ("denied", "Unavailable", "", ""),
-        }
-    };
-    let detail = if d.state == Permission::Granted {
-        String::new()
-    } else if status == "blocked" {
-        d.next_step.clone().unwrap_or_else(|| "Windows or an organisation policy blocks this access. Ask this PC’s administrator to review the policy.".into())
-    } else if d.action == PermissionAction::Restart {
-        "After changing Windows settings, restart isocastd.exe once recording, streaming and exports have stopped. Your setup is kept.".into()
-    } else {
-        d.next_step.clone().unwrap_or_else(|| instructions.into())
-    };
-    PermissionItem {
-        id: PermissionKind::NAMES[index(d.permission)].into(),
-        icon: icon.into(),
-        title: title.into(),
-        purpose: if needed || d.permission == PermissionKind::SystemAudio {
-            purpose.into()
-        } else {
-            format!("{purpose} This setup doesn’t use it.").into()
-        },
-        status: status.into(),
-        status_label: label.into(),
-        detail: detail.into(),
-        action: action.into(),
-        action_label: action_label.into(),
-        alt_action: "".into(),
-        alt_label: "".into(),
-        busy: busy.is_some(),
-        needed,
-    }
-}
-
 /// The helper's one line.
 fn helper_line(app: &str, drag: bool) -> String {
     if drag {
@@ -737,13 +672,17 @@ fn helper_line(app: &str, drag: bool) -> String {
 /// bare isocastd (a development build), whose name means nothing to a
 /// person.
 fn shown_name(d: &PermissionDetail) -> &str {
-    if cfg!(windows) {
-        isocast_protocol::platform_text::ENGINE
-    } else if d.app_path.is_none() && d.app == "isocastd" {
+    if d.app_path.is_none() && d.app == "isocastd" {
         "Isocast"
     } else {
         &d.app
     }
+}
+
+/// Nothing left to do before recording: granted, or unknown (it can only
+/// be found out by recording, which tries it).
+fn settled(state: Permission) -> bool {
+    matches!(state, Permission::Granted | Permission::Unknown)
 }
 
 fn index(kind: PermissionKind) -> usize {

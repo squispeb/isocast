@@ -11,7 +11,7 @@
 
 import { Theme } from "../../theme.slint";
 import { Icons } from "../../icons.slint";
-import { Ui, PlatformText } from "../../state.slint";
+import { Ui } from "../../state.slint";
 import {
     Capsule, CapsuleButton, CapsuleDivider, IconButton, Lcd, LcdCell, LcdTime, LcdTone, MasterMeter,
     Tip, TransportButton, TransportKind,
@@ -159,9 +159,9 @@ export component ControlBar inherits Rectangle {
                     label: "CPU";
                     idle: !ControlsArea.engine-running || !ControlsArea.lcd-cpu-known;
                     last: true;
-                    description: "The engine’s share of this " + PlatformText.machine + "’s processor (all cores)";
+                    description: "The engine’s share of this Mac’s processor (all cores)";
                     Tooltip {
-                        Tip { text: "The engine’s share of this " + PlatformText.machine + "’s processor (all cores)"; }
+                        Tip { text: "The engine’s share of this Mac’s processor (all cores)"; }
                     }
                 }
             }
@@ -215,7 +215,7 @@ export component ControlBar inherits Rectangle {
                         kind: TransportKind.record;
                         active: root.recording || ControlsArea.record-state == "starting";
                         enabled: Ui.has-setup && !ControlsArea.busy-record;
-                        label: ControlsArea.record-state == "starting" ? "Starting…" : ControlsArea.record-state == "stopping" ? "Stopping…" : root.recording ? "Stop Recording" : "Start Recording";
+                        label: ControlsArea.record-state == "starting" ? "Starting…" : ControlsArea.record-state == "stopping" ? "Finalizing…" : root.recording ? "Stop Recording" : "Start Recording";
                         clicked => { ControlsArea.toggle-record(); }
                     }
                 }

@@ -752,10 +752,7 @@ fn verdict(o: &Optimized) -> String {
     match (&t.recommendation, &t.change) {
         // The settings it picked didn't fit; what was applied does.
         (Some(recommendation), Some(_)) => {
-            format!(
-                "Stepped down to fit this {}: {recommendation}.",
-                isocast_protocol::platform_text::MACHINE
-            )
+            format!("Stepped down to fit this Mac: {recommendation}.")
         }
         _ => format!("{base}{speed}."),
     }

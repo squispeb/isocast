@@ -23,7 +23,6 @@ use isocast_protocol::library::{
     Library as Listing, LibraryAction, LibraryChange, LibraryCreateParams, LibraryDocument,
     LibraryEntry, LibraryKind, LibraryRenameParams, LibrarySwitchParams, LibraryTarget,
 };
-use isocast_protocol::platform_text::SHOW_IN_FILES;
 use slint::{ComponentHandle, ModelRc, VecModel};
 
 use super::{Area, Changed};
@@ -515,7 +514,7 @@ impl Library {
                     let reveal = path.clone();
                     app.show_toast(
                         Toast::new(ToastKind::Success, format!("Exported “{name}”"), path)
-                            .action(SHOW_IN_FILES, move |_| platform::reveal(&reveal)),
+                            .action("Show in Finder", move |_| platform::reveal(&reveal)),
                     );
                 }
                 Err(error) => {

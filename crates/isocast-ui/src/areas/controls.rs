@@ -10,7 +10,6 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use isocast_protocol::api::{Capacity, EngineState, Event, LiveFile, Method, Overload};
-use isocast_protocol::platform_text as wording;
 use isocast_protocol::replay::{ReplaySaved, ReplayState, ReplayStatus};
 use isocast_protocol::stream::{StreamService, StreamState, StreamStatus};
 use isocast_protocol::timeline::{RecordTarget, RecordTargetParams, RecordingInto};
@@ -592,8 +591,8 @@ impl Area for Controls {
                     clips: if arg == "new" { 1 } else { 4 },
                 };
                 let report: isocast_protocol::api::Report = match serde_json::from_value(json!({
-                    "folder": wording::select("/Users/you/Movies/Isocast/2026-10-17 19-27-03 Untitled", r"C:\Users\you\Videos\Isocast\2026-10-17 19-27-03 Untitled"),
-                    "manifest": wording::select("/Users/you/Movies/Isocast/2026-10-17 19-27-03 Untitled/2026-10-17 19-27-03.session.json", r"C:\Users\you\Videos\Isocast\2026-10-17 19-27-03 Untitled\2026-10-17 19-27-03.session.json"),
+                    "folder": "/Users/you/Movies/Isocast/2026-10-17 19-27-03 Untitled",
+                    "manifest": "/Users/you/Movies/Isocast/2026-10-17 19-27-03 Untitled/2026-10-17 19-27-03.session.json",
                     "duration_seconds": 12.0,
                     "files": [],
                 })) {
@@ -670,11 +669,7 @@ impl Area for Controls {
                 "saved" => replay_saved(
                     app,
                     &ReplaySaved {
-                        path: wording::select(
-                            "~/Movies/Isocast/Replay 2026-10-15 14-32-18.mov",
-                            "~/Videos/Isocast/Replay 2026-10-15 14-32-18.mov",
-                        )
-                        .into(),
+                        path: "~/Movies/Isocast/Replay 2026-10-15 14-32-18.mov".into(),
                         seconds: 30.4,
                         frames: 1824,
                         bytes: 46_100_000,
@@ -692,10 +687,7 @@ impl Area for Controls {
                 app.toast(
                     ToastKind::Error,
                     "Couldn’t start recording",
-                    wording::select(
-                        "Not enough free space on Macintosh HD: 3.2 GB free, 20 GB needed.",
-                        "Not enough free space on C: 3.2 GB free, 20 GB needed.",
-                    ),
+                    "Not enough free space on Macintosh HD: 3.2 GB free, 20 GB needed.",
                 );
                 app.toast(
                     ToastKind::Warning,
@@ -705,7 +697,7 @@ impl Area for Controls {
                 app.toast(
                     ToastKind::Success,
                     "Recording saved",
-                    wording::select("3 files in ~/Movies/Isocast", "3 files in ~/Videos/Isocast"),
+                    "3 files in ~/Movies/Isocast",
                 );
                 app.show_toast(
                     Toast::new(ToastKind::Info, "Removed “Intro Clip”", "").action("Undo", |_| {}),
@@ -800,11 +792,12 @@ fn sample_overload(fits: bool) -> Overload {
         protected_dropping: false,
         reason: String::new(),
         estimate: Some(CapacityEstimate {
-            chip: wording::select("Apple M2", "Sample Windows PC").into(),
+            chip: "Apple M2".into(),
             encode_engines: 1,
             engine_pixels_per_second: 8e8,
             basis: "measured".into(),
             outputs: Vec::new(),
+            resources: Vec::new(),
             load: if fits { 0.6 } else { 1.09 },
             capacity: if fits {
                 Capacity::Fits
@@ -1012,6 +1005,9 @@ impl Controls {
         let recording = state == Some(EngineState::Recording);
         area.set_record_state(
             match (state, s.busy_record) {
+                // Finishing its files after a stop (even one asked while
+                // it was still starting).
+                (Some(_), _) if s.finalizing() => "stopping",
                 (Some(EngineState::Starting), _) => "starting",
                 (Some(EngineState::Recording), true) => "stopping",
                 (Some(EngineState::Recording), false) => "recording",
@@ -1019,7 +1015,7 @@ impl Controls {
             }
             .into(),
         );
-        area.set_busy_record(s.busy_record);
+        area.set_busy_record(s.record_busy());
         let live = s.status.as_ref().and_then(|x| x.live.as_ref());
         self.recording
             .set(recording.then(|| live.map_or(0.0, |l| l.elapsed_seconds)));
@@ -2148,6 +2144,9 @@ fn add_marker(app: &Rc<App>, label: &str) {
 }
 
 fn split(app: &Rc<App>) {
+    if app.session.borrow().record_busy() {
+        return;
+    }
     app.call(Method::Split, |app, result| match result {
         Ok(started) => {
             let files = started["files"].as_array().map_or(0, Vec::len);
@@ -2183,15 +2182,23 @@ fn reveal(path: &str) {
 fn toggle_recording(app: &Rc<App>) {
     let recording = {
         let mut s = app.session.borrow_mut();
-        if s.busy_record {
+        if s.record_busy() {
             return;
         }
         s.busy_record = true;
+        // Status reads asked before this say nothing newer.
+        s.record_epoch += 1;
         let recording = s
             .status
             .as_ref()
             .is_some_and(|x| matches!(x.state, EngineState::Recording | EngineState::Starting));
-        if !recording {
+        if recording {
+            // Shown as finalizing at once; only a status read or the
+            // `stopped` event ends it, never the stop's acknowledgement.
+            if let Some(status) = s.status.as_mut() {
+                status.finalizing = true;
+            }
+        } else {
             // Shown as starting at once (the engine may take a moment).
             match s.status.as_mut() {
                 Some(status) => status.state = EngineState::Starting,
@@ -2209,12 +2216,27 @@ fn toggle_recording(app: &Rc<App>) {
         app.refresh_status(true);
     };
     if recording {
-        app.call(Method::Stop, move |app, result| {
+        let epoch = app.session.borrow().record_epoch;
+        // Answered at once: the files are still being finished (the
+        // status's `finalizing`) until the `stopped` event.
+        app.call(Method::RequestStop, move |app, result| {
             match result {
                 // The `stopped` event's toast says where it went (#114),
                 // for this window's stop and any other alike.
                 Ok(_) => {}
-                Err(error) => app.failed("Couldn’t stop recording", &error),
+                Err(error) => {
+                    // Not stopping after all (the status read below says
+                    // whether the engine finishes files anyway).
+                    {
+                        let mut session = app.session.borrow_mut();
+                        if session.record_epoch == epoch
+                            && let Some(status) = session.status.as_mut()
+                        {
+                            status.finalizing = false;
+                        }
+                    }
+                    app.failed("Couldn’t stop recording", &error);
+                }
             }
             done(app);
         });
@@ -2248,7 +2270,7 @@ fn toggle_recording(app: &Rc<App>) {
 /// Pause the recording (its files stay open, a stream carries on) or
 /// resume it.
 fn toggle_pause(app: &Rc<App>) {
-    if app.controls.busy_pause.get() {
+    if app.controls.busy_pause.get() || app.session.borrow().record_busy() {
         return;
     }
     let paused = app
@@ -2646,11 +2668,11 @@ fn sample_vcam(app: &Rc<App>, which: &str) -> anyhow::Result<VirtualCameraStatus
     match which {
         "missing" => {
             status.state = VirtualCameraState::Failed;
-            status.last_error = Some(wording::select("virtual_camera: Isocast Virtual Camera is not installed/approved; run scripts/vcam-install.sh (a development engine never installs it)", "virtual_camera: Windows virtual camera installation is not available in this build").into());
+            status.last_error = Some("virtual_camera: Isocast Virtual Camera is not installed/approved; run scripts/vcam-install.sh (a development engine never installs it)".into());
         }
         "approval" => {
             status.state = VirtualCameraState::Failed;
-            status.last_error = Some(wording::select("virtual_camera: allow Isocast Virtual Camera in System Settings › General › Login Items & Extensions › Camera Extensions (macOS asks once); it starts as soon as you do", "virtual_camera: Windows virtual camera installation is not available in this build").into());
+            status.last_error = Some("virtual_camera: allow Isocast Virtual Camera in System Settings › General › Login Items & Extensions › Camera Extensions (macOS asks once); it starts as soon as you do".into());
         }
         "running" => {
             status.state = VirtualCameraState::Running;
@@ -2835,7 +2857,7 @@ pub fn replay_saved(app: &Rc<App>, saved: &ReplaySaved) {
     let shown = saved.path.clone();
     app.show_toast(
         Toast::new(ToastKind::Success, "Replay saved", message)
-            .action(wording::SHOW_IN_FILES, move |_| reveal(&shown)),
+            .action("Show in Finder", move |_| reveal(&shown)),
     );
 }
 
@@ -2856,10 +2878,9 @@ fn vertical_stream_state(s: &crate::session::Session) -> (bool, bool, Option<&'s
     let problem = if !configured || all_off {
         None
     } else if enabled.is_empty() || enabled.iter().any(|x| !x.key_set) {
-        Some(wording::select(
+        Some(
             "Add the vertical canvas’s stream key. It’s kept in the Keychain, apart from the main canvas’s.",
-            "Add the vertical canvas’s stream key. It’s kept in the Credential Manager, apart from the main canvas’s.",
-        ))
+        )
     } else if enabled.iter().any(|x| x.key_problem.is_some()) {
         Some(
             "The vertical canvas’s saved stream key can’t be read. Settings › Stream says how to fix it.",
@@ -2977,10 +2998,7 @@ fn toggle_stream(app: &Rc<App>) {
         let missing = if s.setup.as_ref().is_some_and(|x| x.stream.is_none()) {
             Some("Choose where to stream first.")
         } else if s.stream.as_ref().is_some_and(|x| !x.key_set) {
-            Some(wording::select(
-                "Add your stream key first. It’s kept in the Keychain, never in the setup.",
-                "Add your stream key first. It’s kept in the Credential Manager, never in the setup.",
-            ))
+            Some("Add your stream key first. It’s kept in the Keychain, never in the setup.")
         } else if s.stream.as_ref().is_some_and(|x| x.key_problem.is_some()) {
             Some("The saved stream key can’t be read. Settings › Stream says how to fix it.")
         } else {
@@ -3118,10 +3136,7 @@ pub(crate) fn governor_words(
         parts.push("kept settings stop it lowering more".to_string());
     }
     Some(if parts.is_empty() {
-        format!(
-            "Automatic quality is watching this {}’s load",
-            wording::MACHINE
-        )
+        "Automatic quality is watching this Mac’s load".to_string()
     } else {
         format!("Automatic quality: {}", parts.join(", "))
     })
@@ -3219,10 +3234,9 @@ fn sample_stream(which: &str) -> anyhow::Result<StreamStatus> {
         "key-problem" => json!({
             "state": "offline", "service": "twitch", "server": "live.twitch.tv",
             "key_set": true,
-            "key_problem": wording::select("The saved key was stored by a differently signed copy of this \
+            "key_problem": "The saved key was stored by a differently signed copy of this \
                 Isocast, and macOS lets only that copy use or replace it. Open Keychain Access, \
-                delete the “dev.isocast.release.stream” item, then paste the key and press Save Key.",
-                "The saved key could not be read from Credential Manager. Open Credential Manager › Windows Credentials and check the Isocast entry, then paste the key and press Save Key.")
+                delete the “dev.isocast.release.stream” item, then paste the key and press Save Key."
         }),
         other => anyhow::bail!(
             "no sample stream {other:?}; one of live, reconnecting, connecting, short, \
@@ -3494,12 +3508,31 @@ fn saved_toast(
         "{files} file{} in {folder}",
         if files == 1 { "" } else { "s" }
     );
+    // Problems while recording: not "saved" (as `isocast stop` fails on
+    // them). The files it lists were still finished; say where they are.
+    if let Some(first) = report.errors.first() {
+        let more = match report.errors.len() - 1 {
+            0 => String::new(),
+            n => format!(" (and {n} more)"),
+        };
+        let shown = report.manifest.display().to_string();
+        app.show_toast(
+            Toast::new(
+                ToastKind::Error,
+                "The recording had errors",
+                format!("{}{more} · {files} kept", crate::app::sentence(first)),
+            )
+            .key("recording-saved")
+            .action("Show in Finder", move |_| reveal(&shown)),
+        );
+        return;
+    }
     let Some(into) = into.filter(|into| into.takes > 0) else {
         let shown = report.manifest.display().to_string();
         app.show_toast(
             Toast::new(ToastKind::Success, "Recording saved", files)
                 .key("recording-saved")
-                .action(wording::SHOW_IN_FILES, move |_| reveal(&shown)),
+                .action("Show in Finder", move |_| reveal(&shown)),
         );
         return;
     };

@@ -36,9 +36,9 @@ use isocast_protocol::api::{
     EventKind, EventKinds, Frame, FrameParams, FrameRate, FrameStream, FramesParams, GetParams,
     ImportObsParams, Live, LiveStatus, Marked, Method, Notification, Overload, OverloadedFile,
     Plan, Refreshed, Report, Request, Resolved, Response, RpcError, SharedFrameStream,
-    SharedFramesParams, Snapshot, SnapshotParams, StartParams, Started, Status, StreamKey,
-    StreamKeyParams, StreamKeyTarget, Switched, TakeCause, TuneParams, Tuning, WatchParams,
-    lock_path, shared, socket_path,
+    SharedFramesParams, Snapshot, SnapshotParams, StartParams, Started, Status, StopAccepted,
+    StreamKey, StreamKeyParams, StreamKeyTarget, Switched, TakeCause, TuneParams, Tuning,
+    WatchParams, lock_path, shared, socket_path,
 };
 use isocast_protocol::change::{Change, diff, merge_patch, missing_removals};
 use isocast_protocol::devices::{PermissionKind, PermissionsReport};
@@ -83,7 +83,7 @@ const WATCH_HANGUP_CHECK: Duration = Duration::from_secs(1);
 /// any amount of memory. A setup is far smaller.
 const MAX_REQUEST: usize = 16 << 20;
 
-use platform::NativePlatform;
+use platform::{NativePlatform, native};
 
 mod canvases;
 mod data;
@@ -929,7 +929,7 @@ impl CpuMeter {
 
 /// The processor time this process has used, user and system, in seconds.
 fn process_cpu_seconds() -> Option<f64> {
-    NativePlatform.process_cpu_seconds()
+    native().process_cpu_seconds()
 }
 
 #[derive(Default)]
@@ -1332,7 +1332,7 @@ fn start_engine(
     on_event: OnEngineEvent,
 ) -> Result<Arc<dyn LiveEngine>> {
     Ok(Arc::new(LiveEngineOf::start(
-        &NativePlatform,
+        native(),
         setup,
         Some(control),
         Some(on_event),
@@ -1462,7 +1462,11 @@ impl Daemon {
         if self.shutting_down.load(Ordering::SeqCst)
             && !matches!(
                 request.method,
-                Method::Status | Method::Get(_) | Method::Stop | Method::Shutdown
+                Method::Status
+                    | Method::Get(_)
+                    | Method::Stop
+                    | Method::RequestStop
+                    | Method::Shutdown
             )
         {
             return Response::err(
@@ -1710,6 +1714,7 @@ impl Daemon {
             Method::TimelineRelink(params) => self.timeline_relink(params).and_then(to_json),
             Method::TimelineExportNle(params) => self.timeline_export_nle(params).and_then(to_json),
             Method::EstimateCapacity(params) => self.estimate_capacity(*params).and_then(to_json),
+            Method::RequestStop => self.request_stop().and_then(to_json),
             Method::Stop | Method::Shutdown => match self.stop() {
                 // Shutting down while idle is fine.
                 Err(err) if shutdown && err.code == RpcError::WRONG_STATE => {
@@ -2395,9 +2400,14 @@ impl Daemon {
                 .session
                 .as_ref()
                 .ok_or_else(|| wrong("recording: idle; valid action: start".into()))?;
-            if session.stop.load(Ordering::SeqCst) || session.files.lock().is_none() {
+            if session.stop.load(Ordering::SeqCst) {
                 return Err(wrong(
-                    "recording: starting or stopping; wait for recording state".into(),
+                    "recording: finalizing (a stop was requested); it can't pause or resume".into(),
+                ));
+            }
+            if session.files.lock().is_none() {
+                return Err(wrong(
+                    "recording: starting; wait for recording state".into(),
                 ));
             }
             let control = state.control().expect("recording engine");
@@ -2885,6 +2895,10 @@ impl Daemon {
 
     fn status(&self) -> Status {
         let state = self.state.read();
+        let finalizing = state
+            .session
+            .as_ref()
+            .is_some_and(|session| session.stop.load(Ordering::SeqCst));
         let (engine, mut live, files) = match &state.session {
             None => (EngineState::Idle, None, Vec::new()),
             Some(session) => match session.files.lock().clone() {
@@ -2926,6 +2940,7 @@ impl Daemon {
             .and_then(|session| self.recording_into(&session.takes));
         let mut status = Status {
             state: engine,
+            finalizing,
             governor: Some(isocast_engine::governor::status()),
             machine_profile: Some(self.machine_status(false)),
             #[cfg(target_os = "macos")]
@@ -2951,9 +2966,7 @@ impl Daemon {
             data: Some(self.data.status()),
             diagnostics: Some({
                 let mut health = isocast_diagnostics::health();
-                health["frame_budget"] = NativePlatform
-                    .frame_budget()
-                    .unwrap_or(serde_json::Value::Null);
+                health["frame_budget"] = native().frame_budget().unwrap_or(serde_json::Value::Null);
                 health
             }),
             interrupted: self.interrupted.lock().clone(),
@@ -3322,14 +3335,17 @@ impl Daemon {
                 project
             }
             Err(err) => {
-                self.publish(Event::Stopped {
-                    report: None,
-                    error: Some(err.message.clone()),
-                    project: None,
-                    folder: None,
-                    timeline: None,
-                });
-                self.ended(id, Err(err.message.clone()));
+                self.ended(
+                    id,
+                    Err(err.message.clone()),
+                    Event::Stopped {
+                        report: None,
+                        error: Some(err.message.clone()),
+                        project: None,
+                        folder: None,
+                        timeline: None,
+                    },
+                );
                 return Err(err);
             }
         };
@@ -3356,14 +3372,17 @@ impl Daemon {
             Ok(engine) => engine,
             Err(err) => {
                 discard(&project);
-                self.publish(Event::Stopped {
-                    report: None,
-                    error: Some(err.message.clone()),
-                    project: None,
-                    folder: None,
-                    timeline: None,
-                });
-                self.ended(id, Err(err.message.clone()));
+                self.ended(
+                    id,
+                    Err(err.message.clone()),
+                    Event::Stopped {
+                        report: None,
+                        error: Some(err.message.clone()),
+                        project: None,
+                        folder: None,
+                        timeline: None,
+                    },
+                );
                 return Err(err);
             }
         };
@@ -3447,16 +3466,16 @@ impl Daemon {
             if ended.is_err() {
                 discard(&project);
             }
-            daemon.publish(Event::Stopped {
+            let stopped = Event::Stopped {
                 report: ended.clone().ok().map(Box::new),
                 error: ended.clone().err(),
                 // Unless the folder went again (it held nothing).
                 project: project.folder.exists().then(|| project.id.clone()),
                 folder: project.folder.exists().then(|| project.folder.clone()),
                 timeline: daemon.recording_into(&takes),
-            });
+            };
             let error = ended.as_ref().err().cloned();
-            daemon.ended(id, ended);
+            daemon.ended(id, ended, stopped);
             // A refused Start is final: a client may retry as soon as it
             // receives the error, so release the session before answering.
             if let Some(message) = error {
@@ -3535,12 +3554,23 @@ impl Daemon {
         }
         // Else what the chip's numbers predict, with the stream if it runs
         // (#66): only when it can't keep up, so a fitting setup never nags.
-        let streaming = {
+        let (streaming, backends) = {
             let state = self.state.lock();
-            [state.streaming_on(CanvasId::Main), state.streaming_extra()]
+            (
+                [state.streaming_on(CanvasId::Main), state.streaming_extra()],
+                prores_backends(&state),
+            )
         };
-        let estimate =
-            estimate_capacity(&setup, Some(engine), streaming, true, &memory, None).ok()?;
+        let estimate = estimate_capacity(
+            &setup,
+            Some(engine),
+            streaming,
+            true,
+            &memory,
+            None,
+            &backends,
+        )
+        .ok()?;
         if estimate.capacity != isocast_protocol::api::Capacity::CannotKeepUp {
             return None;
         }
@@ -3559,7 +3589,7 @@ impl Daemon {
     /// `estimate_capacity`: whether a setup's files (the live setup's, at
     /// its sources' live formats) fit this Mac's encoders, by per-chip data.
     fn estimate_capacity(&self, params: CapacityParams) -> Result<CapacityEstimate, RpcError> {
-        let (setup, streaming, recording, engine, memory) = {
+        let (setup, streaming, recording, engine, memory, backends) = {
             let state = self.state.read();
             let live = params.setup.is_none();
             let Some(setup) = params.setup.or_else(|| state.setup.clone()) else {
@@ -3582,7 +3612,12 @@ impl Daemon {
             let recording = live && state.session.is_some();
             let engine = state.engine.clone().filter(|_| live);
             let memory = capacity::memory_path(state.file.legacy());
-            (setup, streaming, recording, engine, memory)
+            let backends = if live {
+                prores_backends(&state)
+            } else {
+                Vec::new()
+            };
+            (setup, streaming, recording, engine, memory, backends)
         };
         estimate_capacity(
             &setup,
@@ -3591,6 +3626,7 @@ impl Daemon {
             recording,
             &memory,
             params.add_iso.as_deref(),
+            &backends,
         )
         .map_err(|message| RpcError {
             code: RpcError::INVALID_PARAMS,
@@ -4077,6 +4113,32 @@ impl Daemon {
         }
     }
 
+    /// Ask the running session to stop (or cancel one still starting) and
+    /// answer at once: the session's own coordinator finishes its files and
+    /// ends it as `stop` waits for. Only flags and copies under the lock;
+    /// asking again while it finishes answers the same way.
+    fn request_stop(&self) -> Result<StopAccepted, RpcError> {
+        let state = self.state.read();
+        let Some(session) = &state.session else {
+            return Err(RpcError {
+                code: RpcError::WRONG_STATE,
+                message: "not recording".into(),
+            });
+        };
+        let files = session.files.lock().clone().unwrap_or_default();
+        session.stop.store(true, Ordering::SeqCst);
+        let session_id = session.id;
+        #[cfg(windows)]
+        if let Some(control) = state.control() {
+            control.wake_recording();
+        }
+        Ok(StopAccepted {
+            session_id,
+            finalizing: true,
+            files,
+        })
+    }
+
     /// Stop the running session (or cancel one still starting) and wait
     /// for its files to be finished.
     fn stop(&self) -> Result<Report, RpcError> {
@@ -4089,6 +4151,10 @@ impl Daemon {
         };
         session.stop.store(true, Ordering::SeqCst);
         let id = session.id;
+        #[cfg(windows)]
+        if let Some(control) = state.control() {
+            control.wake_recording();
+        }
         let timeout = state.wait_while_for(&self.ended, STOP_TIMEOUT, |s| s.ended_session < id);
         if timeout.timed_out() {
             return Err(RpcError {
@@ -4111,7 +4177,9 @@ impl Daemon {
     }
 
     /// Session `id` has ended, with its report or why it has none.
-    fn ended(&self, id: u64, ended: Result<Report, String>) {
+    fn ended(&self, id: u64, ended: Result<Report, String>, stopped: Event) {
+        // Logging can touch disk; it must not hold the control-state lock.
+        diagnostics::event(&stopped);
         // Broken control state must not prevent a writer's completed report
         // from reaching the emergency finalizer (the lock never poisons).
         let mut state = self.state.lock();
@@ -4126,6 +4194,11 @@ impl Daemon {
             }
             Err(error) => state.last_error = Some(error),
         }
+        // Queue the completion after updating state but before releasing the
+        // session to Start/Shutdown or waking blocking Stop. Watchers refreshing
+        // status see the new state; shutdown cannot exit before it was announced.
+        // Unlike publish, send_event only queues bytes, with no state callbacks.
+        self.send_event(stopped);
         self.ended.notify_all();
     }
 }
@@ -4967,7 +5040,7 @@ fn redact_value(value: &mut serde_json::Value, key: &str) {
 
 /// The host clock, which markers and scene switches are stamped with.
 fn now() -> Time {
-    NativePlatform.now()
+    native().now()
 }
 
 /// The Keychain service this build keeps stream keys under:
@@ -4984,7 +5057,7 @@ fn key_service() -> &'static str {
 }
 
 fn app_identifier() -> Option<String> {
-    NativePlatform.app_identifier()
+    native().app_identifier()
 }
 
 /// The stream key for `account`: this build's own, or one an older Isocast
@@ -5072,11 +5145,11 @@ fn retire_legacy_key(account: &str) {
 }
 
 fn has_secret(service: &str, account: &str) -> Result<bool> {
-    NativePlatform.has_secret(service, account)
+    native().has_secret(service, account)
 }
 
 fn secret(service: &str, account: &str) -> Result<Option<String>> {
-    let key = NativePlatform.secret(service, account)?;
+    let key = native().secret(service, account)?;
     if let Some(key) = &key {
         isocast_diagnostics::redact::remember_secret(service, account, key);
     }
@@ -5084,23 +5157,23 @@ fn secret(service: &str, account: &str) -> Result<Option<String>> {
 }
 
 fn set_secret(service: &str, account: &str, value: &str) -> Result<()> {
-    NativePlatform.set_secret(service, account, value)
+    native().set_secret(service, account, value)
 }
 
 fn delete_secret(service: &str, account: &str) -> Result<bool> {
-    NativePlatform.delete_secret(service, account)
+    native().delete_secret(service, account)
 }
 
 fn permissions() -> Result<PermissionsReport> {
-    NativePlatform.permissions()
+    native().permissions()
 }
 
 fn request_permissions(only: Option<PermissionKind>) -> Result<PermissionsReport> {
-    NativePlatform.request_permissions(only)
+    native().request_permissions(only)
 }
 
 fn open_permission_settings(permission: PermissionKind) -> Result<String> {
-    NativePlatform.open_permission_settings(permission)
+    native().open_permission_settings(permission)
 }
 
 /// A take's drop counts when it began, and whether its overload was said.
@@ -5126,7 +5199,31 @@ fn overloaded(dropped: u64, due: u64) -> bool {
 fn this_machine() -> Option<&'static isocast_protocol::api::Machine> {
     static MACHINE: std::sync::OnceLock<isocast_protocol::api::Machine> =
         std::sync::OnceLock::new();
-    Some(MACHINE.get_or_init(|| NativePlatform.machine()))
+    Some(MACHINE.get_or_init(|| native().machine()))
+}
+
+/// Backend observations from the actual take, not editable next-take settings.
+fn prores_backends(state: &State) -> Vec<(isocast_protocol::Codec, Option<bool>)> {
+    state
+        .session
+        .as_ref()
+        .and_then(|s| s.live.lock().clone())
+        .map(|live| {
+            live.files
+                .into_iter()
+                .filter_map(|f| {
+                    f.codec
+                        .filter(|c| {
+                            !matches!(
+                                c,
+                                isocast_protocol::Codec::H264 | isocast_protocol::Codec::Hevc
+                            )
+                        })
+                        .map(|c| (c, f.hardware_accelerated))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Estimate `setup`'s capacity: sources at their live formats in `engine`
@@ -5138,7 +5235,13 @@ fn estimate_capacity(
     recording: bool,
     memory: &Path,
     add_iso: Option<&str>,
+    backends: &[(isocast_protocol::Codec, Option<bool>)],
 ) -> Result<CapacityEstimate, String> {
+    if !cfg!(target_os = "macos") {
+        // The table is measured for Apple's media engines, not a CPU-named
+        // Windows GPU. Native encoder budgeting has a separate qualification.
+        return Err("capacity estimates are only supported on macOS so far".into());
+    }
     let Some(machine) = this_machine() else {
         return Err("capacity estimates are only supported on macOS so far".into());
     };
@@ -5152,16 +5255,30 @@ fn estimate_capacity(
                 .collect()
         })
         .unwrap_or_default();
-    let probed = isocast_engine::estimate::probed_formats(&NativePlatform, setup, add_iso, &|id| {
+    let probed = isocast_engine::estimate::probed_formats(native(), setup, add_iso, &|id| {
         live.contains_key(id)
     });
     let formats = |id: &str| live.get(id).or_else(|| probed.get(id)).copied();
     let kept = capacity::Memory::load(memory);
-    let profile = capacity::load_profile(
+    let mut profile = capacity::load_profile(
         &capacity::profile_path(memory),
         machine,
         &daemon_build().build,
     );
+    if let Some(profile) = &mut profile {
+        // A running native fallback must not inherit earlier hardware costs.
+        // Unknown/different selection invalidates only that codec's resource
+        // observations here; the saved profile is never rewritten in a take.
+        // During startup the first live-file snapshot may not exist yet:
+        // an empty observation list is unknown, not proof that HW was chosen.
+        profile.encoders.retain(|m| {
+            m.evidence != isocast_protocol::machine::Evidence::ProresResource
+                || (!recording || backends.iter().any(|(codec, _)| *codec == m.codec))
+                    && backends.iter().filter(|(codec, _)| *codec == m.codec).all(
+                        |(_, hardware)| hardware.is_some() && *hardware == m.hardware_accelerated,
+                    )
+        });
+    }
     let key = machine_key();
     isocast_engine::estimate::estimate(
         &isocast_engine::estimate::Inputs {
@@ -5180,11 +5297,11 @@ fn estimate_capacity(
 /// Which machine and OS `tune`'s measurements here hold for.
 fn machine_key() -> Option<&'static str> {
     static KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    Some(KEY.get_or_init(|| capacity::machine_key(&NativePlatform.machine())))
+    Some(KEY.get_or_init(|| capacity::machine_key(&native().machine())))
 }
 
 fn tune(setup: &Setup, folder: Option<&Path>, memory: &Path) -> Result<Tuning> {
-    isocast_engine::tune::tune(&NativePlatform, setup, folder, Some(memory))
+    isocast_engine::tune::tune(native(), setup, folder, Some(memory))
 }
 
 /// Refuse a scene id the setup (the recording's, while recording) lacks.
@@ -5253,7 +5370,7 @@ fn with_graphics<T>(draw: impl FnOnce(&mut Graphics) -> Result<T>) -> Result<T> 
     }
     let graphics = match &mut *cached {
         Some(graphics) => graphics,
-        none => none.insert(Graphics::new(&NativePlatform)?),
+        none => none.insert(Graphics::new(native())?),
     };
     let result = draw(graphics);
     // Lost while drawing: this answer may fail, the next opens a new one.
@@ -5285,7 +5402,7 @@ fn frames(
         }
     }
     frames.extend(isocast_engine::snapshot::take_frames(
-        &NativePlatform,
+        native(),
         setup,
         &missing,
         data,
@@ -5330,18 +5447,18 @@ fn scene_png(
 /// it that exists).
 fn free_bytes(folder: &Path) -> Option<u64> {
     let existing = folder.ancestors().find(|path| path.exists())?;
-    NativePlatform
+    native()
         .volume(existing)
         .ok()
         .map(|volume| volume.free_bytes)
 }
 
 fn doctor(setup: Option<&Setup>, folder: Option<&Path>) -> isocast_protocol::api::Doctor {
-    isocast_engine::doctor::doctor(&NativePlatform, setup, folder)
+    isocast_engine::doctor::doctor(native(), setup, folder)
 }
 
 fn devices() -> Result<isocast_protocol::devices::Devices> {
-    NativePlatform.devices()
+    native().devices()
 }
 
 /// Read an OBS scene collection, matching its devices and sizes against
@@ -5413,7 +5530,7 @@ fn content_size(kind: &SourceKind) -> Option<(u32, u32)> {
     let (tx, rx) = std::sync::mpsc::channel();
     let kind = kind.clone();
     thread::spawn(move || {
-        let _ = tx.send(isocast_engine::content_size(&NativePlatform, &kind));
+        let _ = tx.send(isocast_engine::content_size(native(), &kind));
     });
     match rx.recv_timeout(CONTENT_SIZE_TIMEOUT) {
         Ok(size) => size,
