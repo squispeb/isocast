@@ -1600,6 +1600,9 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
     workers retain two ALPC ports per open/close, even without DX12 import.
     Check long-idle RPC scavenging and isolate apartment/device/item/pool
     creation; reuse MTA workers if needed. W.5b evidence has the repro.
+  - [ ] **W.4 codec boundary gate:** tag/guard encoded codec at the engine
+    boundary before wiring HEVC files. Existing live frame-stream/FLV paths
+    assume H.264 parameter sets; HEVC must use its explicit hvcC/track type.
 - [ ] **W.5 Capture, audio and encoders.** Windows.Graphics.Capture for
   screens/windows, Media Foundation cameras, WASAPI input/loopback/output,
   NVENC-first, hardware MF (NVENC/QSV/AMF) fallback, software last;
@@ -1650,6 +1653,8 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
     MF hardware/software fallback, HEVC, GPU output pools, native AAC and
     engine priority/ISO shedding remain gates before Platform selection.
   - [x] **W.5c2 H.264 Media Foundation fallback (agent/windows-capture).**
+    Commit7b17f64; Actions39089312953 portable jobs passed; native UI build
+    failed with rustc-LLVM out-of-memory (platform crate compiled).
     NVENC-first provider selection, observable hardware-MFT/software-MFT
     fallback, private GPU NV12 conversion and tracked-sample retention.
     Explicit software download only; bounded admission and timestamp checks.
@@ -1661,6 +1666,17 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
     clippy,81 engine tests, full remote Mac gates and independent review pass.
     Ready for CI; HEVC/10-bit follows this slice. No WindowsPlatform selection
     or full recording parity yet.
+  - [x] **W.5c3 HEVC Main/Main10 (agent/windows-capture).** Extend native
+    NVENC and hardware MF without codec/depth downgrade; length-prefixed HEVC
+    packets and truthful hvcC, GPU-resident BGRA8 and actual RGB10 input,
+    P010 conversion and matching DX12 import. Verify real1080p60/4K60 files,
+    decoded10-bit precision, bounded retention/drain and H.264 regressions.
+    NVIDIA HEVC MFT is installed on exon-desk; no software HEVC MFT is present.
+    Final1980/1980-frame matrix, true10-bit precision, concurrency, lifetime
+    and pressure checks pass; native strict clippy/81 engine tests, full
+    remote Mac gates and independent review pass. Ready for CI.
+    Engine codec-tag guard remains required when
+    wiring HEVC to the writer, never the H.264 live/FLV path.
 - [ ] **W.6 App, IPC and shared surfaces.** Slint Windows window and native
   integration, same-user named pipes with isolated engines, D3D11/D3D12
   surface hand-over/fences with adapter identity and bounded per-viewer
@@ -1702,6 +1718,22 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
 - FilmCraft reads `session.json` to line up ISO files without audio sync.
 
 ## Log
+
+- W.5c3 (2026-10-17, #105, ready for CI): HEVC Main/Main10 now encodes
+  through NVENC/MF from GPU BGRA8 or realRGB10; no codec/depth downgrade.
+  hvcC is SPS-derived, hvc1 removes parameter sets and rejects changes after
+  configuration. Final11-file matrix fully decodes1980/1980 frames at1080p60/
+  4K60 with zero observed pool/rate/callback/encoder drops; mux/decode keys
+  match[0,60,90,150]. RGB10 pool/DX12 preserves1024 levels; NVENC/MF decode
+  877limitedY levels with correct endpoints/chroma. Replaced incorrect NVIDIA
+  P010 video-processor output with explicit GPU quantization; four simultaneous
+  colour encoders remain exact. 20MFMain10 opens keep521handles; bounded
+  overload and12-session refusal/recovery pass, no software HEVC installed.
+  Native strict clippy/81 engine tests, full Mac gates232tests+1doctest and
+  review/re-review pass. No writer edits or Platform selection. W.5c2 Actions
+  portable jobs pass but UI compile hit LLVM OOM; coordinator owns CI action.
+  Camera/WASAPI/nativeAAC and codec-safe Platform/writer/priority integration
+  follow, retaining WGC handle and other-GPU qualification gates.
 
 - W.5c2 (2026-10-17, #105, ready for CI): NVENC-first H.264 selection now
   falls through same-adapter hardware MF to explicitly labelled software MF.

@@ -10,10 +10,13 @@ use isocast_engine::gpu::{FrameImporter, Gpu, GpuFrame, GpuPixels};
 use wgpu::hal;
 use windows::Win32::Graphics::Direct3D11::{ID3D11Fence, ID3D11Texture2D};
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM,
+};
 use windows::core::{GUID, IUnknown, Interface, implement};
 
 use crate::Frame;
+use crate::frames::PixelFormat;
 
 const KEPT_SURFACES: usize = 16;
 const MAX_SURFACES: usize = 64;
@@ -43,6 +46,7 @@ pub struct Dx12Importer {
 struct Surface {
     // A native reference prevents pointer reuse (the cache key), but is NOT
     // a frame lease: the pool can reuse the slot once its consumers finish.
+    // A texture's size and format are immutable, including across pool reuse.
     _source: ID3D11Texture2D,
     texture: wgpu::Texture,
     used: Instant,
@@ -106,6 +110,13 @@ impl Dx12Importer {
     }
 
     fn texture(&self, frame: &Frame, retain: bool) -> Result<wgpu::Texture> {
+        let (native_format, format) = match frame.pixel_format() {
+            PixelFormat::Bgra8 => (DXGI_FORMAT_B8G8R8A8_UNORM, wgpu::TextureFormat::Bgra8Unorm),
+            PixelFormat::Rgba10 => (
+                DXGI_FORMAT_R10G10B10A2_UNORM,
+                wgpu::TextureFormat::Rgb10a2Unorm,
+            ),
+        };
         let mut resource: Option<ID3D12Resource> = None;
         unsafe {
             self.raw
@@ -120,13 +131,13 @@ impl Dx12Importer {
             || desc.DepthOrArraySize != 1
             || desc.MipLevels != 1
             || desc.SampleDesc.Count != 1
-            || desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM
+            || desc.Format != native_format
             || !desc
                 .Flags
                 .contains(D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS)
         {
             bail!(
-                "DX12 capture texture must be a single-plane BGRA simultaneous-access texture matching the frame"
+                "DX12 capture texture must be a single-plane {native_format:?} simultaneous-access texture matching the frame"
             );
         }
         if retain {
@@ -141,7 +152,6 @@ impl Dx12Importer {
             height: frame.height(),
             depth_or_array_layers: 1,
         };
-        let format = wgpu::TextureFormat::Bgra8Unorm;
         let texture = unsafe {
             hal::dx12::Device::texture_from_raw(
                 resource,

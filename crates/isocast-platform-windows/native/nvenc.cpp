@@ -19,8 +19,9 @@ std::atomic<uint32_t> sessions{0};
 
 struct Config {
     uint32_t width, height, fps, bitrate, constant_bitrate, keyframe_interval;
+    uint32_t codec, input_depth, output_depth;
 };
-static_assert(sizeof(Config) == 24);
+static_assert(sizeof(Config) == 36);
 
 struct Packet {
     const uint8_t *data;
@@ -48,6 +49,8 @@ struct Encoder {
     NV_ENCODE_API_FUNCTION_LIST api = {};
     NV_ENC_INITIALIZE_PARAMS init = {};
     NV_ENC_CONFIG config = {};
+    NV_ENC_BUFFER_FORMAT input_format = NV_ENC_BUFFER_FORMAT_ARGB;
+    DXGI_FORMAT texture_format = DXGI_FORMAT_B8G8R8A8_UNORM;
     ID3D11DeviceContext *context = nullptr;
     Slot slots[slots_count];
     HANDLE eos = nullptr;
@@ -93,7 +96,7 @@ struct Encoder {
         desc.Width = init.encodeWidth;
         desc.Height = init.encodeHeight;
         desc.MipLevels = desc.ArraySize = desc.SampleDesc.Count = 1;
-        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        desc.Format = texture_format;
         desc.Usage = D3D11_USAGE_DEFAULT;
         desc.BindFlags = D3D11_BIND_RENDER_TARGET;
         HRESULT result = device->CreateTexture2D(&desc, nullptr, &input.texture);
@@ -107,7 +110,7 @@ struct Encoder {
         reg.resourceToRegister = input.texture;
         reg.width = init.encodeWidth;
         reg.height = init.encodeHeight;
-        reg.bufferFormat = NV_ENC_BUFFER_FORMAT_ARGB;
+        reg.bufferFormat = input_format;
         reg.bufferUsage = NV_ENC_INPUT_IMAGE;
         auto native = api.nvEncRegisterResource(session, &reg);
         if (native != NV_ENC_SUCCESS) return fail("register D3D11 input texture", native);
@@ -174,6 +177,18 @@ struct Encoder {
     }
 
     int open(void *device, const Config &spec) {
+        if (spec.codec > 1 || (spec.output_depth != 8 && spec.output_depth != 10)
+            || (spec.input_depth != 8 && spec.input_depth != 10)
+            || spec.input_depth > spec.output_depth
+            || (spec.codec == 0 && spec.output_depth != 8)) {
+            std::snprintf(error, sizeof(error), "unsupported codec/input/output bit-depth combination");
+            return internal_error;
+        }
+        const auto codec = spec.codec == 0 ? NV_ENC_CODEC_H264_GUID : NV_ENC_CODEC_HEVC_GUID;
+        if (spec.input_depth == 10) {
+            input_format = NV_ENC_BUFFER_FORMAT_ABGR10;
+            texture_format = DXGI_FORMAT_R10G10B10A2_UNORM;
+        }
         library = LoadLibraryExW(L"nvEncodeAPI64.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
         if (!library) return win_error("load the system NVIDIA encoder driver");
         using Version = NVENCSTATUS (NVENCAPI *)(uint32_t *);
@@ -204,20 +219,47 @@ struct Encoder {
         cap.version = NV_ENC_CAPS_PARAM_VER;
         cap.capsToQuery = NV_ENC_CAPS_ASYNC_ENCODE_SUPPORT;
         int asynchronous = 0;
-        status = api.nvEncGetEncodeCaps(session, NV_ENC_CODEC_H264_GUID, &cap, &asynchronous);
-        if (status != NV_ENC_SUCCESS) return fail("query asynchronous H.264 support", status);
+        status = api.nvEncGetEncodeCaps(session, codec, &cap, &asynchronous);
+        if (status != NV_ENC_SUCCESS) return fail("query codec asynchronous support", status);
         if (!asynchronous) {
             std::snprintf(error, sizeof(error), "NVIDIA asynchronous encoding is unavailable (requires a WDDM driver)");
+            return internal_error;
+        }
+        if (spec.output_depth == 10) {
+            cap.capsToQuery = NV_ENC_CAPS_SUPPORT_10BIT_ENCODE;
+            int ten_bit = 0;
+            status = api.nvEncGetEncodeCaps(session, codec, &cap, &ten_bit);
+            if (status != NV_ENC_SUCCESS) return fail("query ten-bit encode support", status);
+            if (!ten_bit) {
+                std::snprintf(error, sizeof(error), "HEVC Main10 is not supported by this GPU");
+                return internal_error;
+            }
+        }
+        NV_ENC_BUFFER_FORMAT formats[64] = {};
+        uint32_t format_count = 0;
+        status = api.nvEncGetInputFormatCount(session, codec, &format_count);
+        if (status != NV_ENC_SUCCESS) return fail("query codec input format count", status);
+        if (format_count > 64) {
+            std::snprintf(error, sizeof(error), "NVENC returned too many input formats");
+            return internal_error;
+        }
+        status = api.nvEncGetInputFormats(session, codec, formats, 64, &format_count);
+        if (status != NV_ENC_SUCCESS) return fail("query codec input formats", status);
+        bool found = false;
+        for (uint32_t i = 0; i < format_count; ++i) found |= formats[i] == input_format;
+        if (!found) {
+            std::snprintf(error, sizeof(error), "requested RGB input precision is not supported for this codec");
             return internal_error;
         }
         NV_ENC_PRESET_CONFIG preset = {};
         preset.version = NV_ENC_PRESET_CONFIG_VER;
         preset.presetCfg.version = NV_ENC_CONFIG_VER;
-        status = api.nvEncGetEncodePresetConfigEx(session, NV_ENC_CODEC_H264_GUID,
+        status = api.nvEncGetEncodePresetConfigEx(session, codec,
             NV_ENC_PRESET_P5_GUID, NV_ENC_TUNING_INFO_LOW_LATENCY, &preset);
         if (status != NV_ENC_SUCCESS) return fail("query P5 low-latency preset", status);
         config = preset.presetCfg;
-        config.profileGUID = NV_ENC_H264_PROFILE_HIGH_GUID;
+        config.profileGUID = spec.codec == 0 ? NV_ENC_H264_PROFILE_HIGH_GUID
+            : spec.output_depth == 10 ? NV_ENC_HEVC_PROFILE_MAIN10_GUID : NV_ENC_HEVC_PROFILE_MAIN_GUID;
         config.gopLength = spec.keyframe_interval;
         config.frameIntervalP = 1;
         config.frameFieldMode = NV_ENC_PARAMS_FRAME_FIELD_MODE_FRAME;
@@ -231,14 +273,28 @@ struct Encoder {
         rc.enableTemporalAQ = 0;
         rc.zeroReorderDelay = 1;
         rc.multiPass = NV_ENC_MULTI_PASS_DISABLED;
-        auto &h264 = config.encodeCodecConfig.h264Config;
-        h264.idrPeriod = spec.keyframe_interval;
-        h264.repeatSPSPPS = 1;
-        h264.outputAUD = 1;
-        h264.enableFillerDataInsertion = spec.constant_bitrate != 0;
-        h264.chromaFormatIDC = 1;
-        h264.inputBitDepth = h264.outputBitDepth = NV_ENC_BIT_DEPTH_8;
-        auto &vui = h264.h264VUIParameters;
+        NV_ENC_CONFIG_H264_VUI_PARAMETERS *colour;
+        if (spec.codec == 0) {
+            auto &h264 = config.encodeCodecConfig.h264Config;
+            h264.idrPeriod = spec.keyframe_interval;
+            h264.repeatSPSPPS = 1;
+            h264.outputAUD = 1;
+            h264.enableFillerDataInsertion = spec.constant_bitrate != 0;
+            h264.chromaFormatIDC = 1;
+            h264.inputBitDepth = h264.outputBitDepth = NV_ENC_BIT_DEPTH_8;
+            colour = &h264.h264VUIParameters;
+        } else {
+            auto &hevc = config.encodeCodecConfig.hevcConfig;
+            hevc.idrPeriod = spec.keyframe_interval;
+            hevc.repeatSPSPPS = 1;
+            hevc.outputAUD = 1;
+            hevc.enableFillerDataInsertion = spec.constant_bitrate != 0;
+            hevc.chromaFormatIDC = 1;
+            hevc.inputBitDepth = spec.input_depth == 10 ? NV_ENC_BIT_DEPTH_10 : NV_ENC_BIT_DEPTH_8;
+            hevc.outputBitDepth = spec.output_depth == 10 ? NV_ENC_BIT_DEPTH_10 : NV_ENC_BIT_DEPTH_8;
+            colour = &hevc.hevcVUIParameters;
+        }
+        auto &vui = *colour;
         vui.videoSignalTypePresentFlag = vui.colourDescriptionPresentFlag = 1;
         vui.videoFormat = NV_ENC_VUI_VIDEO_FORMAT_UNSPECIFIED;
         vui.videoFullRangeFlag = 0;
@@ -246,7 +302,7 @@ struct Encoder {
         vui.transferCharacteristics = NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
         vui.colourMatrix = NV_ENC_VUI_MATRIX_COEFFS_BT709;
         init.version = NV_ENC_INITIALIZE_PARAMS_VER;
-        init.encodeGUID = NV_ENC_CODEC_H264_GUID;
+        init.encodeGUID = codec;
         init.presetGUID = NV_ENC_PRESET_P5_GUID;
         init.tuningInfo = NV_ENC_TUNING_INFO_LOW_LATENCY;
         init.encodeWidth = init.darWidth = spec.width;
@@ -256,7 +312,7 @@ struct Encoder {
         init.enableEncodeAsync = init.enablePTD = 1;
         init.encodeConfig = &config;
         status = api.nvEncInitializeEncoder(session, &init);
-        if (status != NV_ENC_SUCCESS) return fail("initialize H.264 encoder", status);
+        if (status != NV_ENC_SUCCESS) return fail("initialize video encoder", status);
         auto graphics = static_cast<ID3D11Device *>(device);
         graphics->GetImmediateContext(&context);
         int result = event(&eos);
@@ -280,7 +336,7 @@ struct Encoder {
         sequence.inBufferSize = sizeof(headers);
         sequence.outSPSPPSPayloadSize = &headers_size;
         status = api.nvEncGetSequenceParams(session, &sequence);
-        return status == NV_ENC_SUCCESS ? 0 : fail("read H.264 decoder configuration", status);
+        return status == NV_ENC_SUCCESS ? 0 : fail("read decoder configuration", status);
     }
 };
 } // namespace
@@ -316,6 +372,14 @@ int isocast_nvenc_submit(Encoder *encoder, ID3D11Texture2D *texture, uint64_t pt
         std::snprintf(encoder->error, sizeof(encoder->error), "NVENC input slot is still mapped");
         return internal_error;
     }
+    D3D11_TEXTURE2D_DESC desc = {};
+    texture->GetDesc(&desc);
+    if (desc.Width != encoder->init.encodeWidth || desc.Height != encoder->init.encodeHeight
+        || desc.Format != encoder->texture_format || desc.ArraySize != 1
+        || desc.MipLevels != 1 || desc.SampleDesc.Count != 1) {
+        std::snprintf(encoder->error, sizeof(encoder->error), "input texture shape/format changed");
+        return internal_error;
+    }
     encoder->context->CopyResource(input.texture, texture);
     encoder->context->Flush();
     NV_ENC_MAP_INPUT_RESOURCE map = {};
@@ -331,7 +395,7 @@ int isocast_nvenc_submit(Encoder *encoder, ID3D11Texture2D *texture, uint64_t pt
     picture.inputTimeStamp = pts;
     picture.inputDuration = 1000000000ULL / encoder->init.frameRateNum;
     picture.inputBuffer = input.mapped;
-    picture.bufferFmt = NV_ENC_BUFFER_FORMAT_ARGB;
+    picture.bufferFmt = encoder->input_format;
     picture.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
     picture.outputBitstream = slot.buffer;
     picture.completionEvent = slot.event;
@@ -342,7 +406,7 @@ int isocast_nvenc_submit(Encoder *encoder, ID3D11Texture2D *texture, uint64_t pt
         auto unmapped = encoder->api.nvEncUnmapInputResource(encoder->session, input.mapped);
         if (unmapped != NV_ENC_SUCCESS) return encoder->fail("unmap refused input", unmapped);
         input.mapped = nullptr;
-        return status == NV_ENC_ERR_ENCODER_BUSY ? again : encoder->fail("submit H.264 frame", status);
+        return status == NV_ENC_ERR_ENCODER_BUSY ? again : encoder->fail("submit video frame", status);
     }
     slot.completed = false;
     ++encoder->count;
@@ -399,7 +463,7 @@ int isocast_nvenc_flush(Encoder *encoder) {
     picture.completionEvent = encoder->eos;
     auto status = encoder->api.nvEncEncodePicture(encoder->session, &picture);
     if (status == NV_ENC_ERR_ENCODER_BUSY) return again;
-    if (status != NV_ENC_SUCCESS) return encoder->fail("flush H.264 encoder", status);
+    if (status != NV_ENC_SUCCESS) return encoder->fail("flush video encoder", status);
     encoder->flushing = true;
     return 0;
 }

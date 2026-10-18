@@ -6253,6 +6253,34 @@ each section. Delete entries that stop being true.
 
 ## Gotchas
 
+- 2026-10-17 (#105 W.5c3): NVIDIA VideoProcessorBlt's P010 output is NOT
+  correctly quantized on RTX5070/617.42: before any MFT, GPU readback gives
+  raw16 black4129/white60423/neutralUV32899 with nonzero low6bits; decoded10bit
+  white944/UV514 instead940/512. MF10bit now uses explicit GPU Rec709 matrix,
+  left-sited chroma filter and quantized q<<6 through P010 plane UAVs. Raw
+  4096/60160/32768, low6bits0, actual GPU-ramp decode877 distinct Y64..940/UV512
+  verified. NVENC direct RGB10 was already correct. Whole CS bind/dispatch/
+  unbind sequence holds ID3D11Multithread: four simultaneous MF colour encoders
+  remain exact. No CPU pixels/copies added; eight-bit native VP stays as before.
+
+- 2026-10-17 (#105 W.5c3): RGB10A2 storage is DXGI R10G10B10A2_UNORM and
+  NVENC ABGR10 (red occupies low bits), not ARGB10. GPU-generated1024-level
+  ramp survives the bounded frame pool and DX12 import exactly. HEVC Main10
+  may expand BGRA8 on GPU but cannot invent source precision; this is SDR709,
+  not HDR. NVIDIA HEVC MFT supports Main/Main10; no software HEVC MFT is
+  installed here. At12 occupied sessions the factory must refuse HEVC clearly,
+  never silently choose H.264 or eight-bit; existing sessions survive refusal.
+
+- 2026-10-17 (#105 W.5c3): HEVC hvc1 uses frozen SPS-derived hvcC and strips
+  in-band VPS/SPS/PPS; changed complete parameter sets fail closed because
+  the writer already has its description BEFORE the first picture. Main/Main10
+  IDR sync flags match decoded automatic/forced keys[0,60,90,150]. Current
+  EncodedVideo.parameter_sets is H.264-only: keep live constructors H.264 and
+  add an engine codec tag/guard before Platform/writer integration. QSV/AMF,
+  GPU-less software and HDR remain unqualified. W.5c2 Actions39089312953 failed
+  only when compiling isocast-ui with LLVM OOM; portable jobs passed and native
+  platform crate compiled. Coordinator owns CI retry/configuration.
+
 - 2026-10-17 (#105 W.5c2): Windows10 MFStartup/MFShutdown around an activated
   encoder retains14 handles per reopen (5Event,2IRTimer,1IoCompletion,
   1TpWorkerFactory,5WaitCompletionPacket). Startup/shutdown without activating

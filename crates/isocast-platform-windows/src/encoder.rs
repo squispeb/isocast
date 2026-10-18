@@ -4,15 +4,94 @@
 use std::time::Duration;
 
 use anyhow::{Result, bail};
-use isocast_engine::{EncodedVideo, LiveVideoSpec, Time, VideoEncoder};
+use isocast_engine::{EncodedVideo, LiveVideoSpec, ParameterSets, Time, VideoEncoder};
 
-use crate::{EncodeStats, Frame, GraphicsDevice, MfEncoder, MfMode, NvencEncoder};
+use crate::{EncodeStats, Frame, GraphicsDevice, MfEncoder, MfMode, NvencEncoder, PixelFormat};
+use crate::{h264, hevc};
+
+/// SDR Rec.709 encoding. Main10 preserves a ten-bit input, or expands an
+/// eight-bit input on GPU; it does not turn SDR/eight-bit capture into HDR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoEncoding {
+    H264,
+    Hevc,
+    Hevc10,
+}
+
+impl VideoEncoding {
+    pub fn bit_depth(self) -> u8 {
+        if self == Self::Hevc10 { 10 } else { 8 }
+    }
+
+    pub(crate) fn validate(self, input: PixelFormat) -> Result<()> {
+        if input == PixelFormat::Rgba10 && self != Self::Hevc10 {
+            bail!("video.input: ten-bit RGB requires HEVC Main10; no silent bit-depth reduction");
+        }
+        Ok(())
+    }
+}
+
+pub(crate) enum Parameters {
+    H264(ParameterSets),
+    Hevc { depth: u8, sets: hevc::Parameters },
+}
+
+impl Parameters {
+    pub(crate) fn new(encoding: VideoEncoding) -> Self {
+        match encoding {
+            VideoEncoding::H264 => Self::H264(ParameterSets::default()),
+            _ => Self::Hevc {
+                depth: encoding.bit_depth(),
+                sets: hevc::Parameters::default(),
+            },
+        }
+    }
+
+    pub(crate) fn headers(&mut self, bytes: &[u8]) -> Result<()> {
+        let nals = h264::annex_b(bytes)?;
+        match self {
+            Self::H264(sets) => *sets = h264::parameters(&nals),
+            Self::Hevc { sets, .. } => {
+                let next = hevc::parameters(&nals)?;
+                if !sets.vps.is_empty()
+                    && !sets.sps.is_empty()
+                    && !sets.pps.is_empty()
+                    && *sets != next
+                {
+                    bail!("HEVC parameter sets changed; open a new hvc1 track");
+                }
+                *sets = next;
+            }
+        }
+        self.config()?;
+        Ok(())
+    }
+
+    pub(crate) fn config(&self) -> Result<Vec<u8>> {
+        match self {
+            Self::H264(sets) => h264::config(sets),
+            Self::Hevc { depth, sets } => {
+                if sets.bit_depth()? != *depth {
+                    bail!("encoder returned HEVC with a different bit depth than requested");
+                }
+                hevc::config(sets)
+            }
+        }
+    }
+
+    pub(crate) fn packet(&mut self, bytes: &[u8], pts: Time) -> Result<Option<EncodedVideo>> {
+        match self {
+            Self::H264(sets) => h264::packet(bytes, pts, sets),
+            Self::Hevc { sets, .. } => hevc::packet(bytes, pts, sets),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EncoderBackend {
     Nvenc,
     MediaFoundationHardware(String),
-    /// This provider downloads NV12 for a CPU encoder. Never call it a
+    /// This provider downloads NV12/P010 for a CPU encoder. Never call it a
     /// zero-copy or hardware encoding path in diagnostics.
     MediaFoundationSoftware(String),
 }
@@ -26,23 +105,35 @@ pub struct WindowsVideoEncoder {
     encoder: Encoder,
     backend: EncoderBackend,
     fallback_reasons: Vec<String>,
+    encoding: VideoEncoding,
 }
 
 impl WindowsVideoEncoder {
     pub fn new(device: &GraphicsDevice, spec: &LiveVideoSpec) -> Result<Self> {
+        Self::with_format(device, spec, VideoEncoding::H264, PixelFormat::Bgra8)
+    }
+
+    pub fn with_format(
+        device: &GraphicsDevice,
+        spec: &LiveVideoSpec,
+        encoding: VideoEncoding,
+        input: PixelFormat,
+    ) -> Result<Self> {
+        encoding.validate(input)?;
         let mut reasons = Vec::new();
-        match NvencEncoder::new(device, spec) {
+        match NvencEncoder::with_format(device, spec, encoding, input) {
             Ok(encoder) => {
                 return Ok(Self {
                     encoder: Encoder::Nvenc(encoder),
                     backend: EncoderBackend::Nvenc,
                     fallback_reasons: reasons,
+                    encoding,
                 });
             }
             Err(error) => reasons.push(format!("NVENC: {error:#}")),
         }
         for mode in [MfMode::Hardware, MfMode::Software] {
-            match MfEncoder::new(device, spec, mode) {
+            match MfEncoder::with_format(device, spec, mode, encoding, input) {
                 Ok(encoder) => {
                     let name = encoder.info().name.clone();
                     let backend = match mode {
@@ -53,19 +144,23 @@ impl WindowsVideoEncoder {
                         encoder: Encoder::Mf(encoder),
                         backend,
                         fallback_reasons: reasons,
+                        encoding,
                     });
                 }
                 Err(error) => reasons.push(format!("MF {mode:?}: {error:#}")),
             }
         }
         bail!(
-            "encoder: no H.264 provider could open: {}",
+            "encoder: no {encoding:?} provider could open: {}",
             reasons.join("; ")
         )
     }
 
     pub fn backend(&self) -> &EncoderBackend {
         &self.backend
+    }
+    pub fn encoding(&self) -> VideoEncoding {
+        self.encoding
     }
     pub fn fallback_reasons(&self) -> &[String] {
         &self.fallback_reasons

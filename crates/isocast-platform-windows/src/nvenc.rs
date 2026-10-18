@@ -1,4 +1,4 @@
-//! Asynchronous native H.264 from D3D11 textures. Eight pictures at most
+//! Asynchronous native H.264/HEVC from D3D11 textures. Eight pictures at most
 //! remain leased to NVENC; encoded bytes, never raw pixels, cross to the CPU.
 
 use std::collections::VecDeque;
@@ -7,11 +7,12 @@ use std::ptr::NonNull;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use isocast_engine::{EncodedVideo, LiveVideoSpec, ParameterSets, Time, VideoEncoder};
+use isocast_engine::{EncodedVideo, LiveVideoSpec, Time, VideoEncoder};
 use windows::core::Interface;
 
-use crate::h264::{self, MAX_PACKET, annex_b, parameters};
-use crate::{Frame, GraphicsDevice};
+use crate::encoder::Parameters;
+use crate::h264::MAX_PACKET;
+use crate::{Frame, GraphicsDevice, PixelFormat, VideoEncoding};
 
 const IN_FLIGHT: usize = 8;
 const STALL_WAIT: Duration = Duration::from_millis(400);
@@ -25,6 +26,9 @@ struct Config {
     bitrate: u32,
     constant_bitrate: u32,
     keyframe_interval: u32,
+    codec: u32,
+    input_depth: u32,
+    output_depth: u32,
 }
 
 #[repr(C)]
@@ -36,7 +40,7 @@ struct Packet {
     keyframe: u32,
 }
 
-const _: () = assert!(std::mem::size_of::<Config>() == 24);
+const _: () = assert!(std::mem::size_of::<Config>() == 36);
 const _: () = assert!(std::mem::size_of::<Packet>() == 24);
 
 unsafe extern "C" {
@@ -83,8 +87,9 @@ pub struct EncodeStats {
     pub last_receive_latency: Duration,
 }
 
-/// H.264 High/8-bit/Rec.709 limited range, P5 low-latency, single pass,
-/// spatial AQ8, no temporal AQ/lookahead/B-frames. Shared input is copied on
+/// H.264 High by default, or HEVC Main/Main10; SDR Rec.709 limited range,
+/// P5 low-latency, single pass, spatial AQ8, no temporal AQ/lookahead/B-frames.
+/// Shared input is copied on
 /// GPU into one of eight private slots: NVENC forbids client access while
 /// its input is mapped. Other consumers can still use the original Frame.
 pub struct NvencEncoder {
@@ -94,7 +99,8 @@ pub struct NvencEncoder {
     low_latency: bool,
     pending: VecDeque<Pending>,
     ready: VecDeque<EncodedVideo>,
-    parameters: ParameterSets,
+    parameters: Parameters,
+    input: PixelFormat,
     last_pts: Option<Time>,
     finishing: bool,
     finish_deadline: Option<Instant>,
@@ -110,13 +116,25 @@ unsafe impl Send for NvencEncoder {}
 
 impl NvencEncoder {
     pub fn new(device: &GraphicsDevice, spec: &LiveVideoSpec) -> Result<Self> {
+        Self::with_format(device, spec, VideoEncoding::H264, PixelFormat::Bgra8)
+    }
+
+    /// HEVC output has an hvcC decoder config and no H.264 `parameter_sets`.
+    /// The caller must select a matching HEVC mux track, never the live FLV path.
+    pub fn with_format(
+        device: &GraphicsDevice,
+        spec: &LiveVideoSpec,
+        encoding: VideoEncoding,
+        input: PixelFormat,
+    ) -> Result<Self> {
+        encoding.validate(input)?;
         let bitrate = bitrate(spec.fps, spec.bitrate_kbps)?;
         if spec.width == 0
             || spec.height == 0
             || !spec.width.is_multiple_of(2)
             || !spec.height.is_multiple_of(2)
         {
-            bail!("video.size: H.264 4:2:0 requires positive even width and height");
+            bail!("video.size: 4:2:0 requires positive even width and height");
         }
         if spec.keyframe_interval == 0 {
             bail!("video.keyframe_interval: must be at least 1");
@@ -128,6 +146,9 @@ impl NvencEncoder {
             bitrate,
             constant_bitrate: u32::from(spec.constant_bitrate),
             keyframe_interval: spec.keyframe_interval,
+            codec: u32::from(encoding != VideoEncoding::H264),
+            input_depth: if input == PixelFormat::Rgba10 { 10 } else { 8 },
+            output_depth: u32::from(encoding.bit_depth()),
         };
         let mut error = [0 as c_char; 512];
         let native = unsafe {
@@ -151,7 +172,8 @@ impl NvencEncoder {
             low_latency: spec.low_latency,
             pending: VecDeque::new(),
             ready: VecDeque::new(),
-            parameters: ParameterSets::default(),
+            parameters: Parameters::new(encoding),
+            input,
             last_pts: None,
             finishing: false,
             finish_deadline: None,
@@ -164,11 +186,9 @@ impl NvencEncoder {
         if data.is_null() || size == 0 || size > 4096 {
             bail!("NVENC returned invalid decoder configuration size");
         }
-        let headers = annex_b(unsafe { std::slice::from_raw_parts(data, size as usize) })?;
-        encoder.parameters = parameters(&headers);
-        if encoder.parameters.sps.is_empty() || encoder.parameters.pps.is_empty() {
-            bail!("NVENC decoder configuration is missing H.264 SPS/PPS");
-        }
+        encoder
+            .parameters
+            .headers(unsafe { std::slice::from_raw_parts(data, size as usize) })?;
         Ok(encoder)
     }
 
@@ -186,9 +206,9 @@ impl NvencEncoder {
         }
     }
 
-    /// avcC for the encoded-packet muxer. No B-frame reordering is enabled.
+    /// avcC or hvcC for the encoded-packet muxer. No B-frame reordering.
     pub fn decoder_config(&self) -> Result<Vec<u8>> {
-        h264::config(&self.parameters)
+        self.parameters.config()
     }
 
     /// Try admission without waiting for an output slot. Native mapping and
@@ -215,6 +235,13 @@ impl NvencEncoder {
         }
         if !self.device.owns(frame) {
             bail!("video.device: NVENC input must belong to its D3D11 device");
+        }
+        if frame.pixel_format() != self.input {
+            bail!(
+                "video.input: NVENC requires {:?}, got {:?}",
+                self.input,
+                frame.pixel_format()
+            );
         }
         if self.pending.len() == IN_FLIGHT {
             return Ok(false);
@@ -308,10 +335,12 @@ impl NvencEncoder {
             bail!("NVENC returned invalid packet size {}", packet.size);
         }
         let source = unsafe { std::slice::from_raw_parts(packet.data, packet.size as usize) };
-        let decoded = h264::packet(source, pts, &mut self.parameters)?
-            .context("NVENC packet contains no H.264 picture")?;
+        let decoded = self
+            .parameters
+            .packet(source, pts)?
+            .context("NVENC packet contains no picture")?;
         if decoded.keyframe != (packet.keyframe != 0) {
-            bail!("NVENC keyframe flag disagrees with its H.264 picture");
+            bail!("NVENC keyframe flag disagrees with its picture");
         }
         Ok(decoded)
     }

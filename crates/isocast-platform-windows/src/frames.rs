@@ -18,6 +18,15 @@ use crate::native::{Event, SharedHandle};
 
 pub const MAX_POOL_FRAMES: usize = 32;
 
+/// GPU RGB storage; ten-bit storage does not imply HDR colorimetry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PixelFormat {
+    /// DXGI_FORMAT_B8G8R8A8_UNORM.
+    Bgra8,
+    /// DXGI_FORMAT_R10G10B10A2_UNORM.
+    Rgba10,
+}
+
 /// A D3D11 device with a GPU timeline shared by its captures. No software
 /// adapter fallback: this path promises native GPU surfaces, not CPU pixels.
 #[derive(Clone)]
@@ -132,6 +141,7 @@ struct Slot {
     shared: SharedHandle,
     width: u32,
     height: u32,
+    format: PixelFormat,
     ready: AtomicU64,
 }
 
@@ -141,6 +151,9 @@ impl Frame {
     }
     pub fn height(&self) -> u32 {
         self.slot.height
+    }
+    pub fn pixel_format(&self) -> PixelFormat {
+        self.slot.format
     }
     pub fn texture(&self) -> &ID3D11Texture2D {
         &self.slot.texture
@@ -183,36 +196,74 @@ impl Frame {
     }
 }
 
-pub(crate) struct TexturePool {
+/// Bounded owned GPU frames, shared across sizes and pixel formats.
+pub struct TexturePool {
     device: GraphicsDevice,
     slots: Vec<Arc<Slot>>,
 }
 
 impl TexturePool {
-    pub(crate) fn new(device: GraphicsDevice) -> Self {
+    pub fn new(device: GraphicsDevice) -> Self {
         Self {
             device,
             slots: Vec::new(),
         }
     }
 
-    pub(crate) fn copy(
+    /// Copy the top-left `width` by `height` region without CPU readback.
+    /// Returns `None` when all `MAX_POOL_FRAMES` slots are still in use.
+    /// Supports BGRA8 and RGB10A2 default-usage, single-mip/slice/sample textures.
+    ///
+    /// The source must belong to this pool's device. External producers must
+    /// finish submitting writes on the shared device's immediate context
+    /// before this call; cross-API producers must synchronize their writes
+    /// with that device first. Do not overwrite or recycle the source until
+    /// the returned frame's fence reaches its ready value (or order subsequent
+    /// writes after this copy on the same immediate context).
+    pub fn copy(
         &mut self,
         source: &ID3D11Texture2D,
         width: u32,
         height: u32,
     ) -> Result<Option<Frame>> {
+        let owner: ID3D11Device5 = unsafe { source.GetDevice() }?.cast()?;
+        let mut source_desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { source.GetDesc(&mut source_desc) };
+        let format = match source_desc.Format {
+            DXGI_FORMAT_B8G8R8A8_UNORM => PixelFormat::Bgra8,
+            DXGI_FORMAT_R10G10B10A2_UNORM => PixelFormat::Rgba10,
+            other => bail!(
+                "copy source format {other:?}: valid formats are B8G8R8A8_UNORM and R10G10B10A2_UNORM"
+            ),
+        };
+        if owner != *self.device.raw()
+            || width == 0
+            || height == 0
+            || width > source_desc.Width
+            || height > source_desc.Height
+            || source_desc.MipLevels != 1
+            || source_desc.ArraySize != 1
+            || source_desc.SampleDesc.Count != 1
+            || source_desc.SampleDesc.Quality != 0
+            || source_desc.Usage != D3D11_USAGE_DEFAULT
+            || source_desc.CPUAccessFlags != 0
+        {
+            bail!(
+                "copy source must be same-device, GPU-only default usage, single mip/slice/sample with nonzero copy dimensions within the texture"
+            );
+        }
         let completed = self.device.completed()?;
-        // On resize, discard only idle old-size textures; retained pictures
-        // keep their dimensions and still count toward the 32-frame bound.
+        // Discard only idle old-size/format textures; retained pictures keep
+        // their layout and still count toward the same 32-frame bound.
         self.slots.retain(|slot| {
-            (slot.width == width && slot.height == height)
+            (slot.width == width && slot.height == height && slot.format == format)
                 || Arc::strong_count(slot) > 1
                 || slot.ready.load(Ordering::Acquire) > completed
         });
         let slot = self.slots.iter().find(|slot| {
             slot.width == width
                 && slot.height == height
+                && slot.format == format
                 && Arc::strong_count(slot) == 1
                 && slot.ready.load(Ordering::Acquire) <= completed
         });
@@ -225,7 +276,7 @@ impl TexturePool {
                     Height: height,
                     MipLevels: 1,
                     ArraySize: 1,
-                    Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    Format: source_desc.Format,
                     SampleDesc: DXGI_SAMPLE_DESC {
                         Count: 1,
                         Quality: 0,
@@ -256,6 +307,7 @@ impl TexturePool {
                     shared,
                     width,
                     height,
+                    format,
                     ready: AtomicU64::new(0),
                 });
                 self.slots.push(slot.clone());

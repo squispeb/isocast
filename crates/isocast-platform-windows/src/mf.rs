@@ -8,7 +8,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use isocast_engine::{EncodedVideo, LiveVideoSpec, ParameterSets, Time, VideoEncoder};
+use isocast_engine::{EncodedVideo, LiveVideoSpec, Time, VideoEncoder};
 use parking_lot::Mutex;
 use windows::Win32::Foundation::{E_NOTIMPL, E_POINTER, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
@@ -19,9 +19,10 @@ use windows::Win32::System::Variant::VARIANT;
 use windows::core::{GUID, Interface, PWSTR, Ref, implement};
 
 use crate::convert::Converter;
+use crate::encoder::Parameters;
 use crate::h264;
 use crate::native::{Apartment, Event};
-use crate::{EncodeStats, Frame, GraphicsDevice};
+use crate::{EncodeStats, Frame, GraphicsDevice, PixelFormat, VideoEncoding};
 
 const IN_FLIGHT: usize = 8;
 const FINISH_WAIT: Duration = Duration::from_secs(5);
@@ -36,7 +37,7 @@ type Job = Box<dyn FnOnce(&mut Session) + Send>;
 
 /// All COM/MFT operations stay on one private MTA worker, even if the
 /// engine moves this handle between its own threads. Software is explicit:
-/// it downloads NV12, while hardware receives a DXGI texture sample.
+/// it downloads NV12/P010, while hardware receives a DXGI texture sample.
 pub struct MfEncoder {
     jobs: Option<mpsc::SyncSender<Job>>,
     worker: Option<JoinHandle<()>>,
@@ -49,6 +50,17 @@ pub struct MfEncoder {
 
 impl MfEncoder {
     pub fn new(device: &GraphicsDevice, spec: &LiveVideoSpec, mode: MfMode) -> Result<Self> {
+        Self::with_format(device, spec, mode, VideoEncoding::H264, PixelFormat::Bgra8)
+    }
+
+    pub fn with_format(
+        device: &GraphicsDevice,
+        spec: &LiveVideoSpec,
+        mode: MfMode,
+        encoding: VideoEncoding,
+        input: PixelFormat,
+    ) -> Result<Self> {
+        encoding.validate(input)?;
         validate(spec.fps, spec.bitrate_kbps)?;
         if spec.width == 0
             || spec.height == 0
@@ -56,7 +68,7 @@ impl MfEncoder {
             || !spec.height.is_multiple_of(2)
             || spec.keyframe_interval == 0
         {
-            bail!("video: MF H.264 requires positive even dimensions and keyframe_interval >= 1");
+            bail!("video: MF requires positive even dimensions and keyframe_interval >= 1");
         }
         let (tx, rx) = mpsc::sync_channel::<Job>(1);
         let (started, startup) = mpsc::sync_channel(1);
@@ -69,7 +81,7 @@ impl MfEncoder {
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
                         let _apartment = Apartment::new()?;
                         let _runtime = Runtime::new()?;
-                        let mut session = Session::open(&device, &settings, mode)?;
+                        let mut session = Session::open(&device, &settings, mode, encoding, input)?;
                         if started.send(Ok(session.info.clone())).is_err() {
                             return Ok(());
                         }
@@ -147,7 +159,7 @@ impl MfEncoder {
         })
     }
     pub fn decoder_config(&self) -> Result<Vec<u8>> {
-        self.call(|session| h264::config(&session.parameters))
+        self.call(|session| session.parameters.config())
     }
     pub fn stats(&self) -> Result<EncodeStats> {
         let mut stats = self.call(|session| Ok(session.stats()))?;
@@ -363,7 +375,8 @@ struct Session {
     slots: Vec<Arc<Slot>>,
     info: MfEncoderInfo,
     output_info: MFT_OUTPUT_STREAM_INFO,
-    parameters: ParameterSets,
+    parameters: Parameters,
+    input: PixelFormat,
     size: (u32, u32),
     fps: u32,
     need_input: u32,
@@ -380,18 +393,32 @@ struct Session {
 }
 
 impl Session {
-    fn open(device: &GraphicsDevice, spec: &LiveVideoSpec, mode: MfMode) -> Result<Self> {
+    fn open(
+        device: &GraphicsDevice,
+        spec: &LiveVideoSpec,
+        mode: MfMode,
+        encoding: VideoEncoding,
+        input: PixelFormat,
+    ) -> Result<Self> {
         let mut failures = Vec::new();
         let hardware = mode == MfMode::Hardware;
-        for activation in candidates(hardware, hardware.then(|| device.adapter_luid()))? {
+        for activation in candidates(hardware, hardware.then(|| device.adapter_luid()), encoding)? {
             let label = name(&activation)?;
-            match Self::open_one(device, spec, mode, Activation(activation), label.clone()) {
+            match Self::open_one(
+                device,
+                spec,
+                mode,
+                Activation(activation),
+                label.clone(),
+                encoding,
+                input,
+            ) {
                 Ok(session) => return Ok(session),
                 Err(error) => failures.push(format!("{label}: {error:#}")),
             }
         }
         bail!(
-            "no usable {mode:?} Media Foundation H.264 encoder{}",
+            "no usable {mode:?} Media Foundation {encoding:?} encoder{}",
             if failures.is_empty() {
                 " is installed".into()
             } else {
@@ -406,6 +433,8 @@ impl Session {
         mode: MfMode,
         activation: Activation,
         label: String,
+        encoding: VideoEncoding,
+        pixel_format: PixelFormat,
     ) -> Result<Self> {
         unsafe {
             let transform: IMFTransform = activation.0.ActivateObject()?;
@@ -418,7 +447,7 @@ impl Session {
             let (mut inputs, mut outputs) = (0, 0);
             transform.GetStreamCount(&mut inputs, &mut outputs)?;
             if inputs != 1 || outputs != 1 {
-                bail!("H.264 encoder must expose one input and one output stream");
+                bail!("video encoder must expose one input and one output stream");
             }
             let (mut input, mut output) = ([0], [0]);
             if let Err(error) = transform.GetStreamIDs(&mut input, &mut output)
@@ -427,7 +456,7 @@ impl Session {
                 return Err(error.into());
             }
             if input[0] != 0 || output[0] != 0 {
-                bail!("H.264 encoder has unsupported nonzero stream ids");
+                bail!("video encoder has unsupported nonzero stream ids");
             }
             let manager = if mode == MfMode::Hardware {
                 if !asynchronous || !d3d11 {
@@ -459,7 +488,9 @@ impl Session {
             }
             set(&codec, &CODECAPI_AVLowLatencyMode, VARIANT::from(true))
                 .context("enable low-latency encoding")?;
-            if codec.IsSupported(&CODECAPI_AVEncH264CABACEnable).is_ok() {
+            if encoding == VideoEncoding::H264
+                && codec.IsSupported(&CODECAPI_AVEncH264CABACEnable).is_ok()
+            {
                 set(&codec, &CODECAPI_AVEncH264CABACEnable, VARIANT::from(true))?;
             }
             set(
@@ -481,21 +512,40 @@ impl Session {
             if !spec.constant_bitrate {
                 set(&codec, &CODECAPI_AVEncCommonMaxBitRate, VARIANT::from(bits))?;
             }
-            let output = media_type(spec, MFVideoFormat_H264)?;
+            let output = media_type(spec, subtype(encoding))?;
             output.SetUINT32(&MF_MT_AVG_BITRATE, bits)?;
-            output.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High.0 as u32)?;
+            let profile = match encoding {
+                VideoEncoding::H264 => eAVEncH264VProfile_High.0 as u32,
+                VideoEncoding::Hevc => eAVEncH265VProfile_Main_420_8.0 as u32,
+                VideoEncoding::Hevc10 => eAVEncH265VProfile_Main_420_10.0 as u32,
+            };
+            output.SetUINT32(&MF_MT_VIDEO_PROFILE, profile)?;
             transform.SetOutputType(0, &output, 0)?;
-            let input = media_type(spec, MFVideoFormat_NV12)?;
+            let bytes_per_pixel = if encoding.bit_depth() == 10 { 2 } else { 1 };
+            let input = media_type(
+                spec,
+                if bytes_per_pixel == 2 {
+                    MFVideoFormat_P010
+                } else {
+                    MFVideoFormat_NV12
+                },
+            )?;
             input.SetUINT32(&MF_MT_ALL_SAMPLES_INDEPENDENT, 1)?;
             input.SetUINT32(&MF_MT_FIXED_SIZE_SAMPLES, 1)?;
-            input.SetUINT32(&MF_MT_DEFAULT_STRIDE, spec.width)?;
+            input.SetUINT32(
+                &MF_MT_DEFAULT_STRIDE,
+                spec.width
+                    .checked_mul(bytes_per_pixel)
+                    .context("video stride overflow")?,
+            )?;
             input.SetUINT32(
                 &MF_MT_SAMPLE_SIZE,
                 spec.width
                     .checked_mul(spec.height)
                     .and_then(|n| n.checked_mul(3))
+                    .and_then(|n| n.checked_mul(bytes_per_pixel))
                     .map(|n| n / 2)
-                    .context("NV12 dimensions overflow")?,
+                    .context("video dimensions overflow")?,
             )?;
             transform.SetInputType(0, &input, 0)?;
             let wake = Arc::new(Event::new()?);
@@ -504,7 +554,18 @@ impl Session {
             } else {
                 None
             };
-            let converter = Converter::new(device, spec.width, spec.height, spec.fps)?;
+            let converter = if encoding == VideoEncoding::H264 {
+                Converter::new(device, spec.width, spec.height, spec.fps)?
+            } else {
+                Converter::with_format(
+                    device,
+                    spec.width,
+                    spec.height,
+                    spec.fps,
+                    pixel_format,
+                    encoding.bit_depth(),
+                )?
+            };
             let output_info = transform.GetOutputStreamInfo(0)?;
             let mut session = Self {
                 activation,
@@ -522,9 +583,11 @@ impl Session {
                     asynchronous,
                     d3d11,
                     b_picture_control,
+                    encoding,
                 },
                 output_info,
-                parameters: ParameterSets::default(),
+                parameters: Parameters::new(encoding),
+                input: pixel_format,
                 size: (spec.width, spec.height),
                 fps: spec.fps,
                 need_input: 0,
@@ -572,14 +635,19 @@ impl Session {
             return Ok(());
         }
         if size > 65536 {
-            bail!("MF H.264 configuration is too large");
+            bail!("MF video configuration is too large");
         }
         let mut bytes = vec![0; size as usize];
         unsafe { ty.GetBlob(&MF_MT_MPEG_SEQUENCE_HEADER, &mut bytes, None) }?;
-        let sets = h264::parameters(&h264::annex_b(&bytes)?);
-        if !sets.sps.is_empty() && !sets.pps.is_empty() {
-            self.parameters = sets;
+        if self.info.encoding == VideoEncoding::H264 {
+            // Preserve the H.264 path's tolerance for incomplete open-time
+            // headers; in-band SPS/PPS can complete them before output.
+            let sets = h264::parameters(&h264::annex_b(&bytes)?);
+            if sets.sps.is_empty() || sets.pps.is_empty() {
+                return Ok(());
+            }
         }
+        self.parameters.headers(&bytes)?;
         Ok(())
     }
 
@@ -637,6 +705,13 @@ impl Session {
         }
         if self.size != (frame.width(), frame.height()) || !self.device.owns(frame) {
             bail!("video.frame: must match the MF encoder size and D3D11 device");
+        }
+        if frame.pixel_format() != self.input {
+            bail!(
+                "video.input: MF requires {:?}, got {:?}",
+                self.input,
+                frame.pixel_format()
+            );
         }
         Ok(())
     }
@@ -794,12 +869,11 @@ impl Session {
         let packet = if data.is_null() || length == 0 || length as usize > h264::MAX_PACKET {
             Err(anyhow!("MF returned invalid encoded packet size {length}"))
         } else {
-            h264::packet(
+            self.parameters.packet(
                 unsafe { std::slice::from_raw_parts(data, length as usize) },
                 self.pending
                     .front()
                     .map_or(Time::from_nanos(0), |pending| pending.pts),
-                &mut self.parameters,
             )
         };
         unsafe { buffer.Unlock() }?;
@@ -822,7 +896,7 @@ impl Session {
         if let Ok(dts) = unsafe { sample.GetUINT64(&MFSampleExtension_DecodeTimestamp) }
             && dts as i64 != at
         {
-            bail!("MF encoder returned reordered H.264 pictures");
+            bail!("MF encoder returned reordered pictures");
         }
         let pending = self.pending.pop_front().expect("checked above");
         self.counts.last_receive_latency = pending.submitted.elapsed();
@@ -1005,6 +1079,7 @@ pub struct MfEncoderInfo {
     /// Some hardware MFTs expose low-latency control but not B-picture count.
     /// Output timestamps are checked for reordering in either case.
     pub b_picture_control: bool,
+    pub encoding: VideoEncoding,
 }
 
 struct Runtime;
@@ -1025,10 +1100,22 @@ impl Runtime {
     }
 }
 
-fn candidates(hardware: bool, adapter: Option<(u32, i32)>) -> Result<Vec<IMFActivate>> {
+fn subtype(encoding: VideoEncoding) -> GUID {
+    if encoding == VideoEncoding::H264 {
+        MFVideoFormat_H264
+    } else {
+        MFVideoFormat_HEVC
+    }
+}
+
+fn candidates(
+    hardware: bool,
+    adapter: Option<(u32, i32)>,
+    encoding: VideoEncoding,
+) -> Result<Vec<IMFActivate>> {
     let output = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
-        guidSubtype: MFVideoFormat_H264,
+        guidSubtype: subtype(encoding),
     };
     let flags = if hardware {
         MFT_ENUM_FLAG_HARDWARE
@@ -1089,14 +1176,20 @@ fn name(activation: &IMFActivate) -> Result<String> {
 /// Enumerate and inspect H.264 transforms on a private COM thread. This
 /// never opens a capture device, reads a user file or prompts for permission.
 pub fn mf_encoders() -> Result<Vec<MfEncoderInfo>> {
+    mf_encoders_for(VideoEncoding::H264)
+}
+
+/// The result describes installed transforms, not successful bit-depth
+/// negotiation or available sessions; opening still checks those properties.
+pub fn mf_encoders_for(encoding: VideoEncoding) -> Result<Vec<MfEncoderInfo>> {
     std::thread::Builder::new()
         .name("MF encoder discovery".into())
-        .spawn(|| -> Result<_> {
+        .spawn(move || -> Result<_> {
             let _apartment = Apartment::new()?;
             let _runtime = Runtime::new()?;
             let mut result = Vec::new();
             for hardware in [true, false] {
-                for activation in candidates(hardware, None)? {
+                for activation in candidates(hardware, None, encoding)? {
                     let name = name(&activation)?;
                     let transform: IMFTransform = unsafe { activation.ActivateObject() }?;
                     let attributes = unsafe { transform.GetAttributes() }?;
@@ -1112,6 +1205,7 @@ pub fn mf_encoders() -> Result<Vec<MfEncoderInfo>> {
                             unsafe { codec.IsSupported(&CODECAPI_AVEncMPVDefaultBPictureCount) }
                                 .is_ok()
                         }),
+                        encoding,
                     };
                     unsafe { activation.ShutdownObject() }?;
                     result.push(info);
@@ -1121,5 +1215,5 @@ pub fn mf_encoders() -> Result<Vec<MfEncoderInfo>> {
         })?
         .join()
         .map_err(|_| anyhow::anyhow!("MF discovery worker panicked"))?
-        .context("enumerate Media Foundation H.264 encoders")
+        .context("enumerate Media Foundation video encoders")
 }
