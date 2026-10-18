@@ -5,6 +5,12 @@ each section. Delete entries that stop being true.
 
 ## Environment
 
+- 2026-10-17 (#105 W.5c2): delegator stopped the lane's isolated OBS PID13804.
+  Verified its exact executable was no longer running, then removed only its
+  generated `scratch/obs-portable/config/obs-studio/plugin_config/obs-websocket/config.json`.
+  No credential contents read or logged. W.5c1 commit692314a and all three
+  Actions39086165352 jobs are green.
+
 - 2026-10-17 (#105 W.5a): capture lane uses
   `ISOCAST_WINDOWS_ROOT=C:/isocast-dev/lanes/capture` and
   `ISOCAST_WINDOWS_OUT=/Volumes/IsocastBuild/windows-capture/scratch/native`
@@ -278,19 +284,6 @@ each section. Delete entries that stop being true.
   Privacy & Security for that app, and ask Ryan to grant it.
 
 ## Waiting on Ryan
-
-- 2026-10-17 (#105 W.5c1, cleanup only): quit the capture lane's isolated OBS
-  from its Windows tray menu. PID13804 was verified at
-  `C:\isocast-dev\lanes\capture\scratch\obs-portable\bin\64bit\obs64.exe`;
-  recording stopped, WGC item disabled, all files decoded. Hidden tray window
-  is absent from Cua's window list; CloseMainWindow returnedfalse and Cua
-  kill_app refused foreign_process_termination_denied. Do not bypass that
-  permission boundary or touch the installed personal OBS. Verify exit with
-  `EXON_DESK_HOST=exon-desk-lan exon-desk-ps 'Get-Process obs64 -ErrorAction SilentlyContinue | Select-Object Id,Path'`;
-  afterwards remove only the private generated
-  `C:\isocast-dev\lanes\capture\scratch\obs-portable\config\obs-studio\plugin_config\obs-websocket\config.json`.
-  Its temporary control credential is owner-ACL protected and never logged.
-  This does not block code CI; the authenticated test listener ends with OBS.
 
 - 2026-10-17 (#104): NLE export checked in DaVinci Resolve only. Final Cut
   Pro's trial now comes from the App Store (needs an Apple ID) and Premiere
@@ -6259,6 +6252,39 @@ each section. Delete entries that stop being true.
   starts at 900 because the window's minimum width is 900.
 
 ## Gotchas
+
+- 2026-10-17 (#105 W.5c2): Windows10 MFStartup/MFShutdown around an activated
+  encoder retains14 handles per reopen (5Event,2IRTimer,1IoCompletion,
+  1TpWorkerFactory,5WaitCompletionPacket). Startup/shutdown without activating
+  an MFT does not reproduce it. One process-lifetime MFStartup fixes growth;
+  actual16 hardware+16 software frame sessions stayed469/482 handles after
+  warm-up. Only the runtime is pinned: each transform shuts down and each
+  encoder worker joins. This is distinct from WGC's two ALPC ports per worker.
+
+- 2026-10-17 (#105 W.5c2): NVIDIA H.264 MFT is async/D3D11-aware but does
+  not implement AVEncMPVDefaultBPictureCount (IsSupported=E_NOTIMPL,
+  SetValue=E_INVALIDARG); AVLowLatencyMode works. Require low latency, set
+  zero B pictures when supported, and verify every output PTS/DTS. Microsoft
+  H264 Encoder MFT is synchronous software. Both accept live bitrate changes
+  but reject live FPS changes on this machine; do not report a rate change
+  as successful or silently recreate a recording session. 12 occupied native
+  NVENC sessions produce NVENC21 and MF hardwareC00D6D76, then the explicit
+  software fallback records normally. Hardware MFT enumeration is adapter-
+  matched with MFTEnum2; Intel/AMD hardware remains unqualified.
+
+- 2026-10-17 (#105 W.5c2): D3D11 NV12 staging Map(DO_NOT_WAIT) can transiently
+  return STILL_DRAWING after a completed GPU fence. The explicit software
+  path retries at1ms under a2s deadline; no hardware pixel readback. Both
+  hardware and software red patches decode YUV63/102/240 (709 limited).
+  Software1080p60 counter/red runs passed120/120 on Ryzen5700, not a complex-
+  scene throughput guarantee; overload must still shed/count honestly.
+  MF's NeedInput callback can lag output consumption by a work-queue hop:
+  a300-frame low-latency run dropped1 before a bounded2ms credit wait.
+  Afterward, three1080p60+one4K60 low-latency MF runs each decoded300/300 with
+  zero losses. Final software1080p and NVENC1080p/4K regression runs did too.
+  Native handle counts in the final32-open check stayed464/481 after warmup;
+  both providers cap cached output at8 and report55 drops from64 overloaded
+  submissions, with all9 accepted pictures drained.
 
 - 2026-10-17 (#105 W.5c1): NVENC's D3D11 MapInputResource synchronizes prior
   graphics writes, but forbids client access while mapped (SDK13 header4130).

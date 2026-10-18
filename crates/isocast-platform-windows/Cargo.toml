@@ -14,6 +14,7 @@ cc = "1.8.0"
 [target.'cfg(windows)'.dependencies]
 anyhow = "1.0.104"
 isocast-engine = { path = "../isocast-engine" }
+isocast-protocol = { path = "../isocast-protocol" }
 parking_lot = "0.12"
 wgpu = { version = "=30.0.1", default-features = false, features = ["std", "parking_lot", "dx12", "wgsl"] }
 # The COM lease attached to an imported resource uses the implementation
@@ -31,8 +32,11 @@ windows = { version = "0.62.2", features = [
     "Win32_Graphics_Direct3D12",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
+    "Win32_Media_MediaFoundation",
     "Win32_Security",
     "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
     "Win32_System_Performance",
     "Win32_System_Threading",
     "Win32_System_WinRT_Direct3D11",

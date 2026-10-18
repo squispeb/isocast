@@ -10,11 +10,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use isocast_engine::{EncodedVideo, LiveVideoSpec, ParameterSets, Time, VideoEncoder};
 use windows::core::Interface;
 
+use crate::h264::{self, MAX_PACKET, annex_b, parameters};
 use crate::{Frame, GraphicsDevice};
 
 const IN_FLIGHT: usize = 8;
-const MAX_PACKET: usize = 24 << 20;
-const MAX_NALS: usize = 1024;
 const STALL_WAIT: Duration = Duration::from_millis(400);
 const FINISH_WAIT: Duration = Duration::from_secs(5);
 
@@ -189,34 +188,7 @@ impl NvencEncoder {
 
     /// avcC for the encoded-packet muxer. No B-frame reordering is enabled.
     pub fn decoder_config(&self) -> Result<Vec<u8>> {
-        let sets = &self.parameters;
-        let first = sets
-            .sps
-            .first()
-            .filter(|sps| sps.len() >= 4)
-            .context("NVENC SPS is too short")?;
-        if sets.sps.len() > 31 || sets.pps.len() > 255 {
-            bail!("too many H.264 parameter sets");
-        }
-        let mut data = vec![
-            1,
-            first[1],
-            first[2],
-            first[3],
-            0xff,
-            0xe0 | sets.sps.len() as u8,
-        ];
-        for sps in &sets.sps {
-            write_set(&mut data, sps)?;
-        }
-        data.push(sets.pps.len() as u8);
-        for pps in &sets.pps {
-            write_set(&mut data, pps)?;
-        }
-        if first[1] == 100 {
-            data.extend_from_slice(&[0xfd, 0xf8, 0xf8, 0]);
-        }
-        Ok(data)
+        h264::config(&self.parameters)
     }
 
     /// Try admission without waiting for an output slot. Native mapping and
@@ -336,34 +308,12 @@ impl NvencEncoder {
             bail!("NVENC returned invalid packet size {}", packet.size);
         }
         let source = unsafe { std::slice::from_raw_parts(packet.data, packet.size as usize) };
-        let nals = annex_b(source)?;
-        let sets = parameters(&nals);
-        if !sets.sps.is_empty() && !sets.pps.is_empty() {
-            self.parameters = sets;
+        let decoded = h264::packet(source, pts, &mut self.parameters)?
+            .context("NVENC packet contains no H.264 picture")?;
+        if decoded.keyframe != (packet.keyframe != 0) {
+            bail!("NVENC keyframe flag disagrees with its H.264 picture");
         }
-        let mut data = Vec::new();
-        data.try_reserve(source.len().saturating_add(nals.len() * 4))?;
-        let mut picture = false;
-        for nal in nals {
-            let kind = nal[0] & 31;
-            if kind == 7 || kind == 8 {
-                continue;
-            }
-            picture |= (1..=5).contains(&kind);
-            data.extend_from_slice(&(nal.len() as u32).to_be_bytes());
-            data.extend_from_slice(nal);
-        }
-        if !picture {
-            bail!("NVENC packet contains no H.264 picture");
-        }
-        let keyframe = packet.keyframe != 0;
-        Ok(EncodedVideo {
-            data,
-            pts,
-            dts: pts,
-            keyframe,
-            parameter_sets: keyframe.then(|| self.parameters.clone()),
-        })
+        Ok(decoded)
     }
 
     /// Flush and return every remaining compressed picture, in order. Only a
@@ -507,64 +457,4 @@ fn bitrate(fps: u32, kbps: u32) -> Result<u32> {
 
 fn millis(duration: Duration) -> u32 {
     duration.as_millis().min(u128::from(u32::MAX - 1)) as u32
-}
-
-fn annex_b(data: &[u8]) -> Result<Vec<&[u8]>> {
-    let mut starts = Vec::new();
-    let mut i = 0;
-    while i + 3 <= data.len() {
-        let prefix = if data[i..].starts_with(&[0, 0, 0, 1]) {
-            4
-        } else if data[i..].starts_with(&[0, 0, 1]) {
-            3
-        } else {
-            i += 1;
-            continue;
-        };
-        if starts.len() == MAX_NALS {
-            bail!("NVENC access unit has too many NAL units");
-        }
-        starts.push((i, i + prefix));
-        i += prefix;
-    }
-    let mut nals = Vec::with_capacity(starts.len());
-    for (index, &(begin, start)) in starts.iter().enumerate() {
-        if index == 0 && data[..begin].iter().any(|byte| *byte != 0) {
-            bail!("NVENC packet has bytes before its first start code");
-        }
-        let mut end = starts.get(index + 1).map_or(data.len(), |next| next.0);
-        while end > start && data[end - 1] == 0 {
-            end -= 1;
-        }
-        if start == end {
-            bail!("NVENC packet contains an empty NAL unit");
-        }
-        nals.push(&data[start..end]);
-    }
-    if nals.is_empty() {
-        bail!("NVENC packet has no Annex B start codes");
-    }
-    Ok(nals)
-}
-
-fn parameters(nals: &[&[u8]]) -> ParameterSets {
-    ParameterSets {
-        sps: nals
-            .iter()
-            .filter(|nal| nal[0] & 31 == 7)
-            .map(|nal| nal.to_vec())
-            .collect(),
-        pps: nals
-            .iter()
-            .filter(|nal| nal[0] & 31 == 8)
-            .map(|nal| nal.to_vec())
-            .collect(),
-    }
-}
-
-fn write_set(data: &mut Vec<u8>, set: &[u8]) -> Result<()> {
-    let len = u16::try_from(set.len()).context("H.264 parameter set is too large")?;
-    data.extend_from_slice(&len.to_be_bytes());
-    data.extend_from_slice(set);
-    Ok(())
 }

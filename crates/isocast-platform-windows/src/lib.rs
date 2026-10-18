@@ -6,13 +6,19 @@
 
 mod capture;
 mod clock;
+mod convert;
+mod encoder;
 mod frames;
 mod gpu;
+mod h264;
+mod mf;
 mod native;
 mod nvenc;
 
 pub use capture::{CaptureStats, CaptureTarget, DisplayCapture, capture_screen};
 pub use clock::now;
+pub use encoder::{EncoderBackend, WindowsVideoEncoder};
 pub use frames::{Frame, GraphicsDevice, MAX_POOL_FRAMES};
 pub use gpu::Dx12Importer;
+pub use mf::{MfEncoder, MfEncoderInfo, MfMode, mf_encoders};
 pub use nvenc::{EncodeStats, NvencEncoder};

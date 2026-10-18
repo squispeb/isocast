@@ -3274,6 +3274,7 @@ dependencies = [
  "anyhow",
  "cc",
  "isocast-engine",
+ "isocast-protocol",
  "parking_lot",
  "wgpu",
  "windows",

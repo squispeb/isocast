@@ -1637,7 +1637,8 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
     the process MTA; Windows10 RPC handle retention across fresh capture
     workers remains a measured follow-up before Platform integration.
     Output pools/NVENC/writer/daemon selection remain separate work.
-  - [ ] **W.5c1 Native NVENC H.264 (agent/windows-capture).** Asynchronous
+  - [x] **W.5c1 Native NVENC H.264 (agent/windows-capture).** Commit692314a,
+    Actions39086165352 green. Asynchronous
     D3D11 P5/low-latency/High/709-limited encoding, eight bounded private GPU
     input/output slots, no CPU pixel readback. Native mapping is exclusive,
     so copy shared frames on GPU before mapping. H.264+mux files decode at
@@ -1648,6 +1649,18 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
     Not full program/ISO parity: benchmark AAC is an external FFmpeg helper.
     MF hardware/software fallback, HEVC, GPU output pools, native AAC and
     engine priority/ISO shedding remain gates before Platform selection.
+  - [x] **W.5c2 H.264 Media Foundation fallback (agent/windows-capture).**
+    NVENC-first provider selection, observable hardware-MFT/software-MFT
+    fallback, private GPU NV12 conversion and tracked-sample retention.
+    Explicit software download only; bounded admission and timestamp checks.
+    Final low-latency hardware1080p60/4K60, software1080p60 and NVENC
+    regression files decode2400/2400 frames with zero drops;
+    12 occupied NVENC sessions force the software fallback, which records
+    60/60 frames while existing sessions survive and capacity returns.
+    16 real reopens per MF provider have stable native handles. Strict native
+    clippy,81 engine tests, full remote Mac gates and independent review pass.
+    Ready for CI; HEVC/10-bit follows this slice. No WindowsPlatform selection
+    or full recording parity yet.
 - [ ] **W.6 App, IPC and shared surfaces.** Slint Windows window and native
   integration, same-user named pipes with isolated engines, D3D11/D3D12
   surface hand-over/fences with adapter identity and bounded per-viewer
@@ -1689,6 +1702,21 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
 - FilmCraft reads `session.json` to line up ISO files without audio sync.
 
 ## Log
+
+- W.5c2 (2026-10-17, #105, ready for CI): NVENC-first H.264 selection now
+  falls through same-adapter hardware MF to explicitly labelled software MF.
+  Hardware uses GPU BGRA→NV12 conversion and tracked-sample private slots;
+  software alone downloads pixels. Final eight low-latency files fully decode
+  2400/2400 frames at1080p60/4K60 (software1080p), zero counted losses;
+  redYUV63/102/240, keyframes, invalid-PTS recovery and bounded overload pass.
+  12 occupied NVENCs force software60/60; old session survives and capacity
+  returns. Fixed per-open MF runtime14-handle retention and async-credit lag;
+  16 real opens each provider keep stable464/481 handles after warmup. Native
+  strict clippy/81 engine tests and full remote Mac gates232tests+1doctest
+  pass; independent review/re-review approve. Detailed evidence in capture
+  lane REPORT.md. W.5c1 Actions39086165352 green; isolated OBS/credential
+  cleaned. HEVC/10-bit, camera/WASAPI, nativeAAC and Platform/priority wiring
+  follow; Intel/AMD and GPU-less software remain unqualified.
 
 - W.5c1 (2026-10-17, #105, ready for CI): native NVENC now
   consumes GPU-resident frames and produces aligned H.264 through the W.2
