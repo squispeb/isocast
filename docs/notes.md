@@ -5,6 +5,17 @@ each section. Delete entries that stop being true.
 
 ## Environment
 
+- 2026-10-17 (#105 W.5a): capture lane uses
+  `ISOCAST_WINDOWS_ROOT=C:/isocast-dev/lanes/capture` and
+  `ISOCAST_WINDOWS_OUT=/Volumes/IsocastBuild/windows-capture/scratch/native`
+  with windows-remote.sh. `ISOCAST_WINDOWS_GPU_LOCK=1` takes the shared
+  `C:\isocast-dev\gpu.lock`; source/target/cache/home/IPC remain lane-local.
+  Cua's existing Session 1 daemon launches native probes without activation;
+  SSH is Session 0, unsuitable for real desktop capture. OBS 32.1.2 binaries
+  copied into the lane's `scratch/obs-portable` (portable_mode.txt), not
+  Ryan's profile. No OBS recording comparison yet. Evidence in capture
+  lane REPORT.md. The daemon still selects StubPlatform on Windows.
+
 - 2026-10-17 (#105 W.1e): Windows UI now builds with Slint 1.18.1/Skia
   and renders offscreen through RTX 5070/DX12. First native release build
   of daemon/CLI/UI took 14m11s; relinking generated UI after a client change
@@ -267,6 +278,19 @@ each section. Delete entries that stop being true.
   Privacy & Security for that app, and ask Ryan to grant it.
 
 ## Waiting on Ryan
+
+- 2026-10-17 (#105 W.5c1, cleanup only): quit the capture lane's isolated OBS
+  from its Windows tray menu. PID13804 was verified at
+  `C:\isocast-dev\lanes\capture\scratch\obs-portable\bin\64bit\obs64.exe`;
+  recording stopped, WGC item disabled, all files decoded. Hidden tray window
+  is absent from Cua's window list; CloseMainWindow returnedfalse and Cua
+  kill_app refused foreign_process_termination_denied. Do not bypass that
+  permission boundary or touch the installed personal OBS. Verify exit with
+  `EXON_DESK_HOST=exon-desk-lan exon-desk-ps 'Get-Process obs64 -ErrorAction SilentlyContinue | Select-Object Id,Path'`;
+  afterwards remove only the private generated
+  `C:\isocast-dev\lanes\capture\scratch\obs-portable\config\obs-studio\plugin_config\obs-websocket\config.json`.
+  Its temporary control credential is owner-ACL protected and never logged.
+  This does not block code CI; the authenticated test listener ends with OBS.
 
 - 2026-10-17 (#104): NLE export checked in DaVinci Resolve only. Final Cut
   Pro's trial now comes from the App Store (needs an Apple ID) and Premiere
@@ -6235,6 +6259,69 @@ each section. Delete entries that stop being true.
   starts at 900 because the window's minimum width is 900.
 
 ## Gotchas
+
+- 2026-10-17 (#105 W.5c1): NVENC's D3D11 MapInputResource synchronizes prior
+  graphics writes, but forbids client access while mapped (SDK13 header4130).
+  Shared Frames also feed compositor/other encoders, so NVENC has eight
+  private BGRA GPU inputs: one GPU copy, no CPU readback, map until completion
+  then unmap before reuse. Source leases remain held through encode completion
+  for now; budget/shorten retention before multi-encoder fan-out (32-frame
+  source pool). A4K input ring costs~253MiB VRAM; NV12 is a later optimization.
+  `hwEncodeStatus` is NOT NVENCSTATUS:2 means frame complete, not an error.
+  Readiness is the completion event plus successful LockBitstream. A red patch
+  decodes YUV63/103/240, confirming709-limited conversion rather than601 tags.
+
+- 2026-10-17 (#105 W.5c1): RTX5070/driver617.42 admits12 NVENC sessions;
+  the13th returnsNVENC21, NOT out-of-memory. Do not hard-code8 or make fallback
+  recognize only error10. Existing session remains usable, all12 release and
+  another opens. This is admission, not a12×4K60 throughput claim. MF fallback
+  and program/ISO priority wiring must precede selecting WindowsPlatform.
+
+- 2026-10-17 (#105 W.5c1): OBS32.1.2 native recording requires an audio
+  encoder; disabling sources gives silentAAC, not video-only. First comparison
+  matches WGC,CBR24Mbps,P5/ll,single-pass,AQ8spatial-only,709-limited,noB/lookahead.
+  Isocast's test helper encodes silent48k stereo160kbpsAAC with FFmpeg; its CPU
+  and RSS are included, but it is NOT a native audio backend. OBS settings:
+  `obs_nvenc_h264_tex`, `bf=0`, `device=-1` (explicit0 forces texture fallback),
+  `opts=enableAQ=1 aqStrength=8 enableTemporalAQ=0 enableLookahead=0 lookaheadDepth=0`.
+  OBS logs confirmed WGC and native NVENC. First numbers are one-window direct
+  source recording, not the full program+ISO engine or a complex-scene benchmark.
+
+- 2026-10-17 (#105 W.5b): DX12 import must wait on
+  `gpu.queue.as_hal::<Dx12>().as_raw()`, NOT `Device::raw_queue()` (that is
+  wgpu's separate presentation queue). D3D11 CreateSharedHandle is once per
+  texture; the slot owns its unnamed NT handle. OpenSharedHandle maps the
+  same GPU allocation into a distinct DX12 resource/private-data store.
+  Noncached imports attach an IUnknown frame lease there until wgpu releases
+  the resource after completion. Cached imports keep only native texture
+  references; the existing engine contract retains frames through GPU work.
+  BGRA input imports are read-only and REQUIRE ALLOW_SIMULTANEOUS_ACCESS;
+  on RTX5070/617.42 Win10, flags=33, COMMON promotion/decay validates. If
+  another driver omits that flag, refuse it; the future alternative is
+  explicit release-to-COMMON barriers, never weakening the flag check.
+
+- 2026-10-17 (#105 W.5b): destroying the last MTA after capture invalidates
+  windows-rs's process-cached WinRT activation factories on Win10. A real
+  reopen crashed in GraphicsCaptureSession::IsSupported (unmapped vtable).
+  One process-lifetime CoIncrementMTAUsage reference, matching those cached
+  factories' lifetime, fixes the crash (120 real reopen/render cycles).
+  Individual capture workers still balance RoInitialize/RoUninitialize.
+  Handle-type measurement also found two ALPC ports retained per fresh
+  capture worker, with capture only AND with DX12 import, even after3s idle
+  and dropping the D3D11 device; this is NOT a leak-free reopen claim.
+  Qualify RPC scavenging or reuse long-lived MTA workers before selecting
+  WindowsPlatform. GPU cache references are bounded separately at64 surfaces.
+
+- 2026-10-17 (#105 W.5a): WGC `TryGetNextFrame` returns S_OK + null when
+  empty; windows-rs 0.62.2 represents this as Error::empty(), not E_POINTER.
+  On Win10 build19045, Item.Closed did not fire when the target exited;
+  HWND capture checks liveness with an idle wait bounded at250ms. QPC is
+  10MHz on exon-desk. Real WGC presentation stamps arrive13–16ms ahead of
+  callback time (same QPC domain): preserve them, report signed offsets,
+  never call a saturating zero difference measured capture latency. Synthetic
+  WinForms windows need explicit DPI awareness: otherwise1920x1080 becomes
+  3840x2160 at the desktop's200% scale. WGC's own pre-delivery losses are
+  not exposed; our pool/rate/resize counters do not claim to count those.
 
 - 2026-10-17 (#105 W.1e): NPFS refuses WAIT→NOWAIT with ERROR_PIPE_BUSY
   while this endpoint has buffered outgoing bytes (even an 8-byte release),

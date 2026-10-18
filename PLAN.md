@@ -1595,6 +1595,11 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
   hosted recording; fail clearly
   for unsupported devices/codecs. A synthetic program and ISOs produce
   decodable, aligned files on windows-latest, with honest loss counters.
+  - [ ] **W.4 platform-selection gate:** resolve/qualify Windows10 RPC port
+    retention before switching the daemon to WindowsPlatform. Fresh capture
+    workers retain two ALPC ports per open/close, even without DX12 import.
+    Check long-idle RPC scavenging and isolate apartment/device/item/pool
+    creation; reuse MTA workers if needed. W.5b evidence has the repro.
 - [ ] **W.5 Capture, audio and encoders.** Windows.Graphics.Capture for
   screens/windows, Media Foundation cameras, WASAPI input/loopback/output,
   NVENC-first, hardware MF (NVENC/QSV/AMF) fallback, software last;
@@ -1609,6 +1614,40 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
   at 1080p60 and 4K60 with ISOs: launch-to-first-preview, ready-to-record,
   start-record latency, CPU/GPU/memory and dropped frames. Install isolated
   OBS as a permitted test dependency, never use Ryan's OBS profile.
+  - [x] **W.5a Native capture substrate (agent/windows-capture).** Commit
+    8619c20, Actions39074561618 green. WGC display/HWND capture into bounded,
+    fenced D3D11 BGRA textures; QPC stamps, cursor switch, resize, pressure
+    counts and joined teardown. Six 1080p60/4K60 runs at 59.997–59.998 fps,
+    zero observable pool/rate drops; 32 retained frames force counted drops
+    and resume correctly, retained pixels survive resize. Two simultaneous
+    captures share a device, window-close fallback verified on Windows 19045.
+    ~230 ms device-open-to-first frame; not UI/record readiness. One GPU copy,
+    no CPU readback; wgpu import, encoding and Platform selection still pending.
+    OBS portable installed, matched record/ISO comparisons not yet possible.
+  - [x] **W.5b Zero-copy DX12 input (agent/windows-capture).** Commit267a169,
+    Actions39080080156 green. Same-adapter
+    NT-handle imports and GPU-side waits on wgpu's rendering queue; no extra
+    pixel copy/upload/readback. Cached surfaces and native frame leases keep
+    the pool bounded through GPU work. Real renderer, held-texture pressure,
+    blocked-GPU retention, resize and simultaneous imports verified under
+    D3D12 GPU validation; native build/strict clippy,81 engine tests and full
+    remote Mac gates pass. Final six10s runs:3606 completed renders at1080p/4K,
+    no counted drops; callback→GPU completion0.575/0.878ms median.
+    Reopening also exposed a WinRT factory lifetime crash, fixed by retaining
+    the process MTA; Windows10 RPC handle retention across fresh capture
+    workers remains a measured follow-up before Platform integration.
+    Output pools/NVENC/writer/daemon selection remain separate work.
+  - [ ] **W.5c1 Native NVENC H.264 (agent/windows-capture).** Asynchronous
+    D3D11 P5/low-latency/High/709-limited encoding, eight bounded private GPU
+    input/output slots, no CPU pixel readback. Native mapping is exclusive,
+    so copy shared frames on GPU before mapping. H.264+mux files decode at
+    1080p60/4K60; red-patch colour, repeated input plus concurrent compositor,
+    rate changes, flush/drain and12-session driver admission verified.
+    First matched single-window/silent-AAC OBS comparison:12 files decode,
+    zero reported losses; prototypeCPU7.0/8.2% vsOBS9.8/12.7% of one core.
+    Not full program/ISO parity: benchmark AAC is an external FFmpeg helper.
+    MF hardware/software fallback, HEVC, GPU output pools, native AAC and
+    engine priority/ISO shedding remain gates before Platform selection.
 - [ ] **W.6 App, IPC and shared surfaces.** Slint Windows window and native
   integration, same-user named pipes with isolated engines, D3D11/D3D12
   surface hand-over/fences with adapter identity and bounded per-viewer
@@ -1650,6 +1689,38 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
 - FilmCraft reads `session.json` to line up ISO files without audio sync.
 
 ## Log
+
+- W.5c1 (2026-10-17, #105, ready for CI): native NVENC now
+  consumes GPU-resident frames and produces aligned H.264 through the W.2
+  packet mux. Driver617.42 admits12 sessions, refuses13 with NVENC21;
+  existing encoding survives and capacity returns after teardown. Real red
+  patch decodes709-limited YUV63/103/240. Three interleaved8s OBS pairs per
+  resolution produce12 decodable files, zero reported losses; scoped results
+  and limitations in capture REPORT. Native strict clippy/81 tests and full
+  remote Mac gates232 tests+1 doctest pass; two read-only reviews clear.
+  Writer d54df54 merged without commit, staged separately from this feature;
+  final integrated1080p/4K records fully decode120frames each. Coordinator
+  owns merge/feature commits and CI. Isolated OBS cleanup needs a human exit
+  after Cua refused process termination; no recording remains active.
+
+- W.5b (2026-10-17, #105, ready for CI): native read-only
+  D3D11→wgpu DX12 import now renders captured textures in place. Shared
+  handle/fence lifetime, GPU completion retention and cache reuse verified
+  on RTX5070; no shared engine/macOS edits. W.5a Actions39074561618 confirmed
+  green. Native build, strict clippy and81 engine tests pass; full remote
+  Mac gates232 unit tests+1 doctest pass. Independent review/re-review clear
+  for this unselected substrate; RPC handle retention gates later Platform
+  selection. Coordinator commits/CI next, no commits made by this lane.
+  Writer e38160a integrated without commit, staged separately; combined
+  capture/mux Windows clippy and full remote Mac gates also pass.
+
+- W.5a (2026-10-17, #105, native qualification): separate Windows capture
+  lane/root and shared GPU lock; new crate's WGC/QPC/D3D11 pool works on RTX
+  5070. Real frames, known pixels, bounded retention/resize, simultaneous
+  capture and closed-window callbacks checked. Windows strict clippy and
+  release build pass; full remote Mac gates pass. Work remains uncommitted
+  for coordinator CI. No daemon platform switch, writer edits, CPU capture
+  fallback or recording/OBS-parity claim; W.4/W.5 remain open.
 
 - W.2b/W.2c (2026-10-17, #105 #28): Windows startup now repairs encoded
   takes and writes truthful manifests through one pinned folder lease.

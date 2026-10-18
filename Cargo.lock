@@ -3268,6 +3268,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "isocast-platform-windows"
+version = "0.0.6"
+dependencies = [
+ "anyhow",
+ "cc",
+ "isocast-engine",
+ "parking_lot",
+ "wgpu",
+ "windows",
+ "windows-core",
+]
+
+[[package]]
 name = "isocast-protocol"
 version = "0.0.6"
 dependencies = [

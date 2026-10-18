@@ -1,0 +1,41 @@
+[package]
+name = "isocast-platform-windows"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Windows native media back end for Isocast."
+
+[build-dependencies]
+# Already locked: compile the small C++ boundary against NVIDIA's public ABI
+# instead of hand-maintaining Rust layouts for its versioned bitfield structs.
+cc = "1.8.0"
+
+[target.'cfg(windows)'.dependencies]
+anyhow = "1.0.104"
+isocast-engine = { path = "../isocast-engine" }
+parking_lot = "0.12"
+wgpu = { version = "=30.0.1", default-features = false, features = ["std", "parking_lot", "dx12", "wgsl"] }
+# The COM lease attached to an imported resource uses the implementation
+# macro's windows-core path. Same version already used by windows/wgpu.
+windows-core = "0.62.2"
+# Already locked by wgpu's DX12 backend. WinRT capture and native D3D11
+# interfaces must use the same bindings as the DX12 importer.
+windows = { version = "0.62.2", features = [
+    "Foundation",
+    "Graphics_Capture",
+    "Graphics_DirectX_Direct3D11",
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Performance",
+    "Win32_System_Threading",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
+    "Win32_UI_WindowsAndMessaging",
+] }
