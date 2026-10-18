@@ -19,6 +19,8 @@
 # ISOCAST_WINDOWS_TIMEOUT: command seconds (default 1800).
 # ISOCAST_WINDOWS_ROOT: C:/isocast-dev or a lane below it (default unchanged).
 # ISOCAST_WINDOWS_GPU_LOCK: 1 takes the shared GPU lock for a hardware run.
+# One timeout budget covers lock acquisition, sync and execution. Lock metadata
+# follows the locked first byte; read from byte 1 to inspect a live holder.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")/.." && pwd)"
@@ -84,6 +86,7 @@ trap 'cancel; exit 130' INT
 trap 'cancel; exit 143' TERM
 
 head="$(git -C "$here" rev-parse HEAD)"
+lane="$(git -C "$here" symbolic-ref --short -q HEAD || basename "$here")"
 tree=
 if [ "$op" != status ] && [ "$op" != fetch ]; then
     [ -z "$(git -C "$here" diff --name-only --diff-filter=U)" ] || {
@@ -112,11 +115,11 @@ PS
     git -C "$here" archive "$tree" | /usr/bin/ssh -T "$host" "tar.exe -xf - -C $root/staging/$job"
 fi
 
-request="$(python3 - "$op" "$job" "$tree" "$head" "$seconds" "$root" "$gpu_lock" "$@" <<'PY'
+request="$(python3 - "$op" "$job" "$tree" "$head" "$seconds" "$root" "$gpu_lock" "$lane" "$@" <<'PY'
 import base64, json, sys
-op, job, tree, head, seconds, root, gpu_lock, *args = sys.argv[1:]
+op, job, tree, head, seconds, root, gpu_lock, lane, *args = sys.argv[1:]
 print(base64.b64encode(json.dumps(dict(op=op, job=job, tree=tree, head=head,
-    seconds=int(seconds), root=root, gpu_lock=bool(int(gpu_lock)), args=args)).encode()).decode())
+    seconds=int(seconds), root=root, gpu_lock=bool(int(gpu_lock)), lane=lane, args=args)).encode()).decode())
 PY
 )"
 
@@ -130,7 +133,7 @@ status=0
     cat <<'PS'
 $ErrorActionPreference = 'Stop'
 $worker = @'
-import base64, codecs, ctypes, ctypes.wintypes, hashlib, json, msvcrt, os, pathlib
+import base64, codecs, ctypes, ctypes.wintypes, datetime, hashlib, json, msvcrt, os, pathlib
 import shutil, stat, subprocess, sys, threading, time, traceback
 
 r = json.loads(base64.b64decode(os.environ.pop('ISOCAST_REMOTE_REQUEST')))
@@ -139,6 +142,74 @@ src = root / 'src'
 stage = root / 'staging' / r['job']
 job = root / 'scratch' / 'remote' / r['job']
 marker = src / '.windows-remote.json'
+started = time.time()
+deadline = time.monotonic() + r['seconds']
+finished = threading.Event()
+
+def hard_timeout():
+    # A blocked SSH stdout or sync must not retain a GPU/build lock forever.
+    # The ordinary deadline unwinds finally; this emergency watchdog kills
+    # our own worker tree after a bounded cleanup grace. Windows then closes
+    # its lock handles even when Python cannot unwind a blocked native call.
+    if finished.is_set(): return
+    try:
+        subprocess.run(['taskkill.exe', '/PID', str(os.getpid()), '/T', '/F'],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+    finally:
+        os._exit(124)
+
+watchdog = threading.Timer(r['seconds'] + 30, hard_timeout)
+watchdog.daemon = True
+watchdog.start()
+
+def utc(seconds):
+    return datetime.datetime.fromtimestamp(seconds, datetime.timezone.utc).isoformat()
+
+class Lock:
+    def __init__(self, path, label):
+        # Do not append or truncate before acquiring the byte-range lock:
+        # a waiting lane must never replace the current holder's metadata.
+        self.file = os.fdopen(os.open(path, os.O_RDWR | os.O_CREAT, 0o600), 'r+b', buffering=0)
+        self.held = False
+        self.owner = dict(pid=os.getpid(), lane=r['lane'], started_utc=utc(started),
+                          deadline_utc=utc(started+r['seconds']), job=r['job'],
+                          process_created=creation_time_handle(ctypes.windll.kernel32.GetCurrentProcess()))
+        try:
+            while True:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f'{label} lock timed out')
+                self.file.seek(0)
+                try:
+                    msvcrt.locking(self.file.fileno(), msvcrt.LK_NBLCK, 1)
+                    self.held = True
+                    break
+                except OSError:
+                    time.sleep(min(1, max(0, deadline-time.monotonic())))
+            self.file.write(b'0')
+            self.metadata('held')
+        except BaseException:
+            self.close()
+            raise
+
+    def metadata(self, state):
+        data = dict(self.owner, state=state, updated_utc=utc(time.time()))
+        self.file.seek(1)
+        self.file.write(('\n'+json.dumps(data, indent=2)+'\n').encode('utf-8'))
+        self.file.truncate()
+        self.file.flush()
+
+    def close(self):
+        if self.file.closed: return
+        try:
+            if self.held:
+                try:
+                    self.metadata('released')
+                finally:
+                    self.file.seek(0)
+                    msvcrt.locking(self.file.fileno(), msvcrt.LK_UNLCK, 1)
+                    self.held = False
+        finally:
+            self.file.close()
 
 def safe_dir(path):
     for parent in (path, *path.parents):
@@ -213,16 +284,21 @@ def sync():
     save(marker, dict(managed=True, tree=r['tree'], head=r['head'], files=sorted(incoming)))
     print(f'sync: {copied} changed, {removed} removed, {len(incoming)-copied} unchanged; tree {r["tree"]}', flush=True)
 
-def creation_time(process):
+def creation_time_handle(handle):
     kernel = ctypes.WinDLL('kernel32', use_last_error=True)
     times = [ctypes.wintypes.FILETIME() for _ in range(4)]
     kernel.GetProcessTimes.argtypes = [ctypes.wintypes.HANDLE] + [ctypes.POINTER(ctypes.wintypes.FILETIME)] * 4
     kernel.GetProcessTimes.restype = ctypes.wintypes.BOOL
-    if not kernel.GetProcessTimes(int(process._handle), *(ctypes.byref(t) for t in times)):
+    if not kernel.GetProcessTimes(handle, *(ctypes.byref(t) for t in times)):
         return None
     return str((times[0].dwHighDateTime << 32) | times[0].dwLowDateTime)
 
+def creation_time(process):
+    return creation_time_handle(int(process._handle))
+
 def execute(command, env, input_bytes=None, low=False):
+    if time.monotonic() >= deadline:
+        return 124
     flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
     if low: flags |= subprocess.BELOW_NORMAL_PRIORITY_CLASS
     # File-backed capture cannot be held open by a background grandchild which
@@ -237,7 +313,6 @@ def execute(command, env, input_bytes=None, low=False):
         try: child.stdin.write(input_bytes); child.stdin.close()
         except (OSError, ValueError): pass
     if input_bytes: threading.Thread(target=write, daemon=True).start()
-    deadline = time.monotonic() + r['seconds']
     decoder = codecs.getincrementaldecoder('utf-8')('replace')
     cutoff = None
     try:
@@ -262,9 +337,14 @@ def execute(command, env, input_bytes=None, low=False):
                 if not data: time.sleep(0.1)
     finally:
         if child.poll() is None:
-            subprocess.run(['taskkill.exe', '/PID', str(child.pid), '/T', '/F'],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
-            child.wait(timeout=30)
+            try:
+                subprocess.run(['taskkill.exe', '/PID', str(child.pid), '/T', '/F'],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+            finally:
+                # Popen holds the original process HANDLE: this fallback cannot
+                # target a recycled PID if tree cleanup failed.
+                if child.poll() is None: child.kill()
+                child.wait(timeout=10)
         active.unlink(missing_ok=True)
         output.close()
         try: live_path.unlink()
@@ -272,7 +352,6 @@ def execute(command, env, input_bytes=None, low=False):
             print('note: a background child retained output.log; the captured run.log is complete', flush=True)
 
 code = 1
-started = time.time()
 lock = None
 gpu_lock = None
 try:
@@ -286,27 +365,11 @@ try:
             source={k:source.get(k) for k in ('head','tree')}, tracked_files=len(source.get('files',[])))))
         code = 0
     else:
-        lock = (root/'build.lock').open('a+b')
-        if lock.tell() == 0: lock.write(b'0'); lock.flush()
-        deadline = time.monotonic() + r['seconds']
-        while True:
-            lock.seek(0)
-            try: msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1); break
-            except OSError:
-                if time.monotonic() >= deadline: raise TimeoutError('native build lock timed out')
-                time.sleep(1)
+        lock = Lock(root/'build.lock', 'native build')
         if shutil.disk_usage(root).free < 20 * 2**30:
             raise RuntimeError('less than 20 GiB free on the Windows build drive')
         if r['gpu_lock']:
-            gpu_lock = pathlib.Path('C:/isocast-dev/gpu.lock').open('a+b')
-            if gpu_lock.tell() == 0: gpu_lock.write(b'0'); gpu_lock.flush()
-            deadline = time.monotonic() + r['seconds']
-            while True:
-                gpu_lock.seek(0)
-                try: msvcrt.locking(gpu_lock.fileno(), msvcrt.LK_NBLCK, 1); break
-                except OSError:
-                    if time.monotonic() >= deadline: raise TimeoutError('shared GPU lock timed out')
-                    time.sleep(1)
+            gpu_lock = Lock(pathlib.Path('C:/isocast-dev/gpu.lock'), 'shared GPU')
         if r['op'] != 'fetch':
             sync()
             shutil.rmtree(stage)
@@ -376,12 +439,20 @@ except Exception as error:
     traceback.print_exc(file=sys.stdout)
     code = 1
 finally:
-    if job.is_dir():
-        save(job/'result.json', dict(operation=r['op'], head=r['head'], tree=r['tree'],
-            exit_code=code, seconds=round(time.time()-started,2)))
-    if lock is not None: lock.close()
-    if gpu_lock is not None: gpu_lock.close()
-    if stage.exists() and not stage.is_symlink(): shutil.rmtree(stage)
+    # Release BOTH locks even if result publication or another close fails.
+    # Keep the watchdog armed through cleanup, including blocked SSH output.
+    try:
+        try:
+            if gpu_lock is not None: gpu_lock.close()
+        finally:
+            if lock is not None: lock.close()
+        if job.is_dir():
+            save(job/'result.json', dict(operation=r['op'], head=r['head'], tree=r['tree'],
+                exit_code=code, seconds=round(time.time()-started,2)))
+        if stage.exists() and not stage.is_symlink(): shutil.rmtree(stage)
+    finally:
+        finished.set()
+        watchdog.cancel()
 sys.exit(code if 0 <= code <= 255 else 1)
 '@
 $worker | & python -I -X utf8 -

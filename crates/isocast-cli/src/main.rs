@@ -89,6 +89,25 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum MachineCommand {
+    /// Show the profile and calibration state without starting a measurement.
+    Show {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Start an idle-only self-test (at most 30 seconds); poll show for results.
+    Calibrate {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Cancel a self-test, retaining the previous profile.
+    Cancel {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum Command {
     /// Read a bounded page from a redacted report preview.
     ReportFile {
@@ -179,9 +198,10 @@ enum Command {
         #[command(subcommand)]
         command: data::DataCommand,
     },
-    /// Timelines: takes in order, joined into one file by `export`. While
-    /// one is current, every take that finishes (`stop`, or a `split`) is
-    /// added to its end; `retake` records the last one again.
+    /// Timelines: takes in order, joined into one file by `export`. Each
+    /// recording starts a new project with its own timeline unless
+    /// `isocast record-target` (or `timeline new`) chose one to add its
+    /// takes to; `retake` records the last one again.
     Timeline {
         #[command(subcommand)]
         command: timeline::TimelineCommand,
@@ -245,6 +265,10 @@ enum Command {
     /// and return once every file is created. Same options as `record`;
     /// with neither a setup nor --source, records the live setup. A setup
     /// or --source given here becomes the live setup.
+    ///
+    /// Its takes go where `isocast record-target` says (a new project with
+    /// its own timeline, unless a timeline was chosen); --new-project or
+    /// --into choose for this recording only.
     Start {
         setup: Option<PathBuf>,
         #[arg(long = "source", value_name = "SPEC")]
@@ -254,6 +278,23 @@ enum Command {
         seconds: Option<f64>,
         #[arg(long)]
         folder: Option<PathBuf>,
+        /// Start a new project with its own timeline.
+        #[arg(long, conflicts_with = "into")]
+        new_project: bool,
+        /// Add a take to this timeline (an id from `isocast timeline
+        /// list`), in the folder of its last take.
+        #[arg(long, value_name = "TIMELINE")]
+        into: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Where the next recording goes, or choose it: `new` (each recording
+    /// starts a new project with its own timeline; the default) or a
+    /// timeline's id (its next take). Kept across restarts; a recording
+    /// running keeps its own.
+    RecordTarget {
+        /// `new`, or a timeline's id; absent: show the choice.
+        target: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -348,6 +389,11 @@ enum Command {
         folder: Option<PathBuf>,
         #[arg(long)]
         json: bool,
+    },
+    /// Measure this machine quietly, inspect its profile, or cancel calibration.
+    Machine {
+        #[command(subcommand)]
+        command: MachineCommand,
     },
     /// Benchmark the encoders on a setup's files (the live setup if none is
     /// given), all at once as in a recording, and say whether this Mac keeps
@@ -1285,8 +1331,18 @@ fn run(cli: Cli) -> Result<ExitCode> {
             sources,
             seconds,
             folder,
+            new_project,
+            into,
             json,
-        } => start(setup.as_deref(), &sources, seconds, folder, json),
+        } => start(
+            setup.as_deref(),
+            &sources,
+            seconds,
+            folder,
+            (new_project, into),
+            json,
+        ),
+        Command::RecordTarget { target, json } => timeline::record_target(target, json),
         Command::Stop { json } => stop(json),
         Command::Pause { json } => pause(true, json),
         Command::Resume { json } => pause(false, json),
@@ -1407,6 +1463,21 @@ fn run(cli: Cli) -> Result<ExitCode> {
             folder,
             json,
         } => doctor(setup.as_deref(), folder, json),
+        Command::Machine { command } => {
+            let (method, json) = match command {
+                MachineCommand::Show { json } => (Method::MachineProfile, json),
+                MachineCommand::Calibrate { json } => (Method::MachineCalibrate, json),
+                MachineCommand::Cancel { json } => (Method::MachineCancel, json),
+            };
+            let result: isocast_protocol::machine::MachineStatus =
+                Client::connect_or_launch()?.call(method)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!("{}", result.summary);
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Tune {
             setup,
             folder,
@@ -1816,50 +1887,17 @@ fn check(path: &Path, json: bool) -> Result<ExitCode> {
     Ok(code)
 }
 
-/// Whether `setup`'s files fit this Mac's encoders, by per-chip data.
-#[cfg(target_os = "macos")]
+/// Use the daemon's estimate, including its profile and exact tune results;
+/// setup validation remains local if the daemon cannot answer.
 fn capacity_check(setup: &Setup) -> Option<isocast_protocol::api::Check> {
-    let has_video = setup.recording.program.enabled
-        || setup
-            .vertical
-            .as_ref()
-            .and_then(|v| v.recording.as_ref())
-            .is_some_and(|r| r.enabled)
-        || (setup.recording.iso.enabled && !setup.recording.iso.sources.is_empty());
-    if !has_video {
-        return None;
-    }
-    // setup check stays isolated and advisory: an unavailable daemon omits
-    // capacity rather than turning valid syntax into a failed validation.
-    let owner = isocast_client::IsolatedDaemon::launch().ok()?;
-    let checked = (|| {
-        let mut client = owner.connect().ok()?;
-        let params = |stream| {
-            Method::EstimateCapacity(Box::new(CapacityParams {
-                setup: Some(setup.clone()),
-                stream: Some(stream),
-                add_iso: None,
-            }))
-        };
-        let recording: CapacityEstimate = client.call(params(false)).ok()?;
-        let streaming = (setup.stream.is_some()
-            || setup.vertical.as_ref().is_some_and(|v| v.stream.is_some()))
-        .then(|| client.call::<CapacityEstimate>(params(true)).ok())
-        .flatten();
-        Some(isocast_engine::estimate::check_estimates(
-            &recording,
-            streaming.as_ref(),
-        ))
-    })();
-    if let Err(error) = owner.close() {
-        isocast_diagnostics::diagnostic!("warn"; "capacity check cleanup: {error:#}");
-    }
-    checked
-}
-
-#[cfg(not(target_os = "macos"))]
-fn capacity_check(_setup: &Setup) -> Option<isocast_protocol::api::Check> {
-    None
+    let estimate: CapacityEstimate = Client::connect_or_launch()
+        .ok()?
+        .call(Method::EstimateCapacity(Box::new(CapacityParams {
+            setup: Some(setup.clone()),
+            ..Default::default()
+        })))
+        .ok()?;
+    isocast_engine::estimate::check(&estimate)
 }
 
 fn import_obs(
@@ -2256,6 +2294,7 @@ fn start(
     sources: &[String],
     seconds: Option<f64>,
     folder: Option<PathBuf>,
+    (new_project, into): (bool, Option<String>),
     json: bool,
 ) -> Result<ExitCode> {
     // Neither a setup nor sources: record the live setup.
@@ -2272,6 +2311,8 @@ fn start(
         setup,
         folder,
         seconds,
+        new_project,
+        into,
     })))?;
     if json {
         println!("{}", serde_json::to_string_pretty(&started)?);
@@ -2353,6 +2394,7 @@ fn status(json: bool) -> Result<ExitCode> {
         }
         None => Status {
             state: EngineState::Idle,
+            machine_profile: None,
             load_warning: None,
             scene: None,
             preview: None,
@@ -2372,6 +2414,8 @@ fn status(json: bool) -> Result<ExitCode> {
             interrupted: Vec::new(),
             timeline: None,
             timeline_problem: None,
+            record_target: None,
+            recording_into: None,
             export: None,
             virtual_camera: None,
             replay: None,
@@ -2390,6 +2434,9 @@ fn status(json: bool) -> Result<ExitCode> {
     }
     if let Some(warning) = &status.load_warning {
         eprintln!("warning: {}", warning.message);
+    }
+    if let Some(machine) = &status.machine_profile {
+        println!("Machine: {}", machine.summary);
     }
     if let (Some(collection), Some(profile)) = (&status.collection, &status.profile) {
         println!(
@@ -2431,13 +2478,39 @@ fn status(json: bool) -> Result<ExitCode> {
     }
     if let Some(timeline) = &status.timeline {
         println!(
-            "Timeline: {:?} ({}), {} clip{}, {:.2} s; finished takes are added to it",
+            "Timeline: {:?} ({}), {} clip{}, {:.2} s (current)",
             timeline.name,
             timeline.id,
             timeline.clips,
             if timeline.clips == 1 { "" } else { "s" },
             timeline.duration_seconds
         );
+    }
+    if let Some(into) = &status.recording_into {
+        println!(
+            "Recording into: {}",
+            match into.new_project {
+                true => format!(
+                    "a new project, timeline {:?} ({})",
+                    into.name, into.timeline
+                ),
+                false => format!(
+                    "take {} of {:?} ({})",
+                    into.clips + 1,
+                    into.name,
+                    into.timeline
+                ),
+            }
+        );
+    }
+    if let Some(target) = &status.record_target {
+        println!(
+            "Next recording: {} (`isocast record-target` changes it)",
+            timeline::target_words(target)
+        );
+        for note in &target.notes {
+            println!("note: {note}");
+        }
     }
     if let Some(problem) = &status.timeline_problem {
         println!("warning: {problem}");
@@ -3782,11 +3855,25 @@ fn watch(levels: bool, kinds: &[String], except: &[String], json: bool) -> Resul
                 time_seconds,
                 ..
             } => println!("marker {label:?} at {time_seconds:.2} s in take {take}"),
-            Event::Stopped { report, error, .. } => match (report, error) {
+            Event::Stopped {
+                report,
+                error,
+                timeline,
+                ..
+            } => match (report, error) {
                 (Some(report), _) => println!(
-                    "recording stopped after {:.2} s; manifest {}",
+                    "recording stopped after {:.2} s; manifest {}{}",
                     report.duration_seconds,
-                    report.manifest.display()
+                    report.manifest.display(),
+                    timeline
+                        .map(|into| format!(
+                            "; {} take{} on timeline {} ({} clips)",
+                            into.takes,
+                            if into.takes == 1 { "" } else { "s" },
+                            into.timeline,
+                            into.clips
+                        ))
+                        .unwrap_or_default()
                 ),
                 (None, Some(error)) => println!("recording failed: {error}"),
                 (None, None) => println!("recording stopped"),
@@ -3960,6 +4047,9 @@ fn watch(levels: bool, kinds: &[String], except: &[String], json: bool) -> Resul
                 path.display(),
                 if editor { " (in the editor)" } else { "" }
             ),
+            Event::RecordTarget { target } => {
+                println!("next recording: {}", timeline::target_words(&target))
+            }
         }
     }
     // Events end only when isocastd hangs up; a watcher must not mistake

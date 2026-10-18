@@ -494,6 +494,16 @@ come later (clips already carry in/out points on their take).
   at the takes' own files, every ISO on its own track with the program on
   top, the clip's angle the one on, crops, markers, audio per file.
 
+- [x] **C.6 Where a recording goes (#114).** Ryan, 2026-10-17: three
+  separate recordings landed as takes of one old "current" timeline.
+  Each recording now starts a new project with its own timeline unless a
+  record target was chosen (`record_target`, CLI `isocast record-target
+  new|ID`, `start --new-project|--into ID`, MCP `record_target`,
+  obs-websocket StartRecord and hotkeys follow it); splits and retakes
+  stay with their recording; an old current timeline is migrated (shown,
+  not used). App: the target next to Start Recording with its menu, the
+  status bar, the editor's Record Next Take Here, "Saved as …" toasts.
+
 ### S. Stress testing and performance (Ryan, 2026-10-13)
 
 - [ ] **S.1 Head-to-head with OBS.** A repeatable benchmark that runs the
@@ -632,6 +642,41 @@ come later (clips already carry in/out points on their take).
     drops, equal final A/V durations and truthful ISO losses. Final-byte
     codec/lifecycle/crash checks and release gates pass; full tables and
     rejected global-hint/sustained-pressure trials are in the round report.
+
+### T. Self-tuning on every machine (#110, 2026-10-17)
+
+Design and safety contract: [docs/self-tuning.md](docs/self-tuning.md).
+Tier 1: build → review → fixes → re-review for each behavior-changing slice.
+
+- [ ] **T.1 Measured machine profile.** Silent, cancellable, low-priority
+  calibration within 30 s, first launch/updates/on demand, never alongside
+  recording/streaming. Platform-neutral codec, compositor, conversion,
+  memory/disk measurements; versioned isolated persistence; method table,
+  CLI/MCP/status/Settings; measured capacity/Optimize with unchanged absent-
+  profile fallback. AWS M2s and exonbook: compare existing capacity cases
+  against real drops, cancel/start races, fresh-machine behavior.
+  - [x] **T.1a Profile foundation (awaiting Tier-1 re-review).** Portable
+    measurements, killable idle-only helper, persistence/build invalidation,
+    API/CLI/MCP/Settings and covered HEVC capacity/Optimize integration.
+    M2s/exonbook recordings, refusal/cancellation/deadline, fallback and full
+    strict e2e verified; details and scope limits in the lane's scratch
+    REPORT.md. Fix round 1 confines automatic calibration to the default
+    daemon, unifies capacity checks and preserves exact Optimize passes;
+    main integrated, 233 tests and strict e2e 18/18 pass.
+  - [ ] **T.1b Complete coverage and prediction qualification.** Other
+    ProRes variants, live-H.264 resource costs, missed 4K60/10-bit cells,
+    repeatability under outside load and post-GPU-lane integration. M4
+    overload prediction improves; M2 percentage accuracy is within variation,
+    not proven better than the table. Do not call all of T.1 complete yet.
+- [ ] **T.2 Live governor.** Fixed reversible degradation order, hysteresis,
+  visible reasons and protected-output integrity; qualify against outside
+  CPU/GPU/encoder load without changing the established priority contract.
+- [ ] **T.3 Low-end defaults and pins.** Measured 8 GB/base-chip defaults,
+  persistent per-setting Automatic/pinned controls, backend-neutral mapping
+  to NVENC/QSV/AMF/software with the Windows lane.
+- [ ] **T.4 Weak-machine matrix.** Prototype taskpolicy/CPU limits and a
+  GPU-contention helper during T.1; then bounded memory pressure, full
+  e2e/bench/soak, GPU-less Windows software encoding and governor recovery.
 
 ### A. Alpha: the daily driver (Ryan, 2026-10-13)
 
@@ -1589,12 +1634,43 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
   capture teardown, encoder pressure/loss, A/V timing, commit/finalize,
   interrupted recovery and ownership. Every implemented platform must pass;
   extend existing checks first, obtain approval before new test files.
+  - [x] **W.3a Shared native contract harness.** Dedicated harness/test files
+    approved on2026-10-17. Identical generic Platform checks, one bounded
+    worker per case: clock, pools/retention, GPU completion, writer pressure,
+    A/V timing, commit/kill/recovery/ownership and capture teardown. Reports
+    distinguish passed, failed, unavailable and not requested; a stub/core
+    pass is never full native qualification. Verify the verifier rejects
+    wrong counts, timing, shortened tracks and missing capabilities.
+  - [ ] **W.3b Both native backends qualified.** Mac native suite on a
+    reserved test machine; Windows native suite after the capture lane exposes
+    a Platform implementation and writer. W.5c3 now exports WGC/DX12 and
+    NVENC/MF video encoder pieces, but still selects StubPlatform. Do not mark this done from
+    a Windows stub or packet-only writer run.
+    Blocked: Windows still has no native Platform adapter. The new Mac
+    early-importer-drop GPU probe retains one pool slot per completed round
+    (32→31→30→29), even after independent render work. Stop after three
+    unsuccessful diagnostic attempts. Independent texture lifetime remains
+    the chosen contract (owned textures must not depend on a live importer);
+    further Mac importer/runtime investigation is a separate Tier-1 change.
+    Keep the failure visible; do not weaken it to obtain a green full run.
 - [ ] **W.4 Windows synthetic platform.** Add `isocast-platform-windows`:
   clock, bounded BGRA/YUV frames, importer, synthetic sources and W.2 writer.
   Prefer hardware MF/NVENC when available, software only as last resort for
   hosted recording; fail clearly
   for unsupported devices/codecs. A synthetic program and ISOs produce
   decodable, aligned files on windows-latest, with honest loss counters.
+  Ownership (2026-10-18): agent/windows owns new Platform/FileWriter adapter
+  files, writable-output pool and minimal agreed Frame/importer plumbing,
+  daemon selection and contract integration. Use an explicit generic BGRA
+  compositor-output capability first (preserve the existing Mac YUV default),
+  not fake NV12 textures. True NV12/P010 plane-view integration remains a
+  performance follow-up/gate. Capture lane owns encoder input acceptance,
+  recording-quality controls, nonterminal barriers/session lifecycle, native
+  conversion, MF AAC/MMCSS, camera/WASAPI and WGC lifetime fixes; it will not
+  concurrently edit frames.rs/gpu.rs during the output-pool slice. Coordinate
+  lib.rs/Cargo.toml hooks and future YUV variants. No adapter work is underway
+  in the capture lane; unfinished capabilities fail closed, no FFmpeg AAC
+  process in production, no native selection before the real-output gates.
   - [ ] **W.4 platform-selection gate:** resolve/qualify Windows10 RPC port
     retention before switching the daemon to WindowsPlatform. Fresh capture
     workers retain two ALPC ports per open/close, even without DX12 import.
@@ -1617,6 +1693,15 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
   at 1080p60 and 4K60 with ISOs: launch-to-first-preview, ready-to-record,
   start-record latency, CPU/GPU/memory and dropped frames. Install isolated
   OBS as a permitted test dependency, never use Ryan's OBS profile.
+  Standing Windows performance gates (Ryan,2026-10-18), matched full-engine
+  program+ISOs at1080p60 and4K60: CPU at most half OBS, memory below OBS at
+  every size, faster launch→first preview and launch→ready-to-record,
+  stop<20ms and zero drops. Profile with WPR/ETW. Native MF AAC, GPU-resident
+  NV12, exclusive-ownership direct NVENC registration where safe, fewer
+  per-frame map/unmap/fences and MMCSS belong in W.5, not a later polish pass.
+  Report timing/durability boundaries and matched settings; do not meet a
+  metric by hiding helper CPU, deferring finalization or violating NVENC's
+  mapped-resource ownership contract.
   - [x] **W.5a Native capture substrate (agent/windows-capture).** Commit
     8619c20, Actions39074561618 green. WGC display/HWND capture into bounded,
     fenced D3D11 BGRA textures; QPC stamps, cursor switch, resize, pressure
@@ -1719,6 +1804,28 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
 
 ## Log
 
+- Windows CI memory controls (2026-10-18, #105, ready for CI): merged
+  main49a98729 without commit, retaining W.3a and native Windows package.
+  Stable Cargo timings/PowerShell samples isolate the~69MB generated UI:
+  one compiler peaks~13.5GiB WS/~15GiB private, before the much smaller linker.
+  Native-job-only jobs1/debug-info0 keeps bin/test compilers from overlapping;
+  assertions, overflow checks, compiled Slint and every target remain. Rejected
+  opt1/opt-s/CGU overrides as no useful memory improvement. Exact all-targets
+  nine-package build passes20m19s; strict contract clippy,12verifier tests,
+  stub clock/pool contracts and13UI tests pass. Full remote Mac gates pass
+  233unit+1doctest. Hosted GitHub rerun still required; no native Windows
+  Platform qualification claimed. Standing full-engine OBS CPU/memory/start/
+  stop/drop targets recorded above for the remaining W.5 integration.
+
+- Windows CI investigation (2026-10-18, #105, blocked): Actions39092440023
+  confirms isocast-ui LLVM OOM, not capture/encoder compile failure. Merged
+  W.3a c668d98b without commit, retaining native Windows package and all
+  contract checks. Three bounded12GiB native attempts failed even with one
+  compiler/no debug symbols:8CGUs,256CGUs,256CGUs+UIopt-level1. Stopped at
+  the debugging limit; unqualified workflow edits reverted. Need actual
+  uncapped per-UI compiler peak/phase diagnosis, not more guessed profile
+  changes. Evidence and coordinator question in capture REPORT.md/notes.
+
 - W.5c3 (2026-10-17, #105, ready for CI): HEVC Main/Main10 now encodes
   through NVENC/MF from GPU BGRA8 or realRGB10; no codec/depth downgrade.
   hvcC is SPS-derived, hvc1 removes parameter sets and rejects changes after
@@ -1782,6 +1889,30 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
   for coordinator CI. No daemon platform switch, writer edits, CPU capture
   fallback or recording/OBS-parity claim; W.4/W.5 remain open.
 
+- W integration (2026-10-18, #105 #28 #110 #114): main49e7732 merged into
+  agent/windows with profile-aware capacity checks retained, standalone
+  record explicitly starting a new project, workspace lock versions0.0.7,
+  and unsupported non-mac calibration skipped before any worker launch.
+  Merged full hosted e2e19/19 passes; real record Ctrl-C exits0 with3complete
+  H.264 files, no drops, private workspace removed and sentinel target intact.
+  Its .isoprj opens via the real editor's project-open path after private
+  timeline cleanup, with decoded preview and3file lanes. Mac full gates
+  pass233unit+1doctest; Windows scoped strict clippy and190tests pass.
+  GPU-lifetime task remains separate; no such fix is included in the merge.
+
+- W.3a (2026-10-17, #105 #28): shared development-only Platform contract
+  workers and bounded runner implemented; new files explicitly approved.
+  Same generic clock/pool/GPU/writer/capture checks, real decode/A-V and
+  commit-kill-repair verification,12 falsification/selftests on both hosts.
+  Mac/Windows strict scoped clippy and build pass; existing Mac full gates
+  pass232unit+1doctest. Windows stub/core passes; native/full is explicitly
+  unavailable. Mac full suite has7passes/1GPU failure: dropping the importer
+  before submitted work completes retains one pool slot per round. Strict
+  test preserved and independently reviewed, no production backend changes.
+  W.3b and whole W.3 remain blocked on Mac lifetime investigation and the
+  capture lane's Windows Platform/FileWriter adapter. CI additions run only
+  the supported core profiles, not a false full-native qualification.
+
 - W.2b/W.2c (2026-10-17, #105 #28): Windows startup now repairs encoded
   takes and writes truthful manifests through one pinned folder lease.
   Fixed stale999999-frame/999s claims in a real daemon reproduction; counts
@@ -1836,6 +1967,13 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
   Startup retry/exit waiting reduced new callback353->308ms and setupcheck
   155->70ms (base40ms), capacity JSON identical. Main a9b661f merge staged
   separately; feature unstaged for coordinator. W.1c Actions39060641784 green.
+- C.6 #114 (2026-10-17): recordings start a new project each unless a
+  timeline is chosen as the record target; the app shows and changes the
+  choice next to Start Recording, in the status bar and in the editor.
+  Verified with e2e `timeline` (three default recordings → three projects
+  and timelines; a chosen timeline gets take 2 in its folder; split and
+  retake stay together; an old current.json migrated), `projects`, `edit`,
+  offscreen snapshots and the layout audit.
 
 - S.3 #111 fix round 1 (2026-10-17): keep scene compositors across reuse,
   clear an old scene's reuse when its publisher switches, debounce raster
@@ -1855,6 +1993,21 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
   footprint 416.3→204.1 MiB, CPU 65.8→64.8%, zero recording losses.
   Initial stress noise also reproduced on baseline; both preserved.
   Uncommitted for coordinator Tier-1 review: perf-2/scratch/REPORT.md.
+- T.1a fix round 1 (2026-10-17, #110, awaiting re-review): isolated engines
+  never auto-calibrate by default and harnesses force off; snapshot.sh
+  rendered after a 10 s wait with no calibration child. Failed-build retry
+  suppression, dead-owner cleanup, fit guards, unified capacity checks and
+  exact Optimize-pass preservation verified on M2-b. Merged main a9b661f;
+  remote gates 233 pass, one strict e2e run 18/18 pass. Evidence:
+  `/Volumes/IsocastBuild/machine-profile/scratch/REPORT.md`, Fix round 1.
+
+- T.1a (2026-10-17, #110, awaiting Tier-1 review): measured machine profile,
+  bounded idle-only calibration and shared API/CLI/MCP/Settings; covered HEVC
+  estimates/Optimize use local numbers. AWS M2s/exonbook media checks, race/
+  refusal/deadline/fallback, remote workspace gates (230 pass) and strict
+  e2e 18/18 pass. T.1b remains open; REPORT.md states coverage/accuracy limits.
+  T.4 contention prototype preserves failures (86.1%/96.2% drops vs clean
+  controls), not a governor or a true CPU-core-limit simulator.
 
 - #108/#109 (2026-10-17): the first layout audit's 11 issues fixed (narrow
   Controls/source toolbar/mixer/vertical head adapt, source child names

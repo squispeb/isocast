@@ -92,6 +92,8 @@ fn record(
                 setup: Some(setup),
                 folder: Some(folder),
                 seconds,
+                new_project: true,
+                into: None,
             })));
             let _ = started_tx.send(result);
         })?;

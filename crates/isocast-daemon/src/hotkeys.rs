@@ -635,6 +635,7 @@ impl Daemon {
                     setup: None,
                     folder: None,
                     seconds: None,
+                    ..Default::default()
                 })),
                 "recording.stop" => Method::Stop,
                 "recording.pause" => Method::Pause,
@@ -658,6 +659,7 @@ impl Daemon {
                             setup: None,
                             folder: None,
                             seconds: None,
+                            ..Default::default()
                         }))
                     }
                 }

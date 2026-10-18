@@ -5,6 +5,93 @@ each section. Delete entries that stop being true.
 
 ## Environment
 
+- 2026-10-18 (#105 lock helper): capture lane adopted the peer's verified
+  tree83f33006 scripts/windows-remote.sh byte-for-byte (blob a9185e45ac12c4ffe379b87aa7b43f29593105ac),
+  without editing the peer worktree. One acquire/sync/run budget, watchdog,
+  finally-release and byte1+ owner metadata now apply here too. bash/ShellCheck/
+  worker AST pass; non-GPU held-owner metadata smoke f8eb900… and intentional
+  exit17/released-lock smoke be4bae29… pass. GPU lock was free at07:04:45UTC;
+  no reservation retained. Helper adoption is separate from the CI env fix.
+
+- 2026-10-18 (#105 W.4 pressure handoff): answered the peer directly in
+  `/Volumes/IsocastBuild/windows/scratch/REPORT.md` under "Capture-lane
+  response — ownership/API handoff". Agent/windows owns writable BGRA pool,
+  portable compositor preference and minimal Frame/DX12 target hooks. It
+  already has a TLS MMCSS OS helper; reuse it rather than implementing another.
+  Capture lane owns native AAC/recording policy/barriers and encoder-pressure
+  diagnosis. Retained two-output4K run-065131 reaches23ISO accepted/15completed/
+  8pending at tick23, with0.573mslateness and append maxima1.750/2.376ms:
+  completion backlog, not a normal-append blocking receive loop. Three4K
+  outputs need10.155s for5s media. No real-time/CPU victory or hardware-capacity
+  root cause yet. Inspect/adopt peer's bounded self-identifying windows-remote
+  lock helper before new hardware runs; never bypass incumbent locks.
+
+- 2026-10-18 (#105 ownership): agent/windows now owns new Platform/FileWriter
+  adapter files, writable output pool, minimal Frame/importer plumbing,
+  daemon selection and W.3 contracts. Capture lane will not concurrently edit
+  frames.rs/gpu.rs while that slice is owned there. First output contract is
+  honest BGRA capability with existing Mac YUV default retained; never fake
+  NV12 as two unrelated textures. Plane-view/YUV input changes require an
+  agreed resource/format/fence contract. Capture lane owns native encoder
+  input/quality/drain/reuse, conversion, MF-AAC/MMCSS, camera/WASAPI and WGC
+  lifetime fixes; no adapter pieces implemented here. Stable video APIs
+  are committed5d05c5ce; AAC/camera/WASAPI and writable pool draw/take are NOT
+  ready. TexturePool.copy is not engine FramePool; Dx12Importer.target and
+  ycbcr_target still reject writes. Encoder finish is terminal, returns the
+  tail and has a5s failure deadline, not a<20ms stop guarantee or reusable
+  session API. Prioritize hooks currently have no native admission policy.
+  Keep HEVC config/codec explicit and off H.264 live/FLV paths; feed mux
+  length-prefixed samples, not AnnexB. Coordinate lib.rs/manifest hooks before
+  touching shared files; no production FFmpeg AAC fallback.
+
+- 2026-10-18 (#105 adapter boundary): recording construction must take the
+  existing VideoTrackSpec/EncoderQuality through a recording-specific native
+  policy (CQ/QP), not infer bitrate from VideoToolbox's quality.value(). The
+  mapping/method is not shipped yet. Nonterminal commit snapshots accepted
+  input and collects its output without EOS; persist each received packet
+  before surfacing timeout/error, never discard a partial drain Vec. Existing
+  try_encode/receive_timeout allow a video barrier in the adapter now. Keep
+  session timestamps monotonic across file reuse; rebase only at the mux and
+  force an IDR for a new file. AAC partial input must not be padded merely to
+  force a mid-stream commit: it limits the honest committed watermark until
+  a complete block exists. Terminal tail padding/trim is a separate contract.
+
+- 2026-10-18 (#105 output contract): pinned wgpu30 guarantees only binding
+  usage for NV12/P010 (texture/format.rs1005–1006); the engine currently asks
+  for separate plane Textures. Agent/windows owns honest BGRA compositor
+  preference/output-pool plumbing, not fictitious NV12 planes. This preference
+  must describe composed output only, not constrain future native camera/ISO
+  input formats. Renderability requires explicit output-pool provenance:
+  capture slots already have native RENDER_TARGET bind flags but remain
+  immutable. Target-cache usage/state must distinguish writable output from
+  binding-only capture. Publication needs real producer completion/ordering,
+  not a ready marker at allocation/target creation. Do not let DX12 signal
+  the capture D3D11 fence counter without total queue ordering; use the proven
+  PendingFrame completion handoff or a separately ordered output timeline.
+
+- 2026-10-18 (#105 CI): uncapped PowerShell samples and Cargo timings show
+  the69.2MB generated Slint Rust (67,760functions) makes a single Windows UI
+  compiler peak~13.5GiB working set/~15GiB private memory. Linker peak is much
+  smaller and late; changing linker is not justified. UIopt1/opt-s take~19min
+  for the binary versus~6min at defaultopt0, with similar memory; CGU256/16
+  also have similar peaks. Keep defaults. Native CI now only sets jobs1 and
+  Rust debug-info0 in that job; Slint metadata, assertions, overflow checks,
+  compiled UI and all targets remain. Exact merged-main nine-package build
+  passes in20m19s, contracts strict clippy/12verifier/core-stub checks and13UI
+  unit tests pass. GitHub's16GB runner confirmation is the next CI rerun,
+  not claimed from the128GB diagnostic host. Mac CI normally codegens the
+  real UI in release, not the Windows job's dev profile.
+
+- 2026-10-18 (#105): Ryan's standing Windows full-engine performance targets
+  on exon-desk are <=half OBS CPU at1080p60/4K60 with program+ISOs, memory below
+  OBS at every size, faster first preview/record readiness, stop<20ms and zero
+  drops. Use WPR/ETW and matched settings. Integrate native MF AAC, GPU NV12,
+  reduced synchronization and MMCSS with camera/audio/Platform work. Removing
+  NVENC's copy requires proving exclusive mapped-input ownership; never map
+  a texture concurrently read by the compositor or another encoder just to
+  reduce the measured copy count. Old one-window FFmpeg-AAC numbers are not
+  qualification for these new full-engine targets.
+
 - 2026-10-17 (#105 W.5c2): delegator stopped the lane's isolated OBS PID13804.
   Verified its exact executable was no longer running, then removed only its
   generated `scratch/obs-portable/config/obs-studio/plugin_config/obs-websocket/config.json`.
@@ -42,6 +129,41 @@ each section. Delete entries that stop being true.
   use `$OutputEncoding = [Text.UTF8Encoding]::new($false)` when piping Unicode
   source to Python/rustc. Process plugins and recording still refuse the stub.
   Real control-plane CLI/MCP work; W.1d record/UI/writer remain separate.
+- 2026-10-17 (#110, fix round 1): automatic calibration is default-daemon
+  only; either ISOCAST_SOCKET or ISOCAST_SETUP disables it unless explicitly
+  opted in with ISOCAST_CALIBRATION=on. Snapshot/visual/layout/e2e/bench/
+  stress/soak/motion/drag-lag harnesses set off. Failed builds are remembered
+  in `setup.machine.failed-build`; explicit calibration retries, success
+  clears it, cancellation does not write it. Dead-owner calibration dirs
+  are swept (live/unknown owners and links retained). Profile measurement
+  version 3 prioritizes the three fit cells and rejects short/non-monotonic
+  samples. Recording-only Optimize retains its exact selected tune pass;
+  setup check/doctor now use the daemon's same profile-aware estimate.
+  Release `--snapshot-watch` is invalid (needs ui-dev/live-slint); use
+  `--snapshot … --state wait:10000` for a release-mode idle-window check.
+  Re-review evidence: machine-profile/scratch/REPORT.md, Fix round 1.
+
+- 2026-10-17 (#110, machine-profile lane): T.1a measurements live in
+  `setup.machine.json` beside the isolated setup/tune file; CLI
+  `isocast machine calibrate|show|cancel`, same method table/MCP. The helper
+  is nice 15/utility QoS, synthetic only, parent-killed/reaped before output
+  starts and at 29 s (its own watchdog also exits after 28 s). M2 wall
+  23.5 s, M4 Max 20.7 s; M2 omits 4K60 HEVC10 to meet the budget. Do not
+  equate file finish time with encoder throughput: the initial trial did,
+  and was rejected. Read-only completed-picture counter deltas are now used.
+  Only covered HEVC High/8-bit costs replace the table; codec/topology/live
+  H.264/recovery assumptions and unfinished T.1b are explicit in REPORT.md.
+  No governor or defaults change. Main advanced to GPU merge `9783eb22`
+  while this lane was uncommitted; coordinator owns commit/integration/review.
+  Evidence: `/Volumes/IsocastBuild/machine-profile/scratch/`.
+- 2026-10-17 (#110/T.4): bounded `scripts/weak-machine.py` + `weak-gpu.swift`
+  prototype uses an active hw-batch reservation, not a hostname allowlist:
+  m2-a's LocalHostName is `Mac-mini`. `taskpolicy` is `/usr/sbin/taskpolicy`.
+  Eight CPU competitors + Metal compute + background scheduling made strict
+  e2e record/iso lose 86.1%/96.2% of pictures and one audio dropout each;
+  unpressured controls were loss-free. These are contention, not true core
+  limits. Failed results propagate; helpers are cleaned up. No claim of
+  protection from this load until T.2. Job 20261017-135605-machine-profile-cmd.
 
 - 2026-10-17 (#100): **hw-batch `--mac any` jobs hold `.bench.lock` only
   while they build and pick a Mac**, then just that Mac's lock (as the
@@ -1727,6 +1849,45 @@ each section. Delete entries that stop being true.
 
 ## Decisions
 
+- 2026-10-18 (#105 #110 #114): merge qualification retains main's profile-
+  aware CLI capacity_check and estimate::check, not the isolated check or
+  check_estimates helper. `isocast record` explicitly sends new_project:true,
+  into:None. Non-mac calibration loads compatible existing status but never
+  launches a worker (even ISOCAST_CALIBRATION=on); explicit calibration is
+  refused before scratch/worker creation, not remembered as a failed build.
+  Mac behaviour stays unchanged. Native merged e2e19/19 and Ctrl-C pass;
+  an isolated recording's self-contained .isoprj opens in the real editor
+  after its private timeline workspace is gone (preview +3file lanes).
+  Evidence: windows/scratch/merge-main/{e2e,record-editor}. GPU lifetime
+  investigation is a separate subsequent Tier-1 task, not part of this merge.
+
+- 2026-10-17 (#105 W.3): dedicated Platform contract harness/test files were
+  explicitly approved. New isocast-platform-contracts workers plus Python
+  runner use one generic implementation per case, isolated fresh directories,
+  bounded/killed/reaped children and explicit unavailable results. Windows
+  native is unavailable until the capture lane supplies Platform/FileWriter;
+  StubPlatform core results never qualify native Windows. Mac normal/pressure
+  recordings, A/V, commit/kill/recovery and capture teardown pass, as do the
+  original GPU tests. New stronger early-importer-drop GPU test is blocked:
+  after three completed command-only rounds, availability is31,30,29 of32.
+  Pixel correctness and completion callbacks pass; source-free render and
+  empty submission do not restore slots. No production backend edits made.
+  Ryan delegated the lifetime decision: retain the independent-lifetime
+  contract, because the API returns owned GPU textures. Full qualification
+  remains blocked pending separate Mac importer/runtime investigation; do
+  not convert the failing case into a pass by keeping its importer alive.
+  Final review finds no source-frame retainer in the test: wgpu-core drops
+  its trackers before the completion callback. The correlated boundary is
+  CVMetalTexture outliving CVMetalTextureCache; exact native ownership is
+  still unproved. Normal importer-outlives-textures production ordering was
+  not shown broken. Evidence: windows/scratch/w3a/gpu-three-rounds/gpu.err.
+- 2026-10-17 (#105 W.3): don't equate capture callback-arrival and presentation
+  time. Real ScreenCaptureKit samples were7.5–13.3ms ahead of arrival; the
+  contract permits one requested presentation period, not an invented10ms
+  latency target. Core tick checks are engine arithmetic at a native origin,
+  not a two-hour drift measurement. GPU readback proves pixels/lifetimes, not
+  absence of internal copies; no zero-copy performance claim from these tests.
+
 - 2026-10-17 (#105 W.2b/W.2c): Windows startup recovery is storage-level,
   independent of NativePlatform's capture/encoder implementation. Engine cfg
   routes to `isocast_mux::recovery`; Unix bodies and Mac writers are unchanged.
@@ -1823,6 +1984,27 @@ each section. Delete entries that stop being true.
   point), not an unchecked create/truncate. File/folder sync failures still
   propagate; this is compile groundwork, not a claim of qualified Windows
   durability. Security-103 is integrated; no daemon plugin policy changes.
+- 2026-10-17 (#114): **A recording goes to a new project unless one was
+  chosen.** The current timeline used to take every finished take, and it
+  never ended, so separate recordings became takes of one edit. Now the
+  engine keeps a record target (`current.json`'s `record`): none (each
+  recording makes a new project folder and, when its first take begins, a
+  timeline named like the folder) or a timeline (the take goes into the
+  folder of its last take). A session keeps the timeline it started with
+  (splits and retakes too); `timeline open`/`project open` only change
+  the current timeline (what the editor shows); `timeline new` also
+  chooses the new one; idle `retake` records into the timeline it retakes.
+  A `current.json` without `record` is migrated once: target none, a notice
+  (`record_target.notes`, `migrated`) until a choice is made.
+  App, two designs tried offscreen (`record-target/scratch/shots`): A, a
+  quiet full-width row under Start Recording ("New project" / "Take 4 ·
+  Untitled", with a menu); B, a square button beside it (folder or stack
+  icon, lit when adding to a timeline). Picked A because the words are
+  visible where you press Record; a dock too short for one more row (a
+  window under about 1000 px tall) shows B instead, and a squeezed one
+  says "Record" beside it (#108's pattern). The status bar always names
+  the target; the stop toast says where it went and replaces "Recording
+  saved" (its Show in Finder action became Open in Editor).
 
 - 2026-10-17 (#111 F1–F4): **A recent publication isn't evidence that a
   scene is still on air.** Keeping tile compositors avoided pipeline churn
@@ -6405,6 +6587,10 @@ each section. Delete entries that stop being true.
   zero processes). New NLE XML exporters use Unix file URL assumptions;
   Windows explicitly refuses XML until that seam is ported, not malformed
   successful exports. OTIO plain-path behavior is unchanged.
+- 2026-10-17 (#114): **A `self.x.lock()` temporary in a struct literal
+  lives to the end of the `let`.** Two `self.timelines.lock()` calls as
+  fields of `Status { … }` deadlocked `status` (parking_lot isn't
+  reentrant): read everything under one guard in a block first.
 
 - 2026-10-17 (#104): **Driving DaVinci Resolve (free) on a test Mac**:
   only Studio takes external scripts, its Scripts menu lists Lua only
