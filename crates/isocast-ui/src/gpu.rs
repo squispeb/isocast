@@ -23,11 +23,19 @@ impl Gpu {
         // The platform's own API only: Metal on macOS, DX12 on Windows,
         // Vulkan elsewhere (never GL).
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::PRIMARY,
+            backends: if cfg!(windows) {
+                wgpu::Backends::DX12
+            } else {
+                wgpu::Backends::PRIMARY
+            },
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
         let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::LowPower,
+            power_preference: if cfg!(windows) {
+                wgpu::PowerPreference::HighPerformance
+            } else {
+                wgpu::PowerPreference::LowPower
+            },
             ..Default::default()
         }))
         .context("no GPU found")?;
@@ -36,6 +44,7 @@ impl Gpu {
             ..Default::default()
         }))
         .context("could not open the GPU")?;
+        isocast_client::shared::register_gpu(&device, &queue)?;
         Ok(Self {
             instance,
             adapter,

@@ -466,6 +466,22 @@ impl TexturePool {
         width: u32,
         height: u32,
     ) -> Result<Option<Frame>> {
+        self.copy_with(source, subresource, width, height, |_, _| Ok(()))
+    }
+
+    /// Finish a capture write BEFORE publishing its Frame and signaling ready.
+    /// The destination is reserved here, never supplied by a caller: only an
+    /// idle slot owned exclusively by this pool is writable. Consumer-held or
+    /// foreign Frames cannot enter this path. On error retire the whole pool
+    /// and quarantine the source, since GPU work may precede a failed Signal.
+    pub(crate) fn copy_with(
+        &mut self,
+        source: &ID3D11Texture2D,
+        subresource: u32,
+        width: u32,
+        height: u32,
+        finish: impl FnOnce(&ID3D11DeviceContext4, &ID3D11Texture2D) -> Result<()>,
+    ) -> Result<Option<Frame>> {
         let owner: ID3D11Device5 = unsafe { source.GetDevice() }?.cast()?;
         let mut source_desc = D3D11_TEXTURE2D_DESC::default();
         unsafe { source.GetDesc(&mut source_desc) };
@@ -551,6 +567,7 @@ impl TexturePool {
                 subresource,
                 Some(&bounds),
             );
+            finish(&submit.context, &slot.texture)?;
             submit.context.Signal(&self.device.0.fence, value)?;
             submit.context.Flush();
         }

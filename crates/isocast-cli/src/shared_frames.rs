@@ -69,6 +69,9 @@ pub fn run(options: Options) -> Result<ExitCode> {
     } else {
         None
     };
+    if let Some(gpu) = &gpu {
+        isocast_client::shared::register_gpu(&gpu.device, &gpu.queue)?;
+    }
     let started = Instant::now();
     let length = Duration::try_from_secs_f64(options.seconds.max(0.0)).unwrap_or(Duration::ZERO);
     let mut stats = Stats::default();

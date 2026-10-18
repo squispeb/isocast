@@ -81,16 +81,7 @@ them:
 
 Completed movie fragments can survive a crash; see the recovery limitations
 below. Power loss is not covered: the files aren't forced to the disk, so
-more than the last fragment can be lost.
-
-`isocast stop` only asks the recording to stop and returns at once; the
-files are still being finished. Until they are, `isocast status` says
-finalizing (`finalizing: true` in `--json`) and a new `start` is refused;
-then `last` (or `last_error`) and the `stopped` event give the outcome.
-`isocast stop --wait` waits and prints the report instead (MCP:
-`request_stop_recording` and `stop_recording`).
-
-`isocast split` starts a new take without stopping anything;
+more than the last fragment can be lost. `isocast split` starts a new take without stopping anything;
 `isocast marker "intro done"` marks a moment. `isocast project list` shows
 the projects and `isocast project rename <id> "Rust talk"` names one once it
 has stopped (the folder becomes `2026-10-12 09-30-00 Rust talk`; manifests

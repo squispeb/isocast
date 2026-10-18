@@ -3179,7 +3179,6 @@ dependencies = [
  "taffy",
  "wasmtime",
  "wgpu",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3318,11 +3317,14 @@ name = "isocast-surfaces"
 version = "0.0.7"
 dependencies = [
  "anyhow",
+ "isocast-ipc",
  "mach2",
  "objc2-core-foundation",
  "objc2-io-surface",
  "objc2-metal 0.3.2",
  "wgpu",
+ "windows",
+ "windows-core",
 ]
 
 [[package]]

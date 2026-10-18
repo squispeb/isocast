@@ -59,16 +59,12 @@ if [ "$op" = build ] || [ "$op" = fetch ]; then
     done
 fi
 command -v exon-desk-ps >/dev/null || { echo "windows-remote: exon-desk-ps is required" >&2; exit 2; }
-# Every remote transport gets a local wall-clock cap: SSH keepalives notice a
-# dead network, not a remote PowerShell that never starts the worker.
-tmo="$(command -v timeout || command -v gtimeout || true)"
-[ -n "$tmo" ] || { echo "windows-remote: GNU timeout is required (brew install coreutils)" >&2; exit 2; }
 mkdir -p "$out"
 job="$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
 work="$(mktemp -d "$out/export.XXXXXX")"
 result="$out/runs/$job"
 mkdir -p "$result"
-remote_ps() { EXON_DESK_HOST="$host" "$tmo" --foreground -k 10 120 exon-desk-ps; }
+remote_ps() { EXON_DESK_HOST="$host" exon-desk-ps; }
 # shellcheck disable=SC2329 # invoked by the INT/TERM traps
 cancel() {
     # Only our own child, with the original creation time (never a reused PID).
@@ -85,35 +81,9 @@ if (Test-Path -LiteralPath \$path) {
 }
 PS
 }
-# shellcheck disable=SC2329 # invoked by the traps and after a failed launch
-disarm() {
-    # A worker that starts late must refuse before touching src: sync() rejects
-    # a stage holding the reserved marker. The stage is never moved or deleted
-    # here (a missing stage would sync as empty). CreateNew never recreates a
-    # stage the worker already consumed, and result.json means it finished.
-    remote_ps <<PS || true
-\$ErrorActionPreference = 'Stop'
-\$jobdir = '$root/scratch/remote/$job'
-\$stage = '$root/staging/$job'
-if (Test-Path -LiteralPath "\$jobdir/result.json") { 'disarm: worker already published result.json'; return }
-if (Test-Path -LiteralPath "\$jobdir/active.json") { 'disarm: worker child is active; cancelling it' }
-if (-not (Test-Path -LiteralPath \$stage -PathType Container)) {
-    'disarm: no stage (status/fetch, or the worker already synced it)'; return
-}
-if ((Get-Item -LiteralPath \$stage).Attributes -band [IO.FileAttributes]::ReparsePoint) {
-    throw "Refusing reparse point: \$stage"
-}
-try {
-    [IO.File]::Open("\$stage/.windows-remote.json", 'CreateNew', 'Write').Close()
-    'disarm: reserved marker written; a late worker refuses to sync'
-} catch [IO.IOException] {
-    "disarm: marker not written (worker may be syncing or done): \$(\$_.Exception.Message)"
-}
-PS
-}
 trap 'rm -rf "${work:?}"' EXIT
-trap 'disarm; cancel; exit 130' INT
-trap 'disarm; cancel; exit 143' TERM
+trap 'cancel; exit 130' INT
+trap 'cancel; exit 143' TERM
 
 head="$(git -C "$here" rev-parse HEAD)"
 lane="$(git -C "$here" symbolic-ref --short -q HEAD || basename "$here")"
@@ -142,7 +112,7 @@ foreach (\$path in \$paths) {
 }
 New-Item -ItemType Directory -Path '$root/staging/$job' | Out-Null
 PS
-    git -C "$here" archive "$tree" | "$tmo" --foreground -k 10 "$seconds" /usr/bin/ssh -T "$host" "tar.exe -xf - -C $root/staging/$job"
+    git -C "$here" archive "$tree" | /usr/bin/ssh -T "$host" "tar.exe -xf - -C $root/staging/$job"
 fi
 
 request="$(python3 - "$op" "$job" "$tree" "$head" "$seconds" "$root" "$gpu_lock" "$lane" "$@" <<'PY'
@@ -156,7 +126,8 @@ PY
 # PowerShell only bootstraps Python. Native stdout/stderr are merged by Python
 # before PowerShell sees them, so cargo's progress on stderr isn't an error.
 # The request is never persisted or echoed (run scripts can contain private data).
-launch_script() {
+status=0
+{
     # shellcheck disable=SC2016 # PowerShell variable, not a shell expansion
     printf '$env:ISOCAST_REMOTE_REQUEST = "%s"\n' "$request"
     cat <<'PS'
@@ -487,57 +458,12 @@ sys.exit(code if 0 <= code <= 255 else 1)
 $worker | & python -I -X utf8 -
 exit $LASTEXITCODE
 PS
-}
-# One newline-terminated base64 frame, read with ReadLine: unlike the
-# exon-desk-ps ReadToEnd bootstrap, launch never waits for stdin EOF. The fixed
-# shim otherwise matches exon-desk-ps (UTF-8, error records, exit status).
-frame_max=5592408 # base64 length of 4 MiB
-frame="$(launch_script | base64 | tr -d '\n')"
-[ "${#frame}" -le "$frame_max" ] || { echo "windows-remote: launch frame exceeds 4 MiB" >&2; exit 2; }
-boot="$(cat <<PS
-\$ProgressPreference = "SilentlyContinue"
-[Console]::OutputEncoding = [Text.Encoding]::UTF8
-\$global:failed = \$false
-try {
-  \$line = [Console]::In.ReadLine()
-  if (\$null -eq \$line -or \$line.Length -gt $frame_max -or \$line -cnotmatch '\A[A-Za-z0-9+/]+={0,2}\z') {
-    throw 'windows-remote: malformed launch frame'
-  }
-  \$s = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(\$line))
-  & ([scriptblock]::Create(\$s)) *>&1 | ForEach-Object {
-    if (\$_ -is [Management.Automation.ErrorRecord]) { \$global:failed = \$true; [Console]::Error.WriteLine("ERROR: \$_") }
-    elseif (\$_ -is [Management.Automation.WarningRecord]) { [Console]::Error.WriteLine("WARNING: \$(\$_.Message)") }
-    else { \$_ }
-  } | Out-String -Stream -Width 300
-} catch { [Console]::Error.WriteLine("ERROR: \$_"); exit 1 }
-if (\$global:failed) { exit 1 }
-if (\$LASTEXITCODE) { exit \$LASTEXITCODE }
-exit 0
-PS
-)"
-enc="$(printf '%s' "$boot" | iconv -f UTF-8 -t UTF-16LE | base64 | tr -d '\n')"
-# The worker's own watchdog fires at seconds+30; this cap is the backstop for
-# a launch that never reaches it.
-status=0
-printf '%s\n' "$frame" |
-    "$tmo" --foreground -k 15 "$((seconds + 60))" /usr/bin/ssh -T -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
-        "$host" "powershell -NoProfile -NonInteractive -EncodedCommand $enc" 2>&1 |
-    tee "$result/console.log" || status=$?
-unset frame
-case "$status" in
-    124|137|255)
-        # Timed out or lost transport: disarm a not-yet-started worker, then
-        # kill only our own verified child. Both are no-ops after result.json.
-        echo "windows-remote: launch ended with $status (transport timeout/loss, or worker timeout); disarming job $job" >&2
-        disarm
-        cancel
-        ;;
-esac
+} | remote_ps 2>&1 | tee "$result/console.log" || status=$?
 
 # Raw tar over SSH, never through PowerShell's text pipeline. Even failed
 # cargo commands keep result.json and run.log for diagnosis.
 fetch_status=0
-"$tmo" --foreground -k 10 "$seconds" /usr/bin/ssh -T "$host" "tar.exe -cf - --exclude=output.log --exclude=./output.log -C $root/scratch/remote/$job ." |
+/usr/bin/ssh -T "$host" "tar.exe -cf - --exclude=output.log --exclude=./output.log -C $root/scratch/remote/$job ." |
     tar -xf - -C "$result" || fetch_status=$?
 if [ "$status" = 0 ] && [ "$fetch_status" != 0 ]; then status=$fetch_status; fi
 if [ -d "$result/bin" ]; then

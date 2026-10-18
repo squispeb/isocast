@@ -36,9 +36,9 @@ use isocast_protocol::api::{
     EventKind, EventKinds, Frame, FrameParams, FrameRate, FrameStream, FramesParams, GetParams,
     ImportObsParams, Live, LiveStatus, Marked, Method, Notification, Overload, OverloadedFile,
     Plan, Refreshed, Report, Request, Resolved, Response, RpcError, SharedFrameStream,
-    SharedFramesParams, Snapshot, SnapshotParams, StartParams, Started, Status, StopAccepted,
-    StreamKey, StreamKeyParams, StreamKeyTarget, Switched, TakeCause, TuneParams, Tuning,
-    WatchParams, lock_path, shared, socket_path,
+    SharedFramesParams, Snapshot, SnapshotParams, StartParams, Started, Status, StreamKey,
+    StreamKeyParams, StreamKeyTarget, Switched, TakeCause, TuneParams, Tuning, WatchParams,
+    lock_path, shared, socket_path,
 };
 use isocast_protocol::change::{Change, diff, merge_patch, missing_removals};
 use isocast_protocol::devices::{PermissionKind, PermissionsReport};
@@ -635,9 +635,18 @@ fn stream_shared_frames(
     thread::spawn({
         let left = left.clone();
         move || {
-            for line in reader.lines() {
-                let Ok(line) = line else { break };
-                match serde_json::from_str::<shared::Control>(&line) {
+            let mut reader = reader;
+            let mut line = Vec::new();
+            loop {
+                line.clear();
+                let read = std::io::Read::take(&mut reader, 4097).read_until(b'\n', &mut line);
+                if !matches!(read, Ok(n) if n > 0)
+                    || line.len() > 4096
+                    || line.last() != Some(&b'\n')
+                {
+                    break;
+                }
+                match serde_json::from_slice::<shared::Control>(&line) {
                     Ok(shared::Control::Release { generation, slot }) => {
                         control.release(generation, slot);
                     }
@@ -1462,11 +1471,7 @@ impl Daemon {
         if self.shutting_down.load(Ordering::SeqCst)
             && !matches!(
                 request.method,
-                Method::Status
-                    | Method::Get(_)
-                    | Method::Stop
-                    | Method::RequestStop
-                    | Method::Shutdown
+                Method::Status | Method::Get(_) | Method::Stop | Method::Shutdown
             )
         {
             return Response::err(
@@ -1714,7 +1719,6 @@ impl Daemon {
             Method::TimelineRelink(params) => self.timeline_relink(params).and_then(to_json),
             Method::TimelineExportNle(params) => self.timeline_export_nle(params).and_then(to_json),
             Method::EstimateCapacity(params) => self.estimate_capacity(*params).and_then(to_json),
-            Method::RequestStop => self.request_stop().and_then(to_json),
             Method::Stop | Method::Shutdown => match self.stop() {
                 // Shutting down while idle is fine.
                 Err(err) if shutdown && err.code == RpcError::WRONG_STATE => {
@@ -2400,14 +2404,9 @@ impl Daemon {
                 .session
                 .as_ref()
                 .ok_or_else(|| wrong("recording: idle; valid action: start".into()))?;
-            if session.stop.load(Ordering::SeqCst) {
+            if session.stop.load(Ordering::SeqCst) || session.files.lock().is_none() {
                 return Err(wrong(
-                    "recording: finalizing (a stop was requested); it can't pause or resume".into(),
-                ));
-            }
-            if session.files.lock().is_none() {
-                return Err(wrong(
-                    "recording: starting; wait for recording state".into(),
+                    "recording: starting or stopping; wait for recording state".into(),
                 ));
             }
             let control = state.control().expect("recording engine");
@@ -2895,10 +2894,6 @@ impl Daemon {
 
     fn status(&self) -> Status {
         let state = self.state.read();
-        let finalizing = state
-            .session
-            .as_ref()
-            .is_some_and(|session| session.stop.load(Ordering::SeqCst));
         let (engine, mut live, files) = match &state.session {
             None => (EngineState::Idle, None, Vec::new()),
             Some(session) => match session.files.lock().clone() {
@@ -2940,7 +2935,6 @@ impl Daemon {
             .and_then(|session| self.recording_into(&session.takes));
         let mut status = Status {
             state: engine,
-            finalizing,
             governor: Some(isocast_engine::governor::status()),
             machine_profile: Some(self.machine_status(false)),
             #[cfg(target_os = "macos")]
@@ -3335,17 +3329,14 @@ impl Daemon {
                 project
             }
             Err(err) => {
-                self.ended(
-                    id,
-                    Err(err.message.clone()),
-                    Event::Stopped {
-                        report: None,
-                        error: Some(err.message.clone()),
-                        project: None,
-                        folder: None,
-                        timeline: None,
-                    },
-                );
+                self.publish(Event::Stopped {
+                    report: None,
+                    error: Some(err.message.clone()),
+                    project: None,
+                    folder: None,
+                    timeline: None,
+                });
+                self.ended(id, Err(err.message.clone()));
                 return Err(err);
             }
         };
@@ -3372,17 +3363,14 @@ impl Daemon {
             Ok(engine) => engine,
             Err(err) => {
                 discard(&project);
-                self.ended(
-                    id,
-                    Err(err.message.clone()),
-                    Event::Stopped {
-                        report: None,
-                        error: Some(err.message.clone()),
-                        project: None,
-                        folder: None,
-                        timeline: None,
-                    },
-                );
+                self.publish(Event::Stopped {
+                    report: None,
+                    error: Some(err.message.clone()),
+                    project: None,
+                    folder: None,
+                    timeline: None,
+                });
+                self.ended(id, Err(err.message.clone()));
                 return Err(err);
             }
         };
@@ -3466,16 +3454,16 @@ impl Daemon {
             if ended.is_err() {
                 discard(&project);
             }
-            let stopped = Event::Stopped {
+            daemon.publish(Event::Stopped {
                 report: ended.clone().ok().map(Box::new),
                 error: ended.clone().err(),
                 // Unless the folder went again (it held nothing).
                 project: project.folder.exists().then(|| project.id.clone()),
                 folder: project.folder.exists().then(|| project.folder.clone()),
                 timeline: daemon.recording_into(&takes),
-            };
+            });
             let error = ended.as_ref().err().cloned();
-            daemon.ended(id, ended, stopped);
+            daemon.ended(id, ended);
             // A refused Start is final: a client may retry as soon as it
             // receives the error, so release the session before answering.
             if let Some(message) = error {
@@ -4048,7 +4036,7 @@ impl Daemon {
             })?;
         let reply = SharedFrameStream {
             target: params.target.clone(),
-            transport: "iosurface-mach".into(),
+            transport: isocast_surfaces::TRANSPORT.into(),
             service: exporter.service().to_string(),
             format: "rgba8unorm".into(),
             fps,
@@ -4113,32 +4101,6 @@ impl Daemon {
         }
     }
 
-    /// Ask the running session to stop (or cancel one still starting) and
-    /// answer at once: the session's own coordinator finishes its files and
-    /// ends it as `stop` waits for. Only flags and copies under the lock;
-    /// asking again while it finishes answers the same way.
-    fn request_stop(&self) -> Result<StopAccepted, RpcError> {
-        let state = self.state.read();
-        let Some(session) = &state.session else {
-            return Err(RpcError {
-                code: RpcError::WRONG_STATE,
-                message: "not recording".into(),
-            });
-        };
-        let files = session.files.lock().clone().unwrap_or_default();
-        session.stop.store(true, Ordering::SeqCst);
-        let session_id = session.id;
-        #[cfg(windows)]
-        if let Some(control) = state.control() {
-            control.wake_recording();
-        }
-        Ok(StopAccepted {
-            session_id,
-            finalizing: true,
-            files,
-        })
-    }
-
     /// Stop the running session (or cancel one still starting) and wait
     /// for its files to be finished.
     fn stop(&self) -> Result<Report, RpcError> {
@@ -4177,9 +4139,7 @@ impl Daemon {
     }
 
     /// Session `id` has ended, with its report or why it has none.
-    fn ended(&self, id: u64, ended: Result<Report, String>, stopped: Event) {
-        // Logging can touch disk; it must not hold the control-state lock.
-        diagnostics::event(&stopped);
+    fn ended(&self, id: u64, ended: Result<Report, String>) {
         // Broken control state must not prevent a writer's completed report
         // from reaching the emergency finalizer (the lock never poisons).
         let mut state = self.state.lock();
@@ -4194,11 +4154,6 @@ impl Daemon {
             }
             Err(error) => state.last_error = Some(error),
         }
-        // Queue the completion after updating state but before releasing the
-        // session to Start/Shutdown or waking blocking Stop. Watchers refreshing
-        // status see the new state; shutdown cannot exit before it was announced.
-        // Unlike publish, send_event only queues bytes, with no state callbacks.
-        self.send_event(stopped);
         self.ended.notify_all();
     }
 }

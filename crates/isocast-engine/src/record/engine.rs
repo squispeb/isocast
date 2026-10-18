@@ -2238,7 +2238,7 @@ impl<F: Clone + Send + 'static> AudioRun<F> {
             let id = id.to_string();
             move || {
                 let failure = fault_inner.worker(&format!("audio source {id}"), || {
-                    platform.real_time_thread();
+                    platform.audio_thread();
                     let frame_samples = channels.max(1) as usize;
                     while !stop.load(Ordering::SeqCst) {
                         match audio.chunks.recv_timeout(Duration::from_millis(10)) {
@@ -2467,7 +2467,7 @@ fn ensure_mixer<P: Platform>(inner: &Arc<Inner<P>>, state: &mut State<P>) {
             let outputs = inner.program_audio.clone();
             let shared = shared.clone();
             move || {
-                platform.real_time_thread();
+                platform.audio_thread();
                 let _ = fault_inner.worker("mixer", || {
                     mixer.run(&platform, &shared, from, Some(&control), &outputs)
                 });
@@ -3078,7 +3078,12 @@ fn run_program<P: Platform>(
         compositor.protect_inputs(output.program_video.has_recording());
         let monitored = program_rates.any(now);
         let preview_wanted = preview_rates.any(now);
-        if now > tick + 3 * frame {
+        let obsolete = if platform.prefers_deadline_timer() {
+            now >= epoch.add_ticks(n + 1, fps) + frame
+        } else {
+            now > tick + 3 * frame
+        };
+        if obsolete {
             if outputs || monitored {
                 output.frames_missed.fetch_add(1, Ordering::Relaxed);
                 if outputs {
@@ -3576,7 +3581,13 @@ fn run_iso<P: Platform>(
                 runner.id
             );
         }
-        if platform.now() > tick + 3 * frame {
+        let now = platform.now();
+        let obsolete = if platform.prefers_deadline_timer() {
+            now >= epoch.add_ticks(n + 1, fps) + frame
+        } else {
+            now > tick + 3 * frame
+        };
+        if obsolete {
             continue;
         }
         let Some(image) = runner.slot.newest_until(tick + frame / 2) else {
@@ -3885,6 +3896,8 @@ fn record<P: Platform>(engine: &Engine<P>, options: &RecordOptions) -> Result<Re
         drop(state);
         thread::sleep(Duration::from_millis(20));
     }
+
+    let _recording_activity = platform.recording_activity()?;
 
     // Sources whose ISO files are filtered.
     let filtered: Vec<&str> = match iso.filtered {

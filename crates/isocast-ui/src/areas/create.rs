@@ -755,7 +755,7 @@ impl Create {
             let s = app.session.borrow();
             (
                 s.status.as_ref().map(|x| x.state),
-                s.record_busy(),
+                s.busy_record,
                 s.setup.is_some(),
             )
         };
@@ -905,7 +905,7 @@ impl Create {
     }
 
     fn retake(&self, app: &Rc<App>) {
-        if self.retake_since.get().is_some() || app.session.borrow().record_busy() {
+        if self.retake_since.get().is_some() {
             return;
         }
         self.retake_since.set(Some(crate::clock::now()));

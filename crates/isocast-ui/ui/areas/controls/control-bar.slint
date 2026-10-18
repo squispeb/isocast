@@ -215,7 +215,7 @@ export component ControlBar inherits Rectangle {
                         kind: TransportKind.record;
                         active: root.recording || ControlsArea.record-state == "starting";
                         enabled: Ui.has-setup && !ControlsArea.busy-record;
-                        label: ControlsArea.record-state == "starting" ? "Starting…" : ControlsArea.record-state == "stopping" ? "Finalizing…" : root.recording ? "Stop Recording" : "Start Recording";
+                        label: ControlsArea.record-state == "starting" ? "Starting…" : ControlsArea.record-state == "stopping" ? "Stopping…" : root.recording ? "Stop Recording" : "Start Recording";
                         clicked => { ControlsArea.toggle-record(); }
                     }
                 }

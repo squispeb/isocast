@@ -198,11 +198,13 @@ impl Platform for WindowsPlatform {
 
     fn shared_surface(
         &self,
-        _gpu: &Gpu,
-        _width: u32,
-        _height: u32,
+        gpu: &Gpu,
+        width: u32,
+        height: u32,
     ) -> Result<(isocast_surfaces::Surface, wgpu::Texture)> {
-        Err(unsupported("shared preview surfaces"))
+        let surface = isocast_surfaces::Surface::rgba_on(&gpu.device, width, height)?;
+        let texture = surface.texture(&gpu.device, wgpu::TextureUsages::RENDER_ATTACHMENT)?;
+        Ok((surface, texture))
     }
 
     fn encode_jpeg(

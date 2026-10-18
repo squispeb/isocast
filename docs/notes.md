@@ -5,84 +5,366 @@ each section. Delete entries that stop being true.
 
 ## Environment
 
-- 2026-10-18 (#105, Stop ACK ready for CI): additive request_stop returns a
-  StopAccepted snapshot; old RPC Stop/Shutdown and foreground recording still
-  wait for the durable Report. CLI stop now acknowledges, --wait preserves
-  report/error behavior; MCP exposes both. App shows Finalizing, rejects stale
-  status replies and reports finalization errors instead of a success toast.
-  Stopped is enqueued after state update but before releasing/waking Stop or
-  Shutdown; diagnostics stay outside the state lock. Actual20 normal stops,
-  1080p60program+4K60screenISO: ACKp50=0.13425ms,p99=0.1822ms (nearest-rank,
-  observed max, not population-tail guarantee). Durable completion remains
-  31.70–134.59ms. Four edge cases also pass;48files/5266frames fully decode,
-  zero reported loss,881checks. Video-only; A/V tail error remains separate.
-  Native strictClippy/213tests and Mac250incldoc/one hardwareignore pass; ProRes
-  capacity test is green natively. Regular Windows UI build completed16m42s
-  after the earlier combined-run timeout; receipt0d983bb3, UI SHAeb2673ec….
-  Evidence: windows/scratch/w11-stop/REPORT.md and w11-stop-percentiles.json.
-  No claim of cold-CLI/UI latency or observed transient UI state. Uncommitted;
-  audio proof then camera-free OBS comparison remain the next ordered items.
+- 2026-10-18 (#105 W.6 shared previews): Windows uses owner-ACL random named
+  DX12 allocations and authenticated one-shot offers, same login session and
+  exact adapter LUID only. Register the rendering queue before opening a
+  shared viewer; releases follow its native GPU fence. At most current plus
+  one retired ring per viewer; resize coalesces while old frames remain held.
+  Reconnect caches need process-unique ring identities, not wire generations.
+  Real program/studio, source Properties (bars→bars2) and projectors verified
+  on exon-desk; app kill leaves three 10s/300-frame files intact. Native
+  6ea81dd3 checks/build, 86827de6 measurements/kill, e59f1f89 Properties;
+  portable final gates250 pass including doctest, one existing hardware ignore.
+  Oracle7 pass/2 pending: its B5 tests H.264 scene feeds/snapshots, NOT shared
+  textures. Initial oracle API errors fixed by importing main04760a00; one
+  initial ISO stop timeout did not reproduce in the final complete run.
+  First visible picture upper bounds3.39s Isocast (daemon warm),5.73s OBS32.1.2
+  (engine starts too), so not a matched cold-engine speed win. A later
+  matched fresh-daemon+app / fresh-OBS pair (warm filesystem caches)
+  observed pictures by4.98s/3.45s, with broad2.79–4.98s/3.08–3.45s sampling
+  brackets: no precise startup delta or optimization claim. At720p30 one
+  sample per stage: app+daemon CPU13.91→16.95→21.34%onecore for1/2/3 viewers;
+  summed per-PID GPU-engine counters6.85→7.77→9.02%, not whole-device utilization.
+  Program/source app-arrival medians36.25/3.10ms; not display/photon latency.
+  Private receipts/screenshots in windows-capture/scratch; none committed.
+  GUI qualification must issue API commands at the same integrity level:
+  a medium-token daemon cannot authenticate the elevated SSH process handle.
+  Cua Windows launch arguments are joined unquoted; interpreter expressions
+  must be Windows-quoted or whitespace-free. Adopt a tagged supervisor while
+  launch waits for its window. No security bypass or protected-process changes.
 
-- 2026-10-18 (#105, Windows disk capacity): `space::device` now reads a local
-  volume's GUID + format serial from an opened closest ancestor, following
-  links and refusing dangling/inaccessible targets instead of guessing a disk.
-  Platform free space uses GetDiskFreeSpaceExW caller-available bytes on the
-  handle-derived GUID root; GUID-less shares keep the previous handle query.
-  Windows estimates now use the recorder's USERPROFILE-aware home resolver.
-  Previously failing ProRes capacity test now passes:85/85 native engine tests,
-  strict native Clippy, full Mac gates250 incldoc/one hardwareignore, and native
-  51/51 volume checks +6/6 driver checks. Existing C:/G: identities differ;
-  aliases/Unicode/missing children agree; free space matches WinAPI exactly;
-  HOME-unset synthetic calibration gives Fits only for the matching disk.
-  No settings changes or calibration backfill. UNC/denied mounts not runtime
-  qualified; GUID-less shares stay uncalibrated. Old Windows profiles with no
-  disk identity need fresh calibration. Evidence: windows/scratch/w10-volume/
-  v10-20261018T193825Z-292c5185dc19.driver.json and REPORT.md. Ready for CI,
-  uncommitted; next slice is immediate Stop acknowledgement, then audio/OBS.
+- 2026-10-18 (#105 capture/main integration): coordinator committed performance
+  and orphaned audio probes as1b9fc578. Merged main565729db with --no-commit;
+  leave the merge staged. Main's canvas/governor/retention behavior survives,
+  with camera metadata and opt-in Windows pacing/scheduling added. Manifest
+  calls now pass canvas_controls plus camera readers; masks and camera exports
+  both retained. Main1b6761bb UI memory strategy wins: separate -j1 UI step,
+  ISOCAST_UI_NO_GALLERY, no global jobs override; native platform build coverage
+  retained. Portable gates248unit+1doc/onehardwareignore pass onexonbook;
+  native release/all-target services build127942c4 passes, separate CI-config
+  UI+test buildb7d48d82 passes (28m27s). Both compiled tree91ec7b7a. One LAN
+  bootstrap stalled before any remote job/Cargo; only its owned SSH transport
+  was cancelled, Tailscale retry passed. actionlint and merge-delta checks pass;
+  seven docs/cli.md whitespace warnings are inherited unchanged from main.
+  Read-only merge review has no blockers. Writer REPORT receives the budget
+  planner/cache and shared completion APIs; daemon wiring remains writer-owned.
 
-- 2026-10-18 (#105, REVIEW-W6 B1): NVENC now retains attempted source leases
-  before its private GPU copy, including failed mapping. Four preallocated
-  EVENT queries prove completion before release/reuse; unprovable copies retain
-  their leases through bounded teardown/quarantine. Rejected attempts never
-  enter accepted-picture accounting. Scratch before/after tests proved pooled
-  early reuse and WGC-helper early Ack on 0c47af4c, neither on the fix; a 5.7s
-  stall verified timeout/Drop quarantine and preserved map + copy errors.
-  Final native media contracts 7/7 and strict all-target Clippy pass. Broad
-  engine tests expose one unchanged Windows ProRes-estimate failure: non-Unix
-  space::device returns None, so unknown disk capacity yields NoMargin rather
-  than the test's Fits. Real A/V take hit the separately observed audio-end
-  finalization issue (159 accepted samples past video end); no audio workaround
-  in B1. Evidence: windows/scratch/w9-nvenc-lifetime/REPORT.md. No production
-  injection hooks, macOS changes, commits or CI launches; tier-1 re-review due.
-  Final video-only daemon take passes37/37: 1080p60program+4K60ISO,361frames
-  each, complete manifest/empty errors/zero reported loss, full decode and
-  owned cleanup. It isolates NVENC; the failed A/V take remains preserved.
+- 2026-10-18 (#110/#27 merge qualification): HEADbb8790a5 + main59f78393
+  merged with `--no-commit`. Governor conflict keeps BOTH `frame budget`
+  exclusion from ISO pin diagnosis and named-secondary `unpinned_secondary`;
+  per-hub ownership and budget-full/5s-tail +30s-quiet restoration retained.
+  Notes conflict keeps both histories. Remote gates249 pass, strict112811
+ 18/18 zero-loss once. Combined AWS112520:24 tiles saturated50s; lastbudget
+  refusal53.65s, preview15→30 at88.20s/full118.61s, no early recovery. Healthy
+  hub1500/failed4000 stay isolated, one VT refusal; three130s files7800/7800
+  frames with equal A/V, no drops. Congested streams lose309/235 video pictures
+  (audio intact), explicitly not a loss-free-upload claim. First combined
+  runner failed due to missing proxy dictionary; corrected experiment only,
+  no production patch/assertion relaxation. Scratch budget-merge/REPORT.md
+  has hashes/results. Merge remains staged/uncommitted; no owned helpers left.
 
-- 2026-10-18 (#105, audible-signal proof): explicit WaveXLRrender loopback,
-  neverdefault-LG playback, recordsone0.600s997Hzburst atPCMpeak0.003. Decoded
-  nativeHEVC/AAC3s file has180/180frames/no losses, FFT996.826Hz, −53.48dBFS;
-  audioonset0.875s vsclockedvisual0.900s gives−25ms (declared±40ms). Defaults,
-  mute andglobal/sessionvolume untouched; all152160capturedframes accounted
-  as6024preroll+144000inrange+2136postend. Zero gap/timestamp/writer losses;
-  oneaggregate discontinuity isnotindependentlyattributedperpacket. Native
-  selected-endpoint API proof withsyntheticmarker, NOTselected-output CLI,
-  WGC oracoustic-latencyproof. Production96-samplejitterpolicy preservesall
-  accepted samples; firstdirect-writerprobe failedone-sampleoverlap, second
-  hadgenuine384-framegap, bothretained. Finalcapturethread usesproduction
-  real_time_thread hook; no causalMMCSS-fixclaim fromonepass. Sources/hashes/
-  commands: windows/scratch/w7-audio-proof/corrected-c/REPORT.md. No moretones.
+- 2026-10-18 (#110 remaining handoff): branch fast-forwarded to main6d6d58fd
+  before edits; current work uncommitted. Mixed H26x overlay, per-hub refusal
+  ownership and named secondary pins qualified onAWS. Gates243/strict18/18,
+  stream3-pair A/B0loss. Real `memory_pressure -p33 -s1` (NOT `-S`) reached
+ 7.92–8.40GiB available and actual warninglevel2; three94.7s files2841frames
+  each and stream2793frames lose nothing, preview fully restores59.91s after
+  release. Helpers/watchdogs reaped; resumed inspection found no lane jobs
+  or helpers left running. Report: self-tuning-2/scratch/remaining/REPORT.md.
+  Regular reviewer unavailable>1h; Astra fallback review/re-review and final
+  evidence acceptance have no blockers. Regular-model review before release
+  remains required. Prior slices are committed6c4663ca/merged6d6d58fd, not
+  pending approval despite the historical entries below.
+- 2026-10-18 (#27 review fixes): 5d06bfef + main6d6d58fd merged without a
+  commit (notes conflict keeps both histories). B1 auxiliary cache eviction
+  happens before the next GPU batch and yields that admission turn, so the
+  same first sixteen owners cannot continually reclaim every permit. Hidden
+  auxiliary inputs and idle compositors release caches too; bindings/reuse
+  state are cleared, older GPU submissions keep their own input leases.
+  B2 notices/counters are copied under the ledger mutex and reported through
+  bounded deferred logging outside it; status JSON is built outside it too.
+  B3 full-budget occupancy and the five-second refusal/release tail both
+  block the governor's 30-second recovery timer (memory pressure kept).
+  Ordinary clones now share a domain claim; independent deliveries still
+  deduplicate. Final evidence: frame-budget/scratch/REPORT.md and fix1/.
+- 2026-10-18 (#27 review verification): matched native pixel run103710,
+  24 staggered masked tiles:23 frozen before. Final130s run110027 keeps all
+  24 subscriptions open through50s saturation (8–10 changes/33s off air),
+  then12 open through recovery (34 changes/35s); program/ISO7800/7800.
+  Disable client read timeouts when testing deliberately shed frames: the
+  early5s client timeout could close a stream while JPEG demand continued.
+  The3s looping-counter experiment
+  aliased with the new~3s update cadence; use test_pattern's six-digit counter
+  for freshness, not repeated clip numbers or frame timestamps. Log-writer
+  delay102500→103117:299→0 program drops. Pressure50s: no false restoration;
+  last refusal53.66s, restore89.09s then118.48s, remaining12 viewers continue.
+  Stress103319:zero protected/audio loss. A/B103220:CPU42.3→42.1%, instructions
+  494.8→493.9M/s, footprint140.4→133.1MB. Gates247 unit +doctest, strict104755
+  18/18, all pass. Binary8e6501b8. Main6d6d58fd is merged without commit.
+  B2's isolated `ISOCAST_BUDGET_LOG_STALL_MS=AFTER_MS:DURATION_MS` probe is
+  capped at10s, once, developer-only; markers go to native-relay JSONL in
+  d.logs, not daemon.log. Original native-priority/device limits remain open.
 
-- 2026-10-18 (#105 transport): large Windowslaunch couldstall BEFOREworker/
-  watchdog; lastjob329a4259 hadstagingbutnoactive/result andwasdisarmed.
-  windows-remote.sh now uses a finite newline/base64 ReadLine frame andlocal
-  transporttimeouts, not EOFdependentReadToEnd foritsmainlaunch. Rootcause
-  remainsunproven; wallcapsboundevenpre-shimstalls. Alltimeoutcallsuse
-  --foreground afterreviewcaughtdeferredCtrl-C; localpgrpSIGINTtrap0.302s.
-  Nativeechoexit0, explicitexit1,5sbudgetSleep30exit124/cleanup andfullnative
-  3binbuild pass. Logs/scripts only; no defaultdevices/locks/otherlanes touched.
-  Source/nativebuild b7be2655, signalproof6e5f755b, finaltransportechoac6ac39d.
-  Nativecontractworker refreshedfororacle: SHAbe76331b99fd4d4eb440ee08dbff05d60275070d6836c8317e716b4adbfe9c96,
-  receipt54b9caa3, HEAD0c47af4c+transportonly. OracleownsitsGPU-lockedruntime.
+- 2026-10-18 (#27, frame-budget lane): replacement design is per-origin,
+  distinct-buffer accounting, not delivery permits. Independent reserves are
+  8 producer, 32 file-recording, 16 auxiliary and 36 protected-compositor
+  pictures; the CV pool's physical ceiling is their sum (92), allocated on
+  demand. The composition reserve is (GPU in-flight limit + one cached input)
+  × (main + MAX_EXTRA_CANVASES), not another arbitrary queue size. A buffer
+  shared across domains counts once in the physical union; repeat deliveries within a
+  domain do not spend another permit. Native VT callbacks retain the same
+  lease, as do GPU inputs/outputs through their existing completion fences.
+  Streams/replay, previews, scene tiles, source-mask caches and virtual-camera
+  reads use the auxiliary reserve; recorded-canvas inputs use composition,
+  and files/ISOs use recording. This fourth domain was added during audit:
+  a stalled passthrough ISO can fill the file reserve, but must not freeze
+  the program reading that same source. Auxiliary refusal feeds the governor
+  without asking it to thin ISOs. This protects against other domains, not a stalled protected
+  writer exceeding its own reserve or the machine's physical encode capacity.
+- 2026-10-18 (#27 design decisions): copy scarce SCK/AVCapture buffers once
+  at ingress, preserving format/bit depth/attachments, rather than letting
+  many outputs retain an eight-surface device pool. Decoder frames remain
+  zero-copy and have a per-reader ledger keyed by native CV buffer identity:
+  two samples aliasing the same native buffer share a charge too, not merely
+  Rust clones of one wrapper. AVAssetWriter's opaque lifetime is
+  isolated in a private threshold-limited copy pool and charged at its full
+  reservation, never reported as an invented exact native count. The camera
+  helper likewise copies before acknowledging enqueue: CMIO retains the
+  helper's pool, never the parent's recycled pixels. Shared IOSurface rings
+  are counted separately (including texture wrappers and Mach offers), with
+  their existing per-ring limit. This is a frame-pool invariant, not a
+  machine-wide RAM allocator or a count of Apple's private codec allocations.
+  Status/doctor expose the ledger and sticky refusal/allocation-failure totals.
+  Windows' platform hook remains explicitly unavailable, not a false pass.
+- 2026-10-18 (#27 diagnostics): isolated developer mode accepts
+  `ISOCAST_FRAME_STALL=iso|live`: hold one real consumer worker for 600 ms,
+  once, after two seconds. It does not stop VT callbacks or the daemon.
+  Normal mode ignores it. Use it to distinguish file-queue retention from
+  capture freshness; numbered media checks detect a frozen input even if
+  a program file continues storing repeated pictures at its nominal fps.
+- 2026-10-18 (#27 device qualification): M2-a's existing signed development
+  app reports screen recording not granted, and `virtual_camera_start` says
+  the camera is not installed/approved. No permission, setting, or install
+  was changed. The fallback AVAssetWriter path did qualify there: program
+  and two ISOs, each 360/360 at 60 fps, zero audio/video loss, full decode.
+  The saved `command` in hw-queue/done/20261018-090156-frame-budget-cmd.json
+  is the exact permission-aware retry through `hw-batch.py now cmd --gui`.
+  Pixel-copy format/plane tests are not a claim of real capture/CMIO success.
+- 2026-10-18 (#27 final verification, a16084a6 daemon): failing 24 s AWS
+  workload (six ISOs, three extra recorded canvases, stream/replay, masks,
+  40 multiview tiles, 1,320 cuts) loses 461 program frames on main; new
+  records every frame in all ten files and the stream/replay. All 45 budget
+  snapshots hold; refusals [0,0,1157,0], auxiliary peak16. Governor lowers
+  previews60→30→15. Final gates244 unit tests + one doctest, strict18/18.
+  Flagship-1080 A/B3 pairs: CPU41.6→42.4% (+0.8 points), instructions+0.5%,
+  GPU86.2→86.0ms/s, footprint125.6→124.7MB; zero media loss on both.
+- 2026-10-18 (#27 remaining native-policy limit): a600ms stopped ISO worker
+  fills its32-frame reserve (5 refused), but the program stays480/480 with
+  every numbered picture advancing. Its own ISO loses22 frames, accounted.
+  A600ms live-worker stall leaves every frame-budget domain unexhausted yet
+  loses51 ISO frames (program480/480, all audio intact): stream.rs includes
+  the hold in native submit latency/health, setting native priority pressure;
+  crash_safe::append_frame then refuses ISO before budget admission. This
+  priority contract is unchanged from main and separate from pool starvation.
+  After three diagnostic attempts, stopped expanding the fix: the wrong
+  assumption was that a native-consumer stall tests only buffer retention.
+  Keep #27 open for the stronger requested no-ISO-loss contract; reconcile
+  native stream-vs-ISO priority with #110 rather than tuning pool caps again.
+  Evidence/retry commands: hw-queue/done/20261018-092625-frame-budget-cmd.json,
+  frame-budget/scratch/consumer-stalls/stalls.json and REPORT.md. No assertion
+  was relaxed to hide this failure; no native policy change was made.
+
+- 2026-10-18 (#110 self-tuning-2 handoff): uncommitted on063a21a5. Gates242
+  pass; the full strict suite ran once under CPU4+Metal+2GiB resident memory,
+  18/18 zero-loss. M2-b's three interleaved flagship1080 A/B pairs lose no
+  frames/audio (daemon CPU median9.8% both); a288 s strict30fps soak has21
+  decoded files,8436 frames per role, zero losses/repeats,8601 stream frames
+  and both crash checks pass. These M2s have24GB, not8GB. Actual kernel
+  memory-pressure samples stayed normal; scoped per-daemon injection separately
+  proves warning/critical, pin/ISO-consent and30s-step recovery. No new M5 run.
+  Scratch REPORT.md lists every job, hashes and failures honestly. Formal
+  Tier-1 review failed before reading code three times (Endpoint unavailable);
+  no approval, commit or GitHub write. T.1b.1/T.3a/T.4a are ready for review,
+  not completion of full T.1b/T.3/T.4 or #110.
+- 2026-10-18 (#110 qualification): four calibrations take22.26–22.86s,
+  including outside CPU load. Every supported ProRes variant, live CBR H.264,
+  UHD60 HEVC10 and three full fit cells are covered;19–21/24 cells total,
+  skipped diagnostics explicit. Multi-canvas and low-end fitting files lose
+  nothing. M2 overloaded ISO loss44.39–53.67% vs measured53.09%/table52.62%:
+  no improved percentage-accuracy claim. New-only init/blank profiles choose30;
+  explicit/copy60, pins and no ISO consent survive restarts. Late-canvas floor
+  now joins at25%; native rollback restores real properties even when numbers
+  equal the last acknowledgement. Same-canvas multi-hub refusal remains
+  canvas-wide (verified one refusal, sibling restored, separate canvas adapts).
+
+- 2026-10-18 (#110 review fixes, current): uncommitted on7705e90. The
+  governor NEVER thins ISO implicitly: `governor.allow_iso_thinning` is false
+  by default; explicit opt-in permits it, pins still override it, and opt-out
+  cancels a running hold. Existing native safety may still drop ISO pictures.
+  Settings exposes the choice; Optimize/setup-check mention it without
+  enabling it or assuming it makes the workload fit. Owner-local native
+  intentional-refusal counters prevent false losses after vertical recovery;
+  preview retune refusals are nonfatal with per-feed error lifetime.
+- 2026-10-18 (#110 fix evidence): real pre-fix035640 reproduces vertical
+  pin→false ISO hold and two disconnected previews under injected VT-property
+  refusal. Rejected partial fix041634 proved native admission attribution
+  was also needed. After043111 pin/natural restoration and down/up refusals
+  pass; consent043746 and corrected Optimize/choice043938 pass. Idle CPU
+  medians0.02589%→0.00988% of one core; disabled0.00939%, overlapping noise.
+  Final gates240 pass once; strict05573918/18 passes once, zero reported
+  media loss. Report has the fix-by-fix evidence table and known F2 limits.
+- 2026-10-18 (#110 storage): preserved current binaries on M2-b at
+  `~/isocast-scratch/machine-profile-preserved/review-candidate` (daemon
+  SHA25688ed7bea5fa07ef2), baseline in its sibling`baseline-7705`. Old,
+  completed synthetic directories `/tmp/govab-*`, `mpmerge-spke3bm4`,
+  `govfix-ew539qol`, `govfix-p27wualk` were checksum-relocated to the lane's
+  local `scratch/retained-m2-b/<name>/`, not discarded. This freed enough
+  M2-b space for gates without lowering its40 GiB guard. Never confuse
+  hw-batch's standard pushed old bin-dir with these explicitly executed
+  remote candidate binaries; strict's `binaries.json` verifies them.
+
+- 2026-10-18 (#110 earlier T.2 handoff): ca4cc010 contains the first slice.
+  Main257ea057 (Windows plumbing, GPU lifetime and masks115) was merged as
+  eaf0b6a7; its results were committed as7705e90c by the delegator.
+  Shared-frame conflict keeps monitor cap AND new max-size argument; ISO
+  keeps governor pin AND GPU retry/presentation-time path. Daemon governor
+  now uses main's NativePlatform alias. Merged gates240 pass; strict e2e18/18
+  and seven native media contracts pass; job20261018-032243 verifies animated
+  program/filtered-ISO masks, split during emergency hold, native readback
+  and full recovery. Binaries stay onM2-b in ~/isocast-builds/machine-profile/
+  target/release (local shared volume only4.8 GiB free; no binary/movie fetch).
+- 2026-10-18 (#110 evidence limits):162024/195658/195715 were interrupted
+  before hardware, not governor failures. Detached201445/201446/201447-cmd/
+  e2e all passed. CPU/GPU contention was loss-free with zero policy steps.
+  Severe foreign4×UHD60 demands: main program1498 video/1695 audio dropouts,
+  governor1329/1623; a single pair is not repeatable improvement. ISO audio
+  stayed whole but native admission held ISO pictures for about121 s: only
+  the governor's extra overlay is bounded to3 s, not physical starvation.
+  Six policy changes/no cycling; native share recovered25.6 s and preview
+  61.1 s after foreign load. Custom-job PASS proves decode/accounting, not
+  zero drops. Independent merge-review tool failed twice (endpoint unavailable);
+  coordinator Tier-1 review remains. Full evidence/limits: lane scratch REPORT.md.
+
+- 2026-10-17 (#110 T.2 history): user approved initial exonbook baseline
+  while retaining AWS qualification. Runtime slice later committed ca4cc010: preview,
+  ISO/vertical admission and shared-stream bitrate controls, profile pins/off,
+  status/events/UI. A zero-ISO limit held for30+ seconds failed real A/B and
+  was replaced by a non-renewable3 s emergency overlay, rearmed after5 quiet
+  seconds. Native ISO_SHARE remains the only encoder-sharing controller.
+  Network shedding is not production loss and never triggers ISO blanking.
+  Exonbook strict e2e18/18 and233 tests pass;600 s fitting workload has zero
+  steps/losses. Real CBR/replay6000→1500→6000 verified; severe encoders can
+  still exceed protected capacity. Ten-minute overloaded run has four changes
+  without cycling, but preview cannot restore until remaining load fits.
+  Initial AWS runners were lost; detached replacements and their results are
+  described above. Report/evidence under the lane's scratch folder.
+
+- 2026-10-17 (#110 F4/F8): `setup check` uses only a reachable existing
+  daemon; otherwise its capacity check says "not checked" (validation still
+  succeeds/fails locally). Automatic calibration also defers while the live
+  engine previews/starts. `ensure_engine` holds the start gate and cancels
+  only an automatic helper before source startup; manual calibration remains
+  available during preview. Exonbook job 20261017-161756-machine-profile-cmd:
+  both offline cases and preview/manual/preemption cases pass, 90/90 frames
+  and 3.000 s A/V. Included in ca4cc010; original gates233 pass.
+- 2026-10-17 (#110 T.2 scheduling): the 0.0.7 release soak
+  `20261017-160535-delegator-soak` owns **both** AWS hardware locks for six
+  hours: m2-a records, m2-b receives. `hw-batch now --mac any` says "no test
+  Mac reachable" when both locks are held, even though SSH is reachable.
+  No lock was bypassed. Required competitors-only baseline on main 24bea09d
+  was queued as `20261017-162024-machine-profile-cmd` (later interrupted). The user
+  subsequently approved exonbook as the initial baseline; implementation
+  continued without waiving AWS qualification. The detached replacements
+  completed overnight; no jobs remain waiting. Report/integration map are in
+  `/Volumes/IsocastBuild/machine-profile/scratch/REPORT.md`.
+
+- 2026-10-18 (#105 final capture performance handoff): all scoped jobs ended,
+  work remains uncommitted. ReadyforCI API slices #1a/#3/#6a/#7a/#11a/#12;
+  not whole daemon integration/OBS parity. DDA's nominal1ms pending Acquire
+  wait measured p9916.071ms. Highres wait + zero-time latest refresh improves
+  CPU6.635→5.699%onecore and update-agep9916.35→2.879ms; matched WGCAboveNormal
+  remains4.685%CPU and DDA still23longgaps. Actual pixels,16GPUcursorcases,
+  pressure/reopen/idle-final-update/two-change-burst and final re-review pass;
+  source/strictClippy receipts in DUPLICATION-REPORT. Both workersAboveNormal.
+  No default DDA switch; dedicated helper only, cursor=false/window usesWGC.
+  Aggregate budget/split/live identity and calibration-cache integration remain
+  writer-owned; preserve its four-slotf1264f87 rather than overwrite with this
+  branch's qualified8-native/16-total policy. Sub1ms and Win11power gates open.
+  Native/portable checks pass as scoped; final optional62688d6d check never
+  ran because writer heldGPUlock. Allown child markers/probes/guards closed;
+  foreignGPUlock left untouched. Localvolume17.808GiB despite removingonly
+  own local ETLduplicates after freshremote/local hashes match. Windows
+  originals retained; no local builds/large fetches/foreign cleanup. See
+  capture scratch REPORT handoff index and owned-only patches; unowned audio
+  probes/exports still byte-identical to inherited snapshot.
+
+- 2026-10-18 (#105 performance qualification): measured P1/P3/P5 capacity
+  on 5070/617.42 is H2641102.879/846.201/347.689, HEVC865.599/617.507/622.934
+  completed1080p-equivalent fps (one short workload, not universal). The HEVC
+  inversion exposed our unsupported monotonic validation rule; removed after
+  review, preserved exact labelled data, and skip ISO downgrades that increase
+  load. Native Clippy/API checks655fa805 pass: measured H2643/3/3 load0.638146,
+  HEVC5/1/3 load0.759703. No automatic daemon cache/integration installed.
+  Real Wave XLR48k scheduling AB/BA14e4908e: first normal steady loses2304
+  frames versus MMCSS0; second steady pair ties0 (normal warm-up loses1824).
+  Process remainsNormal, only own threads pinned, no PCM stored; WPR0lost.
+  Stronger WASAPI061de49d invokes actual registered disconnect callback from
+  main MTA with worker idle250ms/0packets: callback alone wakes infinite wait,
+  stopped once4.433ms, reopen/no-late-callback pass. Earlier worker-side
+  injection proved propagation, not that isolated cross-thread wake alone.
+  DDA functional pixel/cursor/final-idle-update tests and re-review pass, but
+  initial matched CPU4.609→6.635%onecore/gapp9917→33ms regresses; one bounded
+  attribution batch remains, no default replacement/performance-win claim.
+  Local disk hit19.730GiB; removed only hash-verified duplicate local ETLs,
+  retained Windows originals, restored21.740GiB. New large traces stay remote.
+
+- 2026-10-18 (#105 performance continuation): probe_microphone/probe_loopback
+  and their exports were inherited uncommitted, not authored by this session
+  or the writer lane. Preserve them; owned #12 event/disconnection patch is
+  separately retained as capture/scratch/audio-event-only.patch against
+  fa061065, excluding all probe edits. Final WASAPIWPR e52faa8e proves idle
+  capturethread4.02wakeups/s→0; active~100.8/s unchanged,720000frames/15s,
+  no gaps/timestamp errors. Match ETW byPID+TID (TIDs reuse).32audio/video
+  schedulingcycles174handles; own contention288/600misses→0. Powerpolicy
+  GetProcessInformation returns87 onWin10 evenwithdocumentedversion/size;
+  guard leavespolicyuntouched instead of inventingpriorstate (Win11gate).
+  Nativehighrestimer p99~1.05ms, no<1ms/CPUclaim. Fullportablegates nowpass
+  fmt/strictalltargets/233unit+1doc onm2-b, onehardwareignore; initialhost
+  reservations/diskfloors and thenoneformattingfailure were resolved, not
+  bypassed. NVENCcompletion review found/fixed registration afterfatalexit;
+  deterministiccounterfactual reproducesoldrace, fixedrejects,12sessionsone
+  worker and32parallelreopens pass. DDAWIP reviewfinding(finalupdate loss
+  underthrottlethenidle) is being fixed before anyreadyclaim. Reports in
+  capture scratch; traces private, no other apps/process settings touched.
+  Further#7diagnostic5c57b692: AboveNormalvideo p991005us vsbalancedownprocess
+  timeBeginPeriod1 p991024us, both0misses. Threeprecisionapproachesdidnot
+  establishsub1ms; stoptweakingtimer, no timerperiodrequestshipped. Native
+  actualMediaClockopt-in testb503a2a6 passesfirsttickselection, diagnostics,
+  StopandnoPROCESS_STRETCHEDcontamination. Nativecombinedfmt/Clippy/165units
+  pass e38e49aa;900sbudgetendedatlastdocsummary, protocol-doc rerun3ec2ac00
+  passes. #3/#12readyforCI scopednativechanges; notautomaticengineadmission
+  orWin11powerqualification.
+  #7mechanismcorrection: actualexon-desk rustc1.99.1(58cf8f9c3) stdsleep
+  alreadyusesCreateWaitableTimerExW(HIGH_RESOLUTION), closesiteverycall.
+  OurTLShelper removesper-waitCreate/Close andmakesQPCdeadlinesexplicit;
+  it doesNOTremoveanexistingIsocastspinloop. Officialcommit-sourcechecked,
+  consistentwithordinary/explicit~samejitter. Don'trepeatOBSspinsavingsas
+  anIsocastbefore/afterclaim.
+
+- 2026-10-18 (#105 performance#1): exactprogram4K60+screenISO4K60+cameraISO
+  1080p60 confirmsH264P5NVENCsaturation, NOT blanketHEVCP5failure.30swarm/
+  60ssteady: H264P5=6938/10800pictures,625deadline misses+3237refusals,
+  NVENC100%; P3all=10800/10800,0losses,NVENC76.3%. HEVCP5allalreadyfits
+  10800/10800at88.05%; programP5/screenP1/cameraP3alsofitsat78.80%.
+  CPUonecore rises8.72→17.68%H264 and12.83→15.96%HEVC; noCPU/OBSwin claim.
+  WPRCPU+GPU0lostevents+NVML, ownedguardsclose;3f27bf57summarizesreceipts.
+  OfficialSDK13HEVCP3/LL=529fps, NOT HQ947. Addednative explicitpreset and
+  driver-keyed aggregatebudgetAPI, but enginepre-open call/calibrationcache
+  still writerintegration. Reference estimates remain uncalibrated. Reject
+  planningwithactiveNVENCsessions until their workload is accounted;12-output
+  plannerceiling is applicationpolicy, not theSDK's outdated8-sessionclaim.
+  StrictnativeClippy, plan/open/rejection checks,49files1470decodedframes,
+  fallbackAstrareview/re-review pass. Audio probeedits/export left untouched.
 
 - 2026-10-18 (#105, main merge ready for CI): coordinator committed native
   recording as5e2d496b after78a04a8b. Merged main1dbb44c9 with--no-commit,
@@ -7467,6 +7749,32 @@ each section. Delete entries that stop being true.
 
 ## Gotchas
 
+- 2026-10-18 (#64): the media-source A/V check (two burst tracks mixed in
+  one program, burst length ~100 ms in step, ~144 ms if one is 44 ms late)
+  is only valid when both sources open together: changing one source's
+  `files` with `apply` restarts only that source, its loop phase moves, and
+  the bursts stop overlapping (peak -6.9 dB instead of ~-1 dB), which reads
+  as "in step" whatever the decoder does. followups-007's t64.sh second pair
+  was measured that way. Start a fresh engine per pair and check the peak
+  (followups-008/scratch/t64.sh).
+
+- 2026-10-18 (#110 pins): live file counters can lag pin time by a full
+  status interval. A post-pin RPC comparison counted six old square skips as
+  new losses. Retained final-file PTS proved last gap20.200s, pin request
+ 20.190s, then139 continuous30fps pictures; no new engine change/rerun needed.
+  The earlier real bug was `create_writers` flattening every extra canvas to
+  Vertical, now fixed. Persistence uses library documents, not a guaranteed
+  legacy setup.toml: verify through get/apply/restart instead of copying it.
+
+- 2026-10-18 (#110 experiments): `e2e.Engine` re-signs its copied daemon in
+  a bundle, so its whole-file SHA differs from the source binary. Preserve
+  original bytes before A/B and assert those hashes; don't silently waive a
+  failed checksum. One weak-soak job refused before workload startup because
+  `.hw-job` was absent after rapidly handing the Mac lock between queued
+  jobs; the serial retry passed. The marker's check/remove is not atomic
+  (`release_builds`), but no orchestrator change was made in this lane. TERM
+  must raise KeyboardInterrupt in the weak wrapper: InterruptedError is an
+  OSError, which a best-effort ps reader can swallow and incorrectly PASS.
 - 2026-10-18 (#105, native recording probe): valid, visible own windows in
   Session1 with WS_EX_NOACTIVATE gave WGC CreateForWindow E_INVALIDARG.
   Clearing ONLY that extended style in-run made both capturable; keep

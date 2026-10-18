@@ -311,7 +311,7 @@ export component ControlsDock inherits Dock {
                 // every dock at theirs: read from the layout settings, not
                 // this dock, which would loop); else it says "Stop", red
                 // with its light, rather than "Stop R…".
-                text: ControlsArea.record-state == "starting" ? "Starting…" : ControlsArea.record-state == "stopping" ? "Finalizing…" : root.recording ? (root.room-for-words ? "Stop Recording" : "Stop") : root.record-short ? "Record" : "Start Recording";
+                text: ControlsArea.record-state == "starting" ? "Starting…" : ControlsArea.record-state == "stopping" ? "Stopping…" : root.recording ? (root.room-for-words ? "Stop Recording" : "Stop") : root.record-short ? "Record" : "Start Recording";
                 // Recording: the button is red, so its light goes bone.
                 dot: root.recording || ControlsArea.record-state == "starting" ? Theme.bone : Theme.danger;
                 variant: root.recording || ControlsArea.record-state == "starting" ? ButtonVariant.live : ButtonVariant.secondary;

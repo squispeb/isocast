@@ -2135,7 +2135,7 @@ pub(crate) fn stopped(s: &crate::session::Session, canvas: CanvasId) -> Option<&
 
 /// Recording, or starting or stopping it.
 fn recording(s: &crate::session::Session) -> bool {
-    s.record_busy()
+    s.busy_record
         || s.status
             .as_ref()
             .is_some_and(|x| x.state == EngineState::Recording)

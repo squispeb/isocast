@@ -112,13 +112,25 @@ pub trait Platform: Clone + Send + Sync + 'static {
         None
     }
 
-    /// Critical media deadline used only after a clock detects stretched
-    /// ordinary sleeps. Back ends should bound background timer coalescing.
+    /// Media deadline used after a clock detects stretched ordinary sleeps,
+    /// or from the first tick when `prefers_deadline_timer` is true. Back ends
+    /// should bound background timer coalescing.
     fn sleep_until(&self, at: Time) {
         let now = self.now();
         if at > now {
             std::thread::sleep(at.saturating_since(now));
         }
+    }
+
+    /// Use the platform deadline timer from the first media tick, without
+    /// waiting for evidence of stretched ordinary sleeps. Windows has a
+    /// cheap high-resolution waitable timer; other platforms keep the
+    /// existing adaptive policy unless they opt in. Opted-in video workers
+    /// also discard ticks whose next deadline has already passed, rather
+    /// than rendering a burst of obsolete pictures to catch up. File start
+    /// offsets and drop counters expose gaps; timestamps are not rebased.
+    fn prefers_deadline_timer(&self) -> bool {
+        false
     }
 
     /// Everything that can be captured, and the permissions that gate it.
@@ -224,6 +236,20 @@ pub trait Platform: Clone + Send + Sync + 'static {
     /// paces frames or audio in real time (the program, a file's frame
     /// clock, an audio reader, the mix, a file writer).
     fn real_time_thread(&self) {}
+
+    /// Audio mixer scheduling. The default preserves existing back ends;
+    /// Windows distinguishes MMCSS audio from above-normal video workers.
+    fn audio_thread(&self) {
+        self.real_time_thread();
+    }
+
+    /// Optional OS policy held only while a recording is being prepared,
+    /// captured and drained, not for the persistent preview engine's life.
+    /// The returned lease restores its policy when dropped, including on
+    /// startup failure or unwinding. Back ends must handle nested sessions.
+    fn recording_activity(&self) -> anyhow::Result<Option<Box<dyn Send>>> {
+        Ok(None)
+    }
 
     /// Lower a disposable calibration helper's process/thread priority.
     /// Only [`machine_profile::measure`] in the helper may call this.

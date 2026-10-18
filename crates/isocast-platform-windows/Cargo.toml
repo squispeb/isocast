@@ -21,7 +21,7 @@ isocast-diagnostics = { path = "../isocast-diagnostics" }
 isocast-engine = { path = "../isocast-engine" }
 isocast-mux = { path = "../isocast-mux" }
 isocast-protocol = { path = "../isocast-protocol" }
-isocast-surfaces = { path = "../isocast-surfaces" }
+isocast-surfaces = { path = "../isocast-surfaces", features = ["wgpu"] }
 parking_lot = "0.12"
 wgpu = { version = "=30.0.1", default-features = false, features = ["std", "parking_lot", "dx12", "wgsl"] }
 # The COM lease attached to an imported resource uses the implementation

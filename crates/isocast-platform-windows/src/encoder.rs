@@ -225,6 +225,27 @@ impl WindowsVideoEncoder {
         spec: &VideoTrackSpec,
         input: PixelFormat,
     ) -> Result<Self> {
+        Self::recording_policy(device, spec, input, None)
+    }
+
+    /// Open an output from an aggregate NVENC budget plan. Unlike the default
+    /// constructor, this cannot silently fall back to another provider: that
+    /// provider's throughput was not covered by the pre-open admission plan.
+    pub fn recording_with_preset(
+        device: &GraphicsDevice,
+        spec: &VideoTrackSpec,
+        input: PixelFormat,
+        preset: u32,
+    ) -> Result<Self> {
+        Self::recording_policy(device, spec, input, Some(preset))
+    }
+
+    fn recording_policy(
+        device: &GraphicsDevice,
+        spec: &VideoTrackSpec,
+        input: PixelFormat,
+        preset: Option<u32>,
+    ) -> Result<Self> {
         let depth = spec.encoder.effective_bit_depth();
         let encoding = match (spec.encoder.codec, depth) {
             (Codec::H264, 8) => VideoEncoding::H264,
@@ -249,7 +270,14 @@ impl WindowsVideoEncoder {
             low_latency: true,
         };
         let mut reasons = Vec::new();
-        match NvencEncoder::with_quantizer(device, &settings, encoding, input, quality.nvenc_qp) {
+        match NvencEncoder::with_quantizer_preset(
+            device,
+            &settings,
+            encoding,
+            input,
+            quality.nvenc_qp,
+            preset.unwrap_or(5),
+        ) {
             Ok(encoder) => {
                 return Ok(Self {
                     encoder: Encoder::Nvenc(encoder),
@@ -264,6 +292,12 @@ impl WindowsVideoEncoder {
                 });
             }
             Err(error) => reasons.push(format!("NVENC recording QP: {error:#}")),
+        }
+        if preset.is_some() {
+            bail!(
+                "encoder.budget: planned NVENC output could not open; replan before choosing a different provider: {}",
+                reasons.join("; ")
+            );
         }
         for mode in [MfMode::Hardware, MfMode::Software] {
             match MfEncoder::with_quality(
@@ -313,6 +347,13 @@ impl WindowsVideoEncoder {
     /// value. Raw `MfEncoder::info()` exposes requested and actual MF quality.
     pub fn recording_quality(&self) -> Option<RecordingQuality> {
         self.quality
+    }
+
+    pub fn nvenc_preset(&self) -> Option<u32> {
+        match &self.encoder {
+            Encoder::Nvenc(encoder) => Some(encoder.preset()),
+            Encoder::Mf(_) => None,
+        }
     }
 
     pub fn backend(&self) -> &EncoderBackend {
