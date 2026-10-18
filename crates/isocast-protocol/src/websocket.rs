@@ -128,19 +128,17 @@ impl WebsocketSettings {
         }
         let Ok(ip) = self.bind.parse::<std::net::IpAddr>() else {
             return Some(format!(
-                "bind: {:?} is not an IP address; give 127.0.0.1 (this {machine} only), an address \
-                 of this {machine}, or 0.0.0.0 (every network)",
-                self.bind,
-                machine = crate::platform_text::MACHINE
+                "bind: {:?} is not an IP address; give 127.0.0.1 (this Mac only), an address \
+                 of this Mac, or 0.0.0.0 (every network)",
+                self.bind
             ));
         };
         if !self.authentication && !ip.is_loopback() {
             return Some(format!(
                 "bind: {} reaches other computers, so going without a password (no_password) \
-                 isn't allowed there; give bind 127.0.0.1 (this {machine} only) to go without one, or \
+                 isn't allowed there; give bind 127.0.0.1 (this Mac only) to go without one, or \
                  a password",
-                self.bind,
-                machine = crate::platform_text::MACHINE
+                self.bind
             ));
         }
         None

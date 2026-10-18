@@ -238,7 +238,7 @@ pub fn run(options: &Options) -> Result<()> {
                 );
                 if !occluded_time.get().is_zero() {
                     isocast_diagnostics::diagnostic!("warn";
-                        "{}", isocast_protocol::platform_text::select("the window was covered for part of the run (macOS reported it occluded), so it wasn't drawn then: this measurement is not valid", "the window was covered for part of the run (Windows reported it occluded), so it wasn't drawn then: this measurement is not valid")
+                        "the window was covered for part of the run (macOS reported it occluded), so it wasn't drawn then: this measurement is not valid"
                     );
                 }
                 let _ = slint::quit_event_loop();
@@ -246,10 +246,7 @@ pub fn run(options: &Options) -> Result<()> {
         );
     }
 
-    let result = app.run();
-    #[cfg(windows)]
-    crate::update::cleanup();
-    result?;
+    app.run()?;
     APP.with(|s| s.borrow_mut().take());
     Ok(())
 }

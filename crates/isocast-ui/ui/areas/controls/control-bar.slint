@@ -11,7 +11,7 @@
 
 import { Theme } from "../../theme.slint";
 import { Icons } from "../../icons.slint";
-import { Ui, PlatformText } from "../../state.slint";
+import { Ui } from "../../state.slint";
 import {
     Capsule, CapsuleButton, CapsuleDivider, IconButton, Lcd, LcdCell, LcdTime, LcdTone, MasterMeter,
     Tip, TransportButton, TransportKind,
@@ -159,9 +159,9 @@ export component ControlBar inherits Rectangle {
                     label: "CPU";
                     idle: !ControlsArea.engine-running || !ControlsArea.lcd-cpu-known;
                     last: true;
-                    description: "The engine’s share of this " + PlatformText.machine + "’s processor (all cores)";
+                    description: "The engine’s share of this Mac’s processor (all cores)";
                     Tooltip {
-                        Tip { text: "The engine’s share of this " + PlatformText.machine + "’s processor (all cores)"; }
+                        Tip { text: "The engine’s share of this Mac’s processor (all cores)"; }
                     }
                 }
             }

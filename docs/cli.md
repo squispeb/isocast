@@ -2109,7 +2109,7 @@ Every canvas: size, frame rate, scene, recording and streams
 Usage: isocast canvas list [OPTIONS]
 
 Options:
-      --json  
+      --json
   -h, --help  Print help
 ```
 
@@ -2121,7 +2121,7 @@ Add a canvas: `vertical` (the [vertical] canvas) or a new id (lowercase letters,
 Usage: isocast canvas add [OPTIONS] <CANVAS>
 
 Arguments:
-  <CANVAS>  
+  <CANVAS>
 
 Options:
       --name <NAME>                Display label, like "YouTube Shorts"
@@ -2129,7 +2129,7 @@ Options:
       --fps <FPS>                  Its own frame rate (else the main canvas's)
       --follow-main <FOLLOW_MAIN>  Show the main canvas's scene (true) or pick its own (false) [possible values: true, false]
       --record <RECORD>            Record its program with each recording (true or false) [possible values: true, false]
-      --json                       
+      --json
   -h, --help                       Print help
 ```
 
@@ -2141,7 +2141,7 @@ Change a canvas
 Usage: isocast canvas set [OPTIONS] <CANVAS>
 
 Arguments:
-  <CANVAS>  
+  <CANVAS>
 
 Options:
       --name <NAME>                Display label, like "YouTube Shorts"
@@ -2151,7 +2151,7 @@ Options:
       --record <RECORD>            Record its program with each recording (true or false) [possible values: true, false]
       --clear <FIELD>              Reset a field: name, fps (to the main canvas's) or stream (no stream of its own). Repeat for several
       --no-stream                  Shorthand for --clear stream
-      --json                       
+      --json
   -h, --help                       Print help
 ```
 
@@ -2163,10 +2163,10 @@ Remove a canvas with its arrangements, recording and streams (not while it recor
 Usage: isocast canvas remove [OPTIONS] <CANVAS>
 
 Arguments:
-  <CANVAS>  
+  <CANVAS>
 
 Options:
-      --json  
+      --json
   -h, --help  Print help
 ```
 

@@ -1085,7 +1085,7 @@ impl Create {
                             format!("Exported for {}", exported.app.title()),
                             detail,
                         )
-                        .action(isocast_protocol::platform_text::SHOW_IN_FILES, move |_| {
+                        .action("Show in Finder", move |_| {
                             crate::platform::reveal(&shown.display().to_string())
                         }),
                     );
@@ -1132,7 +1132,7 @@ impl Create {
         let menu = MenuBuilder::new()
             .item("editor", "Open in Editor")
             .separator()
-            .item("reveal", isocast_protocol::platform_text::SHOW_IN_FILES)
+            .item("reveal", "Show in Finder")
             .disabled(!file);
         let menu = match offline {
             true => menu.item("relink", "Relink…"),
@@ -2538,7 +2538,7 @@ impl Create {
                             mm_ss(seconds)
                         ),
                     )
-                    .action(isocast_protocol::platform_text::SHOW_IN_FILES, move |_| {
+                    .action("Show in Finder", move |_| {
                         crate::platform::reveal(&shown.display().to_string())
                     }),
                 );

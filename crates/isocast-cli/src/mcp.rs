@@ -28,7 +28,6 @@ use isocast_protocol::obs::{Discovery, Imported};
 use isocast_protocol::optimize::{
     ObsDiscoverParams, OptimizeParams, Optimized, SpeedTest, SpeedTestParams,
 };
-use isocast_protocol::platform_text as wording;
 use isocast_protocol::plugin::{PluginAddParams, PluginChange, PluginTarget, Plugins};
 use isocast_protocol::project::{
     ListProjectsParams, ProjectRenamed, Projects, RenameProjectParams,
@@ -387,12 +386,6 @@ struct StreamKeyToolParams {
     /// The stream key from the service's dashboard. It goes into the
     /// Keychain and is never shown again; prefer `isocast stream key set`
     /// in a terminal, which keeps it out of this conversation.
-    #[cfg_attr(
-        windows,
-        schemars(
-            description = "The stream key from the service's dashboard. It goes into Credential Manager and is never shown again; prefer isocast stream key set in a terminal, keeping it out of this conversation."
-        )
-    )]
     key: String,
     /// A destination ("main", or an id from get_status's streams): its
     /// own key (with service and server only for one not applied yet).
@@ -624,11 +617,11 @@ impl Isocast {
     }
 
     #[tool(
-        description = wording::description("Add an OBS Studio scene collection (its name in OBS's scenes folder, or \
+        description = "Add an OBS Studio scene collection (its name in OBS's scenes folder, or \
                        an absolute .json path) as a scene collection, and/or an OBS profile \
                        (its name, folder or basic.ini) as a profile, with devices matched \
                        against this Mac. Returns what was made and what couldn't come over. \
-                       Give both to bring Source Record's ISO settings into the profile."),
+                       Give both to bring Source Record's ISO settings into the profile.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1201,14 +1194,14 @@ impl Isocast {
     }
 
     #[tool(
-        description = wording::description("Add a stream destination to the live setup: a service (twitch, youtube, \
+        description = "Add a stream destination to the live setup: a service (twitch, youtube, \
                        kick, facebook, custom), its server (custom and kick need one; never with \
                        the key in it), optional id (made from the service), enabled, and its \
                        own video_bitrate_kbps or width/height (else the main destination's; a \
                        different bitrate or size needs an encoder of its own, refused at start \
                        when this Mac's encoders lack room). The first one becomes the [stream] \
                        section itself (id main). Then set_stream_key with its destination id. \
-                       Returns every destination's status."),
+                       Returns every destination's status.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1308,10 +1301,10 @@ impl Isocast {
     }
 
     #[tool(
-        description = wording::description("Remove a stream destination by id (not main: turn it off with \
+        description = "Remove a stream destination by id (not main: turn it off with \
                        stream_destination_set instead; not while it streams). Its stored key \
                        stays in the Keychain until clear_stream_key. Returns every \
-                       destination's status."),
+                       destination's status.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1474,7 +1467,7 @@ impl Isocast {
     }
 
     #[tool(
-        description = wording::description("Turn on the obs-websocket v5 server (off by default; kept across \
+        description = "Turn on the obs-websocket v5 server (off by default; kept across \
                        restarts), optionally setting port (4455), bind (127.0.0.1, this Mac \
                        only; 0.0.0.0 for every network), password (kept in the Keychain) or \
                        no_password (loopback bind only; web pages are then refused and logged; kept \
@@ -1482,7 +1475,7 @@ impl Isocast {
                        a password required and none stored, one is generated and returned \
                        once as generated_password, for the user to enter in the OBS tool. \
                        Returns its status, with a warning if ISOCAST_WEBSOCKET_PASSWORD \
-                       overrides the stored password."),
+                       overrides the stored password.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1559,7 +1552,7 @@ impl Isocast {
     }
 
     #[tool(
-        description = wording::select("Remove Isocast Virtual Camera from macOS (the release app's camera extension), for deleting Isocast cleanly: stops the camera, then macOS asks the user for an administrator password; waits for it (up to about 4 minutes). Ask the user first. A later virtual_camera_start installs it again.", "Request removal of Isocast Virtual Camera. Windows support depends on the native backend; an unsupported operation is reported without installing or removing anything. Ask the user first."),
+        description = "Remove Isocast Virtual Camera from macOS (the release app's camera extension), for deleting Isocast cleanly: stops the camera, then macOS asks the user for an administrator password; waits for it (up to about 4 minutes). Ask the user first. A later virtual_camera_start installs it again.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1612,9 +1605,9 @@ impl Isocast {
     }
 
     #[tool(
-        description = wording::description("Keep a stream key in the macOS Keychain for a streaming service (the live \
+        description = "Keep a stream key in the macOS Keychain for a streaming service (the live \
                        setup's by default). It is never written to setups, logs or status. \
-                       Returns where it is kept, not the key."),
+                       Returns where it is kept, not the key.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1798,10 +1791,10 @@ impl Isocast {
     }
 
     #[tool(
-        description = wording::description("Check this Mac against a setup (the live setup if none is given): \
+        description = "Check this Mac against a setup (the live setup if none is given): \
                        permissions, hardware encoders, whether each source's device is \
                        connected and what format it would record, and the recording disk's \
-                       free space and speed. Each check has a status and, if needed, a fix."),
+                       free space and speed. Each check has a status and, if needed, a fix.",
         annotations(read_only_hint = true)
     )]
     async fn check_setup(
@@ -1816,14 +1809,14 @@ impl Isocast {
     }
 
     #[tool(
-        description = wording::description("Predict instantly, without benchmarking, whether a setup's files (the \
+        description = "Predict instantly, without benchmarking, whether a setup's files (the \
                        live setup's if none is given) fit this Mac's H.264/HEVC media engines, \
                        from measured per-chip data: `capacity` is fits, no_margin or \
                        cannot_keep_up, `load` the busiest engine's share, and `suggestions` \
                        the closest changes that fit (each a patch for plan_change, or a \
                        method like stream_stop; `after_take` ones wait for the recording to \
                        end). With add_iso, `admission` says how to turn that ISO file on so it \
-                       fits (smaller, slower, or left off). tune_encoders measures instead."),
+                       fits (smaller, slower, or left off). tune_encoders measures instead.",
         annotations(read_only_hint = true)
     )]
     async fn estimate_capacity(
@@ -1865,7 +1858,7 @@ impl Isocast {
     }
 
     #[tool(
-        description = wording::description("Benchmark the hardware encoders on a setup's video files (the live \
+        description = "Benchmark the hardware encoders on a setup's video files (the live \
                        setup if none is given), all at once as in a recording, and say whether \
                        this Mac keeps up: `capacity` is fits, no_margin (keeps up, nothing to \
                        spare) or cannot_keep_up (frames will drop). If it doesn't fit, it \
@@ -1873,7 +1866,7 @@ impl Isocast {
                        quality preset, half the frame rate, one ISO file fewer) and recommends \
                        the closest that fits as `change`, a patch for plan_change. start_recording \
                        warns when a setup exceeds what this measured. Takes up to a minute or \
-                       two; refused while recording."),
+                       two; refused while recording.",
         annotations(read_only_hint = true)
     )]
     async fn tune_encoders(
@@ -1981,26 +1974,7 @@ impl Isocast {
     }
 
     #[tool(
-        description = "Shut down the recording daemon only if its atomic idle check permits it. \
-                       Refuses active recording, streaming, exports, replay or camera work; \
-                       cancels an idle calibration. Never launches or force-terminates a daemon; use before updating or \
-                       uninstalling after closing the app.",
-        annotations(
-            read_only_hint = false,
-            destructive_hint = false,
-            idempotent_hint = true
-        )
-    )]
-    async fn shutdown_idle_daemon(&self) -> Result<Json<serde_json::Value>, String> {
-        tokio::task::spawn_blocking(Client::shutdown_if_idle)
-            .await
-            .map_err(|err| format!("{err}"))?
-            .map(|()| Json(serde_json::json!({"stopped": true})))
-            .map_err(|err| format!("{err:#}"))
-    }
-
-    #[tool(
-        description = wording::description("Find OBS Studio's scene collections and profiles on this Mac (its \
+        description = "Find OBS Studio's scene collections and profiles on this Mac (its \
                        settings folder, or `folder`) without importing anything: each \
                        collection with scene and source counts and the profile an import would \
                        use (`profile`, a basic.ini path), each profile's canvas, frame rate, \
@@ -2008,7 +1982,7 @@ impl Isocast {
                        (never the key; `key_in_file` says OBS keeps one in plain text), and \
                        files that couldn't be read. Offer the collections to the user, then \
                        import_obs_collection_or_profile with the collection's `file` and its \
-                       `profile` (stream_key only if the user agreed to move the key)."),
+                       `profile` (stream_key only if the user agreed to move the key).",
         annotations(read_only_hint = true)
     )]
     async fn discover_obs(
@@ -2037,7 +2011,7 @@ impl Isocast {
     }
 
     #[tool(
-        description = wording::description("Optimize the live setup for `goal` recording, streaming or both (OBS's \
+        description = "Optimize the live setup for `goal` recording, streaming or both (OBS's \
                        Auto-Configuration Wizard). Recording favours quality and ISO files \
                        (HEVC High, an ISO file per captured source); streaming sets the \
                        service and a bitrate from the upload speed (upload_kbps, or measured \
@@ -2046,7 +2020,7 @@ impl Isocast {
                        this Mac like tune_encoders and steps down where it can't keep up. \
                        Returns a one-line `summary`, the optimized setup, its differences from \
                        the live setup, the benchmark and notes; with apply it becomes the live \
-                       setup. Takes a minute or two; refused while recording or streaming."),
+                       setup. Takes a minute or two; refused while recording or streaming.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2061,11 +2035,11 @@ impl Isocast {
     }
 
     #[tool(
-        description = wording::description("Read an OBS Studio scene collection into an Isocast setup: sources (ids \
+        description = "Read an OBS Studio scene collection into an Isocast setup: sources (ids \
                        made from their names), scenes and items, filters and the transition, \
                        devices matched against this Mac. Returns the setup, what couldn't come \
                        over and why, notes to check, and counts. Doesn't change the live setup: \
-                       pass the setup to plan_change and apply_change."),
+                       pass the setup to plan_change and apply_change.",
         annotations(read_only_hint = true)
     )]
     async fn import_obs_collection(
@@ -2083,14 +2057,14 @@ impl Isocast {
     }
 
     #[tool(
-        description = wording::description("Make a good starting setup from this Mac's devices: the main display, the \
+        description = "Make a good starting setup from this Mac's devices: the main display, the \
                        best real camera (USB, then Continuity, then built-in; virtual cameras \
                        only if nothing else), the default microphone and desktop audio, in \
                        scenes screen-and-camera (camera as a corner picture-in-picture), camera \
                        and screen, recording the 1080p60 program plus ISO files of the screen \
                        and camera to ~/Movies/Isocast. Every choice can be overridden. Devices \
                        without permission become placeholders, and the notes say what to do. \
-                       With apply, it becomes the live setup."),
+                       With apply, it becomes the live setup.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -2111,10 +2085,10 @@ impl Isocast {
     }
 
     #[tool(
-        description = wording::select("The screen recording, camera and microphone permissions, without asking, \
+        description = "The screen recording, camera and microphone permissions, without asking, \
                        with the next step for each that isn't granted: request it, or turn it \
                        on in System Settings (which app, which pane, and whether isocastd must \
-                       restart afterwards).", "Report Windows capture, camera and microphone access without requesting changes, with the backend's next step. Camera and Microphone privacy settings must allow desktop apps; the recording engine is isocastd.exe."),
+                       restart afterwards).",
         annotations(read_only_hint = true)
     )]
     async fn get_permissions(&self) -> Result<Json<PermissionsReport>, String> {
@@ -2122,10 +2096,10 @@ impl Isocast {
     }
 
     #[tool(
-        description = wording::select("Restart isocastd, which only sees a permission granted in System \
+        description = "Restart isocastd, which only sees a permission granted in System \
                        Settings (screen recording, above all) once restarted; the live setup \
                        is kept. Refused, atomically by isocastd, while it records, streams, \
-                       exports or feeds the virtual camera.", "Restart isocastd.exe after changing access or device settings, keeping the live setup. The daemon atomically refuses while recording or output work is active."),
+                       exports or feeds the virtual camera.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2146,10 +2120,10 @@ impl Isocast {
     }
 
     #[tool(
-        description = wording::select("Ask macOS for screen recording, camera and microphone access where it \
+        description = "Ask macOS for screen recording, camera and microphone access where it \
                        hasn't been decided yet (or only `permission`). Its prompts appear on the \
                        user's screen; waits up to a minute for answers and returns the \
-                       permissions with next steps.", "Check/request Windows capture access supported by the backend (or only permission). Desktop camera and microphone access is controlled in Windows Settings, not individual app permission switches. Returns the permissions and next steps; unsupported operations are reported."),
+                       permissions with next steps.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2169,10 +2143,10 @@ impl Isocast {
     }
 
     #[tool(
-        description = wording::select("Open System Settings on the user's screen at the pane where a \
+        description = "Open System Settings on the user's screen at the pane where a \
                        permission (screen_recording, camera, microphone or system_audio) is \
                        turned on by \
-                       hand, for one that was refused.", "Ask the backend to open Windows Settings for screen_recording, camera, microphone or system_audio access. Camera and Microphone must allow desktop apps (isocastd.exe); system audio uses output-device loopback. Unsupported settings pages are reported."),
+                       hand, for one that was refused.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2497,7 +2471,9 @@ impl Isocast {
     }
 }
 
-const INSTRUCTIONS: &str = "Isocast records every source (screens, cameras, iPhone \
+#[tool_handler(
+    name = "isocast",
+    instructions = "Isocast records every source (screens, cameras, iPhone \
 screens, microphones, system audio) to its own file on one clock, plus a session.json \
 manifest that lines the files up. Typical flow: get_status and list_devices to see what \
 exists; get_setup for the live setup (init_setup makes a first one from this Mac's devices; \
@@ -2521,23 +2497,9 @@ Each recording session writes into its own project folder; list_projects finds t
 rename_project names one once it has stopped. Each has a `<name>.isoprj` project file that \
 open_project opens in the editor, wherever the folder was copied (recent_projects lists those \
 opened lately; relink_clip finds offline takes). \
-Sources and scenes are addressed by id. Errors name the field and list valid options.";
-
-#[tool_handler(name = "isocast")]
-impl ServerHandler for Isocast {
-    fn get_info(&self) -> rmcp::model::ServerConfig {
-        rmcp::model::ServerConfig::new(
-            rmcp::model::ServerCapabilities::builder()
-                .enable_tools()
-                .build(),
-        )
-        .with_server_info(rmcp::model::Implementation::new(
-            "isocast",
-            env!("CARGO_PKG_VERSION"),
-        ))
-        .with_instructions(wording::description(INSTRUCTIONS))
-    }
-}
+Sources and scenes are addressed by id. Errors name the field and list valid options."
+)]
+impl ServerHandler for Isocast {}
 
 fn to_change(params: ChangeParams) -> Result<Change, String> {
     match (parse_setup(params.setup)?, params.patch) {

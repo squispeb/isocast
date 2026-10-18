@@ -54,8 +54,8 @@ pub use shared_frames::{DEFAULT_SLOTS, SharedControl, SharedEvent, SharedFeed};
 
 use crate::source::{AUDIO_CHUNK, FrameSlot};
 use crate::{
-    AudioTrackSpec, BrowserControl, FileWriter, Platform, SAMPLE_RATE, Time, VideoTrackSpec,
-    WriterSpec,
+    AudioTrackSpec, BrowserControl, CameraMetadataReader, FileWriter, Platform, SAMPLE_RATE, Time,
+    VideoTrackSpec, WriterSpec,
 };
 
 /// How far ahead of "now" the session clock starts, so every source and
@@ -154,6 +154,8 @@ pub struct RecordOptions<'a> {
 #[derive(Default)]
 pub struct SessionControl {
     state: Mutex<ControlState>,
+    #[cfg(windows)]
+    recording_wake: parking_lot::Condvar,
     /// While a recording stops, complete mix blocks through its last frame
     /// boundary may bypass the live jitter delay. Zero keeps normal pacing.
     mix_drain_until: AtomicI64,
@@ -335,6 +337,32 @@ impl ControlState {
 }
 
 impl SessionControl {
+    /// Wake the coordinator after its caller sets the recording's stop flag.
+    /// The same lock guards entering the wait, so the notification cannot be
+    /// lost between checking the atomic flag and sleeping.
+    #[cfg(windows)]
+    pub fn wake_recording(&self) {
+        let _state = self.state.lock();
+        self.recording_wake.notify_all();
+    }
+
+    #[cfg(windows)]
+    fn wait_recording(&self, stop: &AtomicBool, observed_stop: bool) {
+        let mut state = self.state.lock();
+        let interval = Duration::from_millis(10);
+        if observed_stop {
+            // An early Stop still respects the minimum take duration. Don't
+            // spin while waiting for that already-scheduled future boundary.
+            self.recording_wake.wait_for(&mut state, interval);
+        } else {
+            self.recording_wake.wait_while_for(
+                &mut state,
+                |_| !stop.load(Ordering::SeqCst),
+                interval,
+            );
+        }
+    }
+
     /// Schedule a shared recording cut. Hotkeys: `recording.pause`
     /// calls this with true, `recording.resume` with false; the
     /// `recording.pause_toggle` action chooses the opposite of `pause_status`.
@@ -822,6 +850,8 @@ struct FilePlan {
     frames: AtomicU64,
     newest: AtomicI64,
     audio_dropouts: AtomicU64,
+    /// Native backend selection: -1 unknown, 0 software, 1 hardware.
+    hardware_accelerated: AtomicI64,
     audio: Vec<String>,
     /// Source timing policy for each audio track (the program is continuous).
     audio_timing: Vec<file::AudioTiming>,
@@ -888,6 +918,10 @@ pub enum Packet<F> {
 struct Formats {
     video: BTreeMap<String, (u32, u32, u32)>,
     audio: BTreeMap<String, u32>,
+    /// Metadata readers of the cameras open when the session started, read
+    /// only when a manifest is written. A device opened later (a changed
+    /// source) isn't one of them, so its counters never mix in.
+    cameras: BTreeMap<String, CameraMetadataReader>,
 }
 
 /// Frame slots by source id.
@@ -1104,6 +1138,7 @@ fn plan_take(setup: &Setup, formats: &Formats, folder: &Path, number: u32) -> Re
                     frames: AtomicU64::new(0),
                     newest: AtomicI64::new(i64::MIN),
                     audio_dropouts: AtomicU64::new(0),
+                    hardware_accelerated: AtomicI64::new(-1),
                     crash_safe: AtomicBool::new(false),
                     committed: AtomicI64::new(-1),
                     commit_requested: AtomicU64::new(0),
@@ -1155,12 +1190,32 @@ fn sidechain_sources(setup: &Setup) -> Vec<&str> {
     out
 }
 
-/// A writer for each file, or none if any can't be created.
-fn create_writers<P: Platform>(platform: &P, plans: &[Arc<FilePlan>]) -> Result<Vec<P::Writer>> {
+/// The slots of the ISO sources whose files take their frames as captured,
+/// by source id, for writers that must see one before they open (see
+/// [`Platform::create_writer_for_frame`]).
+type WriterInputs<F> = BTreeMap<String, Arc<FrameSlot<F>>>;
+
+/// A writer for each file, or none if any can't be created. A file whose
+/// source is in `inputs` waits briefly for that source's first frame.
+fn create_writers<P: Platform>(
+    platform: &P,
+    plans: &[Arc<FilePlan>],
+    inputs: &WriterInputs<P::Frame>,
+) -> Result<Vec<P::Writer>> {
     let mut writers = Vec::new();
     for plan in plans {
-        match platform.create_writer(&plan.spec) {
+        let writer = match inputs.get(&plan.source) {
+            Some(slot) => wait_for_frame(slot)
+                .with_context(|| format!("{:?} sent no frame to record", plan.source))
+                .and_then(|(frame, _)| platform.create_writer_for_frame(&plan.spec, &frame)),
+            None => platform.create_writer(&plan.spec),
+        };
+        match writer {
             Ok(mut writer) => {
+                plan.hardware_accelerated.store(
+                    writer.hardware_accelerated().map_or(-1, i64::from),
+                    Ordering::Relaxed,
+                );
                 if let Some(canvas) = program_canvas(plan) {
                     // Preserve the id for per-canvas pins; native admission
                     // still puts every non-main canvas in the secondary class.
@@ -1232,6 +1287,12 @@ fn live_status(
                 let committed = plan.committed.load(Ordering::Relaxed);
                 LiveFile {
                     source: plan.source.clone(),
+                    codec: Some(plan.spec.video.encoder.codec),
+                    hardware_accelerated: match plan.hardware_accelerated.load(Ordering::Relaxed) {
+                        0 => Some(false),
+                        1 => Some(true),
+                        _ => None,
+                    },
                     frames,
                     dropped_frames: due.saturating_sub(frames),
                     audio_dropouts: plan.audio_dropouts.load(Ordering::Relaxed),
@@ -1254,6 +1315,7 @@ fn take_manifest<P: Platform>(
     stops: &[AudioStopped],
     control: Option<&SessionControl>,
     canvas_controls: &[(CanvasId, &SessionControl)],
+    cameras: &BTreeMap<String, CameraMetadataReader>,
 ) -> SessionManifest {
     let finished = status != SessionStatus::Recording;
     let mapped = |at| control.map_or(at, |c| c.recording_time(at));
@@ -1427,6 +1489,15 @@ fn take_manifest<P: Platform>(
             })
             .collect(),
         errors: errors.to_vec(),
+        // Frozen once the take's final manifest is made, so restating it
+        // later never adds what the cameras saw after the take ended.
+        cameras: match &take.manifest {
+            Some(manifest) => manifest.cameras.clone(),
+            None => cameras
+                .iter()
+                .map(|(id, read)| (id.clone(), read()))
+                .collect(),
+        },
     }
 }
 
