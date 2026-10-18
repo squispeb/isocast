@@ -5,6 +5,289 @@ each section. Delete entries that stop being true.
 
 ## Environment
 
+- 2026-10-18 (#105 merge-main handoff): main565729db merged into095385e0
+  with `--no-commit`, staged and uncommitted. Main's canvases/self-tuning
+  behavior is retained; capacity/estimate differ from main only in platform
+  words/imports. UI retains ExtraCanvas, Segment and the generic secondary
+  canvas stream hint, with Windows vocabulary reapplied. Notes/PLAN preserve
+  both histories. Native build input treeeaa33b0207410513fca59fe1ce21ef6dcc40f858
+  passes on exon-desk (17m35s); Inno0.0.7.3 package40,458,171bytes has SHA256
+  `1fa67e50f65f5a677a732172d54c8a20fe8744037e87535fe0965dda88168ac7`.
+  Own host source/packages: `C:\isocast-dev\vm\native\merge-src-eaa33b02`
+  and `packages\merged-eaa33b02`; no other-lane files touched or release used.
+- 2026-10-18 (#105 merge verification): full Mac gates248unit+1doctest,
+ 1existing hardwareignore, strict all-target Clippy/fmt pass once on exonbook.
+  Separate main565729db and merged release builds produce14 real offscreen
+  snapshot pairs. All compared UI regions are pixel-identical, including
+  named-canvas context menu, two extra canvas video settings and secondary
+  stream's Keychain hint. Dynamic picture/meter/temp-path differences are
+  outside those documented regions; no whole-frame equality claim. Evidence:
+  `windows-pkg/scratch/merge-main/{ui-pixel-comparison.json,main,merged}`.
+  Binaries are in the approved temporary folder `isocast-windows-pkg-merge`
+  rather than the nearly full build volume. Tier1 review remains the
+  coordinator's step after CI, as requested.
+- 2026-10-18 (#105 hosted merge): preserve main's measured **debug** profile
+  with `CARGO_PROFILE_DEV_DEBUG=0`, service build separate from UI `-j1`, and
+  `ISOCAST_UI_NO_GALLERY=1` for every potentially-UI-compiling step (including
+  Clippy/tests/second candidate). Package/snapshot/diagnostic paths use debug.
+  Native release package still has the gallery; no claim its memory usage
+  proves the hosted recipe. Workflow actionlint passes; hosted CI awaits the
+  coordinator. Existing main docs/cli.md has7 trailing-space diagnostics in
+  generated help; preserved unchanged rather than editing unrelated docs.
+
+- 2026-10-18 (#105 W.7 qualified natively): user explicitly approved building
+  on exon-desk while hosted UI builds exceed runner RAM. Packaging owns
+  `C:\isocast-dev\vm\native\{src,target,cargo,tmp,home,appdata,localappdata,logs,tools,packages}`;
+  no other lane folder is used. Source09bf240e plus the uncommitted native
+  fixes produced separate test-key builds0.0.7.1/.2. Inno/CRT/WinSparkle are
+  pinned/recorded; binaries remain on the host to spare the shared Mac disk.
+  Official release credentials/Authenticode signing/publication were not used.
+- 2026-10-18 (#105 actual VM lifecycle): final `clean` restored before testing
+  as standard user packager. Fresh install/Start-menu launch, direct .1→.2
+  upgrade, explicit Ed25519-verified rollback to.1, actual WinSparkle tampered
+  signature refusal and valid update to.2, active-UI uninstall refusal and
+  successful idle-daemon uninstall all pass. Invalid update kept daemon6260
+  and old UI alive; valid update ended both and relaunched new daemon10308.
+  Injected unsigned `/FORCECLOSEAPPLICATIONS /DIR=...` feed arguments were
+  ignored (captured child command line contains only our fixed safe flags).
+  Two real1s H264/AAC movie copies, custom state and3real setup files survived
+  byte-identically; the movie fully decodes after uninstall. Receipts/screenshots
+  are `windows-pkg/scratch/qualified`; exact hashes are in REPORT.md. Ten native
+  offscreen wording images and CLI help also pass. No recording/backend/GPU
+  throughput claim: the daemon is still this branch's stub; renderer is CPU.
+- 2026-10-18 (#105 native gotchas fixed): Windows-only updater callback
+  returned toast's i32 instead of unit (native E0308); now discards it.
+  `Gpu::new` selected Microsoft Basic Render Driver, but Slint1.18.1 rejects
+  CPU adapters unless SLINT_WGPU_CPU exists. The very first Windows main
+  operation now permits that fallback process-locally, before threads, without
+  forcing CPU or changing Mac. PS5 decoded BOM-less release notes as ANSI;
+  appcast.ps1 explicitly reads UTF8. Validated with real native builds and
+  notes roundtrip. Native all-target strict Clippy and14unit+1doctest pass.
+- 2026-10-18 (#105 automation boundary): a UI launched by a Task Scheduler
+  GUI-tool worker inherits a non-breakaway job, so daemon launch correctly
+  fails rather than risking a recording's lifetime. Launch through the actual
+  Start shortcut or Explorer instead; that works without changing daemon
+  policy. Cua native wheel produced no change; an explicit WM_MOUSEMOVE then
+  WM_MOUSEWHEEL in the same interactive guest session scrolled correctly.
+  Cross-session SSH PostMessage is denied. These were automation issues, not
+  reasons to weaken process isolation. GUI/feed/input tasks were removed,
+  no Isocast/updater/tool processes remain in the guest, VM left off.
+
+- 2026-10-18 (#105 W.6 wording): `platform_text` selects vocabulary by target;
+  Slint `PlatformText` is initialized in App::new for both native/offscreen.
+  Windows privacy rows follow the engine's action and next_step, explaining
+  desktop Camera/Mic access for isocastd.exe, optional capture-policy settings,
+  and output loopback separately. Native backend operations remain their own
+  lane; words do not qualify capture/settings/reveal. Fresh Windows setups use
+  `~/Videos/Isocast`; existing saved recording folders are not rewritten.
+- 2026-10-18 (#105 W.6 proof): full remote gates on exonbook pass239 unit
+  tests+1doctest, strict all-target Clippy/fmt,1 existing hardware ignore.
+  Nine actual isolated Mac snapshot pairs have identical upper2880×1200 UI
+  pixels; bottom live counters/private temporary paths vary. Evidence under
+  `windows-pkg/scratch/w6-compare`. Windows native screenshots/help are queued
+  in the existing windows.yml and NOT yet claimed; inspect the retained
+  `windows-wording-snapshots` artifact. Fallback source review and recheck
+  pass; regular reviewer endpoint remains unavailable. Work is uncommitted.
+
+- 2026-10-18 (#105 W.7b, uncommitted): two Windows CI qualification builds
+  are `X.Y.Z.1` and `.2`, explicitly test-only, sharing a public test key and
+  `http://127.0.0.1:17745/appcast-windows-test.xml`. The private test key is
+  only in the host's ACL-restricted `C:\isocast-dev\vm\test-signing` folder,
+  never in GitHub/artifacts or the app. Production uses the committed Sparkle
+  public key and HTTPS latest Windows appcast; test overrides require the
+  compiled test flag and are rejected by production signing/feed generation.
+- 2026-10-18 (#105 W.7b verification): native WinSparkle0.9.4 SDK checksum
+  verified; its verifier accepts a valid real-PE signature and refuses byte
+  tamper/wrong key (supplemental, not an app-update claim). Mac strict release
+  all-target Clippy for client/CLI/UI passes on m2-b in3m38s. After resource
+  waits,15 unit tests+1doctest pass and normal CLI/UI release build passes.
+  Real isolated Mac development Updates pixels match the baseline exactly;
+  this does not qualify a released Sparkle bundle. No override/local build
+  fallback. Configured reviewer unavailable; documented fallback source review
+  and fix re-review have no remaining identified blockers. Native Windows
+  compilation, real packages and full lifecycle checks still await CI.
+  W.7a run39129808275 built Windows successfully but failed its version regex
+  on CRLF (native reproduction: LF0.0.7, CRLFempty), so no artifact exists.
+  W.7b removes that parser in favour of actual compiled app identity; CI now
+  retains diagnostic executables even if packaging fails.
+- 2026-10-18 (#105 VM GUI preparation): a real `packager` desktop (session1)
+  was created with guest-only one-shot auto-login; its password was neither
+  printed nor exported, and a SYSTEM logon task removed DefaultPassword and
+  disabled auto-login immediately. Desktop and cleanup verified. This is a
+  disposable post-clean preparation, not a replacement of `clean`; restore
+  `clean` before qualification and prepare the standard-user desktop again
+  before installing anything. Do not reset account passwords during an
+  upgrade/uninstall data-preservation sequence.
+
+- 2026-10-18 (#105 W.7, packaging lane): `isocast-pkg` is an isolated Gen 2
+  Hyper-V guest on exon-desk-lan, rooted at `C:\isocast-dev\vm`, with 8 vCPU,
+  32 GiB fixed RAM, a 200 GiB dynamic VHDX, Default Switch, Secure Boot and
+  vTPM. Windows 11 Enterprise Evaluation 26H2 comes from Microsoft's official
+  evaluation centre; ISO SHA-256 matches KB5130867
+  `BC3F24086EBADC94489066B5AD78089E2CF5C3491E90E790BB81A2B199C10E38`.
+  Unattended installation and key-only OpenSSH login passed. Guest hostname
+  `ISOCAST-PKG`, build 26300, `Get-WindowsEdition` reports `EnterpriseEval`
+  (Get-ComputerInfo's legacy product label misleadingly says Windows 10).
+  `clean` is an offline standard checkpoint; down/revert/up removed a deliberate
+  guest-only marker, retained SSH host-key trust, and the `packager` login still
+  reports administrator=false. All five wrapper operations and an exact exit-7
+  propagation check pass. No GPU is passed through: never
+  use this guest as GPU/NVENC or real-device performance evidence.
+- 2026-10-18 (#105 W.7 VM control): `scripts/windows-vm.sh up`, `ssh [command]`,
+  `ps 'PowerShell'` (or stdin), `down`, and `revert-clean --yes`. Revert requires
+  the guest to be off and discards only this guest's changes. SSH uses the
+  host's existing personal identity through `exon-desk-lan` as a jump host;
+  the NAT address is discovered every time. Guest host-key trust is bootstrapped
+  over authenticated PowerShell Direct, then pinned in this lane's private
+  scratch `known_hosts`. No host forwarding/firewall/Hyper-V setting is changed.
+  `ISOCAST_WINDOWS_VM_USER=packager` selects the standard (non-administrator)
+  account for installer qualification; the default `isocast` account administers
+  only the guest. Both accept the same existing personal public key, not passwords.
+  The generated local-account password is never printed: host LocalMachine
+  DPAPI plus an explicit file ACL limited to Ryan/SYSTEM/Administrators protects the retained
+  bootstrap credential. CurrentUser DPAPI fails under key-only OpenSSH logons.
+  Hyper-V adds access rules to its root folder, so do not rely on that folder's
+  inheritance for credentials. Only this VM also has read access to the answer
+  ISO. Unattend media and cached guest answer files were removed before the final
+  `clean` checkpoint. Windows also retained `Panther\unattend-original.xml`:
+  after discovering that by filename only, the earlier point was renamed
+  `bootstrap-before-answer-cleanup` and a fresh offline `clean` was taken.
+  Reverting the final `clean` and booting verifies zero cached answer XML and
+  no compiler scratch. Use `clean`, not the earlier provisioning point.
+  The lane leaves the VM off between package runs to free its 32 GiB; `up`
+  waits up to three minutes for guest SSH. No Inno compiler or Isocast is installed
+  in `clean`.
+  Windows 11 initially enabled the SSH firewall rule for Private networks only,
+  while Default Switch appeared Public: host→guest TCP/22 timed out despite a
+  listening server. The guest-only rule now allows LocalSubnet on all profiles;
+  the host firewall was untouched. The evaluation expires after 90 days; it is not a production
+  Windows licence. VM provisioning/evidence stays in `windows-pkg/scratch`.
+
+- 2026-10-18 (#110/#27 merge qualification): HEADbb8790a5 + main59f78393
+  merged with `--no-commit`. Governor conflict keeps BOTH `frame budget`
+  exclusion from ISO pin diagnosis and named-secondary `unpinned_secondary`;
+  per-hub ownership and budget-full/5s-tail +30s-quiet restoration retained.
+  Notes conflict keeps both histories. Remote gates249 pass, strict112811
+ 18/18 zero-loss once. Combined AWS112520:24 tiles saturated50s; lastbudget
+  refusal53.65s, preview15→30 at88.20s/full118.61s, no early recovery. Healthy
+  hub1500/failed4000 stay isolated, one VT refusal; three130s files7800/7800
+  frames with equal A/V, no drops. Congested streams lose309/235 video pictures
+  (audio intact), explicitly not a loss-free-upload claim. First combined
+  runner failed due to missing proxy dictionary; corrected experiment only,
+  no production patch/assertion relaxation. Scratch budget-merge/REPORT.md
+  has hashes/results. Merge remains staged/uncommitted; no owned helpers left.
+
+- 2026-10-18 (#110 remaining handoff): branch fast-forwarded to main6d6d58fd
+  before edits; current work uncommitted. Mixed H26x overlay, per-hub refusal
+  ownership and named secondary pins qualified onAWS. Gates243/strict18/18,
+  stream3-pair A/B0loss. Real `memory_pressure -p33 -s1` (NOT `-S`) reached
+ 7.92–8.40GiB available and actual warninglevel2; three94.7s files2841frames
+  each and stream2793frames lose nothing, preview fully restores59.91s after
+  release. Helpers/watchdogs reaped; resumed inspection found no lane jobs
+  or helpers left running. Report: self-tuning-2/scratch/remaining/REPORT.md.
+  Regular reviewer unavailable>1h; Astra fallback review/re-review and final
+  evidence acceptance have no blockers. Regular-model review before release
+  remains required. Prior slices are committed6c4663ca/merged6d6d58fd, not
+  pending approval despite the historical entries below.
+- 2026-10-18 (#27 review fixes): 5d06bfef + main6d6d58fd merged without a
+  commit (notes conflict keeps both histories). B1 auxiliary cache eviction
+  happens before the next GPU batch and yields that admission turn, so the
+  same first sixteen owners cannot continually reclaim every permit. Hidden
+  auxiliary inputs and idle compositors release caches too; bindings/reuse
+  state are cleared, older GPU submissions keep their own input leases.
+  B2 notices/counters are copied under the ledger mutex and reported through
+  bounded deferred logging outside it; status JSON is built outside it too.
+  B3 full-budget occupancy and the five-second refusal/release tail both
+  block the governor's 30-second recovery timer (memory pressure kept).
+  Ordinary clones now share a domain claim; independent deliveries still
+  deduplicate. Final evidence: frame-budget/scratch/REPORT.md and fix1/.
+- 2026-10-18 (#27 review verification): matched native pixel run103710,
+  24 staggered masked tiles:23 frozen before. Final130s run110027 keeps all
+  24 subscriptions open through50s saturation (8–10 changes/33s off air),
+  then12 open through recovery (34 changes/35s); program/ISO7800/7800.
+  Disable client read timeouts when testing deliberately shed frames: the
+  early5s client timeout could close a stream while JPEG demand continued.
+  The3s looping-counter experiment
+  aliased with the new~3s update cadence; use test_pattern's six-digit counter
+  for freshness, not repeated clip numbers or frame timestamps. Log-writer
+  delay102500→103117:299→0 program drops. Pressure50s: no false restoration;
+  last refusal53.66s, restore89.09s then118.48s, remaining12 viewers continue.
+  Stress103319:zero protected/audio loss. A/B103220:CPU42.3→42.1%, instructions
+  494.8→493.9M/s, footprint140.4→133.1MB. Gates247 unit +doctest, strict104755
+  18/18, all pass. Binary8e6501b8. Main6d6d58fd is merged without commit.
+  B2's isolated `ISOCAST_BUDGET_LOG_STALL_MS=AFTER_MS:DURATION_MS` probe is
+  capped at10s, once, developer-only; markers go to native-relay JSONL in
+  d.logs, not daemon.log. Original native-priority/device limits remain open.
+
+- 2026-10-18 (#27, frame-budget lane): replacement design is per-origin,
+  distinct-buffer accounting, not delivery permits. Independent reserves are
+  8 producer, 32 file-recording, 16 auxiliary and 36 protected-compositor
+  pictures; the CV pool's physical ceiling is their sum (92), allocated on
+  demand. The composition reserve is (GPU in-flight limit + one cached input)
+  × (main + MAX_EXTRA_CANVASES), not another arbitrary queue size. A buffer
+  shared across domains counts once in the physical union; repeat deliveries within a
+  domain do not spend another permit. Native VT callbacks retain the same
+  lease, as do GPU inputs/outputs through their existing completion fences.
+  Streams/replay, previews, scene tiles, source-mask caches and virtual-camera
+  reads use the auxiliary reserve; recorded-canvas inputs use composition,
+  and files/ISOs use recording. This fourth domain was added during audit:
+  a stalled passthrough ISO can fill the file reserve, but must not freeze
+  the program reading that same source. Auxiliary refusal feeds the governor
+  without asking it to thin ISOs. This protects against other domains, not a stalled protected
+  writer exceeding its own reserve or the machine's physical encode capacity.
+- 2026-10-18 (#27 design decisions): copy scarce SCK/AVCapture buffers once
+  at ingress, preserving format/bit depth/attachments, rather than letting
+  many outputs retain an eight-surface device pool. Decoder frames remain
+  zero-copy and have a per-reader ledger keyed by native CV buffer identity:
+  two samples aliasing the same native buffer share a charge too, not merely
+  Rust clones of one wrapper. AVAssetWriter's opaque lifetime is
+  isolated in a private threshold-limited copy pool and charged at its full
+  reservation, never reported as an invented exact native count. The camera
+  helper likewise copies before acknowledging enqueue: CMIO retains the
+  helper's pool, never the parent's recycled pixels. Shared IOSurface rings
+  are counted separately (including texture wrappers and Mach offers), with
+  their existing per-ring limit. This is a frame-pool invariant, not a
+  machine-wide RAM allocator or a count of Apple's private codec allocations.
+  Status/doctor expose the ledger and sticky refusal/allocation-failure totals.
+  Windows' platform hook remains explicitly unavailable, not a false pass.
+- 2026-10-18 (#27 diagnostics): isolated developer mode accepts
+  `ISOCAST_FRAME_STALL=iso|live`: hold one real consumer worker for 600 ms,
+  once, after two seconds. It does not stop VT callbacks or the daemon.
+  Normal mode ignores it. Use it to distinguish file-queue retention from
+  capture freshness; numbered media checks detect a frozen input even if
+  a program file continues storing repeated pictures at its nominal fps.
+- 2026-10-18 (#27 device qualification): M2-a's existing signed development
+  app reports screen recording not granted, and `virtual_camera_start` says
+  the camera is not installed/approved. No permission, setting, or install
+  was changed. The fallback AVAssetWriter path did qualify there: program
+  and two ISOs, each 360/360 at 60 fps, zero audio/video loss, full decode.
+  The saved `command` in hw-queue/done/20261018-090156-frame-budget-cmd.json
+  is the exact permission-aware retry through `hw-batch.py now cmd --gui`.
+  Pixel-copy format/plane tests are not a claim of real capture/CMIO success.
+- 2026-10-18 (#27 final verification, a16084a6 daemon): failing 24 s AWS
+  workload (six ISOs, three extra recorded canvases, stream/replay, masks,
+  40 multiview tiles, 1,320 cuts) loses 461 program frames on main; new
+  records every frame in all ten files and the stream/replay. All 45 budget
+  snapshots hold; refusals [0,0,1157,0], auxiliary peak16. Governor lowers
+  previews60→30→15. Final gates244 unit tests + one doctest, strict18/18.
+  Flagship-1080 A/B3 pairs: CPU41.6→42.4% (+0.8 points), instructions+0.5%,
+  GPU86.2→86.0ms/s, footprint125.6→124.7MB; zero media loss on both.
+- 2026-10-18 (#27 remaining native-policy limit): a600ms stopped ISO worker
+  fills its32-frame reserve (5 refused), but the program stays480/480 with
+  every numbered picture advancing. Its own ISO loses22 frames, accounted.
+  A600ms live-worker stall leaves every frame-budget domain unexhausted yet
+  loses51 ISO frames (program480/480, all audio intact): stream.rs includes
+  the hold in native submit latency/health, setting native priority pressure;
+  crash_safe::append_frame then refuses ISO before budget admission. This
+  priority contract is unchanged from main and separate from pool starvation.
+  After three diagnostic attempts, stopped expanding the fix: the wrong
+  assumption was that a native-consumer stall tests only buffer retention.
+  Keep #27 open for the stronger requested no-ISO-loss contract; reconcile
+  native stream-vs-ISO priority with #110 rather than tuning pool caps again.
+  Evidence/retry commands: hw-queue/done/20261018-092625-frame-budget-cmd.json,
+  frame-budget/scratch/consumer-stalls/stalls.json and REPORT.md. No assertion
+  was relaxed to hide this failure; no native policy change was made.
+
 - 2026-10-18 (#110 self-tuning-2 handoff): uncommitted on063a21a5. Gates242
   pass; the full strict suite ran once under CPU4+Metal+2GiB resident memory,
   18/18 zero-loss. M2-b's three interleaved flagship1080 A/B pairs lose no
@@ -1871,6 +2154,109 @@ each section. Delete entries that stop being true.
   `{exonbook,m2-a}/` and `combined/`.
 
 ## Decisions
+
+- 2026-10-18 (#105 W.6 shortcuts): distinguish UI logical modifiers from
+  configured physical bindings. Slint Control means Command on Mac and Ctrl
+  on Windows; stored hotkey `cmd` means physical Win on Windows. Never rewrite
+  saved bindings to get a Ctrl label. Windows Exit uses Alt+F4, not a nonexistent
+  Ctrl+Q binding. Mac words/glyphs remain unchanged. User content is not passed
+  through vocabulary substitutions; the narrow description helper accepts
+  only authored static tool text. Windows generated help/schema use target-
+  specific overrides, leaving Mac descriptions exact.
+
+- 2026-10-18 (#105 W.7b): **manual Windows checks only**, until notifications
+  can be idle-gated even when a recording starts during a check. WinSparkle's
+  install callback is too late to prevent an unsolicited window entering a
+  capture. The SDK's automatic preference is forced off before init; the
+  disabled switch explains why. Mac daily checks and copy are unchanged.
+  A verified download executes only fixed arguments, never unsigned appcast
+  arguments. Explicit rollback verifies the previous installer's detached
+  signature under the embedded key before idle shutdown/execution. It is not
+  automatic recovery from a failed application launch; Inno does not restore
+  overwritten old files merely because an install aborts.
+- 2026-10-18 (#105 W.7b): installation uses the incoming CLI extracted with
+  its CRT to a temporary directory, so an old installed CLI need not know
+  `engine shutdown`. That command and MCP `shutdown_idle_daemon` share the
+  bounded client call to existing `ShutdownIfIdle`: outputs are refused;
+  idle calibration is cancelled, not refused. An unused/broken installation
+  may uninstall without its CLI; active images still block deletion.
+
+- 2026-10-18 (#105 W.7a): Inno Setup instead of MSIX: per-user installation
+  without elevation, ordinary adjacent UI/CLI/daemon executables, existing
+  AppData paths and no packaged-process virtualization. Pin compiler 7.1.0
+  and its SHA-256; ship the x64 CRT app-local. No PATH modification, service,
+  automatic process termination or recursive uninstall deletion. Deliberate
+  rollback uses the previous trusted installer with `/ALLOWDOWNGRADE=1`;
+  authentic auto-update/idle-engine integration remains W.7b, not implied by
+  successful installer generation. Authenticode credentials and publication
+  stay with Ryan/the delegator; WinGet can follow after alpha qualification.
+
+- 2026-10-18 (#64): **HE-AAC with implicit SBR signalling in Matroska**
+  (the LC core's two-byte AudioSpecificConfig plus OutputSamplingFrequency
+  = 2 x SamplingFrequency, as mkvmerge writes it) played 44 ms late:
+  AudioToolbox finds the SBR data by itself but adds its 2112-frame HE
+  delay, and our ASC parse saw plain LC so nothing was dropped. matroska.rs
+  now reads OutputSamplingFrequency; webm.rs rewrites such a config into
+  explicit (hierarchical, AOT 5) signalling before the decoder sees it, so
+  the existing HE path (cookie + delay) applies. Only plain LC with 1-2
+  channels, a table rate and an output rate exactly twice it is rewritten.
+  Legacy codec ids (`A_AAC/MPEG4/LC/SBR` with no CodecPrivate) are still
+  refused with a message: ffmpeg can't write them, so nothing to test with.
+  Not done: an ASC-driven `kAudioFormatProperty_FormatInfo` setup instead of
+  our own parse (works as is; follow-up).
+- 2026-10-18 (#94): `collection switch` / `library_switch` renames sources
+  whose ids became reserved (`edited`, `vertical`) the same way loading at
+  start does (notes in the reply), and saves the renamed collection at once;
+  before, the switch was refused with a validation error naming the id.
+- 2026-10-18 (#94): system audio always leaves out the Isocast app by its
+  bundle id `dev.isocast.app` exactly, kept apart from the user's fuzzy
+  `exclude` names (review R3: a look-alike named "dev.isocast.app Player"
+  was left out too). Process tap: a process whose own Core Audio bundle id
+  is that, or that is the app itself (not helpers or tools it launched,
+  never isocastd); the set is logged ("audio tap: leaves out …") whenever
+  it changes, and follows processes as they come. ScreenCaptureKit: apps
+  with that bundle id when the capture starts (its list is a snapshot, so
+  an Isocast started later isn't left out there). VM check with real
+  recordings: committed head dropped the look-alike's tone, the fix keeps
+  it and drops only the dev.isocast.app process (followups-008
+  t94excl-tap.log). The app's own silencing while
+  capturing stays as a backstop until this is checked on hardware with
+  BlackHole (rig: editor-007/scratch/rig) with the real editor; a
+  development binary run from a terminal has no bundle id and isn't
+  covered by the engine rule.
+- 2026-10-18 (#94 review R1): `library_switch` chooses the files a renamed
+  collection is saved to under the same state lock as the switch (as
+  `apply` does): two switches at once wrote the renamed collection over
+  the other one 198 times in 200 (t94race.py), 0 after.
+- 2026-10-18 (#94 review R2): renaming a reserved source id also renames
+  it inside every `recording.iso.source_audio` list and in source masks'
+  `mask_source` (`rename_refs` now covers every source reference
+  `validate` checks).
+- 2026-10-18 (#94): the editor forgets thumbnails and waveforms of files no
+  longer on the timeline (each `show_rows`); a waveform read that fails is
+  no longer stored on disk as "no sound" (a file without an audio track
+  still is).
+- 2026-10-18 (#102 FU10): a recording stopping while a stream runs no
+  longer pushes the editor behind the studio when the editor has the
+  keyboard (Behind becomes Show then). Checked in code only: proving it
+  needs a real window plus a live stream on a test Mac.
+
+- 2026-10-18 (#110 remaining): a failed retune belongs to its native hub,
+  not its canvas. Destinations sharing that hub/replay/warm owner retain the
+  same failure latch; independent siblings continue. Destroying/recreating
+  the actual encoder retries. Aggregate stream percentage is the minimum
+  active acknowledgement. Congestion targeting/ladder remains per canvas.
+  `canvases.<id>.fps` pins one secondary canvas; legacy `vertical.fps` keeps
+  all-secondary meaning. File writers must pass realcanvasID, not flatten
+  every non-main file toVertical. Native overload safety remains independent.
+- 2026-10-18 (#110 mixed model): use measured HEVC costs beside separately
+  normalized table H264 recording/live costs; no diagnostic FPS becomes a
+  pool-capacity coefficient. Mixed basis is explicit; every suggested or
+  admitted workload selects its own coverage, unknown dimensions fall back.
+  Mixed file overload actual74.06–77.01% vs predicted67.16%; two-live-hub
+  overload actual61.11% vs69.04%. These qualify categorical boundaries, not
+  improved loss-percentage accuracy. ProRes/10bit resource models and local
+  H264 coefficients remain open; Windows waits for the daemon switch.
 
 - 2026-10-18 (#110 native rollback): the scoped VT-property experiment
   `20261018-085056-self-tuning-2-cmd` reproduced a real uncertainty bug:
@@ -6651,6 +7037,23 @@ each section. Delete entries that stop being true.
   starts at 900 because the window's minimum width is 900.
 
 ## Gotchas
+
+- 2026-10-18 (#64): the media-source A/V check (two burst tracks mixed in
+  one program, burst length ~100 ms in step, ~144 ms if one is 44 ms late)
+  is only valid when both sources open together: changing one source's
+  `files` with `apply` restarts only that source, its loop phase moves, and
+  the bursts stop overlapping (peak -6.9 dB instead of ~-1 dB), which reads
+  as "in step" whatever the decoder does. followups-007's t64.sh second pair
+  was measured that way. Start a fresh engine per pair and check the peak
+  (followups-008/scratch/t64.sh).
+
+- 2026-10-18 (#110 pins): live file counters can lag pin time by a full
+  status interval. A post-pin RPC comparison counted six old square skips as
+  new losses. Retained final-file PTS proved last gap20.200s, pin request
+ 20.190s, then139 continuous30fps pictures; no new engine change/rerun needed.
+  The earlier real bug was `create_writers` flattening every extra canvas to
+  Vertical, now fixed. Persistence uses library documents, not a guaranteed
+  legacy setup.toml: verify through get/apply/restart instead of copying it.
 
 - 2026-10-18 (#110 experiments): `e2e.Engine` re-signs its copied daemon in
   a bundle, so its whole-file SHA differs from the source binary. Preserve

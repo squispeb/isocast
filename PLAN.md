@@ -570,6 +570,17 @@ come later (clips already carry in/out points on their take).
 - [ ] **S.3 Astra optimization rounds.** GPT-6 Astra (opencode, xhigh)
   sessions with S.1/S.2 as their measuring stick, one hot path at a time,
   until Isocast beats OBS on every measure we can control.
+  - [ ] **S.3 #27 Frame-pool invariant.** Distinct-buffer ledger across
+    native/GPU owners, independent recording/auxiliary reserves, capture
+    isolation, status/doctor and governor feedback. Verify many-ISO/canvas/
+    replay/multiview/mask stress, flagship A/B, gates and strict e2e.
+    - [x] Buffer accounting and reservations implemented and qualified:
+      baseline 461 program losses → zero across ten files; final gates
+      244 unit tests + doctest, strict 18/18, flagship-1080 3-pair A/B.
+    - [ ] Stronger native-stream-stall guarantee and device qualification:
+      the existing native priority controller still sheds ISO frames when
+      a live submit stalls, despite zero permit refusals; display permission
+      and installed CMIO are unavailable. See frame-budget scratch REPORT.md.
   - [x] **S.3 #111 multiview and GPU follow-ups (perf-2), implementation.** Tile-sized
     scene rasters and completed program/preview reuse; contained GPU poll
     panics, snapshot/ISO loss recovery, virtual-camera pacing. #27's frame
@@ -671,7 +682,7 @@ Tier 1: build → review → fixes → re-review for each behavior-changing slic
     repeatability under outside load and post-GPU-lane integration. M4
     overload prediction improves; M2 percentage accuracy is within variation,
     not proven better than the table. Do not call all of T.1 complete yet.
-    - [x] **T.1b.1 Bounded coverage and canvas predictions (ready for review).** Separate
+    - [x] **T.1b.1 Bounded coverage and canvas predictions (merged6d6d58fd).** Separate
       recording/live paths and fit/diagnostic evidence, prioritize missing
       4K60/10-bit and ProRes variants, list skipped cells, qualify covered
       canvas predictions and repeated/outside-load calibration on base M2.
@@ -680,6 +691,14 @@ Tier 1: build → review → fixes → re-review for each behavior-changing slic
       19–21/24 cells explicitly covered. Fitting cases lose no frames;
       overload prediction53.09%, actual44.39–53.67%, table52.62%: within
       variation, not improved M2 percentage accuracy. Full T.1b stays open.
+    - [x] **T.1b.2 Hybrid mixed H26x model (ready for review).** Local HEVC
+      costs plus independently normalized table H264 file/live costs, explicit
+      mixed provenance. Re-evaluate coverage for each suggestion/admission;
+      unknown source formats fall back, added ISO sources are probed. Real
+      HEVC+H264 file pairs and two-live-hub+HEVC cases fit/overload as predicted;
+      ISO loss percentages remain approximate, not improved accuracy. Exact
+      H264-only/10bit/ProRes fallback and Optimize notes verified. Local H264
+      coefficients and ProRes pool models remain open, not inferred from diagnostics.
 - [ ] **T.2 Live governor.** Fixed reversible degradation order, hysteresis,
   visible reasons and protected-output integrity; qualify against outside
   CPU/GPU/encoder load without changing the established priority contract.
@@ -702,20 +721,30 @@ Tier 1: build → review → fixes → re-review for each behavior-changing slic
     transitions, JPEG/vertical composition reductions, memory-pressure and
     per-encoder retune failure behavior. No zero-drop promise against foreign
     workloads that already exhaust protected encoder capacity.
+  - [x] **T.2b Per-hub refusal/acknowledgement (ready for review).** A
+    failed encoder no longer restores healthy siblings. Weak owner lifetime,
+    active-hub aggregation and refusal suppression verified with three real
+    hubs: healthy1500/failed4000/other-canvas1250; closing/recreating failed
+    owner clears/retries only that hub. Congestion ladder remains canvas-scoped.
 - [ ] **T.3 Low-end defaults and pins.** Measured 8 GB/base-chip defaults,
   persistent per-setting Automatic/pinned controls, backend-neutral mapping
   to NVENC/QSV/AMF/software with the Windows lane.
-  - [x] **T.3a Conservative initialization (ready for review).** New setups/blank profiles use
+  - [x] **T.3a Conservative initialization (merged6d6d58fd).** New setups/blank profiles use
     30 fps on <=8-core or <=8-GB machines; explicit fps and existing profiles
     survive. Qualify persistent pins/ISO consent, base M2 defaults and native
     rate rollback. Physical 8-GB/backend mapping remains separate.
     API init/blank30 vs explicit/copy60 and restart persistence pass. Scoped
     native refusal reproduces and fixes skipped FPS rollback/false recovery;
     restored settings are actually acknowledged before clearing uncertainty.
+  - [x] **T.3b Named secondary pins (ready for review).**
+    `canvases.<id>.fps` protects just that secondary canvas; legacy
+    `vertical.fps` protects all. Writers retain actual canvas ids. Real files
+    prove pinned shorts/main/ISOs whole, square thinned before live pin and
+    continuous30fps afterwards. Pins persist; native safety is not disabled.
 - [ ] **T.4 Weak-machine matrix.** Prototype taskpolicy/CPU limits and a
   GPU-contention helper during T.1; then bounded memory pressure, full
   e2e/bench/soak, GPU-less Windows software encoding and governor recovery.
-  - [x] **T.4a Bounded macOS contention (ready for review).** Real touched-memory competition
+  - [x] **T.4a Bounded macOS contention (merged6d6d58fd).** Real touched-memory competition
     with verified readiness/cleanup, OS memory-pressure signal, base M2
     strict e2e/bench/short soak and recovery. This is contention, not a
     physical core/RAM limit or Windows software-encoder qualification.
@@ -723,6 +752,14 @@ Tier 1: build → review → fixes → re-review for each behavior-changing slic
     30-fps soak/crash checks pass, zero reported media losses. Injected
     memory warning/critical respects pins/ISO consent and restores fully.
     Gates242 pass. Tier-1 reviewer unavailable; no review approval claimed.
+  - [x] **T.4b Real AWS memory pressure (ready for review).** Authorized
+    `memory_pressure -p33` without `-S` produces7.92–8.40GiB available and
+    actual warninglevel2. Under program/UHD+HD ISO/stream/preview load,
+    files2841frames each and stream2793 lose nothing; preview restores fully
+    59.91s after release. Watchdogs/guards/cleanup verified. This simulates
+    an available-memory budget, not a physical8GiB chip. Gates243, strict18/18
+    and stream A/B3pairs pass. Astra fallback review/re-review accepted;
+    regular-model review remains required before release.
 
 ### A. Alpha: the daily driver (Ryan, 2026-10-13)
 
@@ -1759,10 +1796,35 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
   real Windows executable/privacy controls instead of Mac/Keychain/Finder/
   Command glyphs or "Isocast Engine" macOS privacy instructions. Cover
   onboarding, capacity/admission, settings, errors and shortcut labels.
+  - [x] **W.6 wording qualification.** Windows vocabulary/privacy/executable
+    instructions and shortcut labels verified in ten actual VM offscreen
+    screenshots, native help and the first-launch window. Mac239 unit+
+    1doctest/gates and nine unchanged snapshot text regions pass. No native
+    integration/capture claim from labels; hosted UI memory work is separate.
 - [ ] **W.7 Packaging and updates.** Choose MSIX or installer; reproducible
   install/upgrade/uninstall, correct paths and per-user state, verified
   update authenticity and rollback. Build/test packages on runners; signing
   credentials, releases and publication require the delegator/Ryan.
+  - [ ] **W.7a Per-user installer.** Pinned Inno Setup compiler, adjacent
+    app/CLI/daemon and app-local CRT, no elevation or forced process exits,
+    install/uninstall gate and downloadable unsigned payload in windows.yml.
+    Clean Windows 11 evaluation VM under `C:\isocast-dev\vm`.
+    - [x] **W.7a1 Test VM.** Official hash-verified Windows 11 Enterprise
+      Evaluation, Gen2/Secure Boot/vTPM, 8 vCPU/32 GiB/200 GiB dynamic disk.
+      Key-only admin and standard-user SSH; offline `clean` checkpoint and
+      up/ssh/ps/down/revert wrapper verified, including actual clean restore.
+  - [x] **W.7b Authentic updates.** Windows appcast alongside Sparkle's,
+    pinned update verifier and embedded public key, idle-engine interlock,
+    explicit trusted rollback; real WinSparkle download/signature rejection
+    and successful update verified with a private test key. Feed-supplied
+    installer arguments are ignored. Authenticode/publication remain gated.
+  - [x] **W.7c Clean-machine qualification.** Fresh install/first launch,
+    real older-build upgrade, rollback, uninstall, preserved settings and
+    recordings, tampered-update refusal: native0.0.7.1→.2→.1→.2 in the clean
+    Windows11 VM as a non-admin. Exact binary hashes and retained files
+    verified; after-uninstall movie full decode passes. VM uses WARP/CPU;
+    no GPU/NVENC or production capture qualification. Runner packaging is
+    still open under W.7a pending the hosted UI-memory fix.
 - [ ] **W.8 Windows e2e and stress.** Port existing synthetic e2e/stress
   checks: recording/ISOs/streaming, pause/split/retake/export, killed writers,
   ownership, rapid controls, overload and stalled clients. Run short gates
@@ -1786,6 +1848,76 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
 - FilmCraft reads `session.json` to line up ISO files without audio sync.
 
 ## Log
+
+- Windows packaging merge-main (2026-10-18, #105): main565729db merged with
+  `--no-commit` over095385e0. Canvas/settings/self-tuning behavior retained,
+  W.6 words reapplied; main's debug/no-gallery/isolated-j1 Windows CI memory
+  fix retained with installer and updater gates. Mac gates248unit+1doctest
+  pass;14 main/merge offscreen UI-region comparisons are pixel-identical.
+  Native merged release/installer0.0.7.3 builds on exon-desk; exact hash in
+  notes/REPORT.md. Merge left staged/uncommitted; hosted CI and requested
+  Tier1 release review remain coordinator-owned.
+
+- W.7b/W.7c and W.6 native qualification (2026-10-18, #105): built in the
+  packaging lane's own exon-desk folder after explicit approval. Fixed native
+  callback return type, allowed Slint's existing CPU/WARP fallback before any
+  threads, and decoded appcast notes as UTF8 on PS5. Non-admin clean install/
+  Start launch, .1→.2 upgrade, authenticated rollback, tampered WinSparkle
+  refusal, valid update/idle exit, ignored unsigned arguments and uninstall
+  pass. Both real movies/custom data and3setup files retained byte-identical;
+  full decode after uninstall passes. Ten Windows wording snapshots inspected,
+  native CLI help/capacity words pass. Native strict Clippy and14unit+1doctest
+  pass; fallback review has no blockers. Evidence/hashes in
+  `windows-pkg/scratch/qualified` and REPORT.md. Test key only, no release or
+  production certificate used; all qualification tasks stopped and VM off.
+
+- W.6 wording preparation (2026-10-18, #105): target-aware PC/Credential
+  Manager/Explorer/Ctrl copy, correct desktop-app privacy instructions,
+  isocastd.exe errors, generated CLI/MCP help and fresh Windows Videos default.
+  Mac full gates239 unit+1doctest pass;9 snapshot pairs preserve authored UI
+  pixels in explicit text regions. Review gaps fixed. Native Windows build/
+  snapshots queued through coordinator CI; not yet verified or marked done.
+
+- W.7b preparation (2026-10-18, #105): bounded atomic idle shutdown on
+  client/CLI/MCP, incoming-CLI installer interlock, pinned WinSparkle/manual
+  checks, authenticated explicit rollback, Windows appcast/signing hooks and
+  preservation of adjacent Mac/Windows assets. Source-review blockers fixed;
+  strict Mac client/CLI/UI Clippy,15 unit tests+1doctest and release build pass;
+  development Mac Updates pixels unchanged. Native verifier rejects tamper/
+  wrong key. W.7a hosted build passed but CRLF version parsing prevented any
+  package artifact; W.7b replaces that parser and awaits two-build native CI.
+  Actual install/update/rollback/uninstall qualification is not yet claimed.
+
+- W.7a1 / W.7a preparation (2026-10-18, #105): `isocast-pkg` installed
+  unattended on exon-desk-lan with no host reboot or host-wide setting change.
+  Official ISO hash, Windows11 EnterpriseEval/build26300, Secure Boot, ready
+  vTPM, standard-user SSH, exact exit-code propagation and checkpoint restore
+  pass. Inno7.1.0 compiles the installer source as a non-admin (compiler-only
+  check, not an Isocast install); shellcheck, actionlint and native PS5 parse
+  pass. Unsigned Actions installer gate awaits delegator CI and payload before
+  lifecycle qualification. Authentic updates/rollback and W.6 wording remain
+  open. Evidence: `windows-pkg/scratch/REPORT.md`. No GPU/NVENC claim.
+
+- 0.0.8 follow-ups (2026-10-18, #94 #102 #64): HEVC exports with cuts,
+  the .isoprj shutdown flush/"file wins" warning and Vorbis were already on
+  main and were re-checked (headless Chrome 154 plays EDITED/VERTICAL/crop
+  to the end, pre-fix file fails at 0.33 s; trim+shutdown file revision 3 =
+  engine 3, one warning; Vorbis lag 0). New: HE-AAC with implicit SBR in
+  MKV on time (probe lag 2112 -> 0 samples; engine bursts 145-156 ms ->
+  104-111 ms), reserved source ids renamed on collection switch (was
+  refused), system audio always leaves out the Isocast app, editor caches
+  drop off-timeline files and don't store failed waveform reads, editor
+  kept in front when it has the keyboard. Evidence:
+  /Volumes/IsocastBuild/followups-008/scratch/REPORT.md.
+
+- T.1b.2/T.2b/T.3b/T.4b (#110, 2026-10-18): main6d6d58fd fast-forwarded;
+  hybrid mixed H26x model/coverage fixes, independent hub failures and named
+  secondary pins implemented. Real mixed file/live boundaries, refused hub
+  isolation/recreation, exact pin-file PTS, persistence and genuine AWS memory
+  pressure/recovery verified. Full remote gates243 and strict18/18 once,
+  stream A/B3pairs0loss. Fallback review/re-review accepted (regular reviewer
+  unavailable>1h); uncommitted, ready for review. Explicit model/simulation
+  limits and job IDs: self-tuning-2/scratch/remaining/REPORT.md.
 
 - T.1b.1/T.3a/T.4a (#110, 2026-10-18): explicit diagnostic/fit calibration
   coverage, measured multi-canvas HEVC predictions with independent stream

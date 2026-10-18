@@ -255,7 +255,14 @@ impl PermissionsStep {
             match answer {
                 Ok(report) => self.take(app, report),
                 Err(error) => {
-                    app.toast(ToastKind::Error, "Couldn’t ask macOS", error);
+                    app.toast(
+                        ToastKind::Error,
+                        isocast_protocol::platform_text::select(
+                            "Couldn’t ask macOS",
+                            "Couldn’t check Windows access",
+                        ),
+                        error,
+                    );
                 }
             }
             self.show(app);
@@ -373,7 +380,13 @@ impl PermissionsStep {
                 let step = &app.permissions;
                 step.busy.set(None);
                 if let Err(error) = result {
-                    app.failed("Couldn’t open System Settings", &error);
+                    app.failed(
+                        isocast_protocol::platform_text::select(
+                            "Couldn’t open System Settings",
+                            "Couldn’t open Windows Settings",
+                        ),
+                        &error,
+                    );
                     step.show(app);
                     return;
                 }
@@ -382,7 +395,9 @@ impl PermissionsStep {
                     .borrow()
                     .as_ref()
                     .and_then(|r| r.details.iter().find(|d| d.permission == kind).cloned());
-                if let Some(path) = detail.as_ref().and_then(|d| d.app_path.clone()) {
+                if !cfg!(windows)
+                    && let Some(path) = detail.as_ref().and_then(|d| d.app_path.clone())
+                {
                     let detail = detail.expect("checked above");
                     // A screen recording grant (or a denied one) is turned on
                     // by hand; drag it in if it isn't listed.
@@ -498,7 +513,7 @@ impl PermissionsStep {
             return;
         };
         area.set_app_name(
-            if report.app == "isocastd" {
+            if cfg!(windows) || report.app == "isocastd" {
                 "Isocast"
             } else {
                 report.app.as_str()
@@ -524,6 +539,7 @@ impl PermissionsStep {
 
 /// One permission's row: its status in words, what happened in plain
 /// words, and the one action.
+#[cfg(not(windows))]
 fn row(d: &PermissionDetail, needed: bool, busy: Option<&str>) -> PermissionItem {
     let (icon, title, purpose, pane) = match d.permission {
         PermissionKind::ScreenRecording => (
@@ -634,6 +650,80 @@ fn row(d: &PermissionDetail, needed: bool, busy: Option<&str>) -> PermissionItem
     }
 }
 
+#[cfg(windows)]
+fn row(d: &PermissionDetail, needed: bool, busy: Option<&str>) -> PermissionItem {
+    let (icon, title, purpose, instructions) = match d.permission {
+        PermissionKind::ScreenRecording => (
+            "display",
+            "Screen Recording",
+            "Displays and windows on this PC.",
+            "Choose a display or window in Isocast. Windows capture policies or protected content may prevent capture; check Settings › Privacy & security › Screenshots and screen recording where that page is available.",
+        ),
+        PermissionKind::Camera => (
+            "camera",
+            "Camera",
+            "Cameras and capture cards.",
+            "Open Settings › Privacy & security (Privacy on Windows 10) › Camera. Turn on Camera access and Let desktop apps access your camera. isocastd.exe is the recording engine; desktop apps do not have individual access switches.",
+        ),
+        PermissionKind::Microphone => (
+            "mic",
+            "Microphone",
+            "Microphones and audio interfaces.",
+            "Open Settings › Privacy & security (Privacy on Windows 10) › Microphone. Turn on Microphone access and Let desktop apps access your microphone. isocastd.exe is the recording engine; desktop apps do not have individual access switches.",
+        ),
+        PermissionKind::SystemAudio => (
+            "speaker",
+            "System Audio",
+            "Optional: what this PC and its apps play.",
+            "Output audio uses Windows loopback capture, not a separate microphone grant. Check the output device in Settings › System › Sound; device policy or protected content may prevent capture.",
+        ),
+    };
+    // Follow the engine's action/capability, not a Mac-specific prompt or
+    // signing failure inferred from a denied status. Its native next step wins.
+    let (status, label, action, action_label) = if d.state == Permission::Granted {
+        ("allowed", "Allowed", "", "")
+    } else if d.state == Permission::Restricted || d.action == PermissionAction::AskAdministrator {
+        ("blocked", "Blocked", "", "")
+    } else {
+        match d.action {
+            PermissionAction::Restart => {
+                ("relaunch", "Needs restart", "relaunch", "Restart Engine")
+            }
+            PermissionAction::Request => ("not-asked", "Not checked", "ask", "Check Access"),
+            PermissionAction::OpenSettings => ("denied", "Not allowed", "open", "Open Settings"),
+            _ => ("denied", "Unavailable", "", ""),
+        }
+    };
+    let detail = if d.state == Permission::Granted {
+        String::new()
+    } else if status == "blocked" {
+        d.next_step.clone().unwrap_or_else(|| "Windows or an organisation policy blocks this access. Ask this PC’s administrator to review the policy.".into())
+    } else if d.action == PermissionAction::Restart {
+        "After changing Windows settings, restart isocastd.exe once recording, streaming and exports have stopped. Your setup is kept.".into()
+    } else {
+        d.next_step.clone().unwrap_or_else(|| instructions.into())
+    };
+    PermissionItem {
+        id: PermissionKind::NAMES[index(d.permission)].into(),
+        icon: icon.into(),
+        title: title.into(),
+        purpose: if needed || d.permission == PermissionKind::SystemAudio {
+            purpose.into()
+        } else {
+            format!("{purpose} This setup doesn’t use it.").into()
+        },
+        status: status.into(),
+        status_label: label.into(),
+        detail: detail.into(),
+        action: action.into(),
+        action_label: action_label.into(),
+        alt_action: "".into(),
+        alt_label: "".into(),
+        busy: busy.is_some(),
+        needed,
+    }
+}
+
 /// The helper's one line.
 fn helper_line(app: &str, drag: bool) -> String {
     if drag {
@@ -647,7 +737,9 @@ fn helper_line(app: &str, drag: bool) -> String {
 /// bare isocastd (a development build), whose name means nothing to a
 /// person.
 fn shown_name(d: &PermissionDetail) -> &str {
-    if d.app_path.is_none() && d.app == "isocastd" {
+    if cfg!(windows) {
+        isocast_protocol::platform_text::ENGINE
+    } else if d.app_path.is_none() && d.app == "isocastd" {
         "Isocast"
     } else {
         &d.app

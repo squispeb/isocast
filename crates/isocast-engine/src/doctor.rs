@@ -71,7 +71,11 @@ pub fn doctor<P: Platform>(platform: &P, setup: Option<&Setup>, folder: Option<&
                     (Permission::NotDetermined, _) => check(
                         &name,
                         CheckStatus::Warning,
-                        "not asked yet; macOS asks the first time it is needed".into(),
+                        isocast_protocol::platform_text::select(
+                            "not asked yet; macOS asks the first time it is needed",
+                            "not checked yet; review Windows privacy access for desktop apps",
+                        )
+                        .into(),
                         fix,
                     ),
                     (other, true) => check(
@@ -95,6 +99,21 @@ pub fn doctor<P: Platform>(platform: &P, setup: Option<&Setup>, folder: Option<&
             format!("could not check permissions: {err:#}"),
             None,
         )),
+    }
+
+    // Hardware encoders.
+    if let Some(budget) = platform.frame_budget() {
+        let invariant = budget["invariant"].as_bool() == Some(true);
+        let refused = budget["refused"]
+            .as_array()
+            .is_some_and(|counts| counts.iter().any(|n| n.as_u64().unwrap_or(0) != 0));
+        checks.push(check(
+            "frame budget",
+            if !invariant { CheckStatus::Problem } else if refused { CheckStatus::Warning } else { CheckStatus::Ok },
+            format!("distinct-buffer invariant {}; reserves: production {}, recording {}, auxiliary {}, composition {}; refusals {} (since daemon start)",
+                if invariant { "holds" } else { "FAILED" }, budget["production_reserve"], budget["recording_reserve"], budget["auxiliary_limit"], budget["composition_reserve"], budget["refused"]),
+            refused.then_some("reduce auxiliary viewers/outputs; status.diagnostics.frame_budget identifies the exhausted domain"),
+        ));
     }
 
     // Hardware encoders.
@@ -140,7 +159,7 @@ pub fn doctor<P: Platform>(platform: &P, setup: Option<&Setup>, folder: Option<&
     // Files in folders macOS guards: reading them waits for its prompt.
     let home = std::env::var("HOME").unwrap_or_default();
     let guarded = guarded_files(setup, &home);
-    if !guarded.is_empty() {
+    if !cfg!(windows) && !guarded.is_empty() {
         checks.push(check(
             "folder access",
             CheckStatus::Warning,

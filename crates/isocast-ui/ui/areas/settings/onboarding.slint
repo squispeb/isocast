@@ -8,7 +8,7 @@
 
 import { Theme } from "../../theme.slint";
 import { BrandMark, Icon, Icons } from "../../icons.slint";
-import { Ui } from "../../state.slint";
+import { Ui, PlatformText } from "../../state.slint";
 import {
     Button, ButtonVariant, ControlSize, DialogFooter, FocusRing, GroupRow, IconButton, LinkButton, RowGroup,
     RowPlace, ScrollArea, Segmented, Spinner, Switch, TextField,
@@ -329,7 +329,7 @@ component PermissionsStep inherits VerticalLayout {
     alignment: start;
     StepTitle {
         title: "Let Isocast see and hear";
-        lead: "macOS asks you once for each. You can skip any of them now; your setup leaves out what it can’t use, and you can allow it later.";
+        lead: PlatformText.windows ? "Isocast records through isocastd.exe. Windows Camera and Microphone settings must allow desktop apps. You can skip unavailable inputs now and enable them later." : "macOS asks you once for each. You can skip any of them now; your setup leaves out what it can’t use, and you can allow it later.";
     }
     Rectangle {
         height: 1px;
@@ -398,13 +398,13 @@ component DevicesStep inherits VerticalLayout {
                     alignment: center;
                     Switch {
                         on: SettingsArea.system-audio;
-                        label: "Include what this Mac plays";
+                        label: "Include what this " + PlatformText.machine + " plays";
                         toggled(on) => { SettingsArea.ob-set("system_audio", on ? "true" : "false"); }
                     }
                 }
                 Text {
                     horizontal-stretch: 1;
-                    text: "Include what this Mac plays";
+                    text: "Include what this " + PlatformText.machine + " plays";
                     color: Theme.text-2;
                     font-size: Theme.fs-sm;
                     letter-spacing: Theme.tracking-sm;

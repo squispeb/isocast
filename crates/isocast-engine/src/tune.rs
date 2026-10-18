@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use isocast_protocol::api::{Candidate, Capacity, TunedStream, Tuning, Variant};
 use isocast_protocol::change::merge_patch;
+use isocast_protocol::platform_text::MACHINE;
 use isocast_protocol::{
     CanvasId, Codec, Encoder, EncoderQuality, PROGRAM, QualityPreset, Setup, SourceKind,
 };
@@ -655,7 +656,7 @@ impl<P: Platform> Tuner<'_, P> {
         let mut notes = Vec::new();
         notes.push(match own.capacity {
             Some(Capacity::Fits) if own.feasible => format!(
-                "this Mac keeps up with the setup: {:.2}× real time on hard content",
+                "this {MACHINE} keeps up with the setup: {:.2}× real time on hard content",
                 own.realtime_factor
             ),
             Some(Capacity::Fits) => format!(
@@ -665,13 +666,13 @@ impl<P: Platform> Tuner<'_, P> {
                 own.reason.as_deref().unwrap_or("doesn't fit the disk")
             ),
             Some(Capacity::NoMargin) => format!(
-                "this Mac keeps up with the setup with no margin: {:.2}× real time on hard \
+                "this {MACHINE} keeps up with the setup with no margin: {:.2}× real time on hard \
                  content, so anything else using the encoders (a stream, a call, an export) may \
                  cost frames",
                 own.realtime_factor
             ),
             Some(Capacity::CannotKeepUp) => format!(
-                "this Mac can't keep up with the setup: the encoders run at {:.2}× real time on \
+                "this {MACHINE} can't keep up with the setup: the encoders run at {:.2}× real time on \
                  hard content, so a recording would drop about {:.0}% of its frames",
                 own.realtime_factor,
                 (1.0 - own.realtime_factor) * 100.0

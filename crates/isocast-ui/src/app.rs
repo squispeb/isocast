@@ -91,6 +91,9 @@ impl App {
         mode: Mode,
         canvas: areas::canvas::Canvas,
     ) -> Rc<Self> {
+        window
+            .global::<crate::PlatformText>()
+            .set_windows(cfg!(windows));
         let app = Rc::new(Self {
             window: window.as_weak(),
             tx,
@@ -1232,7 +1235,13 @@ impl App {
                 app.session.borrow_mut().devices = Some(devices);
                 app.changed(Changed::DEVICES);
             }
-            Err(error) => app.failed("Couldn’t list this Mac’s devices", &error),
+            Err(error) => app.failed(
+                isocast_protocol::platform_text::select(
+                    "Couldn’t list this Mac’s devices",
+                    "Couldn’t list this PC’s devices",
+                ),
+                &error,
+            ),
         });
     }
 
