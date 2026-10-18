@@ -444,14 +444,9 @@ impl AssetWriter {
     }
 
     fn append_frame(&mut self, frame: &PixelBuffer, pts: Time) -> Result<bool> {
-        if self.last_video.is_some()
-            && self.priority.as_mut().is_some_and(|p| {
-                if self.gated {
-                    !p.admit()
-                } else {
-                    !p.admit_governor()
-                }
-            })
+        if self.gated
+            && self.last_video.is_some()
+            && self.priority.as_mut().is_some_and(|p| !p.admit())
         {
             self.drain_ready()?;
             return Ok(false);

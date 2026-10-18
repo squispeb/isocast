@@ -248,6 +248,26 @@ fn parse() -> Result<Options> {
 }
 
 fn main() {
+    // A Windows VM can have only Microsoft's CPU/WARP adapter. Our device
+    // selection already permits that fallback, but Slint otherwise rejects
+    // it before opening any window. Permit CPU adapters, not force them: a
+    // hardware adapter remains preferred on ordinary PCs.
+    #[cfg(windows)]
+    if std::env::var_os("SLINT_WGPU_CPU").is_none() {
+        // SAFETY: the first operation in main, before logging, updater or
+        // worker threads start. The setting is process-local, not persisted.
+        unsafe { std::env::set_var("SLINT_WGPU_CPU", "1") };
+    }
+    #[cfg(windows)]
+    if let Some(result) = update::command_line(&std::env::args().skip(1).collect::<Vec<_>>()) {
+        match result {
+            Ok(()) => exit(0),
+            Err(error) => {
+                eprintln!("updates: {error:#}");
+                exit(1);
+            }
+        }
+    }
     let _logs = isocast_diagnostics::init("isocast-ui", true);
     if std::env::args().nth(1).as_deref() == Some("--motion") {
         exit(match motion::main(std::env::args().skip(1).collect()) {
@@ -322,18 +342,6 @@ fn exit(code: i32) -> ! {
     unsafe {
         libc::_exit(code)
     }
-    #[cfg(windows)]
-    // SAFETY: the event loop has returned and logs were flushed above;
-    // recording belongs to the separate daemon. Like _exit on Unix, bypass
-    // native exit callbacks after an observed exit-phase status override.
-    unsafe {
-        windows_sys::Win32::System::Threading::TerminateProcess(
-            windows_sys::Win32::System::Threading::GetCurrentProcess(),
-            code as u32,
-        );
-        // Only reached if terminating this process failed.
-        std::process::exit(code)
-    }
-    #[cfg(not(any(unix, windows)))]
+    #[cfg(not(unix))]
     std::process::exit(code)
 }

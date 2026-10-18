@@ -1,2 +1,4 @@
 docs/handoff export-ignore
 docs/handoff/** export-ignore
+# Preserve exact security-patch bytes on Windows, regardless of autocrlf.
+scripts/windows/*.patch -text

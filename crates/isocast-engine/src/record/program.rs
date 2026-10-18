@@ -26,7 +26,7 @@ use crate::render::{Affine, Layer, Rect, Renderer};
 use crate::scene::ItemLook;
 use crate::transition::{self, Overlay, Transitions, stinger_id};
 use crate::ycbcr::ToYCbCr;
-use crate::{EncoderFrameFormat, FramePool, Platform, Time};
+use crate::{FramePool, Platform, Time};
 
 /// What a frame is drawn for: the program, or studio mode's preview.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,24 +48,15 @@ pub(super) struct Compositor<P: Platform> {
     /// cycling native BGRA buffers that nobody will read.
     private_picture: wgpu::Texture,
     picture_view: wgpu::TextureView,
-    /// The conversion to Y'CbCr, if the platform's encoders take Y'CbCr
-    /// (see [`Platform::encoder_frame_format`]); `None` when they take
-    /// the BGRA canvas as drawn.
-    to_ycbcr: Option<ToYCbCr>,
+    to_ycbcr: ToYCbCr,
     /// What the conversion reads: `picture`.
-    picture_bound: Option<wgpu::BindGroup>,
-    /// The program's frames, handed to its outputs (encoders take them as
-    /// they are): Y'CbCr the canvas is converted into, or with no
-    /// conversion BGRA frames the canvas is drawn into directly.
+    picture_bound: wgpu::BindGroup,
+    /// Y'CbCr frames the canvas is converted into, handed to the program's
+    /// outputs (encoders take them as they are).
     pool: P::FramePool,
     /// The actual BGRA canvas, handed to monitors without a YUV round trip.
     rgb_pool: P::FramePool,
-    pictures: Vec<(
-        wgpu::Texture,
-        wgpu::TextureView,
-        Option<wgpu::BindGroup>,
-        u64,
-    )>,
+    pictures: Vec<(wgpu::Texture, wgpu::TextureView, wgpu::BindGroup, u64)>,
     canvas: (u32, u32),
     /// Raster size; scene monitors keep the layout's coordinates but draw
     /// directly into the viewer's smaller picture.
@@ -231,17 +222,12 @@ impl<P: Platform> Compositor<P> {
         filters.use_masks(true);
         let transitions = Transitions::new(&gpu, renderer.format());
         let importer = platform.frame_importer(&gpu)?;
-        let (pool, to_ycbcr) = match platform.encoder_frame_format() {
-            EncoderFrameFormat::Ycbcr => (
-                platform.ycbcr_frame_pool(size.0, size.1)?,
-                Some(ToYCbCr::new(&gpu)),
-            ),
-            EncoderFrameFormat::Bgra => (platform.frame_pool(size.0, size.1)?, None),
-        };
+        let pool = platform.ycbcr_frame_pool(size.0, size.1)?;
         let rgb_pool = platform.frame_pool(size.0, size.1)?;
         let picture = crate::scene::canvas_texture(&gpu, renderer.format(), size);
         let picture_view = picture.create_view(&Default::default());
-        let picture_bound = bind(&gpu, to_ycbcr.as_ref(), &picture);
+        let to_ycbcr = ToYCbCr::new(&gpu);
+        let picture_bound = to_ycbcr.bind(&gpu, &picture);
         Ok(Self {
             gpu,
             renderer,
@@ -600,21 +586,10 @@ impl<P: Platform> Compositor<P> {
             return Ok(Some((frame.clone(), true)));
         }
         let monitor = rgb;
-        // Without a conversion the program's frame is the BGRA canvas
-        // itself, also handed to monitors: one frame drawn, not two.
-        let direct = feed == Feed::Program && self.to_ycbcr.is_none();
-        let rgb = if monitor && !direct {
-            self.rgb_pool.take()?
-        } else {
-            None
-        };
+        let rgb = if monitor { self.rgb_pool.take()? } else { None };
         let canvas = match feed {
             Feed::Program => self.pool.take()?,
             Feed::Preview => rgb.clone(),
-        };
-        let rgb = match direct && monitor {
-            true => canvas.clone(),
-            false => rgb,
         };
         // Cached imports do not retain their CVPixelBuffers. Hold every
         // sampled source through completion, including filters submitted
@@ -638,17 +613,16 @@ impl<P: Platform> Compositor<P> {
             list.next_tick();
             list.take_draws();
         }
-        match (direct, &rgb) {
-            (true, _) => self.picture_target(&canvas)?,
-            (false, Some(rgb)) => self.picture_target(rgb)?,
-            (false, None) if self.picture != self.private_picture => {
+        match &rgb {
+            Some(rgb) => self.picture_target(rgb)?,
+            None if self.picture != self.private_picture => {
                 self.picture = self.private_picture.clone();
                 self.picture_view = self.picture.create_view(&Default::default());
-                self.picture_bound = bind(&self.gpu, self.to_ycbcr.as_ref(), &self.picture);
+                self.picture_bound = self.to_ycbcr.bind(&self.gpu, &self.picture);
             }
-            (false, None) => {}
+            None => {}
         }
-        let ycbcr = if feed == Feed::Program && !direct {
+        let ycbcr = if feed == Feed::Program {
             Some(self.target_views(&canvas)?)
         } else {
             None
@@ -663,10 +637,9 @@ impl<P: Platform> Compositor<P> {
                 self.draw_transition(feed, changing, scene, from, tick, limit)?;
             }
         }
-        if let (Some((luma, chroma)), Some(to_ycbcr), Some(bound)) =
-            (ycbcr, &self.to_ycbcr, &self.picture_bound)
-        {
-            to_ycbcr.encode(&mut encoder, bound, &luma, &chroma);
+        if let Some((luma, chroma)) = ycbcr {
+            self.to_ycbcr
+                .encode(&mut encoder, &self.picture_bound, &luma, &chroma);
         }
         let done = self.in_flight.submit(&self.gpu, encoder.finish());
         done.then(move |_| drop(inputs));
@@ -694,7 +667,7 @@ impl<P: Platform> Compositor<P> {
             None => {
                 self.picture = self.importer.target(frame)?;
                 self.picture_view = self.picture.create_view(&Default::default());
-                self.picture_bound = bind(&self.gpu, self.to_ycbcr.as_ref(), &self.picture);
+                self.picture_bound = self.to_ycbcr.bind(&self.gpu, &self.picture);
                 return Ok(());
             }
         };
@@ -709,7 +682,7 @@ impl<P: Platform> Compositor<P> {
             Some(index) => index,
             None => {
                 let view = texture.create_view(&Default::default());
-                let bound = bind(&self.gpu, self.to_ycbcr.as_ref(), &texture);
+                let bound = self.to_ycbcr.bind(&self.gpu, &texture);
                 self.pictures.push((texture, view, bound, count));
                 self.pictures.len() - 1
             }
@@ -1344,11 +1317,6 @@ impl<P: Platform> Drop for Compositor<P> {
         // the native buffers until it is actually safe to release them.
         let _ = self.in_flight.drain();
     }
-}
-
-/// What `to_ycbcr` reads `picture` through, if there is a conversion.
-fn bind(gpu: &Gpu, to_ycbcr: Option<&ToYCbCr>, picture: &wgpu::Texture) -> Option<wgpu::BindGroup> {
-    to_ycbcr.map(|to_ycbcr| to_ycbcr.bind(gpu, picture))
 }
 
 /// Add source `source` (an index) to `needed`, after what its masks show

@@ -67,15 +67,7 @@ fn run() -> Result<Value> {
             {
                 dispatch(&isocast_platform_macos::MacPlatform, case, folder)
             }
-            #[cfg(windows)]
-            {
-                dispatch(
-                    &isocast_platform_windows::WindowsPlatform::default(),
-                    case,
-                    folder,
-                )
-            }
-            #[cfg(not(any(target_os = "macos", windows)))]
+            #[cfg(not(target_os = "macos"))]
             {
                 Ok(
                     json!({"unavailable": "no native Platform implementation is selected on this OS; run stub/core only for the explicit CPU placeholder"}),

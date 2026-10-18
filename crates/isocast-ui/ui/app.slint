@@ -10,7 +10,7 @@
 
 import { Theme } from "theme.slint";
 import { Icons } from "icons.slint";
-import { Ui, ConnectionState, ExtraCanvas } from "state.slint";
+import { Ui, ConnectionState, ExtraCanvas, PlatformText } from "state.slint";
 import {
     ColumnSplitter, EditCommands, MenuHost, Menus, RowSplitter, SettingsForms, Toasts, ToastStack, Viewport,
 } from "kit.slint";
@@ -51,6 +51,7 @@ import { ProjectorsArea } from "areas/projectors/projector.slint";
 
 // What Rust sees: the globals and the structs in their models.
 export { Theme, Ui, ConnectionState, ExtraCanvas, Menus, Toasts, EditCommands, SettingsForms }
+export { PlatformText }
 export { CanvasArea, SourcesArea, MixerArea, ControlsArea, SettingsArea, LibraryArea }
 export { CreateArea }
 export { DeveloperArea }
@@ -629,7 +630,7 @@ export component AppWindow inherits Window {
         Menu {
             title: "Tools";
             MenuItem { title: "Auto-Configuration Wizard…"; activated => { Ui.menu("auto_config"); } }
-            MenuItem { title: "Set Up from This Mac…"; activated => { Ui.menu("start_over"); } }
+            MenuItem { title: "Set Up from This " + PlatformText.machine + "…"; activated => { Ui.menu("start_over"); } }
         }
         // Developer mode (#47, src/areas/developer.rs): only while the
         // profile has it on.

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::{Codec, api::Machine};
 
 pub const PROFILE_SCHEMA: u32 = 2;
-pub const MEASUREMENT_VERSION: u32 = 5;
+pub const MEASUREMENT_VERSION: u32 = 4;
 /// Only measurements whose every session was timed at least this long may
 /// back the capacity fit.
 pub const FIT_MIN_SECONDS: f64 = 0.5;
@@ -27,10 +27,6 @@ pub struct MachineProfile {
     /// Burst write speed of the profile's scratch volume, not necessarily
     /// the recording destination. Recording disk checks still run separately.
     pub disk_write_bytes_per_second: Option<f64>,
-    /// Local filesystem device containing the scratch measurement; never
-    /// apply its write rate to a different recording destination.
-    #[serde(default)]
-    pub disk_device: Option<u64>,
     /// Every planned encoder cell that has no measurement, with why: out of
     /// time, unsupported, or failed. Missing cells are never zero-cost cells.
     pub skipped: Vec<SkippedMeasurement>,
@@ -68,17 +64,6 @@ pub struct EncoderMeasurement {
     /// Pictures the encoder dropped in the timed interval, where the path
     /// reports them (live); `None` when not measured.
     pub dropped: Option<u64>,
-    /// Native session property, not inferred from the codec catalogue.
-    #[serde(default)]
-    pub hardware_accelerated: Option<bool>,
-    /// Whole-cell process CPU (including setup/drain) per timed completed
-    /// picture. Native service CPU is not included; not total CPU capacity.
-    #[serde(default)]
-    pub process_cpu_seconds_per_frame: Option<f64>,
-    /// Whole-system busy CPU, including native services and outside work,
-    /// across this cell per timed completed picture. A conservative observation.
-    #[serde(default)]
-    pub system_cpu_seconds_per_frame: Option<f64>,
 }
 
 /// The encoder path a measurement exercised. A recording writer's speed
@@ -98,9 +83,6 @@ pub enum Evidence {
     /// One of the concurrent HEVC cells the capacity fit uses, timed over a
     /// full window ([`FIT_MIN_SECONDS`]) in every session.
     Fit,
-    /// Full-window concurrent ProRes resource measurement, with actual native
-    /// hardware/software selection. Not an H.26x engine fit.
-    ProresResource,
     /// An observation only; never certified capacity.
     Diagnostic,
 }
@@ -163,24 +145,7 @@ impl EncoderMeasurement {
                 && self.codec == Codec::Hevc
                 && self.bit_depth == 8
                 && self.sessions >= 2;
-        let prores = self.evidence != Evidence::ProresResource
-            || self.resource == EncoderResource::RecordingWriter
-                && !matches!(self.codec, Codec::Hevc | Codec::H264)
-                && self.sessions >= 2
-                && self.seconds >= FIT_MIN_SECONDS
-                && self.frames >= 8 * u64::from(self.sessions)
-                && self.hardware_accelerated.is_some();
-        labels
-            && path
-            && fit
-            && prores
-            && self.dropped.is_none_or(|d| d <= 100_000)
-            && self
-                .process_cpu_seconds_per_frame
-                .is_none_or(|v| v.is_finite() && (0.0..=10.0).contains(&v))
-            && self
-                .system_cpu_seconds_per_frame
-                .is_none_or(|v| v.is_finite() && (0.0..=10.0).contains(&v))
+        labels && path && fit && self.dropped.is_none_or(|d| d <= 100_000)
     }
 }
 
@@ -258,11 +223,6 @@ impl MachineProfile {
 
     pub fn summary(&self) -> String {
         let fit = self.encoders.iter().filter(|e| e.certifies_fit()).count();
-        let prores = self
-            .encoders
-            .iter()
-            .filter(|e| e.evidence == Evidence::ProresResource)
-            .count();
         let required = self.skipped.iter().filter(|s| s.required).count();
         let skipped = match (self.skipped.len(), required) {
             (0, _) => String::new(),
@@ -270,7 +230,7 @@ impl MachineProfile {
             (n, r) => format!(", {n} cells skipped ({r} required: partial coverage)"),
         };
         format!(
-            "{}: {} encoder measurements ({fit} H.26x fit, {prores} ProRes resource cells), {} graphics sizes{skipped}; \
+            "{}: {} encoder measurements ({fit} for the capacity fit), {} graphics sizes{skipped}; \
              calibrated {} in {:.1} s",
             self.machine.chip,
             self.encoders.len(),

@@ -20,6 +20,7 @@ use isocast_protocol::change::{Change, merge_patch};
 use isocast_protocol::devices::{CameraKind, Devices, Permission};
 use isocast_protocol::governor::GovernorSettings;
 use isocast_protocol::init::{InitOptions, Layout};
+use isocast_protocol::platform_text as wording;
 use isocast_protocol::stream::{MAIN_DESTINATION, StreamService, StreamState, StreamStatus};
 use isocast_protocol::{CanvasId, EncoderQuality, QualityPreset, Setup};
 use serde_json::{Map, Value, json};
@@ -210,11 +211,17 @@ const SHORTCUTS: &[(&str, &[Shortcut])] = &[
             (&["⌘", "D"], "Center to Screen"),
             (
                 &["⌘", "C"],
-                "Copy the selected source (⌘V: paste it as a reference)",
+                wording::select(
+                    "Copy the selected source (⌘V: paste it as a reference)",
+                    "Copy the selected source (Ctrl+V: paste it as a reference)",
+                ),
             ),
             (
                 &["←", "↑", "→", "↓"],
-                "Nudge the selected source 1 px (with ⇧, 10 px)",
+                wording::select(
+                    "Nudge the selected source 1 px (with ⇧, 10 px)",
+                    "Nudge the selected source 1 px (with Shift, 10 px)",
+                ),
             ),
             (&["⌫"], "Remove the selected source from the scene"),
             (&["Esc"], "Deselect"),
@@ -229,7 +236,10 @@ const SHORTCUTS: &[(&str, &[Shortcut])] = &[
             ),
             (&["⌥", "Drag"], "Crop from an edge or corner"),
             (&["⌘", "Drag"], "Place freely, without snapping"),
-            (&["⌘", "Z"], "Undo (⇧⌘Z: redo)"),
+            (
+                &["⌘", "Z"],
+                wording::select("Undo (⇧⌘Z: redo)", "Undo (Ctrl+Shift+Z: redo)"),
+            ),
         ],
     ),
     (
@@ -237,9 +247,18 @@ const SHORTCUTS: &[(&str, &[Shortcut])] = &[
         &[
             (
                 &["Drag"],
-                "A number’s label: scrub (with ⇧, ×10; with ⌥, ×0.1)",
+                wording::select(
+                    "A number’s label: scrub (with ⇧, ×10; with ⌥, ×0.1)",
+                    "A number’s label: scrub (with Shift, ×10; with Alt, ×0.1)",
+                ),
             ),
-            (&["↑", "↓"], "In a number: step (with ⇧, ×10)"),
+            (
+                &["↑", "↓"],
+                wording::select(
+                    "In a number: step (with ⇧, ×10)",
+                    "In a number: step (with Shift, ×10)",
+                ),
+            ),
             (&["Return"], "Apply what you typed (Esc: put it back)"),
             (&["Double-click"], "A fader: back to 0 dB"),
         ],
@@ -258,7 +277,10 @@ const SHORTCUTS: &[(&str, &[Shortcut])] = &[
             (&["F2"], "In the Scenes or Sources list: rename"),
             (
                 &["←", "→"],
-                "On a slider: move it (with ⇧, ×10; Home and End: its ends)",
+                wording::select(
+                    "On a slider: move it (with ⇧, ×10; Home and End: its ends)",
+                    "On a slider: move it (with Shift, ×10; Home and End: its ends)",
+                ),
             ),
             (
                 &["↑", "↓"],
@@ -370,7 +392,7 @@ impl Default for FirstRun {
             layout: "bottom_right".into(),
             canvas: "1920x1080".into(),
             fps: 60,
-            folder: "~/Movies/Isocast".into(),
+            folder: isocast_protocol::init::DEFAULT_FOLDER.into(),
             name: "My setup".into(),
             creating: false,
         }
@@ -430,9 +452,14 @@ impl Area for Settings {
         ));
         area.set_hotkeys(model(SHORTCUTS.iter().map(|(title, rows)| HotkeyGroup {
             title: (*title).into(),
-            rows: model(rows.iter().map(|(keys, what)| HotkeyRow {
-                what: (*what).into(),
-                keys: model(keys.iter().map(|k| SharedString::from(*k))),
+            rows: model(rows.iter().map(|(keys, what)| {
+                HotkeyRow {
+                    what: (*what).into(),
+                    keys: model(
+                        keys.iter()
+                            .map(|k| SharedString::from(crate::keys::ui_key_cap(k))),
+                    ),
+                }
             })),
         })));
         area.on_server_valid(|text| server_valid(&text));
@@ -793,7 +820,10 @@ impl Area for Settings {
                     _ => Link::Failed,
                 };
                 let why = if arg.is_empty() && link == Link::Failed {
-                    "connect /tmp/isocast.sock: No such file or directory (os error 2)"
+                    wording::select(
+                        "connect /tmp/isocast.sock: No such file or directory (os error 2)",
+                        "connect to isocastd.exe: the recording engine is not available",
+                    )
                 } else {
                     arg
                 };
@@ -1557,7 +1587,10 @@ impl Settings {
                     app.toast(
                         ToastKind::Success,
                         "Stream key saved",
-                        "It’s in your Keychain; Isocast never shows it again.",
+                        format!(
+                            "It’s in your {}; Isocast never shows it again.",
+                            wording::CREDENTIAL_STORE
+                        ),
                     );
                     app.refresh_status(true);
                 }
@@ -1574,7 +1607,11 @@ impl Settings {
             Method::StreamKeyClear(Box::new(target)),
             |app, result| match result {
                 Ok(_) => {
-                    app.toast(ToastKind::Info, "Stream key removed from the Keychain", "");
+                    app.toast(
+                        ToastKind::Info,
+                        &format!("Stream key removed from the {}", wording::CREDENTIAL_STORE),
+                        "",
+                    );
                     app.refresh_status(true);
                 }
                 Err(error) => app.failed("Couldn’t remove the stream key", &error),
@@ -1625,7 +1662,13 @@ impl Settings {
                     app.session.borrow_mut().devices = Some(devices);
                     app.changed(Changed::DEVICES);
                 }
-                Err(error) => app.failed("Couldn’t list this Mac’s devices", &error),
+                Err(error) => app.failed(
+                    wording::select(
+                        "Couldn’t list this Mac’s devices",
+                        "Couldn’t list this PC’s devices",
+                    ),
+                    &error,
+                ),
             }
             app.settings.show(app);
         });
@@ -1793,6 +1836,7 @@ impl Settings {
         area.set_snap_distance(d.prefs.distance as f32);
         area.set_preview_rate(d.prefs.preview_rate.as_str().into());
         area.set_updates_available(crate::update::available());
+        area.set_automatic_updates_available(crate::update::automatic_available());
         area.set_auto_updates(d.prefs.auto_updates);
 
         // Stream: the destinations, and the open one's service, server
@@ -2638,10 +2682,7 @@ impl Settings {
                 if devices.displays.is_empty() {
                     format!(
                         "No displays found{}.",
-                        if !matches!(
-                            devices.permissions.screen_recording,
-                            Permission::Granted | Permission::Unknown
-                        ) {
+                        if devices.permissions.screen_recording != Permission::Granted {
                             " (screen recording isn’t allowed yet)"
                         } else {
                             ""
@@ -2697,11 +2738,10 @@ impl Settings {
                 disabled: false,
             });
             area.set_cameras(model(camera_choices));
-            let default_mic = devices
-                .microphones
-                .iter()
-                .find(|m| m.default)
-                .map_or("Follows System Settings", |m| m.name.as_str());
+            let default_mic = devices.microphones.iter().find(|m| m.default).map_or(
+                wording::select("Follows System Settings", "Follows Windows Settings"),
+                |m| m.name.as_str(),
+            );
             let mut mic_choices = vec![DeviceChoice {
                 value: "default".into(),
                 title: "System default".into(),

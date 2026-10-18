@@ -247,14 +247,9 @@ impl CrashSafeWriter {
     }
 
     fn append_frame(&mut self, frame: &PixelBuffer, pts: Time) -> Result<bool> {
-        if self.last_video.is_some()
-            && self.priority.as_mut().is_some_and(|p| {
-                if matches!(self.spec.video.encoder.codec, Codec::H264 | Codec::Hevc) {
-                    !p.admit()
-                } else {
-                    !p.admit_governor()
-                }
-            })
+        if matches!(self.spec.video.encoder.codec, Codec::H264 | Codec::Hevc)
+            && self.last_video.is_some()
+            && self.priority.as_mut().is_some_and(|p| !p.admit())
         {
             self.drain_ready(false)?;
             return Ok(false);
@@ -701,10 +696,6 @@ impl CrashSafeWriter {
 
 impl FileWriter for CrashSafeWriter {
     type Frame = PixelBuffer;
-
-    fn hardware_accelerated(&self) -> Option<bool> {
-        self.video.hardware_accelerated()
-    }
 
     fn intentional_video_drops(&self) -> u64 {
         self.priority

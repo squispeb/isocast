@@ -49,13 +49,7 @@ pub fn doctor<P: Platform>(platform: &P, setup: Option<&Setup>, folder: Option<&
                     SourceKind::ApplicationAudio(_) | SourceKind::SystemAudio(_)
                 )
             });
-            // Unknown counts: recording tries it rather than being blocked.
-            let either = |kind| {
-                matches!(
-                    report.permissions.get(kind),
-                    Permission::Granted | Permission::Unknown
-                )
-            };
+            let either = |kind| report.permissions.get(kind) == Permission::Granted;
             let played_missing = played
                 && !either(PermissionKind::ScreenRecording)
                 && !either(PermissionKind::SystemAudio);
@@ -77,15 +71,11 @@ pub fn doctor<P: Platform>(platform: &P, setup: Option<&Setup>, folder: Option<&
                     (Permission::NotDetermined, _) => check(
                         &name,
                         CheckStatus::Warning,
-                        "not asked yet; macOS asks the first time it is needed".into(),
-                        fix,
-                    ),
-                    // Never a problem: recording still tries it.
-                    (Permission::Unknown, _) => check(
-                        &name,
-                        CheckStatus::Warning,
-                        "unknown; it can't be checked without using it, so recording tries it"
-                            .into(),
+                        isocast_protocol::platform_text::select(
+                            "not asked yet; macOS asks the first time it is needed",
+                            "not checked yet; review Windows privacy access for desktop apps",
+                        )
+                        .into(),
                         fix,
                     ),
                     (other, true) => check(
@@ -169,7 +159,7 @@ pub fn doctor<P: Platform>(platform: &P, setup: Option<&Setup>, folder: Option<&
     // Files in folders macOS guards: reading them waits for its prompt.
     let home = std::env::var("HOME").unwrap_or_default();
     let guarded = guarded_files(setup, &home);
-    if !guarded.is_empty() {
+    if !cfg!(windows) && !guarded.is_empty() {
         checks.push(check(
             "folder access",
             CheckStatus::Warning,

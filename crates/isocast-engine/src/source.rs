@@ -14,6 +14,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use isocast_protocol::platform_text as wording;
 use isocast_protocol::{
     CameraSource, MediaSource, Setup, SlideshowSource, SourceKind, TestPatternSource, TextSource,
     ToneSource,
@@ -26,9 +27,8 @@ use crate::record::expand_home;
 use crate::synthetic::{TestPattern, Tone};
 use crate::text;
 use crate::{
-    AudioSink, BrowserControl, BrowserPage, CameraMetadataReader, CameraRequest, CaptureFormat,
-    FramePool, MediaInfo, MediaPart, MediaReader, PageLocation, Platform, SAMPLE_RATE,
-    ScreenTarget, Time, VideoSink,
+    AudioSink, BrowserControl, BrowserPage, CameraRequest, CaptureFormat, FramePool, MediaInfo,
+    MediaPart, MediaReader, PageLocation, Platform, SAMPLE_RATE, ScreenTarget, Time, VideoSink,
 };
 
 /// Audio is delivered in 10 ms chunks by generators, like a capture device.
@@ -339,8 +339,6 @@ pub(crate) struct Opened<P: Platform> {
 enum Running<P: Platform> {
     Capture {
         _capture: P::Capture,
-        /// A camera's metadata reader, from [`Platform::camera_metadata`].
-        camera: Option<CameraMetadataReader>,
     },
     Generator {
         _generator: Generator,
@@ -367,13 +365,6 @@ impl<P: Platform> Opened<P> {
             Running::Generator { _generator } => get(_generator),
             Running::Generators { _generators } => _generators.iter().find_map(get),
             Running::Browser { _watcher, .. } => _watcher.as_ref().and_then(get),
-            _ => None,
-        }
-    }
-    /// What a camera source's capture has observed, if its platform says.
-    pub(crate) fn camera_metadata(&self) -> Option<CameraMetadataReader> {
-        match &self._running {
-            Running::Capture { camera, .. } => camera.clone(),
             _ => None,
         }
     }
@@ -456,12 +447,18 @@ impl OpenHelp {
     fn context(&self) -> String {
         match (&self.permission, self.device) {
             (Some(p), _) => format!(
-                "waiting for permission: {p}; check the macOS permission prompt or Privacy & Security"
+                "waiting for permission: {p}; {}",
+                wording::select(
+                    "check the macOS permission prompt or Privacy & Security",
+                    "check Windows Settings › Privacy & security (Privacy on Windows 10); Camera and Microphone must allow desktop apps (isocastd.exe)"
+                )
             ),
-            (None, true) => "its driver, or the app that provides it, isn't answering macOS: \
+            (None, true) => format!(
+                "its driver, or the app that provides it, isn't answering {}: \
                  quit and reopen that app or unplug and replug the device (or choose another \
-                 device), then start again"
-                .into(),
+                 device), then start again",
+                wording::OS
+            ),
             (None, false) => "check its file/device, then start again".into(),
         }
     }
@@ -500,10 +497,11 @@ fn bounded_open<T: Send + 'static>(
             if now >= deadline {
                 let oldest = running.iter().map(|(_, began)| began.elapsed()).max();
                 bail!(
-                    "{what} is not answering: {} earlier opens are still waiting on macOS \
+                    "{what} is not answering: {} earlier opens are still waiting on {os} \
                      (the oldest for {} s); {context}",
                     running.len(),
-                    oldest.unwrap_or_default().as_secs()
+                    oldest.unwrap_or_default().as_secs(),
+                    os = wording::OS
                 );
             }
             pending.1.wait_for(&mut slots, deadline - now);
@@ -711,8 +709,7 @@ fn open_native<P: Platform>(
             let sink = slot_sink(&slot);
             let (capture, format) =
                 platform.capture_camera(device, request, &setup.canvas, sink)?;
-            let camera = platform.camera_metadata(&capture);
-            Ok(captured_video(slot, capture, format, camera))
+            Ok(captured_video(slot, capture, format))
         }
         SourceKind::Microphone(microphone) => {
             let (feed, sink, chunks) = audio_feed();
@@ -853,7 +850,7 @@ fn screen<P: Platform>(
     let sink = slot_sink(&slot);
     let (capture, format) =
         platform.capture_screen(target, setup.canvas.fps, ten_bit, cursor, sink)?;
-    Ok(captured_video(slot, capture, format, None))
+    Ok(captured_video(slot, capture, format))
 }
 
 /// Unload a browser source's page while the program doesn't show it
@@ -906,7 +903,6 @@ fn captured_video<P: Platform>(
     slot: Arc<FrameSlot<P::Frame>>,
     capture: P::Capture,
     format: CaptureFormat,
-    camera: Option<CameraMetadataReader>,
 ) -> Opened<P> {
     Opened {
         video: Some(Video {
@@ -916,10 +912,7 @@ fn captured_video<P: Platform>(
             fps: format.fps,
         }),
         audio: None,
-        _running: Running::Capture {
-            _capture: capture,
-            camera,
-        },
+        _running: Running::Capture { _capture: capture },
     }
 }
 
@@ -936,10 +929,7 @@ fn captured_audio<P: Platform>(
             chunks,
             channels,
         }),
-        _running: Running::Capture {
-            _capture: capture,
-            camera: None,
-        },
+        _running: Running::Capture { _capture: capture },
     }
 }
 

@@ -125,12 +125,11 @@ pub(super) fn start(daemon: &Arc<Daemon>) {
                                 message: warning.message,
                             });
                         }
-                        pressure |=
-                            crate::platform::native()
-                                .governor_headroom()
-                                .is_some_and(|sample| {
-                                    sample.encoder_threatened || sample.memory_pressed()
-                                });
+                        pressure |= crate::platform::NativePlatform
+                            .governor_headroom()
+                            .is_some_and(|sample| {
+                                sample.encoder_threatened || sample.memory_pressed()
+                            });
                     }
                 } else if last_activity.is_some_and(Activity::active) {
                     // Clear stale native warning/health once, not on idle ticks.
@@ -224,7 +223,7 @@ fn sample(
     previous.stalls = stalls;
     #[cfg(target_os = "macos")]
     {
-        sample.headroom = crate::platform::native().governor_headroom();
+        sample.headroom = crate::platform::NativePlatform.governor_headroom();
     }
     let pause = engine
         .as_ref()
@@ -326,17 +325,6 @@ fn sample(
     sample.paused = (!ready || paused) && !live_stream && !replay.iter().any(|on| *on);
     sample.has_vertical = sample.vertical_protected;
     if let Some(live) = &live {
-        for file in &live.files {
-            if file.codec.is_some_and(|codec| {
-                !matches!(
-                    codec,
-                    isocast_protocol::Codec::H264 | isocast_protocol::Codec::Hevc
-                )
-            }) {
-                sample.prores_files += 1;
-                sample.software_prores_files += u32::from(file.hardware_accelerated == Some(false));
-            }
-        }
         let frames = live.files.iter().map(|f| f.frames).sum::<u64>();
         if previous.session == session && !paused {
             progressed |= frames > previous.record_frames;

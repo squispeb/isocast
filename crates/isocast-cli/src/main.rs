@@ -18,6 +18,7 @@ use isocast_protocol::api::{
 use isocast_protocol::change::{Change, Difference, DifferenceOp};
 use isocast_protocol::devices::Devices;
 use isocast_protocol::obs::Imported;
+use isocast_protocol::platform_text as wording;
 use isocast_protocol::stream::{MAIN_DESTINATION, StreamService, StreamState, StreamStatus};
 use isocast_protocol::{CanvasId, QUICK_SOURCES, Setup, Transition};
 
@@ -78,10 +79,11 @@ fn shared_frames(_options: shared_frames::Options) -> Result<ExitCode> {
 #[command(
     name = "isocast",
     version,
-    after_help = "Getting started: `isocast permissions` shows what macOS allows, `isocast \
+    after_help = wording::select("Getting started: `isocast permissions` shows what macOS allows, `isocast \
                   setup init --apply` makes a setup from this Mac's devices, `isocast frame` \
                   saves a picture of the program, `isocast start --seconds 10` records a test, \
-                  and `isocast status` shows how it went. Agents: `isocast mcp`."
+                  and `isocast status` shows how it went. Agents: `isocast mcp`.",
+                  "Getting started: `isocast permissions` reports Windows access, `isocast setup init --apply` makes a setup from this PC's devices, `isocast frame` saves a picture of the program, `isocast start --seconds 10` records a test, and `isocast status` shows how it went. Windows Camera and Microphone settings must allow desktop apps; the recording engine is isocastd.exe. Agents: `isocast mcp`.")
 )]
 struct Cli {
     #[command(subcommand)]
@@ -382,6 +384,12 @@ enum Command {
     /// Check this Mac and a setup: permissions, hardware encoders, whether
     /// the setup's devices are connected, and the recording disk's space and
     /// speed. Exits with an error if anything would stop a recording.
+    #[cfg_attr(
+        windows,
+        command(
+            about = "Check this PC and a setup: permissions, hardware encoders, connected devices and recording disk space/speed. Exits with an error if anything would stop a recording."
+        )
+    )]
     Doctor {
         setup: Option<PathBuf>,
         /// Check this folder instead of the setup's recording.folder.
@@ -403,6 +411,12 @@ enum Command {
     /// recommend the closest that fits, as a patch for `plan` and `apply`.
     /// `start` warns when a setup exceeds what this measured. Runs in
     /// isocastd.
+    #[cfg_attr(
+        windows,
+        command(
+            about = "Benchmark this PC's encoders on a setup's files (the live setup if absent). Recommend the closest changes that fit as a patch for plan/apply. Runs in isocastd.exe; start warns when the setup exceeds the measurement."
+        )
+    )]
     Tune {
         setup: Option<PathBuf>,
         /// Benchmark writing to this folder instead of recording.folder.
@@ -416,6 +430,12 @@ enum Command {
     /// fit this Mac's video encoders, from measured per-chip data, and list
     /// the closest changes that fit as patches for `plan` and `apply`.
     /// `tune` measures instead. Runs in isocastd.
+    #[cfg_attr(
+        windows,
+        command(
+            about = "Predict whether a setup's files fit this PC's video encoders, without benchmarking, and list the closest changes that fit. tune measures instead. Runs in isocastd.exe."
+        )
+    )]
     Capacity {
         setup: Option<PathBuf>,
         /// Count the stream's encode (default: the live setup's if it
@@ -438,6 +458,12 @@ enum Command {
     /// with `isocast stream speed-test`). Then `tune` benchmarks
     /// this Mac and steps down where it can't keep up. Prints a one-line
     /// summary and the changes; --apply makes them. Runs in isocastd.
+    #[cfg_attr(
+        windows,
+        command(
+            about = "Optimize recording, streaming or both: choose settings, benchmark this PC and step down where needed. Prints a summary and changes; --apply makes them. Runs in isocastd.exe."
+        )
+    )]
     Optimize {
         /// recording, streaming or both.
         #[arg(value_parser = optimize::parse_goal)]
@@ -537,6 +563,12 @@ enum Command {
     /// for the ones not decided yet (its prompts appear; --request camera
     /// asks for that one only) and wait up to a minute for the answers;
     /// with --open, open the System Settings pane where one is turned on.
+    #[cfg_attr(
+        windows,
+        command(
+            about = "Report Windows capture, camera, microphone and system audio access. --request checks/requests access supported by the backend; --open opens its Windows Settings page. Camera and Microphone must allow desktop apps (isocastd.exe), not an individual app switch."
+        )
+    )]
     Permissions {
         /// screen_recording, camera, microphone or system_audio; all if
         /// left out.
@@ -594,6 +626,12 @@ enum Command {
     },
     /// Stream the program live over RTMP or RTMPS to the live setup's
     /// [stream] service, and keep its stream key in the Keychain.
+    #[cfg_attr(
+        windows,
+        command(
+            about = "Stream the program live over RTMP or RTMPS; keep its stream key in Credential Manager."
+        )
+    )]
     Stream {
         #[command(subcommand)]
         command: StreamCommand,
@@ -791,6 +829,10 @@ enum StreamCommand {
         command: DestinationCommand,
     },
     /// Keep or remove the stream key (in the Keychain, never in a setup).
+    #[cfg_attr(
+        windows,
+        command(about = "Keep or remove the stream key in Credential Manager, never in a setup.")
+    )]
     Key {
         #[command(subcommand)]
         command: StreamKeyCommand,
@@ -1118,6 +1160,12 @@ enum SetupCommand {
     /// the program and ISO files of the screen and camera (in isocastd).
     /// Prints it as TOML, writes it to --output, or makes it the live setup
     /// with --apply.
+    #[cfg_attr(
+        windows,
+        command(
+            about = "Make a starting setup from this PC's display, camera, microphone and desktop audio, with program and ISO recording. Print TOML, write --output, or make it live with --apply. Runs in isocastd.exe."
+        )
+    )]
     Init {
         /// Write the setup to this file (it must not exist yet).
         #[arg(long, short)]
@@ -1151,6 +1199,7 @@ enum SetupCommand {
         #[arg(long, value_name = "WxH[@FPS]")]
         canvas: Option<String>,
         /// Recording folder; ~/Movies/Isocast by default.
+        #[cfg_attr(windows, arg(help = "Recording folder; ~/Videos/Isocast by default."))]
         #[arg(long)]
         folder: Option<String>,
         /// The setup's name.
@@ -1164,6 +1213,12 @@ enum SetupCommand {
     /// ~/Library/Application Support/obs-studio, or --folder), without
     /// importing anything: each collection with the profile an import
     /// would use, and each profile's video, recording and stream settings.
+    #[cfg_attr(
+        windows,
+        command(
+            about = "Find OBS Studio's scene collections and profiles on this PC (%APPDATA%/obs-studio, or --folder), without importing anything. Reports collections and their profile's video, recording and stream settings."
+        )
+    )]
     DiscoverObs {
         /// Look in this folder instead.
         #[arg(long)]
@@ -1175,6 +1230,12 @@ enum SetupCommand {
     /// scenes and items, filters and transition, matched against this
     /// Mac's devices (in isocastd). Prints the setup as TOML, or writes it
     /// to --output, and lists what couldn't come over.
+    #[cfg_attr(
+        windows,
+        command(
+            about = "Import an OBS scene collection, matching sources against this PC's devices in isocastd.exe. Print the setup as TOML or write --output, and list what could not come over."
+        )
+    )]
     ImportObs {
         /// A collection's .json file, or its name in OBS's scenes folder
         /// (like "Recording").
@@ -2248,7 +2309,10 @@ fn init_setup(
         Client::connect_or_launch()?.call(Method::InitSetup(Box::new(
             isocast_protocol::api::InitParams { options, apply },
         )))?;
-    let mut header = vec!["Made by `isocast setup init` from this Mac's devices.".to_string()];
+    let mut header = vec![format!(
+        "Made by `isocast setup init` from this {}'s devices.",
+        wording::MACHINE
+    )];
     header.extend(made.notes.iter().cloned());
     let mut toml = String::new();
     for line in &header {
@@ -2689,7 +2753,7 @@ fn status(json: bool) -> Result<ExitCode> {
         None => println!("Live engine: stopped"),
     }
     if let Some(cpu) = status.cpu_percent {
-        println!("CPU: {cpu:.1}% of this Mac (isocastd)");
+        println!("CPU: {cpu:.1}% of this {} (isocastd)", wording::MACHINE);
     }
     if let Some(timeline) = &status.timeline {
         println!(
@@ -3184,48 +3248,13 @@ fn capacity(
             if o.assumed { " (size assumed)" } else { "" }
         );
     }
-    for resource in &estimate.resources {
-        let (scale, unit) = if resource.unit == "bytes/second" {
-            (1e6, "MB/s")
-        } else {
-            (1.0, resource.unit.as_str())
-        };
-        println!(
-            "  {}: {:.2} {}; capacity {}{}",
-            resource.resource,
-            resource.demand / scale,
-            unit,
-            resource
-                .capacity
-                .map_or_else(|| "unqualified".into(), |v| format!("{:.2}", v / scale)),
-            resource
-                .load
-                .map_or_else(String::new, |v| format!(", {:.0}% load", v * 100.0))
-        );
-        println!("    {}", resource.basis);
-    }
     let verdict = match estimate.capacity {
         Capacity::Fits => "fits",
-        Capacity::NoMargin
-            if estimate.resources.iter().any(|r| {
-                matches!(
-                    r.resource.as_str(),
-                    "prores" | "recording_disk" | "startup_recovery"
-                ) && r.capacity.is_none()
-            }) =>
-        {
-            "not qualified"
-        }
         Capacity::NoMargin => "keeps up, no margin",
         Capacity::CannotKeepUp => "can't keep up",
     };
     println!(
-        "Verdict: {verdict}, {} at {:.0}%{}",
-        if estimate.resources.is_empty() {
-            "busiest engine"
-        } else {
-            "largest modelled resource"
-        },
+        "Verdict: {verdict}, busiest engine at {:.0}%{}",
         estimate.load * 100.0,
         if estimate.streaming {
             ", stream counted"
@@ -3346,8 +3375,18 @@ fn permissions(
             println!("{}", serde_json::to_string_pretty(&opened)?);
         } else {
             println!(
-                "Opened System Settings at {}; turn the Isocast engine's app on there.",
-                permission.label()
+                "{}",
+                if cfg!(windows) {
+                    format!(
+                        "Opened Windows Settings at {}; review access for desktop apps (isocastd.exe).",
+                        permission.label()
+                    )
+                } else {
+                    format!(
+                        "Opened System Settings at {}; turn the Isocast engine's app on there.",
+                        permission.label()
+                    )
+                }
             );
         }
         return Ok(ExitCode::SUCCESS);
@@ -3361,7 +3400,11 @@ fn permissions(
         });
         if undecided {
             isocast_diagnostics::diagnostic!(
-                "Asking macOS; answer its prompts (waiting up to a minute)…"
+                "{}",
+                wording::select(
+                    "Asking macOS; answer its prompts (waiting up to a minute)…",
+                    "Checking Windows access (waiting up to a minute); Camera and Microphone settings must allow desktop apps (isocastd.exe)…"
+                )
             );
         }
     }
@@ -3926,9 +3969,20 @@ enum EngineCommand {
     Start,
     /// Let the live engine stop once nothing needs it.
     Stop,
+    /// Shut down only if recording/output work is idle; cancels an idle calibration.
+    Shutdown,
 }
 
 fn engine(command: EngineCommand, json: bool) -> Result<ExitCode> {
+    if matches!(command, EngineCommand::Shutdown) {
+        Client::shutdown_if_idle()?;
+        if json {
+            println!("{{\"stopped\":true}}");
+        } else {
+            println!("Daemon: stopped");
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
     let running = matches!(command, EngineCommand::Start);
     let mut client = match running {
         true => Client::connect_or_launch()?,
@@ -4381,8 +4435,9 @@ fn print_stream_key(stored: &StreamKey, json: bool) -> Result<ExitCode> {
         println!("{}", serde_json::to_string_pretty(stored)?);
     } else if stored.key_set {
         println!(
-            "Stream key for {} kept in the Keychain.",
-            stored.service.id()
+            "Stream key for {} kept in the {}.",
+            stored.service.id(),
+            wording::CREDENTIAL_STORE
         );
     } else {
         println!("No stream key kept for {} now.", stored.service.id());
