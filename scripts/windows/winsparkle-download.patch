@@ -29,25 +29,6 @@
  {
  
 -std::wstring GetUniqueTempDirectoryPrefix()
--{
--    wchar_t tmpdir[MAX_PATH + 1];
--    if (GetTempPath(MAX_PATH + 1, tmpdir) == 0)
--        throw Win32Exception("Cannot create temporary directory");
--
--    std::wstring dir(tmpdir);
--    dir += L"Update-";
--    return dir;
--}
--
--std::wstring CreateUniqueTempDirectory()
--{
--    // We need to put downloaded updates into a directory of their own, because
--    // if we put it in $TMP, some DLLs could be there and interfere with the
--    // installer.
--    //
--    // This code creates a new randomized directory name and tries to create it;
--    // this process is repeated if the directory already exists.
--    const std::wstring tmpdir = GetUniqueTempDirectoryPrefix();
 +// Do not inherit permissions from TEMP, or trust an environment-selected path.
 +struct PrivateDirectorySecurity
 +{
@@ -100,7 +81,25 @@
 +// wait and installer launch. Same-user, administrator and SYSTEM compromise
 +// are outside this boundary.
 +struct CheckedDirectory
-+{
+ {
+-    wchar_t tmpdir[MAX_PATH + 1];
+-    if (GetTempPath(MAX_PATH + 1, tmpdir) == 0)
+-        throw Win32Exception("Cannot create temporary directory");
+-
+-    std::wstring dir(tmpdir);
+-    dir += L"Update-";
+-    return dir;
+-}
+-
+-std::wstring CreateUniqueTempDirectory()
+-{
+-    // We need to put downloaded updates into a directory of their own, because
+-    // if we put it in $TMP, some DLLs could be there and interfere with the
+-    // installer.
+-    //
+-    // This code creates a new randomized directory name and tries to create it;
+-    // this process is repeated if the directory already exists.
+-    const std::wstring tmpdir = GetUniqueTempDirectoryPrefix();
 +    HANDLE handle;
 +
 +    CheckedDirectory(const std::wstring& path, const PrivateDirectorySecurity& security,
@@ -301,8 +300,6 @@
 +          m_created(false), m_keep(false),
            m_downloaded(0), m_total(0), m_lastUpdate(-1)
 -    {}
--
--    ~UpdateDownloadSink() { Close(); }
 +    {
 +    }
 +
@@ -320,7 +317,8 @@
 +            RemoveDirectoryW(m_dir.c_str()); // Empty only; never recurse.
 +        }
 +    }
-+
+ 
+-    ~UpdateDownloadSink() { Close(); }
 +    void Keep() { m_keep = true; }
  
      void Close()
@@ -384,13 +382,13 @@
      }
  
      Thread& m_thread;
-+    std::wstring m_dir;
+-    size_t m_downloaded, m_total;
+-    FILE *m_file;
+     std::wstring m_dir;
 +    std::unique_ptr<CheckedDirectory> m_directory;
 +    FILE *m_file;
 +    bool m_created, m_keep;
-     size_t m_downloaded, m_total;
--    FILE *m_file;
--    std::wstring m_dir;
++    size_t m_downloaded, m_total;
      std::wstring m_path;
      clock_t m_lastUpdate;
  };
@@ -400,16 +398,15 @@
      {
 -      const std::wstring tmpdir = CreateUniqueTempDirectory();
 -      Settings::WriteConfigValue("UpdateTempDir", tmpdir);
--
--      UpdateDownloadSink sink(*this, tmpdir);
 +      UpdateRoot root;
 +      const std::wstring tmpdir = CreateUniqueTempDirectory(root);
-+
+ 
+-      UpdateDownloadSink sink(*this, tmpdir);
 +      UpdateDownloadSink sink(*this, tmpdir, root.security);
        DownloadFile(m_appcast.enclosure.DownloadURL, &sink, this, Settings::GetHttpHeadersString());
        sink.Close();
  
-@@ -184,22 +447,19 @@
+@@ -184,28 +447,28 @@
        {
            SignatureVerifier::VerifyEdDSASignatureValid(sink.GetFilePath(), m_appcast.enclosure.EdDsaSignature);
        }
@@ -437,10 +434,78 @@
          UI::NotifyUpdateError(Err_BadSignature);
          throw;
      }
-@@ -223,36 +483,52 @@
-     if ( !Settings::ReadConfigValue("UpdateTempDir", tmpdir) )
-         return;
+     catch ( ... )
+     {
+-        UI::NotifyUpdateError();
++        // Every download-phase refusal (unsafe name, size, staging, transfer)
++        // means nothing verified was installed. Err_Generic is kept for the
++        // appcast check, so an unreachable feed reads as an offline error.
++        UI::NotifyUpdateError(Err_BadSignature);
+         throw;
+     }
+ }
+@@ -215,44 +478,111 @@
+                                cleanup
+  *--------------------------------------------------------------------------*/
  
++namespace
++{
++
++// Only an exact `<LocalAppData>\Isocast-Update-<uuid>` path is ever a
++// cleanup candidate.
++bool IsStagingDirectory(const UpdateRoot& root, const std::wstring& dir)
++{
++    const std::wstring& prefix = root.prefix;
++    bool valid = dir.compare(0, prefix.size(), prefix) == 0 && dir.size() == prefix.size() + 36;
++    for (size_t i = 0; valid && i < 36; ++i)
++    {
++        const wchar_t c = dir[prefix.size() + i];
++        valid = (i == 8 || i == 13 || i == 18 || i == 23) ? c == L'-' :
++            ((c >= L'0' && c <= L'9') || (c >= L'a' && c <= L'f') || (c >= L'A' && c <= L'F'));
++    }
++    return valid;
++}
++
++// Re-check the private staging lease, delete only the fixed payload name
++// through its own handle, then remove the directory only if it is empty. An
++// active download or running installer holds its files without delete
++// sharing, so it is skipped. Throws for unsafe directories: never targets.
++bool RemoveStagingDirectory(const UpdateRoot& root, const std::wstring& dir)
++{
++    {
++        CheckedDirectory directory(dir, root.security, false, true);
++        // Open the fixed payload without following a final link. Mark that
++        // same file for deletion while both directory leases hold.
++        HANDLE file = CreateFileW((dir + L"\\Isocast-update.exe").c_str(),
++            DELETE | FILE_READ_ATTRIBUTES, FILE_SHARE_READ, NULL, OPEN_EXISTING,
++            FILE_FLAG_OPEN_REPARSE_POINT, NULL);
++        if (file != INVALID_HANDLE_VALUE)
++        {
++            BY_HANDLE_FILE_INFORMATION info;
++            if (GetFileInformationByHandle(file, &info) &&
++                !(info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)))
++            {
++                FILE_DISPOSITION_INFO disposition = { TRUE };
++                SetFileInformationByHandle(file, FileDispositionInfo, &disposition, sizeof(disposition));
++            }
++            CloseHandle(file);
++        }
++    }
++    // Release only the child lease for empty-directory removal. The checked
++    // LocalAppData parent remains pinned and excludes other users' writers.
++    return RemoveDirectoryW(dir.c_str()) != 0;
++}
++
++} // anonymous namespace
++
+ void UpdateDownloader::CleanLeftovers()
+ {
+     // Note: this is called at startup. Do not use wxWidgets from this code!
+ 
+-    std::wstring tmpdir;
+-    if ( !Settings::ReadConfigValue("UpdateTempDir", tmpdir) )
+-        return;
+-
 -    // Check that the directory actually is a valid update temp dir, to prevent
 -    // malicious users from forcing us into deleting arbitrary directories:
 +    // Registry persistence is not authority to follow a path. Re-establish the
@@ -449,45 +514,50 @@
      {
 -        if (tmpdir.find(GetUniqueTempDirectoryPrefix()) != 0)
 +        UpdateRoot root;
-+        const std::wstring& prefix = root.prefix;
-+        bool valid = tmpdir.find(prefix) == 0 && tmpdir.size() == prefix.size() + 36;
-+        for (size_t i = 0; valid && i < 36; ++i)
-+        {
-+            const wchar_t c = tmpdir[prefix.size() + i];
-+            valid = (i == 8 || i == 13 || i == 18 || i == 23) ? c == L'-' :
-+                ((c >= L'0' && c <= L'9') || (c >= L'a' && c <= L'f') || (c >= L'A' && c <= L'F'));
-+        }
-+        if (!valid)
++
++        std::wstring tmpdir;
++        if ( Settings::ReadConfigValue("UpdateTempDir", tmpdir) )
          {
-             Settings::DeleteConfigValue("UpdateTempDir");
-             return;
-         }
--    }
--    catch (Win32Exception&) // cannot determine temp directory
-+        {
-+            CheckedDirectory directory(tmpdir, root.security, false, true);
-+            // Open the fixed persisted payload without following a final link.
-+            // Mark that same file for deletion while both directory leases hold.
-+            HANDLE file = CreateFileW((tmpdir + L"\\Isocast-update.exe").c_str(),
-+                DELETE | FILE_READ_ATTRIBUTES, FILE_SHARE_READ, NULL, OPEN_EXISTING,
-+                FILE_FLAG_OPEN_REPARSE_POINT, NULL);
-+            if (file != INVALID_HANDLE_VALUE)
+-            Settings::DeleteConfigValue("UpdateTempDir");
++            if (!IsStagingDirectory(root, tmpdir))
++                Settings::DeleteConfigValue("UpdateTempDir");
++            else
 +            {
-+                BY_HANDLE_FILE_INFORMATION info;
-+                if (GetFileInformationByHandle(file, &info) &&
-+                    !(info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)))
++                try
 +                {
-+                    FILE_DISPOSITION_INFO disposition = { TRUE };
-+                    SetFileInformationByHandle(file, FileDispositionInfo, &disposition, sizeof(disposition));
++                    if (RemoveStagingDirectory(root, tmpdir))
++                        Settings::DeleteConfigValue("UpdateTempDir");
 +                }
-+                CloseHandle(file);
++                catch (...) {} // An orphan, never a cleanup target.
 +            }
 +        }
-+        // Release only the child lease for empty-directory removal. The checked
-+        // LocalAppData parent remains pinned and excludes other users' writers.
-+        if (RemoveDirectoryW(tmpdir.c_str()))
-+            Settings::DeleteConfigValue("UpdateTempDir");
-+    }
++
++        // Downloads interrupted by a crash or kill are never recorded (only
++        // verified ones are). Sweep a bounded number of strictly named
++        // staging directories with the same checks; skip anything else.
++        const std::wstring parent = root.prefix.substr(0, root.prefix.rfind(L'\\') + 1);
++        WIN32_FIND_DATAW found;
++        HANDLE search = FindFirstFileExW((root.prefix + L"*").c_str(), FindExInfoBasic, &found,
++            FindExSearchLimitToDirectories, NULL, 0);
++        if (search == INVALID_HANDLE_VALUE)
+             return;
++        std::vector<std::wstring> candidates;
++        do
++        {
++            const std::wstring dir = parent + found.cFileName;
++            if ((found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
++                !(found.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
++                IsStagingDirectory(root, dir))
++                candidates.push_back(dir);
++        } while (candidates.size() < 64 && FindNextFileW(search, &found));
++        FindClose(search);
++        for (const std::wstring& dir : candidates)
++        {
++            try { RemoveStagingDirectory(root, dir); }
++            catch (...) {} // Unsafe or in use: leave it.
+         }
+     }
+-    catch (Win32Exception&) // cannot determine temp directory
 +    catch (...) // Unsafe/unavailable paths are orphans, never cleanup targets.
      {
          return;
@@ -513,13 +583,16 @@
  } // namespace winsparkle
 --- a/src/download.cpp
 +++ b/src/download.cpp
-@@ -284,33 +284,33 @@
+@@ -284,34 +284,34 @@
      bool filename_set = false;
      if ( HttpQueryInfoA(conn, HTTP_QUERY_CONTENT_DISPOSITION, contentDisposition, &cdSize, NULL) )
      {
 -        char *ptr = strstr(contentDisposition, "filename=");
 -        if ( ptr )
--        {
++        const std::string disposition(contentDisposition, cdSize);
++        const size_t nameAt = disposition.find("filename=");
++        if ( nameAt != std::string::npos )
+         {
 -            char c_filename[512];
 -            ptr += 9;
 -            while ( *ptr == ' ' )
@@ -527,10 +600,6 @@
 -
 -            bool quoted = false;
 -            if ( *ptr == '"' || *ptr == '\'')
-+        const std::string disposition(contentDisposition, cdSize);
-+        const size_t nameAt = disposition.find("filename=");
-+        if ( nameAt != std::string::npos )
-+        {
 +            std::string name = disposition.substr(nameAt + 9);
 +            const size_t start = name.find_first_not_of(" \t");
 +            if (start == std::string::npos)
@@ -562,13 +631,14 @@
 +            sink->SetFilename(AnsiToWide(name));
              filename_set = true;
          }
-+    }
+     }
 +    else if (GetLastError() == ERROR_INSUFFICIENT_BUFFER)
 +    {
 +        throw std::runtime_error("Update filename header is too large");
-     }
++    }
  
      if ( !filename_set )
+     {
 --- a/src/ui.cpp
 +++ b/src/ui.cpp
 @@ -847,16 +847,16 @@
@@ -576,17 +646,20 @@
      LayoutChangesGuard guard(this);
  
 -    m_heading->SetLabel(_("Update Error!"));
-+    m_heading->SetLabel(_("Isocast update not installed"));
- 
+-
      wxString msg;
      switch (err)
      {
-         case Err_Generic:
+-        case Err_Generic:
 -            msg = _("An error occurred in retrieving update information; are you connected to the internet? Please try again later.");
-+            msg = _("This update couldn't be verified and wasn't installed");
++        case Err_Generic: // The appcast check: offline, unreachable or unreadable.
++            m_heading->SetLabel(_("Couldn't check for updates"));
++            msg = _("Isocast couldn't reach its update server. Check your internet connection and try again later.");
              break;
-         case Err_BadSignature:
+-        case Err_BadSignature:
 -            msg = _("The update is improperly signed.");
++        case Err_BadSignature: // Any refused download, including unsafe names.
++            m_heading->SetLabel(_("Isocast update not installed"));
 +            msg = _("This update couldn't be verified and wasn't installed");
              break;
      }

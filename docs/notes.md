@@ -5,6 +5,27 @@ each section. Delete entries that stop being true.
 
 ## Environment
 
+- 2026-10-18 (#105 hosted CI daemon launch): a hosted Actions step runs
+  inside a job object that forbids breakaway. The CLI deliberately launches
+  isocastd with `CREATE_BREAKAWAY_FROM_JOB` and never retries attached, so
+  a recording can't die with its caller. On the runner that launch fails
+  with "Access is denied (os error 5)", which is not a file lock or a path
+  problem. Reproduced exactly on exon-desk and in the VM by running the
+  step inside a fresh default job.
+  - The wording and install steps now start their throwaway isocastd
+    themselves, as the step's child. They wait until `isocast status
+    --json` reports that PID, then use the CLI, and wait for exit on
+    shutdown.
+  - The wording step prints the step's job flags as evidence.
+  - The CLI's own adjacent launch stays qualified by the clean-VM
+    Start-menu lifecycle.
+- 2026-10-18 (#105 B1 review follow-ups): `Err_Generic` (the appcast check)
+  now says "Couldn't check for updates" with an internet hint. Every refused
+  download reports `Err_BadSignature` with the "couldn't be verified" text.
+  `CleanLeftovers` also sweeps up to 64 `Isocast-Update-<uuid>` folders
+  with the same owner, protected-ACL and fixed-name checks, so a download
+  killed mid-transfer no longer leaves its partial file behind. Folders in
+  use stay: they are held without delete sharing.
 - 2026-10-18 (#105 B1 updater confinement): upstream WinSparkle 0.9.4
   wrote a download under the server's `Content-Disposition` name before
   checking the signature, and no fixed release exists. `winsparkle.ps1`

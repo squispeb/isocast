@@ -112,8 +112,14 @@ ships the prebuilt DLL. The patch:
   `[A-Za-z0-9._-]+\.exe` with no `..` that isn't a device name;
 - requires Ed25519 (no DSA or unsigned fallback) and caps the payload at
   1 GiB;
-- deletes refused folders without recursion, through held handles;
-- tells the user "This update couldn't be verified and wasn't installed".
+- deletes refused folders without recursion, through held handles. At
+  startup it also sweeps folders left by an interrupted download (up to 64
+  strictly named, private ones), never touching one in use or one it didn't
+  create;
+- tells the user "This update couldn't be verified and wasn't installed"
+  for any refused download. An unreachable or unreadable feed instead shows
+  "Couldn't check for updates" / "Isocast couldn't reach its update server.
+  Check your internet connection and try again later."
 
 The app refuses a WinSparkle DLL that lacks the patch's
 `win_sparkle_isocast_confined_downloads` export (it must return `1`). The

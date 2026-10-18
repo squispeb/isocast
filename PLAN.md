@@ -1849,6 +1849,16 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
 
 ## Log
 
+- W.7b hosted CI fix and B1 follow-ups (2026-10-18, #105): run
+  39161376599 failed because the hosted step's job forbids breakaway and the
+  CLI deliberately won't start a daemon its caller's job could kill. The
+  wording and install steps now start their own isocastd. Both pass natively
+  inside a fresh no-breakaway job (the old step reproduced "Access is
+  denied"). WinSparkle now shows a distinct offline message and sweeps
+  staging folders left by interrupted downloads. Clean VM: a killed
+  mid-download folder was removed at the next start, decoys were kept, the
+  offline wording showed, and all 23 hostile names were still refused.
+
 - W.7b B1 updater confinement (2026-10-18, #105): WinSparkle 0.9.4 now
   builds from pinned source with `winsparkle-download.patch`. Each update
   downloads only to `Isocast-update.exe` in a private per-user staging

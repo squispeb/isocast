@@ -211,9 +211,26 @@ jobs:
             tools = @('menu-bar-open:Tools')
             files = @('replay:saved')
           }
+          # A hosted step runs in a job object that forbids breakaway, and
+          # the CLI deliberately refuses to start a daemon that its caller's
+          # job could kill (os error 5), so a recording always outlives its
+          # caller. Start this throwaway daemon as the step's own child.
+          Add-Type -Namespace Probe -Name Job -MemberDefinition '[DllImport("kernel32.dll")] public static extern bool IsProcessInJob(IntPtr p, IntPtr j, out bool r); [DllImport("kernel32.dll")] public static extern bool QueryInformationJobObject(IntPtr j, int c, byte[] i, int n, IntPtr r);'
+          $inJob = $false; $null = [Probe.Job]::IsProcessInJob([Diagnostics.Process]::GetCurrentProcess().Handle, [IntPtr]::Zero, [ref]$inJob)
+          $limits = New-Object byte[] 144
+          $flags = if ([Probe.Job]::QueryInformationJobObject([IntPtr]::Zero, 9, $limits, 144, [IntPtr]::Zero)) { [BitConverter]::ToUInt32($limits, 16) } else { 0 }
+          "step job: in_job=$inJob breakaway_ok=$([bool]($flags -band 0x1800)) limit_flags=0x$($flags.ToString('x'))"
+          $daemon = Start-Process $env:ISOCAST_DAEMON -PassThru -NoNewWindow -RedirectStandardOutput "$work/isocastd.out" -RedirectStandardError "$work/isocastd.err"
+          $null = $daemon.Handle
           try {
+            $deadline = (Get-Date).AddSeconds(60)
+            do {
+              Start-Sleep -Milliseconds 250
+              $status = & "$bin/isocast.exe" status --json | ConvertFrom-Json
+            } until ($status.daemon.pid -eq $daemon.Id -or $daemon.HasExited -or (Get-Date) -gt $deadline)
+            if ($status.daemon.pid -ne $daemon.Id) { throw 'Isolated wording daemon did not start' }
             & "$bin/isocast.exe" get --json | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw 'Isolated wording daemon did not start' }
+            if ($LASTEXITCODE -ne 0) { throw 'Isolated wording daemon did not answer' }
             foreach ($view in $views.GetEnumerator()) {
               $arguments = @('--snapshot', "$work/$($view.Key).png", '--size', '1440x900', '--scale', '2', '--a11y')
               foreach ($state in $view.Value) { $arguments += @('--state', $state) }
@@ -229,7 +246,7 @@ jobs:
             }
           } finally {
             & "$bin/isocast.exe" engine shutdown --json
-            if ($LASTEXITCODE -ne 0) { throw 'Could not shut down isolated wording daemon' }
+            if (-not $daemon.WaitForExit(15000)) { $daemon.Kill(); throw 'Could not shut down isolated wording daemon' }
           }
 
       - name: Keep native Windows wording evidence
@@ -266,12 +283,19 @@ jobs:
           & "$install\isocast.exe" --help
           if ($LASTEXITCODE -ne 0) { throw 'Installed CLI did not load' }
           $env:ISOCAST_CALIBRATION = 'off'
-          & "$install\isocast.exe" get --json | Out-Null
-          if ($LASTEXITCODE -ne 0) { throw 'Installed CLI could not launch its adjacent daemon' }
-          $status = & "$install\isocast.exe" status --json | ConvertFrom-Json
-          if ($LASTEXITCODE -ne 0 -or -not $status.daemon.pid) { throw 'No real installed daemon PID was reported' }
-          $daemon = Get-Process -Id $status.daemon.pid
+          # The step's job forbids breakaway, so the CLI refuses to launch the
+          # daemon itself (see the wording step); start the installed one.
+          # The clean-VM lifecycle qualifies the CLI's own adjacent launch.
+          $daemon = Start-Process "$install\isocastd.exe" -PassThru -NoNewWindow -RedirectStandardOutput "$env:RUNNER_TEMP/installed-isocastd.out" -RedirectStandardError "$env:RUNNER_TEMP/installed-isocastd.err"
           $null = $daemon.Handle # Retain this process identity even if its PID is reused.
+          $deadline = (Get-Date).AddSeconds(60)
+          do {
+            Start-Sleep -Milliseconds 250
+            $status = & "$install\isocast.exe" status --json | ConvertFrom-Json
+          } until ($status.daemon.pid -eq $daemon.Id -or $daemon.HasExited -or (Get-Date) -gt $deadline)
+          if ($status.daemon.pid -ne $daemon.Id) { throw 'The installed daemon did not start' }
+          & "$install\isocast.exe" get --json | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Installed CLI could not reach its daemon' }
           New-Item -ItemType Directory -Force "$install\recordings", "$env:LOCALAPPDATA\Isocast" | Out-Null
           'keep recording' | Set-Content "$install\recordings\keep.mp4"
           'keep settings' | Set-Content "$env:LOCALAPPDATA\Isocast\packaging-sentinel"
