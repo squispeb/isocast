@@ -16,6 +16,7 @@ pub mod devices;
 pub mod diagnostics;
 mod fields;
 mod filter;
+pub mod governor;
 pub mod hotkeys;
 pub mod init;
 pub mod isoprj;
@@ -24,6 +25,7 @@ pub mod library;
 pub mod located;
 pub mod machine;
 pub mod manifest;
+mod mask;
 pub mod obs;
 pub mod optimize;
 pub mod plugin;
@@ -43,6 +45,7 @@ pub use content::{Content, ContentKind};
 pub use fields::UnknownFields;
 pub use filter::*;
 pub use layout::Layout;
+pub use mask::*;
 pub use source::*;
 pub use transition::*;
 
@@ -104,6 +107,11 @@ pub struct Setup {
         skip_serializing_if = "developer::DeveloperSettings::is_default"
     )]
     pub developer: developer::DeveloperSettings,
+    #[serde(
+        default,
+        skip_serializing_if = "governor::GovernorSettings::is_default"
+    )]
+    pub governor: governor::GovernorSettings,
 }
 
 /// Audio settings for the whole setup.
@@ -2025,6 +2033,7 @@ impl Setup {
             hotkeys: Default::default(),
             virtual_camera: Default::default(),
             developer: Default::default(),
+            governor: Default::default(),
         })
     }
 
@@ -2141,6 +2150,14 @@ impl Setup {
     /// list means the setup is valid.
     pub fn validate(&self) -> Vec<Issue> {
         let mut issues = Issues::default();
+        if self.governor.pins.len() > 128 {
+            issues.add("governor.pins", "at most 128 pins");
+        }
+        for (i, pin) in self.governor.pins.iter().enumerate() {
+            if !governor::GovernorSettings::valid_pin(pin) {
+                issues.add(format!("governor.pins[{i}]"), "valid pins: preview.fps, recording.iso.fps, recording.iso.sources.<source-id>.fps, vertical.fps, stream.video_bitrate_kbps");
+            }
+        }
 
         if self.version != SETUP_VERSION {
             issues.add(
@@ -2302,6 +2319,7 @@ impl Setup {
         for (i, source) in self.sources.iter().enumerate() {
             audio_filter::check_chain(&format!("sources[{i}]"), source, &audio, &mut issues);
         }
+        mask::check_mask_refs(self, &video, &mut issues);
 
         animation::check_keyframes(&self.keyframes, &mut issues);
         let keyframes: Vec<&str> = self.keyframes.iter().map(|k| k.id.as_str()).collect();
