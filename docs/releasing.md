@@ -35,63 +35,6 @@ exists at the tag and isn't empty. A published version ends the run green
 with "nothing to build or draft" and never asks for an approval; a missing
 tag, a mismatch or missing notes fail there with the reason.
 
-## Windows packaging (W.7, qualification in progress)
-
-Windows uses **Inno Setup 7.1.0**, pinned by version and SHA-256 in
-`scripts/windows/package.ps1`. Its source licence permits open-source and
-commercial use; the vendor requests commercial licences but its
-[licensing FAQ](https://jrsoftware.org/isorder.php#required) says purchase is
-not strictly required and is not expected during qualification. No purchase
-has been made. Unlike MSIX, this keeps the existing native daemon/CLI layout
-and ordinary user-data paths without package identity or filesystem
-virtualization. It installs per user in `%LOCALAPPDATA%\Programs\Isocast`,
-with the app, CLI and `isocastd.exe` beside each other and the x64 Visual C++
-CRT app-local; it needs no administrator prompt or machine-wide runtime.
-There is one Start menu shortcut and no service or PATH modification. WinGet
-distribution is later work, not a requirement to install the alpha.
-
-The Windows CI engine job builds release binaries with the locked Cargo tree,
-packages them with that compiler, exercises install/CLI-load/uninstall, and
-retains `windows-x64-unsigned`. `payload/package.json` records the compiler
-digest and each payload file's digest. This is a pinned packaging recipe,
-**not yet a claim of bit-identical Rust builds across runner images**. The
-delegator runs it through `scripts/windows-ci.sh`; agents do not dispatch,
-push, upload releases or publish. The app still has no Windows updater in
-this first slice. Do not distribute these unsigned qualification installers
-as signed or update-capable releases.
-
-For an already-built Windows payload:
-
-```powershell
-./scripts/windows/package.ps1 -BinDir target/release `
-  -OutputDir C:\isocast-dev\packages\candidate `
-  -ToolsDir C:\isocast-dev\package-tools `
-  -CrtDir '<Visual Studio VC\Redist\MSVC\version\x64\Microsoft.VC143.CRT>'
-```
-
-`OutputDir` must be new. The compiler is installed only inside `ToolsDir`.
-The package never force-quits the app or engine: close them after recording,
-streaming and exports finish. A busy executable blocks installation or
-uninstallation. Uninstall removes only packaged files and the shortcut;
-it does not remove `%LOCALAPPDATA%\Isocast` (the engine's existing state root),
-recordings, credentials or unknown
-files inside the installation directory. A deliberate downgrade requires
-the older trusted installer and `/ALLOWDOWNGRADE=1`; this flag is not an
-automatic update policy. Preserve the previous installer before upgrading.
-
-**Remaining release boundary:** the authentic updater must verify an
-Ed25519-signed Windows installer using an embedded public key, with its own
-`appcast-windows.xml` beside the Mac appcast (never replacing it), and use
-the engine's atomic idle shutdown before installation. Qualification must
-prove signature/tamper rejection, live-recording refusal and rollback before
-W.7 is complete. Authenticode signing belongs in the protected `release`
-environment: sign the three executables, build the installer, sign that
-installer, then calculate its checksum and appcast signature. Require a
-trusted code-signing certificate, SHA-256 and RFC3161 timestamping; no signing
-credential is built into or stored beside the app. Signing, enabling a
-production update feed, release asset validation changes and publication
-remain the delegator/Ryan's work. The existing Mac pipeline is unchanged.
-
 ## One-time setup (Ryan)
 
 ### 1. Publish the workflow and protect its environment

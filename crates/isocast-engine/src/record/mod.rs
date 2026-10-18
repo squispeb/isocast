@@ -54,8 +54,8 @@ pub use shared_frames::{DEFAULT_SLOTS, SharedControl, SharedEvent, SharedFeed};
 
 use crate::source::{AUDIO_CHUNK, FrameSlot};
 use crate::{
-    AudioTrackSpec, BrowserControl, FileWriter, Platform, SAMPLE_RATE, Time, VideoTrackSpec,
-    WriterSpec,
+    AudioTrackSpec, BrowserControl, CameraMetadataReader, FileWriter, Platform, SAMPLE_RATE, Time,
+    VideoTrackSpec, WriterSpec,
 };
 
 /// How far ahead of "now" the session clock starts, so every source and
@@ -888,6 +888,10 @@ pub enum Packet<F> {
 struct Formats {
     video: BTreeMap<String, (u32, u32, u32)>,
     audio: BTreeMap<String, u32>,
+    /// Metadata readers of the cameras open when the session started, read
+    /// only when a manifest is written. A device opened later (a changed
+    /// source) isn't one of them, so its counters never mix in.
+    cameras: BTreeMap<String, CameraMetadataReader>,
 }
 
 /// Frame slots by source id.
@@ -1237,6 +1241,7 @@ fn take_manifest<P: Platform>(
     stops: &[AudioStopped],
     control: Option<&SessionControl>,
     vertical_control: Option<&SessionControl>,
+    cameras: &BTreeMap<String, CameraMetadataReader>,
 ) -> SessionManifest {
     let finished = status != SessionStatus::Recording;
     let mapped = |at| control.map_or(at, |c| c.recording_time(at));
@@ -1395,6 +1400,15 @@ fn take_manifest<P: Platform>(
             })
             .collect(),
         errors: errors.to_vec(),
+        // Frozen once the take's final manifest is made, so restating it
+        // later never adds what the cameras saw after the take ended.
+        cameras: match &take.manifest {
+            Some(manifest) => manifest.cameras.clone(),
+            None => cameras
+                .iter()
+                .map(|(id, read)| (id.clone(), read()))
+                .collect(),
+        },
     }
 }
 

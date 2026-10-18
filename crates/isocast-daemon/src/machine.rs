@@ -25,8 +25,6 @@ pub(super) struct Calibration {
     path: PathBuf,
     status: MachineStatus,
     automatic: bool,
-    /// The running helper was scheduled automatically, rather than requested.
-    background: bool,
 }
 
 impl Calibration {
@@ -211,7 +209,7 @@ impl Daemon {
                 daemon.poll_calibration();
                 let automatic = daemon.machine.lock().automatic;
                 if automatic && Instant::now() >= next {
-                    if let Err(error) = daemon.begin_calibration(true)
+                    if let Err(error) = daemon.machine_calibrate()
                         && error.code != RpcError::WRONG_STATE
                     {
                         let mut calibration = daemon.machine.lock();
@@ -244,21 +242,7 @@ impl Daemon {
         Ok(result)
     }
 
-    pub(super) fn cancel_background_calibration(&self) -> Result<(), RpcError> {
-        let mut calibration = self.machine.lock();
-        if calibration.child.is_some() && calibration.background {
-            calibration
-                .stop("Automatic calibration deferred while the live engine previews")
-                .map_err(failed)?;
-        }
-        Ok(())
-    }
-
     pub(super) fn machine_calibrate(&self) -> Result<MachineStatus, RpcError> {
-        self.begin_calibration(false)
-    }
-
-    fn begin_calibration(&self, automatic: bool) -> Result<MachineStatus, RpcError> {
         // Start calls hold the read side until output state is published.
         // Taking the write side makes idle-check + helper launch atomic.
         let _gate = self.starting.try_write().ok_or_else(busy)?;
@@ -268,17 +252,9 @@ impl Daemon {
         if !cfg!(target_os = "macos") || crate::this_machine().is_none() {
             return Err(failed("this platform has no calibration backend yet"));
         }
-        let previewing = {
-            let state = self.state.read();
-            state.engine.is_some() || state.starting || state.hold
-        };
         let mut calibration = self.machine.lock();
         if calibration.child.is_some() {
             return Ok(calibration.status(true));
-        }
-        if automatic && previewing {
-            calibration.status.summary = "Automatic calibration deferred while the live engine previews; using the per-chip table".into();
-            return Err(busy());
         }
         let parent = calibration
             .path
@@ -319,7 +295,6 @@ impl Daemon {
             }
         };
         calibration.child = Some(child);
-        calibration.background = automatic;
         calibration.started = Some(started);
         calibration.scratch = Some(scratch);
         calibration.status.running = true;

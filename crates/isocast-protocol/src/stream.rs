@@ -794,8 +794,7 @@ pub struct StreamStatus {
     pub height: u32,
     #[serde(default)]
     pub fps: u32,
-    /// Video bitrate acknowledged by the active shared encoder (including
-    /// a governor override); the intended bitrate remains in the setup.
+    /// The bitrates the setup asks for.
     #[serde(default)]
     pub target_video_kbps: u32,
     #[serde(default)]

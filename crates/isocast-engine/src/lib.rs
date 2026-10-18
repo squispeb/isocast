@@ -15,12 +15,10 @@ pub mod doctor;
 pub(crate) mod draw_list;
 pub mod estimate;
 pub mod filter;
-pub mod governor;
 pub mod gpu;
 pub mod hotkeys;
 pub mod layout;
 pub mod machine_profile;
-mod mask;
 mod pacing;
 mod picture;
 pub mod project;
@@ -194,11 +192,6 @@ pub trait Platform: Clone + Send + Sync + 'static {
         None
     }
 
-    /// Read the existing sampler's latest non-consuming headroom observation.
-    fn governor_headroom(&self) -> Option<governor::Headroom> {
-        None
-    }
-
     /// The CPU time the calling thread has used so far, if the OS tells:
     /// what the compositor costs per frame is measured with it.
     fn thread_cpu_time(&self) -> Option<std::time::Duration> {
@@ -271,6 +264,15 @@ pub trait Platform: Clone + Send + Sync + 'static {
         canvas: &Canvas,
         sink: VideoSink<Self::Frame>,
     ) -> anyhow::Result<(Self::Capture, CaptureFormat)>;
+
+    /// A reader of what a camera capture from [`Platform::capture_camera`]
+    /// has observed, for the session manifest. `None` (the default) when
+    /// the platform reports nothing. The reader must hold only the
+    /// device's identity and shared flags, never the capture or GPU
+    /// resources, so it stays readable after the capture stops.
+    fn camera_metadata(&self, _capture: &Self::Capture) -> Option<CameraMetadataReader> {
+        None
+    }
 
     /// Start capturing a microphone ("default", or an id, name or part of
     /// a name from [`Platform::devices`]): the input channels `channels`
@@ -407,12 +409,6 @@ pub struct ParameterSets {
 /// and come out, in decode order, from [`VideoEncoder::receive`].
 pub trait VideoEncoder: Send {
     type Frame;
-
-    /// Cumulative intentional admission refusals included in `dropped()`.
-    /// They remain losses in public accounting, but aren't new overloads.
-    fn intentional_video_drops(&self) -> u64 {
-        0
-    }
 
     /// Rank the canvas's live output ahead of ISO encodes; main comes first.
     fn prioritize_video(&mut self, _canvas: isocast_protocol::CanvasId) {}
@@ -646,6 +642,11 @@ pub type SamplesCallback = Box<dyn Fn(&[f32], Time) + Send + Sync>;
 /// Fills a buffer of interleaved stereo samples for an output device.
 pub type AudioRender = Box<dyn FnMut(&mut [f32]) + Send>;
 
+/// Reads a camera capture's metadata as observed so far. Called only when
+/// a session manifest is written, never per frame.
+pub type CameraMetadataReader =
+    Arc<dyn Fn() -> isocast_protocol::CameraCaptureMetadata + Send + Sync>;
+
 /// Where a running audio capture delivers samples. Called on the capture's
 /// own threads.
 pub struct AudioSink {
@@ -712,12 +713,6 @@ pub trait FramePool: Send {
 /// tracks, all timed on the master clock.
 pub trait FileWriter: Send {
     type Frame;
-
-    /// Cumulative deliberate admission refusals. Read around append_video
-    /// so a later policy restoration cannot reclassify a refused picture.
-    fn intentional_video_drops(&self) -> u64 {
-        0
-    }
 
     /// Protect this program output ahead of optional ISO encodes when the
     /// platform's shared encoder hardware is overloaded.

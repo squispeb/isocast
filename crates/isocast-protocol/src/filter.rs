@@ -10,7 +10,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{Color, GradientMask, Issues, ShapeMask, SourceMask};
+use crate::{Color, Issues};
 
 /// One filter in a source's chain.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -700,7 +700,4 @@ filter_kinds! {
     "image_mask" => ImageMask(ImageMask),
     "lut" => ApplyLut(ApplyLut),
     "render_delay" => RenderDelay(RenderDelay),
-    "shape_mask" => ShapeMask(ShapeMask),
-    "gradient_mask" => GradientMask(GradientMask),
-    "source_mask" => SourceMask(SourceMask),
 }

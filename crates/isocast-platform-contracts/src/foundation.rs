@@ -874,7 +874,9 @@ fn bgra_plane(frame: &GpuFrame, what: &str) -> Result<(&'static str, wgpu::Textu
     let (kind, texture) = match &frame.pixels {
         GpuPixels::Rgb(texture) => ("rgb", texture.clone()),
         GpuPixels::Premultiplied(texture) => ("premultiplied", texture.clone()),
-        GpuPixels::YCbCr { .. } => bail!("{what}: a BGRA frame was imported as Y'CbCr planes"),
+        GpuPixels::YCbCr { .. } | GpuPixels::YCbCrBiPlanar { .. } => {
+            bail!("{what}: a BGRA frame was imported as Y'CbCr planes")
+        }
     };
     check_texture(&texture, what, wgpu::TextureUsages::TEXTURE_BINDING)?;
     Ok((kind, texture))

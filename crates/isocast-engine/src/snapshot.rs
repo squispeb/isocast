@@ -12,7 +12,7 @@ use crate::compiled::{NodeIds, compile};
 use crate::content::{Contents, Sizer};
 use crate::data::DataStore;
 use crate::draw_list::DrawList;
-use crate::filter::{Filters, MaskKey};
+use crate::filter::Filters;
 use crate::gpu::{FrameImporter, Gpu};
 use crate::layout::{Layouter, settings_size};
 use crate::render::{Affine, Layer, Renderer, read_png};
@@ -68,8 +68,6 @@ impl<P: Platform> Graphics<P> {
         max_width: Option<u32>,
     ) -> Result<(Vec<u8>, u32, u32)> {
         let frame = self.importer.import(frame)?;
-        // A source alone shows unmasked by other sources (#115).
-        self.filters.use_masks(false);
         let frame = self.filters.apply(
             &self.gpu,
             &self.renderer,
@@ -101,20 +99,32 @@ impl<P: Platform> Graphics<P> {
         let canvas = (setup.canvas.width, setup.canvas.height);
         let (width, height) = fit(canvas.0, canvas.1, max_width);
         let scale = width as f32 / canvas.0 as f32;
-        let mut imported = Vec::with_capacity(frames.len());
+        let mut pictures = Vec::with_capacity(frames.len());
         for (id, frame) in frames {
-            imported.push((id.as_str(), self.importer.import(frame)?));
+            let mut frame = self.importer.import(frame)?;
+            if let Some(source) = setup.source(id) {
+                frame = self.filters.apply(
+                    &self.gpu,
+                    &self.renderer,
+                    id,
+                    frame,
+                    &source.filters,
+                    self.clock.now(),
+                );
+            }
+            pictures.push((id, frame));
         }
-        let filters_of = |id: &str| setup.source(id).map_or(&[][..], |s| &s.filters[..]);
-        // Laid out with the pictures' sizes after their filters, as the
-        // program does.
+        // Laid out with the pictures' sizes, as the program does.
         let size_of = |id: &str| {
-            imported
+            pictures
                 .iter()
                 .find(|(source, _)| *source == id)
                 .map(|(_, frame)| (frame.width, frame.height))
-                .or_else(|| settings_size(&setup.source(id)?.kind, canvas))
-                .map(|size| crate::filter::output_size(filters_of(id), size))
+                .or_else(|| {
+                    let source = setup.source(id)?;
+                    let size = settings_size(&source.kind, canvas)?;
+                    Some(crate::filter::output_size(&source.filters, size))
+                })
         };
         let mut ids = NodeIds::default();
         let mut scenes = setup.scenes.clone();
@@ -144,65 +154,12 @@ impl<P: Platform> Graphics<P> {
         let start = crate::Time::from_nanos(0);
         let mut list = DrawList::new(&self.gpu, &self.renderer, compiled.clone(), start);
         list.animate(index, start, start, start);
-        // Through their filters, what masks others (#115) before what it
-        // masks; scenes that mask are drawn from the pictures before them.
-        self.filters.use_masks(false);
-        self.filters.use_masks(true);
-        let ids: Vec<&str> = imported.iter().map(|(id, _)| *id).collect();
-        let masking: Vec<&str> = ids
-            .iter()
-            .flat_map(|id| setup.masks_of(id))
-            .filter_map(|mask| match mask {
-                isocast_protocol::MaskRef::Source(id) => Some(id),
-                isocast_protocol::MaskRef::Scene(_) => None,
-            })
-            .collect();
-        let now = self.clock.now();
-        for id in mask_order(setup, &ids) {
-            let Some((_, frame)) = imported.iter().find(|(source, _)| *source == id) else {
-                continue;
-            };
-            for mask in setup.masks_of(id) {
-                let isocast_protocol::MaskRef::Scene(scene) = mask else {
-                    continue;
-                };
-                let Some(at) = compiled.scene_index(Some(scene)) else {
-                    continue;
-                };
-                list.animate(at, start, start, start);
-                let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
-                list.upload(&mut encoder);
-                let canvas = list.encode_canvas(&self.gpu, &self.renderer, &mut encoder, at);
-                self.gpu.queue.submit([encoder.finish()]);
-                let key = MaskKey::Scene(scene.to_string());
-                self.filters.set_mask(
-                    &self.gpu,
-                    &self.renderer,
-                    key,
-                    &canvas,
-                    Some((setup.canvas.width, setup.canvas.height)),
-                    None,
-                );
-            }
-            let frame = self.filters.apply(
-                &self.gpu,
-                &self.renderer,
-                id,
-                frame.clone(),
-                filters_of(id),
-                now,
-            );
-            if masking.contains(&id) {
-                let key = MaskKey::Source(id.to_string());
-                self.filters
-                    .set_mask(&self.gpu, &self.renderer, key, &frame, None, None);
-            }
+        for (id, frame) in &pictures {
             if let Some(source) = compiled.source_index(id) {
-                let group = self.renderer.frame_group(&self.gpu, &frame);
-                list.set_picture(source, Some((&frame, group)));
+                let group = self.renderer.frame_group(&self.gpu, frame);
+                list.set_picture(source, Some((frame, group)));
             }
         }
-        list.animate(index, start, start, start);
         let target = self.renderer.png_target(&self.gpu, width, height)?;
         let view = target.create_view(&Default::default());
         let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
@@ -218,32 +175,6 @@ impl<P: Platform> Graphics<P> {
         let png = read_png(&self.gpu, encoder, &target)?;
         Ok((png, width, height))
     }
-}
-
-/// `ids` in an order where what a source's masks show comes before it.
-fn mask_order<'a>(setup: &'a Setup, ids: &[&'a str]) -> Vec<&'a str> {
-    fn visit<'a>(
-        setup: &'a Setup,
-        ids: &[&'a str],
-        id: &'a str,
-        out: &mut Vec<&'a str>,
-        depth: u32,
-    ) {
-        if out.contains(&id) || depth > isocast_protocol::MAX_MASK_DEPTH {
-            return;
-        }
-        for need in setup.mask_needs(&[id]) {
-            if ids.contains(&need) {
-                visit(setup, ids, need, out, depth + 1);
-            }
-        }
-        out.push(id);
-    }
-    let mut out = Vec::new();
-    for &id in ids {
-        visit(setup, ids, id, &mut out, 0);
-    }
-    out
 }
 
 /// `width`×`height` scaled down to at most `max_width` wide.

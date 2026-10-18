@@ -5,7 +5,7 @@
 //! admission happens here in the engine, before an ISO frame is drawn for
 //! its file ([`IsoCredit`]), so a refused tick costs no GPU work (#29).
 
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use isocast_protocol::CanvasId;
@@ -20,19 +20,6 @@ static ISO_SHARE: AtomicU32 = AtomicU32::new(1000);
 static MAIN_OUTPUTS: AtomicUsize = AtomicUsize::new(0);
 static MAIN_PRESSURE: AtomicUsize = AtomicUsize::new(0);
 static VERTICAL_SHARE: AtomicU32 = AtomicU32::new(1000);
-static STALL_EVENTS: AtomicU64 = AtomicU64::new(0);
-
-pub fn snapshot() -> (usize, u32, u64) {
-    (
-        PRIORITY_PRESSURE.load(Ordering::Relaxed),
-        if PRIORITY_OUTPUTS.load(Ordering::Relaxed) == 0 {
-            100
-        } else {
-            ISO_SHARE.load(Ordering::Relaxed) / 10
-        },
-        STALL_EVENTS.load(Ordering::Relaxed),
-    )
-}
 
 /// ISOs yield first. Only sustained main pressure, after the ISO share has
 /// fallen to a tenth, may also hold vertical work. Main-only admission is unchanged.
@@ -48,20 +35,17 @@ pub struct IsoCredit(u32);
 
 impl IsoCredit {
     /// Whether the file may take this tick's frame.
-    pub fn admit(&mut self, ceiling: u32) -> bool {
+    pub fn admit(&mut self) -> bool {
+        if PRIORITY_OUTPUTS.load(Ordering::Relaxed) == 0 {
+            return true;
+        }
         // Stop adding low-priority work immediately while a protected
         // queue catches up. The reduced steady share avoids repeatedly
         // refilling every encoder at full rate when that pause ends.
-        let protected = PRIORITY_OUTPUTS.load(Ordering::Relaxed) > 0;
-        if protected && PRIORITY_PRESSURE.load(Ordering::Relaxed) > 0 {
+        if PRIORITY_PRESSURE.load(Ordering::Relaxed) > 0 {
             return false;
         }
-        let native = if protected {
-            ISO_SHARE.load(Ordering::Relaxed)
-        } else {
-            1000
-        };
-        self.0 += native.min(ceiling);
+        self.0 += ISO_SHARE.load(Ordering::Relaxed);
         if self.0 < 1000 {
             return false;
         }
@@ -78,7 +62,6 @@ pub struct EncoderPressure {
     stalled: bool,
     adjusted: Instant,
     credit: u32,
-    refused: u64,
 }
 
 impl EncoderPressure {
@@ -94,7 +77,6 @@ impl EncoderPressure {
             stalled: false,
             adjusted: Instant::now(),
             credit: 0,
-            refused: 0,
         }
     }
 
@@ -102,28 +84,15 @@ impl EncoderPressure {
         !self.canvas.is_main() && vertical_held()
     }
 
-    /// Cumulative intentional refusals owned by this encoder. Attribute
-    /// these at admission, not by reading a possibly restored ceiling later.
-    pub fn refused(&self) -> u64 {
-        self.refused
-    }
-
     pub fn admit(&mut self) -> bool {
-        if self.canvas.is_main() {
+        if self.canvas.is_main() || MAIN_OUTPUTS.load(Ordering::Relaxed) == 0 {
             return true;
         }
         if self.held() {
-            self.refused += 1;
             return false;
         }
-        let native = if MAIN_OUTPUTS.load(Ordering::Relaxed) == 0 {
-            1000
-        } else {
-            VERTICAL_SHARE.load(Ordering::Relaxed)
-        };
-        self.credit += native.min(crate::governor::vertical_ceiling());
+        self.credit += VERTICAL_SHARE.load(Ordering::Relaxed);
         if self.credit < 1000 {
-            self.refused += 1;
             return false;
         }
         self.credit -= 1000;
@@ -135,7 +104,6 @@ impl EncoderPressure {
         if stalled
             && (!self.stalled || now.duration_since(self.adjusted) >= Duration::from_millis(100))
         {
-            STALL_EVENTS.fetch_add(1, Ordering::Relaxed);
             if self.canvas.is_main() && ISO_SHARE.load(Ordering::Relaxed) <= 100 {
                 let _ = VERTICAL_SHARE.try_update(Ordering::Relaxed, Ordering::Relaxed, |share| {
                     Some(share * 3 / 4)

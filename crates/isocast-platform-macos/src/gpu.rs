@@ -255,7 +255,7 @@ impl MetalImporter {
         };
         let texture: CFRetained<CVMetalTexture> = unsafe { CFRetained::from_raw(texture) };
         let raw = CVMetalTextureGetTexture(&texture).context("the frame has no Metal texture")?;
-        let keep = Keep(texture, frame.clone(), self.cache.clone());
+        let keep = Keep(texture, frame.clone());
         let (width, height) = (width as u32, height as u32);
         let hal_texture = unsafe {
             hal::metal::Device::texture_from_raw(
@@ -269,8 +269,7 @@ impl MetalImporter {
                     height,
                     depth: 1,
                 },
-                // Retirement can run on a polling thread with no native pool.
-                Some(Box::new(move || autoreleasepool(|_| drop(keep)))),
+                Some(Box::new(move || drop(keep))),
             )
         };
         Ok(unsafe { wrap(&self.device, hal_texture, format, width, height, target) })
@@ -356,18 +355,14 @@ unsafe fn wrap(
     }
 }
 
-/// An uncached texture owns its CoreVideo resources independently of the
-/// importer. CoreVideo leaves the pixel buffer retained if its cache dies
-/// before the CVMetalTexture. Drop the texture first and its cache last.
+/// What an imported texture holds on to: its Metal texture and the frame
+/// whose memory it uses.
 struct Keep(
     #[allow(dead_code)] CFRetained<CVMetalTexture>,
     #[allow(dead_code)] PixelBuffer,
-    #[allow(dead_code)] CFRetained<CVMetalTextureCache>,
 );
 
-// SAFETY: these CoreVideo references are counted atomically and only released
-// here. The guard never calls cache operations; the final cache release cannot
-// race a live importer's calls, because that importer owns a reference too.
+// SAFETY: both are reference counted atomically and only released here.
 unsafe impl Send for Keep {}
 unsafe impl Sync for Keep {}
 
