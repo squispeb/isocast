@@ -5,6 +5,87 @@ each section. Delete entries that stop being true.
 
 ## Environment
 
+- 2026-10-18 (#105 capture takeover): current tree801a6521 passes native
+  fmt, strict Windows all-target Clippy and81engine tests. NV12 array/crop/
+  32-slot retention and exact345,600-component NV12/P010 code checks pass;
+  6hardwareNVENC/MF files/180frames plus1softwareMF file/30frames fully decode.
+  Software NV12 defaultHigh selects actual72. BGRA regression adds37files/1110
+  fully decoded frames (quality/barriers/reuse/live CBR). Receipts and exact
+  source boundaries are at the top of capture/scratch/REPORT.md. Portable
+  gates retry exits69 (remote38/39/39GiB); no local build or disk-floor bypass.
+  Regular review endpoint unavailable; no independent NV12 review claimed.
+
+- 2026-10-18 (#105 camera blocker): public capture_camera on Elgato4K S
+  still fails before publication: media type progressive, sample attributes
+  Interlaced=1/BottomFieldFirst=1. Fresh receipt9973c885 confirms earlier
+  strict/advanced-reader probes. Microsoft Video Interlacing docs say sample
+  attributes override media type; do not discard those flags to claim success.
+  Need known-progressive source/device or separately scoped GPU deinterlacing.
+  camera.rs/lib exports remain WIP; NV12 compositor plane views and writer
+  input-format negotiation are also pending. No driver/settings/apps changed.
+
+- 2026-10-18 (#105 gates): remote space later recovered to43GiB on m2-b.
+  Full scripts/remote-build.sh gates now passes59f36cd4+MFnearest edits:
+  fmt, strict all-target clippy,233unit+1doctest;1hardware-only ignored. Log
+  capture/scratch/mf-nearest-portable-gates.log. No cache cleanup or floor
+  bypass occurred; prior exit69 entries below are historical.
+
+- 2026-10-18 (#105 MF rounding): after59f36cd4, new uncommitted encoder.rs/
+  mf.rs fix negotiates nearest representable quality and reportsactual.
+  Microsoft software Set/Get echoes request until media types are reapplied;
+  GetParameterRange/ValuesE_NOTIMPL.101command oracle yields29levels;70→72,
+  30→29,50→51,85→86. Search is only pre-stream, exactquality fast-path, native
+  tie choice retained; no cached cross-provider grid. Rawinfo requested_quality
+  vsquality(actual); factoryrecording_quality().mf_quality is actual. All101
+  softwarequalities and5production64×48presets pass;115files711frames decoded
+  inclNVIDIA3codec regression,454stablehandles. Source tree0427e636…, reports
+  have receipts. AAC/WASAPI already in59f36cd4, unchanged. Portable gate still
+  exits69 onREMOTE36–39GiB hosts despite LOCAL35GiB; no cache cleanup performed.
+
+- 2026-10-18 (#105 cameras): MF SourceReader+DXGI manager on Elgato4K S
+  really returns1080p60 NV12 IMFDXGIBuffer textures, format103/defaultusage/
+  singleslice. MFSampleExtension_DeviceTimestamp is QPC100ns (MS documented;
+  observedsameasSampleTime onthisdriver), duration166666; STREAMTICK !=frame.
+  Without manager it returnsCPU NV12, not a production fallback. CamLink4K
+  ReadSample fails0xC00D3704 with/withoutGPUmanager; cause unresolved, do not
+  close other apps without approval. Receipt709375f2… and retainedprobes in
+  capture scratch. Peer still owns frames.rs/gpu.rs with onlyBgra8/Rgba10:
+  requested sharedNV12 Frame/importer ownership in writer REPORT before camera
+  code/plumbing edits. Keep camera/ISO NV12 native, no forcedRGB roundtrip.
+
+- 2026-10-18 (#105 recording APIs): native recording factory/barrier slice
+  ready for CI, uncommitted. WindowsVideoEncoder::recording acceptsVideoTrackSpec
+  and inputPixelFormat; explicit CONSTQP30/26/22/18/14 orMFQuality30/50/70/85/100,
+  no VT.value()/bitrate guess orMac-quality parity claim. barrier snapshots
+  accepted work, acknowledges each packet; callbackErr retains that packet.
+  begin_segment after barrier forces next acceptedIDR, globalPTS must continue;
+  only mux rebases. finish remains terminal. Native late errors now preserve
+  queued prefix; fatal/timeout injection not performed. Microsoft software
+  MF roundsQuality30→29,70→72, rejected rather than silently changing policy;
+  100works. NVIDIA MF H264/HEVC/Main10 exact30/70/100verified.41files/1230frames,
+  strict native clippy/81engine tests/read-only review pass. Full portable
+  gates twice exit69: allMac build hosts below40GB floor (35/39/37GB); no bypass.
+  API/evidence in capture and writer REPORTs. No peer adapter or daemon switch.
+
+- 2026-10-18 (#105 native audio): capture lane's new MF AAC and WASAPI APIs
+  are qualified standalone, not wired to the peer Platform yet. AAC inserts
+  exactly1024silent pre-roll frames (otherwise sample0 can disappear); mux
+  priming=1024, rawpacket DTS includes prefix, terminal samples trim padding.
+  Nonterminal polling must not pad/flush. Real24k Flightdeck Stick positions
+  stay24k despite48k delivery: first417frames then nativeposition240. Correct
+  bounded SRC debt against each currentQPC, not an invented fixed clock;
+  uncertain resampled discontinuities stop.48k Wave XLR/HDMI also qualified.
+  Resolve selected endpoints before activation; GetDevice(friendlyname)
+  returns E_INVALIDARG and must fall through to identity-only matching.
+  Idle loopback has no packets; engine fills timestamp gaps. Process/app
+  exclusions unsupported, so monitoring's exclude_own must fail closed.
+  24capture/AAC reopen counts stable151/147; stop1.49–7.05ms is standalone,
+  not a full-engine guarantee. WPR from System32 (19041) cannot merge traces
+  (0x80010106); explicit Windows Performance Toolkit26100 wpr.exe works.
+  CPU+Audio trace0lostevents;2s steady probe samples2.7%one-core including
+  playback, PCM collection and AAC. Full OBS/performance gates still open.
+  Source/receipt details in capture REPORT and peer "Capture-lane response".
+
 - 2026-10-18 (#105 lock helper): capture lane adopted the peer's verified
   tree83f33006 scripts/windows-remote.sh byte-for-byte (blob a9185e45ac12c4ffe379b87aa7b43f29593105ac),
   without editing the peer worktree. One acquire/sync/run budget, watchdog,
@@ -406,6 +487,14 @@ each section. Delete entries that stop being true.
   Privacy & Security for that app, and ask Ryan to grant it.
 
 ## Waiting on Ryan
+
+- 2026-10-18 (#105 W.5d2): need a known-progressive HDMI input on Elgato4K S
+  (or an explicitly scoped GPU-deinterlacing task). Native samples override
+  advertised progressive media type with Interlaced=1; the capture API rightly
+  rejects them. No driver/source settings or unrelated processes changed.
+  Retry the retained public-API qualification under the shared GPU lock:
+  `ISOCAST_WINDOWS_ROOT=C:/isocast-dev/lanes/capture ISOCAST_WINDOWS_GPU_LOCK=1 ISOCAST_WINDOWS_TIMEOUT=180 scripts/windows-remote.sh run '$out=Join-Path $env:ISOCAST_SCRATCH ("camera-retry-"+[guid]::NewGuid()); & "$env:ISOCAST_SCRATCH\camera-api-4969ee27a0b94487958711f98e5a7248\camera-api.exe" $out; exit $LASTEXITCODE'`.
+  This does not unblock NV12 compositor/writer contracts or full OBS gates.
 
 - 2026-10-17 (#104): NLE export checked in DaVinci Resolve only. Final Cut
   Pro's trial now comes from the App Store (needs an Apple ID) and Premiere

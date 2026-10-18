@@ -29,6 +29,8 @@ struct Config {
     codec: u32,
     input_depth: u32,
     output_depth: u32,
+    quality_qp: u32,
+    input_format: u32,
 }
 
 #[repr(C)]
@@ -40,7 +42,7 @@ struct Packet {
     keyframe: u32,
 }
 
-const _: () = assert!(std::mem::size_of::<Config>() == 36);
+const _: () = assert!(std::mem::size_of::<Config>() == 44);
 const _: () = assert!(std::mem::size_of::<Packet>() == 24);
 
 unsafe extern "C" {
@@ -97,6 +99,7 @@ pub struct NvencEncoder {
     device: GraphicsDevice,
     size: (u32, u32),
     low_latency: bool,
+    recording: bool,
     pending: VecDeque<Pending>,
     ready: VecDeque<EncodedVideo>,
     parameters: Parameters,
@@ -121,14 +124,48 @@ impl NvencEncoder {
 
     /// HEVC output has an hvcC decoder config and no H.264 `parameter_sets`.
     /// The caller must select a matching HEVC mux track, never the live FLV path.
+    /// NV12 input keeps its qualified limited-range Rec.709 codes. Main10
+    /// output may expand eight-bit input, but cannot add source precision.
     pub fn with_format(
         device: &GraphicsDevice,
         spec: &LiveVideoSpec,
         encoding: VideoEncoding,
         input: PixelFormat,
     ) -> Result<Self> {
+        Self::open(device, spec, encoding, input, None)
+    }
+
+    /// Recording at a native base QP (0..=51), adjusted by spatial AQ8.
+    /// This is neither lossless at QP 0 nor equivalent to macOS quality.
+    /// Ignores `spec.bitrate_kbps` and `spec.constant_bitrate`; changes to
+    /// recording settings, including fps, require opening a new encoder.
+    pub fn with_quantizer(
+        device: &GraphicsDevice,
+        spec: &LiveVideoSpec,
+        encoding: VideoEncoding,
+        input: PixelFormat,
+        qp: u32,
+    ) -> Result<Self> {
+        Self::open(device, spec, encoding, input, Some(qp))
+    }
+
+    fn open(
+        device: &GraphicsDevice,
+        spec: &LiveVideoSpec,
+        encoding: VideoEncoding,
+        input: PixelFormat,
+        quality_qp: Option<u32>,
+    ) -> Result<Self> {
         encoding.validate(input)?;
-        let bitrate = bitrate(spec.fps, spec.bitrate_kbps)?;
+        let bitrate = if let Some(qp) = quality_qp {
+            if qp > 51 {
+                bail!("video.quantizer: NVENC valid range is 0..=51");
+            }
+            validate_fps(spec.fps)?;
+            0
+        } else {
+            bitrate(spec.fps, spec.bitrate_kbps)?
+        };
         if spec.width == 0
             || spec.height == 0
             || !spec.width.is_multiple_of(2)
@@ -144,11 +181,18 @@ impl NvencEncoder {
             height: spec.height,
             fps: spec.fps,
             bitrate,
-            constant_bitrate: u32::from(spec.constant_bitrate),
+            constant_bitrate: u32::from(quality_qp.is_none() && spec.constant_bitrate),
             keyframe_interval: spec.keyframe_interval,
             codec: u32::from(encoding != VideoEncoding::H264),
             input_depth: if input == PixelFormat::Rgba10 { 10 } else { 8 },
             output_depth: u32::from(encoding.bit_depth()),
+            quality_qp: quality_qp.unwrap_or(u32::MAX),
+            // Matches InputFormat in native/nvenc.cpp; storage is not bit depth.
+            input_format: match input {
+                PixelFormat::Bgra8 => 0,
+                PixelFormat::Rgba10 => 1,
+                PixelFormat::Nv12 => 2,
+            },
         };
         let mut error = [0 as c_char; 512];
         let native = unsafe {
@@ -170,6 +214,7 @@ impl NvencEncoder {
             device: device.clone(),
             size: (spec.width, spec.height),
             low_latency: spec.low_latency,
+            recording: quality_qp.is_some(),
             pending: VecDeque::new(),
             ready: VecDeque::new(),
             parameters: Parameters::new(encoding),
@@ -347,10 +392,19 @@ impl NvencEncoder {
 
     /// Flush and return every remaining compressed picture, in order. Only a
     /// successful flush permits destroying the input/output GPU resources.
+    /// On failure, valid packets remain available through `receive`, followed
+    /// by the sticky encoder error once that prefix has been consumed.
     pub fn finish(&mut self) -> Result<Vec<EncodedVideo>> {
+        if let Err(error) = self.finish_native() {
+            self.failed.get_or_insert_with(|| format!("{error:#}"));
+            return Err(error);
+        }
+        Ok(self.ready.drain(..).collect())
+    }
+
+    fn finish_native(&mut self) -> Result<()> {
         if self.finished {
-            self.healthy()?;
-            return Ok(Vec::new());
+            return self.healthy();
         }
         self.finishing = true;
         // Drop retries share this deadline, never adding a second five-second
@@ -358,7 +412,6 @@ impl NvencEncoder {
         let deadline = *self
             .finish_deadline
             .get_or_insert_with(|| Instant::now() + FINISH_WAIT);
-        let mut packets: Vec<_> = self.ready.drain(..).collect();
         loop {
             if Instant::now() >= deadline {
                 bail!("NVENC did not finish within 5 seconds");
@@ -369,7 +422,7 @@ impl NvencEncoder {
                 break;
             }
             if let Some(packet) = self.read(Duration::ZERO)? {
-                packets.push(packet);
+                self.ready.push_back(packet);
             }
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -379,7 +432,7 @@ impl NvencEncoder {
                 bail!("NVENC did not finish its accepted pictures within 5 seconds");
             }
             if let Some(packet) = self.read(remaining)? {
-                packets.push(packet);
+                self.ready.push_back(packet);
             } else {
                 // A signalled event with LOCK_BUSY must not spin a CPU core.
                 std::thread::sleep(Duration::from_millis(1));
@@ -396,8 +449,7 @@ impl NvencEncoder {
         }
         self.check(status)?;
         self.finished = true;
-        self.healthy()?;
-        Ok(packets)
+        self.healthy()
     }
 }
 
@@ -442,6 +494,9 @@ impl VideoEncoder for NvencEncoder {
     }
 
     fn set_rate(&mut self, fps: u32, bitrate_kbps: u32) -> Result<()> {
+        if self.recording {
+            bail!("encoder.nvenc: recording settings cannot change; open a new encoder");
+        }
         self.healthy()?;
         if self.finishing {
             bail!("NVENC encoder has already begun finishing");
@@ -475,10 +530,15 @@ impl Drop for NvencEncoder {
     }
 }
 
-fn bitrate(fps: u32, kbps: u32) -> Result<u32> {
+fn validate_fps(fps: u32) -> Result<()> {
     if !(1..=240).contains(&fps) {
         bail!("video.fps: valid range is 1..=240");
     }
+    Ok(())
+}
+
+fn bitrate(fps: u32, kbps: u32) -> Result<u32> {
+    validate_fps(fps)?;
     kbps.checked_mul(1000)
         .filter(|value| *value > 0)
         .context("video.bitrate_kbps: must be positive and fit in 32-bit bits/second")

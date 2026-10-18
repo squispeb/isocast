@@ -10,12 +10,14 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use isocast_engine::{EncodedVideo, LiveVideoSpec, Time, VideoEncoder};
 use parking_lot::Mutex;
-use windows::Win32::Foundation::{E_NOTIMPL, E_POINTER, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows::Win32::Foundation::{
+    E_INVALIDARG, E_NOTIMPL, E_POINTER, S_OK, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
 use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Threading::WaitForSingleObject;
-use windows::Win32::System::Variant::VARIANT;
+use windows::Win32::System::Variant::{VARIANT, VT_UI4};
 use windows::core::{GUID, Interface, PWSTR, Ref, implement};
 
 use crate::convert::Converter;
@@ -43,6 +45,7 @@ pub struct MfEncoder {
     worker: Option<JoinHandle<()>>,
     info: MfEncoderInfo,
     low_latency: bool,
+    recording: bool,
     ready: VecDeque<EncodedVideo>,
     dropped: u64,
     native_dropped: Arc<AtomicU64>,
@@ -60,8 +63,42 @@ impl MfEncoder {
         encoding: VideoEncoding,
         input: PixelFormat,
     ) -> Result<Self> {
+        Self::open(device, spec, mode, encoding, input, None)
+    }
+
+    /// Recording at the nearest accepted native MF quality (0..=100), not
+    /// macOS quality. `info()` reports both requested and actual quality.
+    /// Ignores `spec.bitrate_kbps` and `spec.constant_bitrate`. Providers that
+    /// cannot honor quality mode without a bitrate are rejected. Changes to
+    /// recording settings, including fps, require opening a new encoder.
+    pub fn with_quality(
+        device: &GraphicsDevice,
+        spec: &LiveVideoSpec,
+        mode: MfMode,
+        encoding: VideoEncoding,
+        input: PixelFormat,
+        quality: u32,
+    ) -> Result<Self> {
+        Self::open(device, spec, mode, encoding, input, Some(quality))
+    }
+
+    fn open(
+        device: &GraphicsDevice,
+        spec: &LiveVideoSpec,
+        mode: MfMode,
+        encoding: VideoEncoding,
+        input: PixelFormat,
+        quality: Option<u32>,
+    ) -> Result<Self> {
         encoding.validate(input)?;
-        validate(spec.fps, spec.bitrate_kbps)?;
+        if let Some(quality) = quality {
+            if quality > 100 {
+                bail!("video.quality: Media Foundation valid range is 0..=100");
+            }
+            validate_fps(spec.fps)?;
+        } else {
+            validate(spec.fps, spec.bitrate_kbps)?;
+        }
         if spec.width == 0
             || spec.height == 0
             || !spec.width.is_multiple_of(2)
@@ -81,7 +118,8 @@ impl MfEncoder {
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
                         let _apartment = Apartment::new()?;
                         let _runtime = Runtime::new()?;
-                        let mut session = Session::open(&device, &settings, mode, encoding, input)?;
+                        let mut session =
+                            Session::open(&device, &settings, mode, encoding, input, quality)?;
                         if started.send(Ok(session.info.clone())).is_err() {
                             return Ok(());
                         }
@@ -118,6 +156,7 @@ impl MfEncoder {
             worker: Some(worker),
             info,
             low_latency: spec.low_latency,
+            recording: quality.is_some(),
             ready: VecDeque::new(),
             dropped: 0,
             native_dropped: Arc::new(AtomicU64::new(0)),
@@ -167,10 +206,27 @@ impl MfEncoder {
         stats.ready_packets = self.ready.len();
         Ok(stats)
     }
+    /// Finish encoding and return the remaining packets. On native failure,
+    /// completed packets remain available through `receive`, followed by the
+    /// sticky encoder error. A worker/RPC failure preserves packets already
+    /// queued on this handle, but cannot recover an unsent worker-side prefix.
     pub fn finish(&mut self) -> Result<Vec<EncodedVideo>> {
-        let mut packets: Vec<_> = self.ready.drain(..).collect();
-        packets.extend(self.call(Session::finish)?);
-        Ok(packets)
+        let (packets, error) = self.call(|session| {
+            let mut packets = Vec::new();
+            let error = session.finish(&mut packets).err().map(|error| {
+                // Return the completed prefix even when finalization fails;
+                // only the error text, never a COM error, crosses the worker.
+                let error = format!("{error:#}");
+                session.failed.get_or_insert_with(|| error.clone());
+                error
+            });
+            Ok((packets, error))
+        })?;
+        self.ready.extend(packets);
+        if let Some(error) = error {
+            bail!("{error}");
+        }
+        Ok(self.ready.drain(..).collect())
     }
 
     fn media_call<T: Send + 'static>(
@@ -230,6 +286,9 @@ impl VideoEncoder for MfEncoder {
         self.dropped + self.native_dropped.load(Ordering::Acquire)
     }
     fn set_rate(&mut self, fps: u32, bitrate_kbps: u32) -> Result<()> {
+        if self.recording {
+            bail!("encoder.mf: recording settings cannot change; open a new encoder");
+        }
         let bits = validate(fps, bitrate_kbps)?;
         self.call(move |session| session.set_rate(fps, bits))
     }
@@ -379,6 +438,7 @@ struct Session {
     input: PixelFormat,
     size: (u32, u32),
     fps: u32,
+    recording: bool,
     need_input: u32,
     have_output: u32,
     drain_complete: bool,
@@ -399,6 +459,7 @@ impl Session {
         mode: MfMode,
         encoding: VideoEncoding,
         input: PixelFormat,
+        quality: Option<u32>,
     ) -> Result<Self> {
         let mut failures = Vec::new();
         let hardware = mode == MfMode::Hardware;
@@ -408,10 +469,10 @@ impl Session {
                 device,
                 spec,
                 mode,
-                Activation(activation),
-                label.clone(),
+                (Activation(activation), label.clone()),
                 encoding,
                 input,
+                quality,
             ) {
                 Ok(session) => return Ok(session),
                 Err(error) => failures.push(format!("{label}: {error:#}")),
@@ -431,11 +492,12 @@ impl Session {
         device: &GraphicsDevice,
         spec: &LiveVideoSpec,
         mode: MfMode,
-        activation: Activation,
-        label: String,
+        candidate: (Activation, String),
         encoding: VideoEncoding,
         pixel_format: PixelFormat,
+        quality: Option<u32>,
     ) -> Result<Self> {
+        let (activation, label) = candidate;
         unsafe {
             let transform: IMFTransform = activation.0.ActivateObject()?;
             let attrs = transform.GetAttributes()?;
@@ -493,34 +555,57 @@ impl Session {
             {
                 set(&codec, &CODECAPI_AVEncH264CABACEnable, VARIANT::from(true))?;
             }
-            set(
-                &codec,
-                &CODECAPI_AVEncCommonRateControlMode,
-                VARIANT::from(if spec.constant_bitrate { 0u32 } else { 1u32 }),
-            )?;
+            if let Some(quality) = quality {
+                set_required(
+                    &codec,
+                    &CODECAPI_AVEncCommonRateControlMode,
+                    eAVEncCommonRateControlMode_Quality.0 as u32,
+                    "rate control mode",
+                )?;
+                set_required(&codec, &CODECAPI_AVEncCommonQuality, quality, "quality")?;
+            } else {
+                set(
+                    &codec,
+                    &CODECAPI_AVEncCommonRateControlMode,
+                    VARIANT::from(if spec.constant_bitrate { 0u32 } else { 1u32 }),
+                )?;
+            }
             set(
                 &codec,
                 &CODECAPI_AVEncMPVGOPSize,
                 VARIANT::from(spec.keyframe_interval),
             )?;
-            let bits = validate(spec.fps, spec.bitrate_kbps)?;
-            set(
-                &codec,
-                &CODECAPI_AVEncCommonMeanBitRate,
-                VARIANT::from(bits),
-            )?;
-            if !spec.constant_bitrate {
-                set(&codec, &CODECAPI_AVEncCommonMaxBitRate, VARIANT::from(bits))?;
-            }
+            let bits = if quality.is_none() {
+                let bits = validate(spec.fps, spec.bitrate_kbps)?;
+                set(
+                    &codec,
+                    &CODECAPI_AVEncCommonMeanBitRate,
+                    VARIANT::from(bits),
+                )?;
+                if !spec.constant_bitrate {
+                    set(&codec, &CODECAPI_AVEncCommonMaxBitRate, VARIANT::from(bits))?;
+                }
+                Some(bits)
+            } else {
+                None
+            };
             let output = media_type(spec, subtype(encoding))?;
-            output.SetUINT32(&MF_MT_AVG_BITRATE, bits)?;
+            if let Some(bits) = bits {
+                output.SetUINT32(&MF_MT_AVG_BITRATE, bits)?;
+            }
             let profile = match encoding {
                 VideoEncoding::H264 => eAVEncH264VProfile_High.0 as u32,
                 VideoEncoding::Hevc => eAVEncH265VProfile_Main_420_8.0 as u32,
                 VideoEncoding::Hevc10 => eAVEncH265VProfile_Main_420_10.0 as u32,
             };
             output.SetUINT32(&MF_MT_VIDEO_PROFILE, profile)?;
-            transform.SetOutputType(0, &output, 0)?;
+            transform
+                .SetOutputType(0, &output, 0)
+                .context(if quality.is_some() {
+                    "MF recording provider rejected quality output without MF_MT_AVG_BITRATE"
+                } else {
+                    "set MF output type"
+                })?;
             let bytes_per_pixel = if encoding.bit_depth() == 10 { 2 } else { 1 };
             let input = media_type(
                 spec,
@@ -548,24 +633,23 @@ impl Session {
                     .context("video dimensions overflow")?,
             )?;
             transform.SetInputType(0, &input, 0)?;
+            let actual_quality = quality
+                .map(|quality| negotiate_quality(&transform, &codec, &output, &input, quality))
+                .transpose()?;
             let wake = Arc::new(Event::new()?);
             let events = if asynchronous {
                 Some(Events::new(&transform, wake.clone())?)
             } else {
                 None
             };
-            let converter = if encoding == VideoEncoding::H264 {
-                Converter::new(device, spec.width, spec.height, spec.fps)?
-            } else {
-                Converter::with_format(
-                    device,
-                    spec.width,
-                    spec.height,
-                    spec.fps,
-                    pixel_format,
-                    encoding.bit_depth(),
-                )?
-            };
+            let converter = Converter::with_format(
+                device,
+                spec.width,
+                spec.height,
+                spec.fps,
+                pixel_format,
+                encoding.bit_depth(),
+            )?;
             let output_info = transform.GetOutputStreamInfo(0)?;
             let mut session = Self {
                 activation,
@@ -584,12 +668,15 @@ impl Session {
                     d3d11,
                     b_picture_control,
                     encoding,
+                    requested_quality: quality,
+                    quality: actual_quality,
                 },
                 output_info,
                 parameters: Parameters::new(encoding),
                 input: pixel_format,
                 size: (spec.width, spec.height),
                 fps: spec.fps,
+                recording: quality.is_some(),
                 need_input: 0,
                 have_output: 0,
                 drain_complete: false,
@@ -617,6 +704,14 @@ impl Session {
                         bail!("MF encoder did not request its first input within 5 seconds");
                     }
                     session.events(left)?;
+                }
+            }
+            if let Some(quality) = session.info.quality {
+                let actual = read_quality(&session.codec)?;
+                if actual != quality {
+                    bail!(
+                        "MF recording quality: selected {quality}, provider returned {actual} after streaming began"
+                    );
                 }
             }
             session.opened = true;
@@ -923,6 +1018,9 @@ impl Session {
     }
 
     fn set_rate(&mut self, fps: u32, bits: u32) -> Result<()> {
+        if self.recording {
+            bail!("encoder.mf: recording settings cannot change; open a new encoder");
+        }
         self.healthy()?;
         if self.finishing {
             bail!("MF encoder has begun finishing");
@@ -957,10 +1055,9 @@ impl Session {
         Ok(())
     }
 
-    fn finish(&mut self) -> Result<Vec<EncodedVideo>> {
+    fn finish(&mut self, packets: &mut Vec<EncodedVideo>) -> Result<()> {
         if self.finished {
-            self.healthy()?;
-            return Ok(Vec::new());
+            return self.healthy();
         }
         let deadline = *self
             .deadline
@@ -975,14 +1072,13 @@ impl Session {
             self.finishing = true;
             self.need_input = 0;
         }
-        let mut result = Vec::new();
         while !self.drain_complete || self.have_output > 0 {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 bail!("MF encoder did not drain within 5 seconds");
             }
             if let Some(packet) = self.receive(left)? {
-                result.push(packet);
+                packets.push(packet);
             }
         }
         if !self.pending.is_empty() {
@@ -996,8 +1092,7 @@ impl Session {
                 .ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0)
         }?;
         self.finished = true;
-        self.healthy()?;
-        Ok(result)
+        self.healthy()
     }
 }
 
@@ -1006,7 +1101,7 @@ impl Drop for Session {
         // A candidate rejected during startup has never accepted an input.
         // Shutdown it directly, without another drain deadline per fallback.
         if self.opened
-            && let Err(error) = self.finish()
+            && let Err(error) = self.finish(&mut Vec::new())
         {
             eprintln!("MF encoder teardown: {error:#}");
         }
@@ -1020,10 +1115,14 @@ impl Drop for Session {
     }
 }
 
-fn validate(fps: u32, kbps: u32) -> Result<u32> {
+fn validate_fps(fps: u32) -> Result<()> {
     if !(1..=240).contains(&fps) {
         bail!("video.fps: valid range is 1..=240");
     }
+    Ok(())
+}
+fn validate(fps: u32, kbps: u32) -> Result<u32> {
+    validate_fps(fps)?;
     kbps.checked_mul(1000)
         .filter(|bits| *bits > 0)
         .context("video.bitrate_kbps: must be positive and fit in 32-bit bits/second")
@@ -1031,6 +1130,96 @@ fn validate(fps: u32, kbps: u32) -> Result<u32> {
 fn set(codec: &ICodecAPI, property: &GUID, value: VARIANT) -> Result<()> {
     unsafe { codec.SetValue(property, &value) }
         .with_context(|| format!("MF codec property {property:?}"))
+}
+fn set_required(codec: &ICodecAPI, property: &GUID, value: u32, name: &str) -> Result<()> {
+    // The generated IsSupported wrapper folds S_FALSE into Ok(()), but the
+    // codec contract requires exactly S_OK to mean the property is supported.
+    let supported = unsafe { (codec.vtable().IsSupported)(codec.as_raw(), property) };
+    if supported != S_OK {
+        bail!("MF recording {name}: property is not supported ({supported:?})");
+    }
+    set(codec, property, VARIANT::from(value))
+        .with_context(|| format!("MF recording {name}: provider rejected {value}"))
+}
+fn verify_value(codec: &ICodecAPI, property: &GUID, expected: u32, name: &str) -> Result<()> {
+    let value = read_value(codec, property, name)?;
+    if value != expected {
+        bail!("MF recording {name}: requested {expected}, provider returned {value}");
+    }
+    Ok(())
+}
+fn read_value(codec: &ICodecAPI, property: &GUID, name: &str) -> Result<u32> {
+    let value = unsafe { codec.GetValue(property) }
+        .with_context(|| format!("MF recording {name}: cannot read back the value"))?;
+    if value.vt() != VT_UI4 {
+        bail!("MF recording {name}: readback is not a UINT32");
+    }
+    u32::try_from(&value).with_context(|| format!("MF recording {name}: readback is not a UINT32"))
+}
+fn read_quality(codec: &ICodecAPI) -> Result<u32> {
+    verify_value(
+        codec,
+        &CODECAPI_AVEncCommonRateControlMode,
+        eAVEncCommonRateControlMode_Quality.0 as u32,
+        "rate control mode",
+    )?;
+    let quality = read_value(codec, &CODECAPI_AVEncCommonQuality, "quality")?;
+    if quality > 100 {
+        bail!("MF recording quality: provider returned {quality}, outside 0..=100");
+    }
+    Ok(quality)
+}
+fn negotiate_quality(
+    transform: &IMFTransform,
+    codec: &ICodecAPI,
+    output: &IMFMediaType,
+    input: &IMFMediaType,
+    requested: u32,
+) -> Result<u32> {
+    // Read only after media-type negotiation: some MFTs echo SetValue until
+    // the types are applied, then quantize. Exact providers need no retyping.
+    let mut best = read_quality(codec)?;
+    if best == requested {
+        return Ok(best);
+    }
+    let mut command = requested;
+    let apply = |quality| -> windows::core::Result<()> {
+        unsafe {
+            codec.SetValue(&CODECAPI_AVEncCommonQuality, &VARIANT::from(quality))?;
+            transform.SetOutputType(0, output, 0)?;
+            transform.SetInputType(0, input, 0)
+        }
+    };
+    // Range/value enumeration is not implemented by every MFT. The entire
+    // native domain is only 101 commands; search once, before streaming, and
+    // keep the initial native selection on ties. Never cache across sessions.
+    for candidate in 0..=100u32 {
+        match apply(candidate) {
+            Ok(()) => {}
+            Err(error) if error.code() == E_INVALIDARG => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("MF recording quality: negotiate {candidate}"));
+            }
+        }
+        let actual = read_quality(codec)?;
+        if actual.abs_diff(requested) < best.abs_diff(requested) {
+            best = actual;
+            command = candidate;
+            if best == requested {
+                break;
+            }
+        }
+    }
+    apply(command)
+        .with_context(|| format!("MF recording quality: pin selected command {command}"))?;
+    let actual = read_quality(codec)?;
+    if actual != best {
+        bail!(
+            "MF recording quality: unstable selection for requested {requested}; command {command} produced {best}, then {actual}"
+        );
+    }
+    Ok(actual)
 }
 fn attribute(attrs: &IMFAttributes, key: &GUID) -> Result<u32> {
     match unsafe { attrs.GetUINT32(key) } {
@@ -1080,12 +1269,16 @@ pub struct MfEncoderInfo {
     /// Output timestamps are checked for reordering in either case.
     pub b_picture_control: bool,
     pub encoding: VideoEncoding,
+    /// Requested native quality; None for live encoding or enumeration.
+    pub requested_quality: Option<u32>,
+    /// Actual selected native quality; None for live encoding or enumeration.
+    pub quality: Option<u32>,
 }
 
-struct Runtime;
+pub(crate) struct Runtime;
 
 impl Runtime {
-    fn new() -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         // Windows 10 retains a thread-pool factory and 13 associated handles
         // each time an activated MF runtime is shut down and started again.
         // Keep ONE runtime for the process, as we already do for the WinRT
@@ -1206,6 +1399,8 @@ pub fn mf_encoders_for(encoding: VideoEncoding) -> Result<Vec<MfEncoderInfo>> {
                                 .is_ok()
                         }),
                         encoding,
+                        requested_quality: None,
+                        quality: None,
                     };
                     unsafe { activation.ShutdownObject() }?;
                     result.push(info);

@@ -18,17 +18,22 @@ use crate::native::{Event, SharedHandle};
 
 pub const MAX_POOL_FRAMES: usize = 32;
 
-/// GPU RGB storage; ten-bit storage does not imply HDR colorimetry.
+/// GPU storage; ten-bit storage does not imply HDR colorimetry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PixelFormat {
     /// DXGI_FORMAT_B8G8R8A8_UNORM.
     Bgra8,
     /// DXGI_FORMAT_R10G10B10A2_UNORM.
     Rgba10,
+    /// DXGI_FORMAT_NV12, qualified progressive SDR Rec.709 limited-range input
+    /// with left-sited chroma. The producer must validate the color metadata;
+    /// copying a texture does not establish it. Read-only, never an output.
+    Nv12,
 }
 
-/// A D3D11 device with a GPU timeline shared by its captures. No software
-/// adapter fallback: this path promises native GPU surfaces, not CPU pixels.
+/// A D3D11 device with a GPU timeline shared by its captures and uploads.
+/// No software adapter fallback: this path promises native GPU surfaces,
+/// not CPU pixels.
 #[derive(Clone)]
 pub struct GraphicsDevice(Arc<Device>);
 
@@ -127,9 +132,15 @@ impl GraphicsDevice {
     }
 }
 
-/// One lease on an owned GPU texture. Clones share the immutable picture;
-/// neither the capture pool nor the producer can reuse it until all leases
-/// and the GPU copy have finished. The fence must be waited on by consumers.
+/// One lease on an owned GPU texture. Capture pictures are immutable; output
+/// pictures may be drawn into before publication. All clones and uncached GPU
+/// imports keep the slot out of its pool. Cached GPU users must retain a frame
+/// through completion. Never write an output while a consumer is using it.
+/// Capture slots additionally wait for their GPU copy before being recycled.
+///
+/// Consumers wait on the D3D11 fence for capture copies and CPU uploads. A
+/// GPU-written output must also await its producer's `GpuCompletion` before
+/// native consumption: the D3D11 fence does not track wgpu writes.
 #[derive(Clone)]
 pub struct Frame {
     slot: Arc<Slot>,
@@ -142,7 +153,75 @@ struct Slot {
     width: u32,
     height: u32,
     format: PixelFormat,
+    output: bool,
     ready: AtomicU64,
+}
+
+impl Slot {
+    fn new(
+        device: &GraphicsDevice,
+        width: u32,
+        height: u32,
+        format: PixelFormat,
+        output: bool,
+    ) -> Result<Arc<Self>> {
+        if format == PixelFormat::Nv12
+            && (output
+                || width == 0
+                || height == 0
+                || !width.is_multiple_of(2)
+                || !height.is_multiple_of(2))
+        {
+            bail!("NV12 frames require read-only input with positive even dimensions");
+        }
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: match format {
+                PixelFormat::Bgra8 => DXGI_FORMAT_B8G8R8A8_UNORM,
+                PixelFormat::Rgba10 => DXGI_FORMAT_R10G10B10A2_UNORM,
+                PixelFormat::Nv12 => DXGI_FORMAT_NV12,
+            },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: if format == PixelFormat::Nv12 {
+                D3D11_BIND_SHADER_RESOURCE.0 as u32
+            } else {
+                (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET).0 as u32
+            },
+            MiscFlags: (D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED).0 as u32,
+            ..Default::default()
+        };
+        let mut texture = None;
+        unsafe {
+            device
+                .raw()
+                .CreateTexture2D(&desc, None, Some(&mut texture))
+        }?;
+        let texture = texture.context("D3D11 returned no texture")?;
+        let resource: IDXGIResource1 = texture.cast()?;
+        let shared = unsafe {
+            SharedHandle::new(resource.CreateSharedHandle(
+                None,
+                (DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE).0,
+                PCWSTR::null(),
+            )?)
+        };
+        Ok(Arc::new(Self {
+            texture,
+            shared,
+            width,
+            height,
+            format,
+            output,
+            ready: AtomicU64::new(0),
+        }))
+    }
 }
 
 impl Frame {
@@ -158,9 +237,12 @@ impl Frame {
     pub fn texture(&self) -> &ID3D11Texture2D {
         &self.slot.texture
     }
+    /// D3D11 capture/upload timeline only, not completion of wgpu writes.
     pub fn fence(&self) -> &ID3D11Fence {
         &self.device.0.fence
     }
+    /// The last D3D11 capture/upload signal. GPU output consumers must also
+    /// wait for the producer's `GpuCompletion` before using the picture.
     pub fn ready_value(&self) -> u64 {
         self.slot.ready.load(Ordering::Acquire)
     }
@@ -176,9 +258,74 @@ impl Frame {
         self.device.0.shared_fence.handle()
     }
 
+    pub(crate) fn new_output(device: GraphicsDevice, width: u32, height: u32) -> Result<Self> {
+        let slot = Slot::new(&device, width, height, PixelFormat::Bgra8, true)?;
+        Ok(Self { slot, device })
+    }
+
+    pub(crate) fn is_output(&self) -> bool {
+        self.slot.output
+    }
+
+    /// Only the output pool's own lease remains. Unlike capture recycling,
+    /// this need not wait for an earlier D3D11 upload: another upload is
+    /// ordered on the same context, and a GPU target waits on `ready_value`.
+    pub(crate) fn is_idle_output(&self) -> bool {
+        self.is_output() && Arc::strong_count(&self.slot) == 1
+    }
+
+    /// Upload CPU-generated BGRA pixels to an idle output. On failure the
+    /// caller must retire its whole pool, since Signal may not have reached
+    /// the queue. This method never runs the user's drawing callback.
+    pub(crate) fn upload(&mut self, bytes: &[u8]) -> Result<()> {
+        if !self.is_output() {
+            bail!("captured Windows frames are read-only");
+        }
+        let slot = Arc::get_mut(&mut self.slot).context("output frame is still in use")?;
+        let stride = slot
+            .width
+            .checked_mul(4)
+            .context("output row size overflow")?;
+        let len = (stride as usize)
+            .checked_mul(slot.height as usize)
+            .context("output byte size overflow")?;
+        if bytes.len() != len {
+            bail!("output upload requires {len} tightly packed BGRA bytes");
+        }
+        let mut submit = self.device.0.submit.lock();
+        let value = submit.next;
+        submit.next = value
+            .checked_add(1)
+            .context("D3D11 output fence exhausted")?;
+        slot.ready.store(value, Ordering::Release);
+        unsafe {
+            // UpdateSubresource copies the CPU bytes before returning. Only
+            // its GPU write is asynchronous, so one staging Vec is enough.
+            submit.context.UpdateSubresource(
+                &slot.texture,
+                0,
+                None,
+                bytes.as_ptr().cast(),
+                stride,
+                0,
+            );
+            submit
+                .context
+                .Signal(&self.device.0.fence, value)
+                .context("could not signal the D3D11 output upload")?;
+            submit.context.Flush();
+            self.device
+                .raw()
+                .GetDeviceRemovedReason()
+                .context("D3D11 output upload device was removed")?;
+        }
+        Ok(())
+    }
+
     /// For explicit CPU-side consumers/diagnostics only. The compositor and
     /// GPU consumers use fence waits; NVENC's D3D11 input mapping synchronizes
     /// its private GPU copy instead of using this diagnostic polling loop.
+    /// This does not wait for wgpu writes to an output frame.
     pub fn wait_ready(&self, timeout: Duration) -> Result<bool> {
         let started = Instant::now();
         loop {
@@ -210,19 +357,36 @@ impl TexturePool {
         }
     }
 
-    /// Copy the top-left `width` by `height` region without CPU readback.
+    /// Copy the top-left `width` by `height` region of subresource zero without
+    /// CPU readback. See `copy_subresource` for source and lifetime requirements.
+    pub fn copy(
+        &mut self,
+        source: &ID3D11Texture2D,
+        width: u32,
+        height: u32,
+    ) -> Result<Option<Frame>> {
+        self.copy_subresource(source, 0, width, height)
+    }
+
+    /// Copy the top-left `width` by `height` region of one array slice into an
+    /// owned, single-layer texture without CPU readback or a color conversion.
     /// Returns `None` when all `MAX_POOL_FRAMES` slots are still in use.
-    /// Supports BGRA8 and RGB10A2 default-usage, single-mip/slice/sample textures.
+    /// Supports BGRA8, RGB10A2 and NV12 default-usage, single-mip/sample textures;
+    /// `subresource` must name an existing array slice. NV12 requires positive
+    /// even dimensions, including the visible crop, and the qualified Rec.709
+    /// limited-range color contract documented on `PixelFormat::Nv12`.
     ///
     /// The source must belong to this pool's device. External producers must
     /// finish submitting writes on the shared device's immediate context
     /// before this call; cross-API producers must synchronize their writes
     /// with that device first. Do not overwrite or recycle the source until
     /// the returned frame's fence reaches its ready value (or order subsequent
-    /// writes after this copy on the same immediate context).
-    pub fn copy(
+    /// writes after this copy on the same immediate context). For MF cameras,
+    /// retain the source sample as well as the returned frame until completion.
+    pub fn copy_subresource(
         &mut self,
         source: &ID3D11Texture2D,
+        subresource: u32,
         width: u32,
         height: u32,
     ) -> Result<Option<Frame>> {
@@ -232,8 +396,9 @@ impl TexturePool {
         let format = match source_desc.Format {
             DXGI_FORMAT_B8G8R8A8_UNORM => PixelFormat::Bgra8,
             DXGI_FORMAT_R10G10B10A2_UNORM => PixelFormat::Rgba10,
+            DXGI_FORMAT_NV12 => PixelFormat::Nv12,
             other => bail!(
-                "copy source format {other:?}: valid formats are B8G8R8A8_UNORM and R10G10B10A2_UNORM"
+                "copy source format {other:?}: valid formats are B8G8R8A8_UNORM, R10G10B10A2_UNORM and NV12"
             ),
         };
         if owner != *self.device.raw()
@@ -242,15 +407,22 @@ impl TexturePool {
             || width > source_desc.Width
             || height > source_desc.Height
             || source_desc.MipLevels != 1
-            || source_desc.ArraySize != 1
+            || subresource >= source_desc.ArraySize
             || source_desc.SampleDesc.Count != 1
             || source_desc.SampleDesc.Quality != 0
             || source_desc.Usage != D3D11_USAGE_DEFAULT
             || source_desc.CPUAccessFlags != 0
         {
             bail!(
-                "copy source must be same-device, GPU-only default usage, single mip/slice/sample with nonzero copy dimensions within the texture"
+                "copy source must be same-device, GPU-only default usage, single mip/sample with a valid array subresource and nonzero copy dimensions within the texture"
             );
+        }
+        if format == PixelFormat::Nv12
+            && [width, height, source_desc.Width, source_desc.Height]
+                .iter()
+                .any(|size| !size.is_multiple_of(2))
+        {
+            bail!("NV12 copy source and visible dimensions must be even");
         }
         let completed = self.device.completed()?;
         // Discard only idle old-size/format textures; retained pictures keep
@@ -271,45 +443,7 @@ impl TexturePool {
             Some(slot) => slot.clone(),
             None if self.slots.len() == MAX_POOL_FRAMES => return Ok(None),
             None => {
-                let desc = D3D11_TEXTURE2D_DESC {
-                    Width: width,
-                    Height: height,
-                    MipLevels: 1,
-                    ArraySize: 1,
-                    Format: source_desc.Format,
-                    SampleDesc: DXGI_SAMPLE_DESC {
-                        Count: 1,
-                        Quality: 0,
-                    },
-                    Usage: D3D11_USAGE_DEFAULT,
-                    BindFlags: (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET).0 as u32,
-                    MiscFlags: (D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED).0
-                        as u32,
-                    ..Default::default()
-                };
-                let mut texture = None;
-                unsafe {
-                    self.device
-                        .raw()
-                        .CreateTexture2D(&desc, None, Some(&mut texture))
-                }?;
-                let texture = texture.context("D3D11 returned no texture")?;
-                let resource: IDXGIResource1 = texture.cast()?;
-                let shared = unsafe {
-                    SharedHandle::new(resource.CreateSharedHandle(
-                        None,
-                        (DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE).0,
-                        PCWSTR::null(),
-                    )?)
-                };
-                let slot = Arc::new(Slot {
-                    texture,
-                    shared,
-                    width,
-                    height,
-                    format,
-                    ready: AtomicU64::new(0),
-                });
+                let slot = Slot::new(&self.device, width, height, format, false)?;
                 self.slots.push(slot.clone());
                 slot
             }
@@ -338,7 +472,7 @@ impl TexturePool {
                 0,
                 0,
                 source,
-                0,
+                subresource,
                 Some(&bounds),
             );
             submit.context.Signal(&self.device.0.fence, value)?;

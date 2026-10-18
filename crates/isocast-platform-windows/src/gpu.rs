@@ -1,6 +1,7 @@
-//! D3D11 capture textures sampled in place by wgpu/DX12. No pixel upload or
+//! D3D11 textures sampled or drawn in place by wgpu/DX12. No pixel upload or
 //! readback: opening the NT handle maps the same allocation on the same GPU.
-//! D3D11's copy-completion fence gates the actual wgpu rendering queue.
+//! D3D11's capture/upload fence gates the actual wgpu rendering queue. GPU
+//! output is published only after the producer's `GpuCompletion` has finished.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -23,8 +24,8 @@ const MAX_SURFACES: usize = 64;
 const SURFACE_TTL: Duration = Duration::from_secs(2);
 const FRAME_LEASE: GUID = GUID::from_u128(0x5c2880e7_2659_47f3_9296_a7990b7861e1);
 
-/// The default import owns a frame lease until wgpu releases its native
-/// resource after GPU completion. Private data belongs to this particular
+/// An uncached import or target owns a frame lease until wgpu releases its
+/// native resource after GPU completion. Private data belongs to this particular
 /// OpenSharedHandle result, not to the D3D11 texture or other DX12 opens;
 /// retaining it therefore cannot create a cycle back to the pool's slot.
 #[implement()]
@@ -109,6 +110,15 @@ impl Dx12Importer {
         Ok(())
     }
 
+    fn check_target(&self, frame: &Frame) -> Result<()> {
+        if !frame.is_output() || frame.pixel_format() != PixelFormat::Bgra8 {
+            bail!(
+                "Windows render targets require an OutputPool BGRA8 frame; captured frames are read-only"
+            );
+        }
+        Ok(())
+    }
+
     fn texture(&self, frame: &Frame, retain: bool) -> Result<wgpu::Texture> {
         let (native_format, format) = match frame.pixel_format() {
             PixelFormat::Bgra8 => (DXGI_FORMAT_B8G8R8A8_UNORM, wgpu::TextureFormat::Bgra8Unorm),
@@ -116,6 +126,7 @@ impl Dx12Importer {
                 DXGI_FORMAT_R10G10B10A2_UNORM,
                 wgpu::TextureFormat::Rgb10a2Unorm,
             ),
+            PixelFormat::Nv12 => bail!("real NV12 plane import pending"),
         };
         let mut resource: Option<ID3D12Resource> = None;
         unsafe {
@@ -131,6 +142,7 @@ impl Dx12Importer {
             || desc.DepthOrArraySize != 1
             || desc.MipLevels != 1
             || desc.SampleDesc.Count != 1
+            || desc.SampleDesc.Quality != 0
             || desc.Format != native_format
             || !desc
                 .Flags
@@ -140,6 +152,18 @@ impl Dx12Importer {
                 "DX12 capture texture must be a single-plane {native_format:?} simultaneous-access texture matching the frame"
             );
         }
+        // Output surfaces use the same descriptor whether first opened as
+        // an import or a target, so either cached path can reuse this texture.
+        let usage = if frame.is_output() {
+            if !desc.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) {
+                bail!("DX12 output texture must allow render-target access");
+            }
+            wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+        } else {
+            wgpu::TextureUsages::TEXTURE_BINDING
+        };
         if retain {
             let lease: IUnknown = FrameLease {
                 _frame: frame.clone(),
@@ -165,27 +189,51 @@ impl Dx12Importer {
         // SAFETY: the opened resource belongs to this DX12 device and has
         // exactly this layout. D3D11 sharing hands it over in COMMON, with
         // contents preserved (PRESENT maps to COMMON, not UNINITIALIZED).
-        // It is read-only here. Simultaneous-access textures decay to COMMON
-        // after ExecuteCommandLists, even after explicit barriers; on reuse
-        // DX12 permits the previous promotable read state as StateBefore.
-        // The frame lease (or cached-import caller) prevents a D3D11 write
-        // until every GPU reader is done. No external write overlaps a read.
+        // Simultaneous-access textures promote from COMMON to read OR render
+        // states and decay to COMMON after ExecuteCommandLists, even after
+        // explicit barriers. On reuse DX12 permits a prior promotable state
+        // as StateBefore. Output must await its producer's GpuCompletion
+        // before D3D11/native consumption. The frame lease (or cached caller)
+        // prevents pool reuse until all GPU users finish; no external write
+        // overlaps a reader, including NVENC's unchanged private-copy path.
         Ok(unsafe {
             self.device.create_texture_from_hal::<hal::api::Dx12>(
                 texture,
                 &wgpu::TextureDescriptor {
-                    label: Some("captured D3D11 texture"),
+                    label: Some("shared D3D11 texture"),
                     size,
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
                     format,
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                    usage,
                     view_formats: &[],
                 },
                 wgpu::TextureUses::PRESENT,
             )
         })
+    }
+
+    fn cached_texture(&mut self, frame: &Frame) -> Result<wgpu::Texture> {
+        self.check_adapter(frame)?;
+        let key = frame.texture().as_raw() as usize;
+        let now = Instant::now();
+        if !self.surfaces.contains_key(&key) {
+            let texture = self.texture(frame, false)?;
+            self.forget_old(now);
+            self.surfaces.insert(
+                key,
+                Surface {
+                    _source: frame.texture().clone(),
+                    texture,
+                    used: now,
+                },
+            );
+        }
+        self.wait(frame)?;
+        let surface = self.surfaces.get_mut(&key).expect("inserted above");
+        surface.used = now;
+        Ok(surface.texture.clone())
     }
 
     fn forget_old(&mut self, now: Instant) {
@@ -221,35 +269,25 @@ impl FrameImporter for Dx12Importer {
     }
 
     fn import_cached(&mut self, frame: &Frame) -> Result<Option<GpuFrame>> {
-        self.check_adapter(frame)?;
-        let key = frame.texture().as_raw() as usize;
-        let now = Instant::now();
-        if !self.surfaces.contains_key(&key) {
-            let texture = self.texture(frame, false)?;
-            self.forget_old(now);
-            self.surfaces.insert(
-                key,
-                Surface {
-                    _source: frame.texture().clone(),
-                    texture,
-                    used: now,
-                },
-            );
-        }
-        self.wait(frame)?;
-        let surface = self.surfaces.get_mut(&key).expect("inserted above");
-        surface.used = now;
+        let texture = self.cached_texture(frame)?;
         Ok(Some(GpuFrame {
             width: frame.width(),
             height: frame.height(),
-            pixels: GpuPixels::Rgb(surface.texture.clone()),
+            pixels: GpuPixels::Rgb(texture),
         }))
     }
 
-    fn target(&mut self, _frame: &Frame) -> Result<wgpu::Texture> {
-        bail!(
-            "captured Windows frames are read-only; compositor output pools are not implemented yet"
-        )
+    fn target(&mut self, frame: &Frame) -> Result<wgpu::Texture> {
+        self.check_target(frame)?;
+        self.check_adapter(frame)?;
+        let texture = self.texture(frame, true)?;
+        self.wait(frame)?;
+        Ok(texture)
+    }
+
+    fn target_cached(&mut self, frame: &Frame) -> Result<Option<wgpu::Texture>> {
+        self.check_target(frame)?;
+        self.cached_texture(frame).map(Some)
     }
 
     fn ycbcr_target(&mut self, _frame: &Frame) -> Result<(wgpu::Texture, wgpu::Texture)> {

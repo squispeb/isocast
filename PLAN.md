@@ -1762,6 +1762,43 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
     remote Mac gates and independent review pass. Ready for CI.
     Engine codec-tag guard remains required when
     wiring HEVC to the writer, never the H.264 live/FLV path.
+  - [x] **W.5c4 Recording-quality construction and nonterminal barriers.**
+    Explicit native QP/Quality from VideoTrackSpec, no bitrate inferred from
+    VideoToolbox quality. Packet-acknowledged barrier preserves prefix on
+    failure without EOS; drained sessions start new files with forcedIDR and
+    monotonic inputPTS. Native terminal errors preserve queued valid output.
+    41files/1230decoded frames verify native quality ladder, two-file reuse,
+    callback-error retry and liveCBR regression. Microsoft software quality
+    rounding fails closed; default software recording remains unqualified.
+    Native clippy/81engine tests and read-only review pass; full portable gates
+    blocked on build-host disk floors, not bypassed. No full-engine/perf claim.
+  - [x] **W.5c4a Nearest software MF quality.** Read actual after media-type
+    negotiation; bounded nearest-value selection and truthful actual report.
+    Production64×48 H264 defaultHigh70→72 now records; all101raw qualities
+    and5factory presets pass.115files/711frames including NVIDIA regressions
+    decode;101opens keep454handles. Native strict clippy/81tests/review pass.
+    Uncommitted, ready for CI; full remote portable gates pass233unit+1doctest
+    after m2-b space recovered, no cache cleanup or disk-floor bypass.
+  - [x] **W.5d1 Native AAC and WASAPI capture primitives.** Microsoft raw48k
+    AAC-LC with explicit1024-frame pre-roll, bounded admission, nonterminal
+    polling and terminal trim; event-driven mic/endpoint loopback with native
+    clock/loss accounting and joined teardown.56AAC edge cases plus actual
+    24k/48k devices→AAC→MP4/full decode pass; repeated handles stable. WPR/ETW
+    scoped evidence, not full-engine OBS parity. Endpoint exclusions/playback,
+    absolute A/V alignment and reconnect qualification remain separate gates.
+  - [ ] **W.5d2 GPU Media Foundation cameras.** Actual Elgato4K S SourceReader
+    proves1080p60 GPU NV12 textures and QPC device stamps, but public capture
+    rejects its samples: progressive media type conflicts with Interlaced=1.
+    Do not ignore sample flags; need a known-progressive source or explicitly
+    scoped GPU deinterlacing. CamLink4K ReadSample resource failure remains
+    unqualified, no other app terminated. Shared native NV12 input ownership
+    was handed to capture; compositor plane views/writer input selection remain
+    pending. No RGB roundtrip for camera/ISO or fake plane textures.
+    - [ ] **W.5d2a Native NV12 input slice.** GPU array-slice/crop copies,
+      private NVENC input and MF NV12 copy/P010 code expansion pass exact
+      component checks and7files/210decodedframes. BGRA regression37files/
+      1110frames, native fmt/strict Clippy/81tests pass. Uncommitted; review
+      endpoint unavailable and new full portable gates blocked by disk floors.
 - [ ] **W.6 App, IPC and shared surfaces.** Slint Windows window and native
   integration, same-user named pipes with isolated engines, D3D11/D3D12
   surface hand-over/fences with adapter identity and bounded per-viewer
@@ -1803,6 +1840,48 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
 - FilmCraft reads `session.json` to line up ISO files without audio sync.
 
 ## Log
+
+- W.5d2a (2026-10-18, #105, native qualification): inherited NV12-input slice
+  rechecked on exon-desk under bounded GPU lock: exact345,600component copies/
+  expansion, array/crop/pressure/lease checks;7files210frames full-decode,
+  BGRA regression37files1110frames full-decode. Windows fmt/strict all-target
+  Clippy/81engine tests pass. New portable gates exit69 at38/39/39GiB remote
+  disk floors; reviewer endpoint unavailable. No camera success claimed:
+  actual public API still rejects contradictory interlaced samples. No
+  production source changed during this verification takeover; no commits.
+
+- W.5c4a (2026-10-18, #105, ready for CI): replace exact softwareMF quality
+  rejection with bounded nearest actual-value negotiation AFTER media types;
+  SetValue alone only echoes the request. Preserve native choice on ties,
+  re-pin/recheck and expose requested+actual metadata; factory reports actual.
+  All101software inputs and5production presets at64×48 pass, High70→72;
+  NVIDIA3codecs×3qualities unchanged.115files/711decodedframes, stable454handles,
+  native strict clippy/81tests/read-only fallback review pass. Uncommitted.
+  AAC/WASAPI already committed in59f36cd4; no audio internals changed.
+
+- W.5c4 (2026-10-18, #105, ready for CI): recording factory now selects native
+  CONSTQP/MFQuality, preserving codec/depth and live bitrate behavior. New
+  nonterminal barrier individually acknowledges accepted output; failed
+  callback keeps its packet, segment reuse forcesIDR without resettingPTS.
+  Native finish no longer discards valid prefix on ordinary errors.41native
+  files decode1230/1230frames; ordered quality, duration, reuse and liveCBR
+  checks pass. NVIDIA MF all3codecs qualified at30/70/100; Microsoft software
+  rounded quality30/70 rejected,100verified. Native strict clippy/81engine
+  tests/review pass. Full portable gates externally blocked below40GB on all
+  3Mac hosts. Uncommitted; no adapter/daemon selection or full-engine/OBS claim.
+
+- W.5d1 (2026-10-18, #105): native MF AAC and WASAPI mic/endpoint loopback
+  implemented, uncommitted for coordinator. Real sample-zero loss requires
+  deliberate1024-frame pre-roll; native24k capture positions require SRC-aware
+  clock accounting.56AAC edgecases, real24k/48k capture→AAC→mux/decode, atomic
+  admission, nonterminal continuation and24reopens pass; no growing handles.
+  Explicit stall reports48k loss or stops uncertain24k conversion. WPT26100
+  trace0lostevents, isolated steady2.7%one-core including tone playback; not
+  full-engine/OBS. Native strict clippy/build pass; existing scoped test
+  commands pass with0tests; read-only fallback review clears fixes. Ready for
+  CI with disclosed portable-gate blocker: two attempts exit69 because all
+  Mac build hosts are below40GB disk floor. No bypass or adapter/daemon
+  selection; recording CQ/QP/barriers follow as a separate slice.
 
 - Windows CI memory controls (2026-10-18, #105, ready for CI): merged
   main49a98729 without commit, retaining W.3a and native Windows package.

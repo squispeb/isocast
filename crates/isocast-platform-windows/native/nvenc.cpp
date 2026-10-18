@@ -17,11 +17,13 @@ constexpr int again = -1;
 constexpr int internal_error = -2;
 std::atomic<uint32_t> sessions{0};
 
+enum InputFormat : uint32_t { bgra8 = 0, rgba10 = 1, nv12 = 2 };
+
 struct Config {
     uint32_t width, height, fps, bitrate, constant_bitrate, keyframe_interval;
-    uint32_t codec, input_depth, output_depth;
+    uint32_t codec, input_depth, output_depth, quality_qp, input_format;
 };
-static_assert(sizeof(Config) == 36);
+static_assert(sizeof(Config) == 44);
 
 struct Packet {
     const uint8_t *data;
@@ -56,6 +58,7 @@ struct Encoder {
     HANDLE eos = nullptr;
     bool eos_registered = false, submitted = false, flushing = false, flushed = false;
     bool counted = false;
+    bool recording = false;
     unsigned head = 0, count = 0;
     char error[512] = {};
     uint8_t headers[4096] = {};
@@ -98,7 +101,8 @@ struct Encoder {
         desc.MipLevels = desc.ArraySize = desc.SampleDesc.Count = 1;
         desc.Format = texture_format;
         desc.Usage = D3D11_USAGE_DEFAULT;
-        desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+        desc.BindFlags = texture_format == DXGI_FORMAT_NV12
+            ? D3D11_BIND_SHADER_RESOURCE : D3D11_BIND_RENDER_TARGET;
         HRESULT result = device->CreateTexture2D(&desc, nullptr, &input.texture);
         if (FAILED(result)) {
             std::snprintf(error, sizeof(error), "allocate NVENC GPU input: HRESULT 0x%08lx", static_cast<unsigned long>(result));
@@ -177,17 +181,27 @@ struct Encoder {
     }
 
     int open(void *device, const Config &spec) {
+        recording = spec.quality_qp != UINT32_MAX;
+        if (recording && spec.quality_qp > 51) {
+            std::snprintf(error, sizeof(error), "video.quantizer: NVENC valid range is 0..=51");
+            return internal_error;
+        }
         if (spec.codec > 1 || (spec.output_depth != 8 && spec.output_depth != 10)
             || (spec.input_depth != 8 && spec.input_depth != 10)
+            || spec.input_format > nv12
+            || spec.input_depth != (spec.input_format == rgba10 ? 10u : 8u)
             || spec.input_depth > spec.output_depth
             || (spec.codec == 0 && spec.output_depth != 8)) {
-            std::snprintf(error, sizeof(error), "unsupported codec/input/output bit-depth combination");
+            std::snprintf(error, sizeof(error), "unsupported codec/input format/input/output bit-depth combination");
             return internal_error;
         }
         const auto codec = spec.codec == 0 ? NV_ENC_CODEC_H264_GUID : NV_ENC_CODEC_HEVC_GUID;
-        if (spec.input_depth == 10) {
+        if (spec.input_format == rgba10) {
             input_format = NV_ENC_BUFFER_FORMAT_ABGR10;
             texture_format = DXGI_FORMAT_R10G10B10A2_UNORM;
+        } else if (spec.input_format == nv12) {
+            input_format = NV_ENC_BUFFER_FORMAT_NV12;
+            texture_format = DXGI_FORMAT_NV12;
         }
         library = LoadLibraryExW(L"nvEncodeAPI64.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
         if (!library) return win_error("load the system NVIDIA encoder driver");
@@ -248,7 +262,7 @@ struct Encoder {
         bool found = false;
         for (uint32_t i = 0; i < format_count; ++i) found |= formats[i] == input_format;
         if (!found) {
-            std::snprintf(error, sizeof(error), "requested RGB input precision is not supported for this codec");
+            std::snprintf(error, sizeof(error), "requested input format is not supported for this codec");
             return internal_error;
         }
         NV_ENC_PRESET_CONFIG preset = {};
@@ -264,8 +278,19 @@ struct Encoder {
         config.frameIntervalP = 1;
         config.frameFieldMode = NV_ENC_PARAMS_FRAME_FIELD_MODE_FRAME;
         auto &rc = config.rcParams;
-        rc.rateControlMode = spec.constant_bitrate ? NV_ENC_PARAMS_RC_CBR : NV_ENC_PARAMS_RC_VBR;
-        rc.averageBitRate = rc.maxBitRate = rc.vbvBufferSize = spec.bitrate;
+        if (recording) {
+            // CONSTQP is zero, not a testable bit in SUPPORTED_RATECONTROL_MODES.
+            // InitializeEncoder validates this mode together with spatial AQ8;
+            // never silently disable AQ or fall back to bitrate control.
+            rc.rateControlMode = NV_ENC_PARAMS_RC_CONSTQP;
+            rc.constQP.qpIntra = rc.constQP.qpInterP = rc.constQP.qpInterB = spec.quality_qp;
+            rc.averageBitRate = rc.maxBitRate = rc.vbvBufferSize = rc.vbvInitialDelay = 0;
+            rc.targetQuality = rc.targetQualityLSB = 0;
+            rc.enableMinQP = rc.enableMaxQP = rc.enableInitialRCQP = 0;
+        } else {
+            rc.rateControlMode = spec.constant_bitrate ? NV_ENC_PARAMS_RC_CBR : NV_ENC_PARAMS_RC_VBR;
+            rc.averageBitRate = rc.maxBitRate = rc.vbvBufferSize = spec.bitrate;
+        }
         rc.enableLookahead = 0;
         rc.lookaheadDepth = 0;
         rc.enableAQ = 1;
@@ -279,7 +304,7 @@ struct Encoder {
             h264.idrPeriod = spec.keyframe_interval;
             h264.repeatSPSPPS = 1;
             h264.outputAUD = 1;
-            h264.enableFillerDataInsertion = spec.constant_bitrate != 0;
+            h264.enableFillerDataInsertion = !recording && spec.constant_bitrate != 0;
             h264.chromaFormatIDC = 1;
             h264.inputBitDepth = h264.outputBitDepth = NV_ENC_BIT_DEPTH_8;
             colour = &h264.h264VUIParameters;
@@ -288,7 +313,7 @@ struct Encoder {
             hevc.idrPeriod = spec.keyframe_interval;
             hevc.repeatSPSPPS = 1;
             hevc.outputAUD = 1;
-            hevc.enableFillerDataInsertion = spec.constant_bitrate != 0;
+            hevc.enableFillerDataInsertion = !recording && spec.constant_bitrate != 0;
             hevc.chromaFormatIDC = 1;
             hevc.inputBitDepth = spec.input_depth == 10 ? NV_ENC_BIT_DEPTH_10 : NV_ENC_BIT_DEPTH_8;
             hevc.outputBitDepth = spec.output_depth == 10 ? NV_ENC_BIT_DEPTH_10 : NV_ENC_BIT_DEPTH_8;
@@ -312,7 +337,8 @@ struct Encoder {
         init.enableEncodeAsync = init.enablePTD = 1;
         init.encodeConfig = &config;
         status = api.nvEncInitializeEncoder(session, &init);
-        if (status != NV_ENC_SUCCESS) return fail("initialize video encoder", status);
+        if (status != NV_ENC_SUCCESS) return fail(recording
+            ? "initialize constant-QP video encoder with spatial AQ8" : "initialize video encoder", status);
         auto graphics = static_cast<ID3D11Device *>(device);
         graphics->GetImmediateContext(&context);
         int result = event(&eos);
@@ -478,6 +504,10 @@ int isocast_nvenc_wait_flush(Encoder *encoder, uint32_t timeout_ms) {
 }
 
 int isocast_nvenc_set_rate(Encoder *encoder, uint32_t fps, uint32_t bitrate) {
+    if (encoder->recording) {
+        std::snprintf(encoder->error, sizeof(encoder->error), "recording settings cannot change; open a new encoder");
+        return internal_error;
+    }
     auto config = encoder->config;
     config.rcParams.averageBitRate = config.rcParams.maxBitRate = config.rcParams.vbvBufferSize = bitrate;
     NV_ENC_RECONFIGURE_PARAMS change = {};

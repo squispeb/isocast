@@ -4,6 +4,9 @@
 //! until the compositor, encoders and crash-safe writer are qualified.
 #![cfg(windows)]
 
+mod aac;
+mod audio;
+mod camera;
 mod capture;
 mod clock;
 mod convert;
@@ -15,12 +18,22 @@ mod hevc;
 mod mf;
 mod native;
 mod nvenc;
+mod output;
 mod p010;
 
+pub use aac::{AacFinish, AacPacket, AacStats, MfAacEncoder};
+pub use audio::{
+    AudioCapture, AudioCaptureStats, AudioDevice, audio_devices, capture_loopback,
+    capture_microphone, capture_system_audio,
+};
+pub use camera::{
+    CameraCapture, CameraCaptureStats, CameraDevice, CameraFormat, camera_devices, capture_camera,
+};
 pub use capture::{CaptureStats, CaptureTarget, DisplayCapture, capture_screen};
 pub use clock::now;
-pub use encoder::{EncoderBackend, VideoEncoding, WindowsVideoEncoder};
+pub use encoder::{EncoderBackend, RecordingQuality, VideoEncoding, WindowsVideoEncoder};
 pub use frames::{Frame, GraphicsDevice, MAX_POOL_FRAMES, PixelFormat, TexturePool};
 pub use gpu::Dx12Importer;
 pub use mf::{MfEncoder, MfEncoderInfo, MfMode, mf_encoders, mf_encoders_for};
 pub use nvenc::{EncodeStats, NvencEncoder};
+pub use output::OutputPool;
