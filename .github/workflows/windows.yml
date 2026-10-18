@@ -70,13 +70,6 @@ jobs:
     name: daemon + CLI + UI build (windows-latest)
     runs-on: windows-latest
     timeout-minutes: 60
-    # The compiled Slint UI alone peaks around 13.5 GiB working set. Its bin
-    # and test compiler must not overlap on the 16 GiB runner. Omit Rust
-    # symbols, not Slint element metadata; keep all targets, dev assertions
-    # and overflow checks. Other jobs and local/release profiles are unchanged.
-    env:
-      CARGO_BUILD_JOBS: 1
-      CARGO_PROFILE_DEV_DEBUG: 0
     defaults:
       run:
         shell: bash

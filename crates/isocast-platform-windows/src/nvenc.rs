@@ -1,4 +1,4 @@
-//! Asynchronous native H.264/HEVC from D3D11 textures. Eight pictures at most
+//! Asynchronous native H.264/HEVC from D3D11 textures. Four pictures at most
 //! remain leased to NVENC; encoded bytes, never raw pixels, cross to the CPU.
 
 use std::collections::VecDeque;
@@ -14,7 +14,9 @@ use crate::encoder::Parameters;
 use crate::h264::MAX_PACKET;
 use crate::{Frame, GraphicsDevice, PixelFormat, VideoEncoding};
 
-const IN_FLIGHT: usize = 8;
+// Matches native/nvenc.cpp: asynchronous output needs 4 + B-frame count.
+// B-frames and lookahead are disabled for this encoder.
+const IN_FLIGHT: usize = 4;
 const STALL_WAIT: Duration = Duration::from_millis(400);
 const FINISH_WAIT: Duration = Duration::from_secs(5);
 
@@ -30,7 +32,6 @@ struct Config {
     input_depth: u32,
     output_depth: u32,
     quality_qp: u32,
-    input_format: u32,
 }
 
 #[repr(C)]
@@ -42,7 +43,7 @@ struct Packet {
     keyframe: u32,
 }
 
-const _: () = assert!(std::mem::size_of::<Config>() == 44);
+const _: () = assert!(std::mem::size_of::<Config>() == 40);
 const _: () = assert!(std::mem::size_of::<Packet>() == 24);
 
 unsafe extern "C" {
@@ -92,7 +93,7 @@ pub struct EncodeStats {
 /// H.264 High by default, or HEVC Main/Main10; SDR Rec.709 limited range,
 /// P5 low-latency, single pass, spatial AQ8, no temporal AQ/lookahead/B-frames.
 /// Shared input is copied on
-/// GPU into one of eight private slots: NVENC forbids client access while
+/// GPU into one of four private slots: NVENC forbids client access while
 /// its input is mapped. Other consumers can still use the original Frame.
 pub struct NvencEncoder {
     native: NonNull<c_void>,
@@ -124,8 +125,6 @@ impl NvencEncoder {
 
     /// HEVC output has an hvcC decoder config and no H.264 `parameter_sets`.
     /// The caller must select a matching HEVC mux track, never the live FLV path.
-    /// NV12 input keeps its qualified limited-range Rec.709 codes. Main10
-    /// output may expand eight-bit input, but cannot add source precision.
     pub fn with_format(
         device: &GraphicsDevice,
         spec: &LiveVideoSpec,
@@ -187,12 +186,6 @@ impl NvencEncoder {
             input_depth: if input == PixelFormat::Rgba10 { 10 } else { 8 },
             output_depth: u32::from(encoding.bit_depth()),
             quality_qp: quality_qp.unwrap_or(u32::MAX),
-            // Matches InputFormat in native/nvenc.cpp; storage is not bit depth.
-            input_format: match input {
-                PixelFormat::Bgra8 => 0,
-                PixelFormat::Rgba10 => 1,
-                PixelFormat::Nv12 => 2,
-            },
         };
         let mut error = [0 as c_char; 512];
         let native = unsafe {

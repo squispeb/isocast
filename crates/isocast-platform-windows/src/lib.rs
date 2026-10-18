@@ -6,10 +6,11 @@
 
 mod aac;
 mod audio;
-mod camera;
+mod broker;
 mod capture;
 mod clock;
 mod convert;
+mod devices;
 mod encoder;
 mod frames;
 mod gpu;
@@ -20,14 +21,18 @@ mod native;
 mod nvenc;
 mod output;
 mod p010;
+mod permissions;
+mod platform;
+mod system;
+mod writer;
 
 pub use aac::{AacFinish, AacPacket, AacStats, MfAacEncoder};
 pub use audio::{
     AudioCapture, AudioCaptureStats, AudioDevice, audio_devices, capture_loopback,
     capture_microphone, capture_system_audio,
 };
-pub use camera::{
-    CameraCapture, CameraCaptureStats, CameraDevice, CameraFormat, camera_devices, capture_camera,
+pub use broker::{
+    IsolatedCapture, IsolatedCaptureStats, capture_helper_main, isolated_capture_screen,
 };
 pub use capture::{CaptureStats, CaptureTarget, DisplayCapture, capture_screen};
 pub use clock::now;
@@ -37,3 +42,5 @@ pub use gpu::Dx12Importer;
 pub use mf::{MfEncoder, MfEncoderInfo, MfMode, mf_encoders, mf_encoders_for};
 pub use nvenc::{EncodeStats, NvencEncoder};
 pub use output::OutputPool;
+pub use platform::{Capture, Unsupported, WindowsPlatform};
+pub use writer::VideoWriter;

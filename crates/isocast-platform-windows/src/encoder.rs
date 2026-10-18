@@ -110,8 +110,6 @@ pub struct RecordingQuality {
 }
 
 impl RecordingQuality {
-    /// Requested native policy. An opened MF encoder can select a nearby
-    /// supported value; use `WindowsVideoEncoder::recording_quality` for it.
     pub fn new(quality: EncoderQuality) -> Result<Self> {
         let value = match quality {
             EncoderQuality::Preset(preset) => match preset {
@@ -275,12 +273,6 @@ impl WindowsVideoEncoder {
                 quality.mf_quality,
             ) {
                 Ok(encoder) => {
-                    let quality = RecordingQuality {
-                        mf_quality: encoder.info().quality.context(
-                            "MF recording quality: provider did not report selected quality",
-                        )?,
-                        ..quality
-                    };
                     let name = encoder.info().name.clone();
                     let backend = match mode {
                         MfMode::Hardware => EncoderBackend::MediaFoundationHardware(name),
@@ -307,10 +299,6 @@ impl WindowsVideoEncoder {
         )
     }
 
-    /// Native recording controls: `mf_quality` is the actual selected value
-    /// for MF, not necessarily `RecordingQuality::new`'s requested value.
-    /// NVENC uses `nvenc_qp`; the unused provider's field retains its policy
-    /// value. Raw `MfEncoder::info()` exposes requested and actual MF quality.
     pub fn recording_quality(&self) -> Option<RecordingQuality> {
         self.quality
     }

@@ -179,6 +179,14 @@ pub trait Platform: Clone + Send + Sync + 'static {
     /// what encoders take as is, at under half the size of BGRA.
     fn ycbcr_frame_pool(&self, width: u32, height: u32) -> anyhow::Result<Self::FramePool>;
 
+    /// What the program and ISO stages hand H.264 and HEVC encoders:
+    /// Y'CbCr from [`Platform::ycbcr_frame_pool`] (converted on the GPU),
+    /// or BGRA from [`Platform::frame_pool`] for backends that accept RGB
+    /// frames and own their conversion.
+    fn encoder_frame_format(&self) -> EncoderFrameFormat {
+        EncoderFrameFormat::Ycbcr
+    }
+
     /// Ask the OS to run the calling thread ahead of background work: it
     /// paces frames or audio in real time (the program, a file's frame
     /// clock, an audio reader, the mix, a file writer).
@@ -265,15 +273,6 @@ pub trait Platform: Clone + Send + Sync + 'static {
         sink: VideoSink<Self::Frame>,
     ) -> anyhow::Result<(Self::Capture, CaptureFormat)>;
 
-    /// A reader of what a camera capture from [`Platform::capture_camera`]
-    /// has observed, for the session manifest. `None` (the default) when
-    /// the platform reports nothing. The reader must hold only the
-    /// device's identity and shared flags, never the capture or GPU
-    /// resources, so it stays readable after the capture stops.
-    fn camera_metadata(&self, _capture: &Self::Capture) -> Option<CameraMetadataReader> {
-        None
-    }
-
     /// Start capturing a microphone ("default", or an id, name or part of
     /// a name from [`Platform::devices`]): the input channels `channels`
     /// picks (numbered from 1; one is delivered as mono, two as stereo),
@@ -354,6 +353,16 @@ pub trait Platform: Clone + Send + Sync + 'static {
         let _ = (spec, progress);
         anyhow::bail!("joining files isn't supported on this platform yet")
     }
+}
+
+/// The frames a platform's encoders want drawn for them (see
+/// [`Platform::encoder_frame_format`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncoderFrameFormat {
+    /// 8-bit BGRA, as drawn: conversion belongs to the encoder backend.
+    Bgra,
+    /// 8-bit 4:2:0 Y'CbCr, converted by the engine.
+    Ycbcr,
 }
 
 /// What a live H.264 encoder makes: constant-ish bitrate, High profile,
@@ -641,11 +650,6 @@ pub type SamplesCallback = Box<dyn Fn(&[f32], Time) + Send + Sync>;
 
 /// Fills a buffer of interleaved stereo samples for an output device.
 pub type AudioRender = Box<dyn FnMut(&mut [f32]) + Send>;
-
-/// Reads a camera capture's metadata as observed so far. Called only when
-/// a session manifest is written, never per frame.
-pub type CameraMetadataReader =
-    Arc<dyn Fn() -> isocast_protocol::CameraCaptureMetadata + Send + Sync>;
 
 /// Where a running audio capture delivers samples. Called on the capture's
 /// own threads.

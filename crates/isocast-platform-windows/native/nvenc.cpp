@@ -12,18 +12,18 @@
 #include "nvEncodeAPI.h"
 
 namespace {
-constexpr unsigned slots_count = 8;
+// Asynchronous CPU bitstream output needs at least 4 + B-frame count slots.
+// This encoder disables B-frames/lookahead; keep the matching Rust bound.
+constexpr unsigned slots_count = 4;
 constexpr int again = -1;
 constexpr int internal_error = -2;
 std::atomic<uint32_t> sessions{0};
 
-enum InputFormat : uint32_t { bgra8 = 0, rgba10 = 1, nv12 = 2 };
-
 struct Config {
     uint32_t width, height, fps, bitrate, constant_bitrate, keyframe_interval;
-    uint32_t codec, input_depth, output_depth, quality_qp, input_format;
+    uint32_t codec, input_depth, output_depth, quality_qp;
 };
-static_assert(sizeof(Config) == 44);
+static_assert(sizeof(Config) == 40);
 
 struct Packet {
     const uint8_t *data;
@@ -101,8 +101,7 @@ struct Encoder {
         desc.MipLevels = desc.ArraySize = desc.SampleDesc.Count = 1;
         desc.Format = texture_format;
         desc.Usage = D3D11_USAGE_DEFAULT;
-        desc.BindFlags = texture_format == DXGI_FORMAT_NV12
-            ? D3D11_BIND_SHADER_RESOURCE : D3D11_BIND_RENDER_TARGET;
+        desc.BindFlags = D3D11_BIND_RENDER_TARGET;
         HRESULT result = device->CreateTexture2D(&desc, nullptr, &input.texture);
         if (FAILED(result)) {
             std::snprintf(error, sizeof(error), "allocate NVENC GPU input: HRESULT 0x%08lx", static_cast<unsigned long>(result));
@@ -188,20 +187,15 @@ struct Encoder {
         }
         if (spec.codec > 1 || (spec.output_depth != 8 && spec.output_depth != 10)
             || (spec.input_depth != 8 && spec.input_depth != 10)
-            || spec.input_format > nv12
-            || spec.input_depth != (spec.input_format == rgba10 ? 10u : 8u)
             || spec.input_depth > spec.output_depth
             || (spec.codec == 0 && spec.output_depth != 8)) {
-            std::snprintf(error, sizeof(error), "unsupported codec/input format/input/output bit-depth combination");
+            std::snprintf(error, sizeof(error), "unsupported codec/input/output bit-depth combination");
             return internal_error;
         }
         const auto codec = spec.codec == 0 ? NV_ENC_CODEC_H264_GUID : NV_ENC_CODEC_HEVC_GUID;
-        if (spec.input_format == rgba10) {
+        if (spec.input_depth == 10) {
             input_format = NV_ENC_BUFFER_FORMAT_ABGR10;
             texture_format = DXGI_FORMAT_R10G10B10A2_UNORM;
-        } else if (spec.input_format == nv12) {
-            input_format = NV_ENC_BUFFER_FORMAT_NV12;
-            texture_format = DXGI_FORMAT_NV12;
         }
         library = LoadLibraryExW(L"nvEncodeAPI64.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
         if (!library) return win_error("load the system NVIDIA encoder driver");
@@ -262,7 +256,7 @@ struct Encoder {
         bool found = false;
         for (uint32_t i = 0; i < format_count; ++i) found |= formats[i] == input_format;
         if (!found) {
-            std::snprintf(error, sizeof(error), "requested input format is not supported for this codec");
+            std::snprintf(error, sizeof(error), "requested RGB input precision is not supported for this codec");
             return internal_error;
         }
         NV_ENC_PRESET_CONFIG preset = {};

@@ -1,16 +1,16 @@
-//! GPU-only SDR Rec.709 RGB conversion or NV12 code expansion to P010.
+//! GPU-only SDR Rec.709 RGB to P010 with explicit ten-bit quantization.
 //! The caller owns frame leases, GPU ordering, completion and failure quarantine.
 
 use anyhow::{Context, Result, bail};
 use windows::Win32::Graphics::Direct3D::Fxc::{
     D3DCOMPILE_ENABLE_STRICTNESS, D3DCOMPILE_OPTIMIZATION_LEVEL3, D3DCompile,
 };
-use windows::Win32::Graphics::Direct3D::{D3D11_SRV_DIMENSION_TEXTURE2D, ID3DInclude};
+use windows::Win32::Graphics::Direct3D::ID3DInclude;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::{Interface, s};
 
-use crate::{GraphicsDevice, PixelFormat};
+use crate::GraphicsDevice;
 
 const SHADER: &str = r#"
 Texture2D<float4> source : register(t0);
@@ -50,53 +50,15 @@ void main(uint3 thread : SV_DispatchThreadID) {
 }
 "#;
 
-// Preserve the original 8-bit codes and chroma sites: code8 * 4 in ten bits,
-// then << 6 in P010. This expands storage, not source precision or gamut.
-const NV12_SHADER: &str = r#"
-Texture2D<float> source_y : register(t0);
-Texture2D<float2> source_uv : register(t1);
-RWTexture2D<float> luma : register(u0);
-RWTexture2D<float2> chroma : register(u1);
-
-float packed_y(uint2 p) {
-    return round(source_y.Load(int3(p, 0)) * 255.0) * (256.0 / 65535.0);
-}
-
-[numthreads(8, 8, 1)]
-void main(uint3 thread : SV_DispatchThreadID) {
-    uint width, height;
-    source_y.GetDimensions(width, height);
-    uint2 p = thread.xy * 2;
-    if (p.x + 1 >= width || p.y + 1 >= height) return;
-    luma[p] = packed_y(p);
-    luma[p + uint2(1, 0)] = packed_y(p + uint2(1, 0));
-    luma[p + uint2(0, 1)] = packed_y(p + uint2(0, 1));
-    luma[p + uint2(1, 1)] = packed_y(p + uint2(1, 1));
-    chroma[thread.xy] = round(source_uv.Load(int3(thread.xy, 0)) * 255.0)
-        * (256.0 / 65535.0);
-}
-"#;
-
 pub(crate) struct P010Converter {
     device: ID3D11Device3,
     context: ID3D11DeviceContext,
     multithread: ID3D11Multithread,
     shader: ID3D11ComputeShader,
-    input_format: DXGI_FORMAT,
 }
 
 impl P010Converter {
-    pub(crate) fn new(device: &GraphicsDevice, input: PixelFormat) -> Result<Self> {
-        let input_format = match input {
-            PixelFormat::Bgra8 => DXGI_FORMAT_B8G8R8A8_UNORM,
-            PixelFormat::Rgba10 => DXGI_FORMAT_R10G10B10A2_UNORM,
-            PixelFormat::Nv12 => DXGI_FORMAT_NV12,
-        };
-        let source = if input == PixelFormat::Nv12 {
-            NV12_SHADER
-        } else {
-            SHADER
-        };
+    pub(crate) fn new(device: &GraphicsDevice) -> Result<Self> {
         unsafe {
             let device: ID3D11Device3 =
                 device.raw().cast().context("P010 requires ID3D11Device3")?;
@@ -110,8 +72,8 @@ impl P010Converter {
             let mut code = None;
             let mut errors = None;
             let result = D3DCompile(
-                source.as_ptr().cast(),
-                source.len(),
+                SHADER.as_ptr().cast(),
+                SHADER.len(),
                 s!("p010.hlsl"),
                 None,
                 None::<&ID3DInclude>,
@@ -146,7 +108,6 @@ impl P010Converter {
                 context,
                 multithread,
                 shader: shader.context("D3D11 returned no P010 compute shader")?,
-                input_format,
             })
         }
     }
@@ -173,7 +134,7 @@ impl P010Converter {
                     "source",
                     source,
                     D3D11_BIND_SHADER_RESOURCE,
-                    std::slice::from_ref(&self.input_format),
+                    &[DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM][..],
                 ),
                 (
                     "target",
@@ -207,27 +168,11 @@ impl P010Converter {
                 }
             }
             // Create every transient view before taking the shared-context lock.
-            let (input, input_count) = if self.input_format == DXGI_FORMAT_NV12 {
-                (
-                    [
-                        Some(self.input_plane(source, DXGI_FORMAT_R8_UNORM, 0)?),
-                        Some(self.input_plane(source, DXGI_FORMAT_R8G8_UNORM, 1)?),
-                    ],
-                    2,
-                )
-            } else {
-                let mut input = None;
-                self.device
-                    .CreateShaderResourceView(source, None, Some(&mut input))
-                    .context("create P010 RGB shader resource view")?;
-                (
-                    [
-                        Some(input.context("D3D11 returned no P010 RGB shader resource view")?),
-                        None,
-                    ],
-                    1,
-                )
-            };
+            let mut input = None;
+            self.device
+                .CreateShaderResourceView(source, None, Some(&mut input))
+                .context("create P010 RGB shader resource view")?;
+            let input = input.context("D3D11 returned no P010 RGB shader resource view")?;
             let output = [
                 Some(self.plane(target, DXGI_FORMAT_R16_UNORM, 0)?),
                 Some(self.plane(target, DXGI_FORMAT_R16G16_UNORM, 1)?),
@@ -235,47 +180,17 @@ impl P010Converter {
             self.multithread.Enter();
             let _lock = ContextLock(&self.multithread);
             self.context.CSSetShader(&self.shader, None);
-            self.context
-                .CSSetShaderResources(0, Some(&input[..input_count]));
+            self.context.CSSetShaderResources(0, Some(&[Some(input)]));
             self.context
                 .CSSetUnorderedAccessViews(0, 2, Some(output.as_ptr()), None);
             self.context
                 .Dispatch((width / 2).div_ceil(8), (height / 2).div_ceil(8), 1);
             self.context
                 .CSSetUnorderedAccessViews(0, 2, Some([None, None].as_ptr()), None);
-            self.context
-                .CSSetShaderResources(0, Some(&[None, None][..input_count]));
+            self.context.CSSetShaderResources(0, Some(&[None]));
             self.context.CSSetShader(None, None);
         }
         Ok(())
-    }
-
-    fn input_plane(
-        &self,
-        source: &ID3D11Texture2D,
-        format: DXGI_FORMAT,
-        plane: u32,
-    ) -> Result<ID3D11ShaderResourceView> {
-        let desc = D3D11_SHADER_RESOURCE_VIEW_DESC1 {
-            Format: format,
-            ViewDimension: D3D11_SRV_DIMENSION_TEXTURE2D,
-            Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC1_0 {
-                Texture2D: D3D11_TEX2D_SRV1 {
-                    MostDetailedMip: 0,
-                    MipLevels: 1,
-                    PlaneSlice: plane,
-                },
-            },
-        };
-        let mut view = None;
-        unsafe {
-            self.device
-                .CreateShaderResourceView1(source, Some(&desc), Some(&mut view))
-        }
-        .with_context(|| format!("create NV12 plane {plane} SRV ({format:?})"))?;
-        view.context("D3D11 returned no NV12 plane SRV")?
-            .cast()
-            .context("query NV12 plane SRV base interface")
     }
 
     fn plane(

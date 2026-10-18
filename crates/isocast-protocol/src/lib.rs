@@ -43,7 +43,6 @@ pub use content::{Content, ContentKind};
 pub use fields::UnknownFields;
 pub use filter::*;
 pub use layout::Layout;
-pub use manifest::CameraCaptureMetadata;
 pub use source::*;
 pub use transition::*;
 

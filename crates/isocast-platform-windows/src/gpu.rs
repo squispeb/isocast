@@ -7,12 +7,12 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use isocast_engine::gpu::{FrameImporter, Gpu, GpuFrame, GpuPixels, Matrix, YCbCr};
+use isocast_engine::gpu::{FrameImporter, Gpu, GpuFrame, GpuPixels};
 use wgpu::hal;
 use windows::Win32::Graphics::Direct3D11::{ID3D11Fence, ID3D11Texture2D};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_FORMAT_R10G10B10A2_UNORM,
+    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM,
 };
 use windows::core::{GUID, IUnknown, Interface, implement};
 
@@ -126,16 +126,6 @@ impl Dx12Importer {
                 DXGI_FORMAT_R10G10B10A2_UNORM,
                 wgpu::TextureFormat::Rgb10a2Unorm,
             ),
-            PixelFormat::Nv12 => {
-                if !self
-                    .device
-                    .features()
-                    .contains(wgpu::Features::TEXTURE_FORMAT_NV12)
-                {
-                    bail!("Windows camera import requires GPU TEXTURE_FORMAT_NV12 support");
-                }
-                (DXGI_FORMAT_NV12, wgpu::TextureFormat::NV12)
-            }
         };
         let mut resource: Option<ID3D12Resource> = None;
         unsafe {
@@ -158,7 +148,7 @@ impl Dx12Importer {
                 .contains(D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS)
         {
             bail!(
-                "DX12 capture texture must be a {native_format:?} simultaneous-access texture matching the frame"
+                "DX12 capture texture must be a single-plane {native_format:?} simultaneous-access texture matching the frame"
             );
         }
         // Output surfaces use the same descriptor whether first opened as
@@ -273,7 +263,7 @@ impl FrameImporter for Dx12Importer {
         Ok(GpuFrame {
             width: frame.width(),
             height: frame.height(),
-            pixels: pixels(frame, texture),
+            pixels: GpuPixels::Rgb(texture),
         })
     }
 
@@ -282,7 +272,7 @@ impl FrameImporter for Dx12Importer {
         Ok(Some(GpuFrame {
             width: frame.width(),
             height: frame.height(),
-            pixels: pixels(frame, texture),
+            pixels: GpuPixels::Rgb(texture),
         }))
     }
 
@@ -301,19 +291,5 @@ impl FrameImporter for Dx12Importer {
 
     fn ycbcr_target(&mut self, _frame: &Frame) -> Result<(wgpu::Texture, wgpu::Texture)> {
         bail!("Windows Y'CbCr output pools are not implemented yet")
-    }
-}
-
-fn pixels(frame: &Frame, texture: wgpu::Texture) -> GpuPixels {
-    match frame.pixel_format() {
-        PixelFormat::Nv12 => GpuPixels::YCbCrBiPlanar {
-            texture,
-            coding: YCbCr {
-                matrix: Matrix::Bt709,
-                full_range: false,
-                bits: 8,
-            },
-        },
-        PixelFormat::Bgra8 | PixelFormat::Rgba10 => GpuPixels::Rgb(texture),
     }
 }

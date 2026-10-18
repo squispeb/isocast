@@ -1,5 +1,4 @@
-//! GPU-only BGRA8/RGB10 conversion or qualified NV12 copy/expansion to
-//! limited-range Rec.709 NV12/P010 for the MF worker.
+//! GPU-only BGRA8/RGB10 to limited-range Rec.709 NV12/P010 for the MF worker.
 //! Ten-bit output is SDR, not HDR. Only an explicitly selected software
 //! encoder may call `readback`.
 
@@ -50,6 +49,10 @@ struct VideoProcessor {
 }
 
 impl Converter {
+    pub(crate) fn new(device: &GraphicsDevice, width: u32, height: u32, fps: u32) -> Result<Self> {
+        Self::with_format(device, width, height, fps, PixelFormat::Bgra8, 8)
+    }
+
     pub(crate) fn with_format(
         device: &GraphicsDevice,
         width: u32,
@@ -61,7 +64,6 @@ impl Converter {
         let input_format = match input {
             PixelFormat::Bgra8 => DXGI_FORMAT_B8G8R8A8_UNORM,
             PixelFormat::Rgba10 => DXGI_FORMAT_R10G10B10A2_UNORM,
-            PixelFormat::Nv12 => DXGI_FORMAT_NV12,
         };
         let output_format = match bit_depth {
             8 => DXGI_FORMAT_NV12,
@@ -83,7 +85,7 @@ impl Converter {
         }
         unsafe {
             let context: ID3D11DeviceContext4 = device.raw().GetImmediateContext()?.cast()?;
-            let video = if bit_depth == 8 && input != PixelFormat::Nv12 {
+            let video = if bit_depth == 8 {
                 let video: ID3D11VideoDevice = device.raw().cast()?;
                 let video_context: ID3D11VideoContext1 = context.cast()?;
                 let rate = DXGI_RATIONAL {
@@ -165,7 +167,7 @@ impl Converter {
             // video: nonzero padding bits, white944 and neutral514 at ten-bit.
             // The shader writes exact limited-range codes with six zero bits.
             let p010 = if bit_depth == 10 {
-                Some(P010Converter::new(device, input)?)
+                Some(P010Converter::new(device)?)
             } else {
                 None
             };
@@ -236,22 +238,13 @@ impl Converter {
                 self.height
             );
         }
-        self.texture_desc(frame.texture(), self.input_format, false)?;
-        self.texture_desc(target, self.output_format, true)?;
-        if self.input_format == DXGI_FORMAT_NV12 && self.output_format == DXGI_FORMAT_NV12 {
-            self.retain(Some(frame.clone()), frame.texture(), target)?;
-            self.check(
-                unsafe { self.context.Wait(frame.fence(), frame.ready_value()) },
-                "wait for captured NV12",
-            )?;
-            unsafe { self.context.CopyResource(target, frame.texture()) };
-            return self.finish();
-        }
+        self.texture_desc(frame.texture(), self.input_format)?;
+        self.texture_desc(target, self.output_format)?;
         if self.p010.is_some() {
             self.retain(Some(frame.clone()), frame.texture(), target)?;
             self.check(
                 unsafe { self.context.Wait(frame.fence(), frame.ready_value()) },
-                "wait for captured P010 source",
+                "wait for captured RGB",
             )?;
             self.p010.as_ref().expect("checked above").convert(
                 frame.texture(),
@@ -264,7 +257,7 @@ impl Converter {
         let video = self
             .video
             .as_ref()
-            .expect("RGB to NV12 converter owns a video processor");
+            .expect("NV12 converter owns a video processor");
         let mut input = None;
         let mut output = None;
         unsafe {
@@ -329,7 +322,7 @@ impl Converter {
 
     pub(crate) fn readback(&mut self, target: &ID3D11Texture2D) -> Result<Vec<u8>> {
         self.idle()?;
-        let mut desc = self.texture_desc(target, self.output_format, true)?;
+        let mut desc = self.texture_desc(target, self.output_format)?;
         desc.Usage = D3D11_USAGE_STAGING;
         desc.BindFlags = 0;
         desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
@@ -422,7 +415,6 @@ impl Converter {
         &self,
         texture: &ID3D11Texture2D,
         format: DXGI_FORMAT,
-        output: bool,
     ) -> Result<D3D11_TEXTURE2D_DESC> {
         let owner: ID3D11Device5 = unsafe { texture.GetDevice() }?.cast()?;
         let mut desc = D3D11_TEXTURE2D_DESC::default();
@@ -437,11 +429,11 @@ impl Converter {
             || desc.SampleDesc.Quality != 0
             || desc.Usage != D3D11_USAGE_DEFAULT
             || desc.CPUAccessFlags != 0
-            || (output
+            || (format == self.output_format
                 && (desc.MiscFlags != 0 || desc.BindFlags & D3D11_BIND_RENDER_TARGET.0 as u32 == 0))
         {
             bail!(
-                "conversion texture must be same-device {}x{} {format:?}, single mip/slice/sample and GPU-only (outputs must be private render targets)",
+                "conversion texture must be same-device {}x{} {format:?}, single mip/slice/sample and GPU-only (YUV must be a private render target)",
                 self.width,
                 self.height
             );

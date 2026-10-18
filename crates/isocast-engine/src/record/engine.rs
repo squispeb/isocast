@@ -3107,7 +3107,8 @@ struct IsoRunner<P: Platform> {
     /// The files' frame size.
     size: (u32, u32),
     fps: u32,
-    /// Its files' encoders take only Y'CbCr (H.264, HEVC).
+    /// Its files' encoders take only Y'CbCr (H.264, HEVC on a platform
+    /// whose encoders want Y'CbCr).
     ycbcr_only: bool,
     /// Every source's filters, if the files record this one filtered.
     filters: Option<SourceFilters>,
@@ -3137,7 +3138,10 @@ type IsoGpu = Mutex<Option<Gpu>>;
 impl<P: Platform> IsoRunner<P> {
     /// Whether `image` must go through the stage before the files take it.
     fn needs_stage(&self, platform: &P, image: &P::Frame) -> bool {
-        self.filters.is_some() || (self.ycbcr_only && !platform.frame_is_ycbcr(image))
+        self.filters.is_some()
+            || (self.ycbcr_only && !platform.frame_is_ycbcr(image))
+            || (platform.encoder_frame_format() == crate::EncoderFrameFormat::Bgra
+                && platform.frame_size(image) != self.size)
     }
 
     /// The stage, made if it isn't yet. Setting one up takes a while (a
@@ -3547,7 +3551,6 @@ fn record<P: Platform>(engine: &Engine<P>, options: &RecordOptions) -> Result<Re
     let mut formats = Formats {
         video: BTreeMap::new(),
         audio: BTreeMap::new(),
-        cameras: BTreeMap::new(),
     };
     let mut slots: BTreeMap<String, Arc<FrameSlot<P::Frame>>> = BTreeMap::new();
     let mut readers: BTreeMap<String, Arc<Routes<P::Frame>>> = BTreeMap::new();
@@ -3568,9 +3571,6 @@ fn record<P: Platform>(engine: &Engine<P>, options: &RecordOptions) -> Result<Re
             if let Some(audio) = &live.audio {
                 formats.audio.insert(id.clone(), audio.channels);
                 readers.insert(id.clone(), audio.routes.clone());
-            }
-            if let Some(camera) = live.opened.as_ref().and_then(|o| o.camera_metadata()) {
-                formats.cameras.insert(id.clone(), camera);
             }
             if live.run == SourceRun::Failed
                 && setup
@@ -3758,7 +3758,8 @@ fn record<P: Platform>(engine: &Engine<P>, options: &RecordOptions) -> Result<Re
     // Each ISO source's frame clock, with the stage its frames go through
     // set up now if its frames need one: that takes a few frames' time.
     let iso_gpu = IsoGpu::default();
-    let ycbcr_only = matches!(iso.encoder.codec, Codec::H264 | Codec::Hevc);
+    let ycbcr_only = platform.encoder_frame_format() == crate::EncoderFrameFormat::Ycbcr
+        && matches!(iso.encoder.codec, Codec::H264 | Codec::Hevc);
     let mut runners: BTreeMap<String, IsoRunner<P>> = BTreeMap::new();
     for plan in plans.iter().filter(|plan| !is_program(&plan.source)) {
         let id = plan.source.as_str();
@@ -3930,7 +3931,6 @@ fn record<P: Platform>(engine: &Engine<P>, options: &RecordOptions) -> Result<Re
                 &stops(),
                 Some(control),
                 vertical_control,
-                &formats.cameras,
             ),
         )
     };
@@ -4062,7 +4062,6 @@ fn record<P: Platform>(engine: &Engine<P>, options: &RecordOptions) -> Result<Re
                                 &stops(),
                                 Some(control),
                                 vertical_control,
-                                &formats.cameras,
                             ),
                         )
                     } else {
@@ -4323,7 +4322,6 @@ fn record<P: Platform>(engine: &Engine<P>, options: &RecordOptions) -> Result<Re
                             &stops,
                             Some(control),
                             vertical_control,
-                            &formats.cameras,
                         );
                         let _ = write_manifest(&take.manifest_path, &manifest);
                         take.manifest = Some(manifest);
@@ -4499,7 +4497,6 @@ fn record<P: Platform>(engine: &Engine<P>, options: &RecordOptions) -> Result<Re
                 &stops,
                 Some(control),
                 vertical_control,
-                &formats.cameras,
             );
             if let Err(err) = write_manifest(&take.manifest_path, &manifest) {
                 file_errors.push(format!("{err:#}"));

@@ -4,9 +4,9 @@
 #   scripts/windows-remote.sh status
 #   scripts/windows-remote.sh sync
 #   scripts/windows-remote.sh cargo check --locked -p isocast-daemon
-#   scripts/windows-remote.sh build [isocastd isocast isocast-ui]
+#   scripts/windows-remote.sh build [isocastd isocast isocast-ui isocast-capture]
 #   scripts/windows-remote.sh run 'Get-ChildItem $env:ISOCAST_SCRATCH'
-#   scripts/windows-remote.sh fetch [isocastd isocast isocast-ui]
+#   scripts/windows-remote.sh fetch [isocastd isocast isocast-ui isocast-capture]
 #
 # Sync exports tracked WORKTREE bytes, including uncommitted changes, through
 # a temporary Git index and git archive (no commit or real-index mutation).
@@ -53,7 +53,7 @@ case "$op" in
 esac
 shift
 if [ "$op" = build ] || [ "$op" = fetch ]; then
-    [ $# -gt 0 ] || set -- isocastd isocast isocast-ui
+    [ $# -gt 0 ] || set -- isocastd isocast isocast-ui isocast-capture
     for bin in "$@"; do
         case "$bin" in ''|*[!a-zA-Z0-9_-]*) echo "windows-remote: use a binary name without .exe" >&2; exit 2 ;; esac
     done

@@ -1,7 +1,9 @@
 use std::sync::OnceLock;
 
-use anyhow::{Result, anyhow};
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use anyhow::{Context, Result, anyhow};
+use windows::Win32::Foundation::{
+    CloseHandle, HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS, SetHandleInformation,
+};
 use windows::Win32::System::Com::CoIncrementMTAUsage;
 use windows::Win32::System::Threading::{CreateEventW, SetEvent};
 use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize};
@@ -17,9 +19,14 @@ unsafe impl Send for SharedHandle {}
 unsafe impl Sync for SharedHandle {}
 
 impl SharedHandle {
-    /// Takes ownership of a newly created, non-inherited sharing handle.
-    pub(crate) unsafe fn new(handle: HANDLE) -> Self {
-        Self(unsafe { Owned::new(handle) })
+    /// Takes ownership of a newly created/duplicated sharing handle, including
+    /// on failure. Enforce non-inheritance even though every creator also
+    /// requests it (null security attributes or DuplicateHandle(false)).
+    pub(crate) unsafe fn new(handle: HANDLE) -> Result<Self> {
+        let owned = Self(unsafe { Owned::new(handle) });
+        unsafe { SetHandleInformation(owned.handle(), HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0)) }
+            .context("could not make the GPU sharing handle non-inheritable")?;
+        Ok(owned)
     }
 
     pub(crate) fn handle(&self) -> HANDLE {

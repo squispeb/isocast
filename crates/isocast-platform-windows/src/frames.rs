@@ -18,18 +18,13 @@ use crate::native::{Event, SharedHandle};
 
 pub const MAX_POOL_FRAMES: usize = 32;
 
-/// GPU storage; ten-bit storage does not imply HDR colorimetry.
+/// GPU RGB storage; ten-bit storage does not imply HDR colorimetry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PixelFormat {
     /// DXGI_FORMAT_B8G8R8A8_UNORM.
     Bgra8,
     /// DXGI_FORMAT_R10G10B10A2_UNORM.
     Rgba10,
-    /// DXGI_FORMAT_NV12, qualified SDR Rec.709 limited-range input, progressive
-    /// or woven from two interleaved fields without changing their rows,
-    /// with left-sited chroma. The producer must validate the color metadata;
-    /// copying a texture does not establish it. Read-only, never an output.
-    Nv12,
 }
 
 /// A D3D11 device with a GPU timeline shared by its captures and uploads.
@@ -90,8 +85,11 @@ impl GraphicsDevice {
             let mut fence = None;
             raw.CreateFence(0, D3D11_FENCE_FLAG_SHARED, &mut fence)?;
             let fence: ID3D11Fence = fence.context("D3D11 returned no fence")?;
-            let shared_fence =
-                SharedHandle::new(fence.CreateSharedHandle(None, GENERIC_ALL.0, PCWSTR::null())?);
+            let shared_fence = SharedHandle::new(fence.CreateSharedHandle(
+                None,
+                GENERIC_ALL.0,
+                PCWSTR::null(),
+            )?)?;
             Ok(Self(Arc::new(Device {
                 raw,
                 submit: Mutex::new(Submit { context, next: 1 }),
@@ -131,6 +129,74 @@ impl GraphicsDevice {
         unsafe { self.0.fence.SetEventOnCompletion(value, event.handle()) }?;
         Ok(())
     }
+
+    /// Import a read-only broker picture without another GPU copy. The native
+    /// texture may be cached, but EVERY picture gets its own slot and remote
+    /// lease. Consumers retain that slot through their GPU completion as usual.
+    pub(crate) fn import_shared(
+        &self,
+        texture: ID3D11Texture2D,
+        shared: Arc<SharedHandle>,
+        fence: &ID3D11Fence,
+        ready: u64,
+        lease: Box<dyn Send + Sync>,
+    ) -> Result<Frame> {
+        let owner: ID3D11Device5 = unsafe { texture.GetDevice() }?.cast()?;
+        let fence_owner: ID3D11Device5 = unsafe { fence.GetDevice() }?.cast()?;
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { texture.GetDesc(&mut desc) };
+        if owner != *self.raw()
+            || fence_owner != *self.raw()
+            || !(1..=16384).contains(&desc.Width)
+            || !(1..=16384).contains(&desc.Height)
+            || desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM
+            || desc.MipLevels != 1
+            || desc.ArraySize != 1
+            || desc.SampleDesc.Count != 1
+            || desc.SampleDesc.Quality != 0
+            || desc.Usage != D3D11_USAGE_DEFAULT
+            || desc.CPUAccessFlags != 0
+            || desc.BindFlags & D3D11_BIND_SHADER_RESOURCE.0 as u32 == 0
+            || desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0 as u32 == 0
+        {
+            bail!(
+                "capture helper texture must be same-device GPU-only BGRA8, single mip/slice/sample, with a shader-readable NT sharing handle"
+            );
+        }
+        let completed = unsafe { fence.GetCompletedValue() };
+        if ready == 0 || completed == u64::MAX || completed < ready {
+            // In particular NEVER enqueue a wait on an uncompleted child
+            // fence: death of that child must not strand our GPU queue.
+            bail!("capture helper published an unfinished copy or lost its GPU device");
+        }
+        let mut submit = self.0.submit.lock();
+        let value = submit.next;
+        submit.next = value
+            .checked_add(1)
+            .context("D3D11 import fence exhausted")?;
+        unsafe {
+            submit.context.Wait(fence, ready)?;
+            submit.context.Signal(&self.0.fence, value)?;
+            submit.context.Flush();
+            self.raw().GetDeviceRemovedReason()?;
+        }
+        // This local signal only imports producer readiness. It does NOT
+        // acknowledge the picture: the slot's lease must survive all later
+        // GpuCompletion/uncached GPU imports and NVENC pending-frame owners.
+        Ok(Frame {
+            slot: Arc::new(Slot {
+                texture,
+                shared,
+                width: desc.Width,
+                height: desc.Height,
+                format: PixelFormat::Bgra8,
+                output: false,
+                ready: AtomicU64::new(value),
+                _lease: Some(lease),
+            }),
+            device: self.clone(),
+        })
+    }
 }
 
 /// One lease on an owned GPU texture. Capture pictures are immutable; output
@@ -150,12 +216,15 @@ pub struct Frame {
 
 struct Slot {
     texture: ID3D11Texture2D,
-    shared: SharedHandle,
+    shared: Arc<SharedHandle>,
     width: u32,
     height: u32,
     format: PixelFormat,
     output: bool,
     ready: AtomicU64,
+    // Last field: release the remote immutable picture after its local native
+    // references. Cached GPU imports must not cache this per-picture lease.
+    _lease: Option<Box<dyn Send + Sync>>,
 }
 
 impl Slot {
@@ -166,15 +235,6 @@ impl Slot {
         format: PixelFormat,
         output: bool,
     ) -> Result<Arc<Self>> {
-        if format == PixelFormat::Nv12
-            && (output
-                || width == 0
-                || height == 0
-                || !width.is_multiple_of(2)
-                || !height.is_multiple_of(2))
-        {
-            bail!("NV12 frames require read-only input with positive even dimensions");
-        }
         let desc = D3D11_TEXTURE2D_DESC {
             Width: width,
             Height: height,
@@ -183,18 +243,13 @@ impl Slot {
             Format: match format {
                 PixelFormat::Bgra8 => DXGI_FORMAT_B8G8R8A8_UNORM,
                 PixelFormat::Rgba10 => DXGI_FORMAT_R10G10B10A2_UNORM,
-                PixelFormat::Nv12 => DXGI_FORMAT_NV12,
             },
             SampleDesc: DXGI_SAMPLE_DESC {
                 Count: 1,
                 Quality: 0,
             },
             Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: if format == PixelFormat::Nv12 {
-                D3D11_BIND_SHADER_RESOURCE.0 as u32
-            } else {
-                (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET).0 as u32
-            },
+            BindFlags: (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET).0 as u32,
             MiscFlags: (D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED).0 as u32,
             ..Default::default()
         };
@@ -211,16 +266,17 @@ impl Slot {
                 None,
                 (DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE).0,
                 PCWSTR::null(),
-            )?)
+            )?)?
         };
         Ok(Arc::new(Self {
             texture,
-            shared,
+            shared: Arc::new(shared),
             width,
             height,
             format,
             output,
             ready: AtomicU64::new(0),
+            _lease: None,
         }))
     }
 }
@@ -358,36 +414,19 @@ impl TexturePool {
         }
     }
 
-    /// Copy the top-left `width` by `height` region of subresource zero without
-    /// CPU readback. See `copy_subresource` for source and lifetime requirements.
-    pub fn copy(
-        &mut self,
-        source: &ID3D11Texture2D,
-        width: u32,
-        height: u32,
-    ) -> Result<Option<Frame>> {
-        self.copy_subresource(source, 0, width, height)
-    }
-
-    /// Copy the top-left `width` by `height` region of one array slice into an
-    /// owned, single-layer texture without CPU readback or a color conversion.
+    /// Copy the top-left `width` by `height` region without CPU readback.
     /// Returns `None` when all `MAX_POOL_FRAMES` slots are still in use.
-    /// Supports BGRA8, RGB10A2 and NV12 default-usage, single-mip/sample textures;
-    /// `subresource` must name an existing array slice. NV12 requires positive
-    /// even dimensions, including the visible crop, and the qualified Rec.709
-    /// limited-range color contract documented on `PixelFormat::Nv12`.
+    /// Supports BGRA8 and RGB10A2 default-usage, single-mip/slice/sample textures.
     ///
     /// The source must belong to this pool's device. External producers must
     /// finish submitting writes on the shared device's immediate context
     /// before this call; cross-API producers must synchronize their writes
     /// with that device first. Do not overwrite or recycle the source until
     /// the returned frame's fence reaches its ready value (or order subsequent
-    /// writes after this copy on the same immediate context). For MF cameras,
-    /// retain the source sample as well as the returned frame until completion.
-    pub fn copy_subresource(
+    /// writes after this copy on the same immediate context).
+    pub fn copy(
         &mut self,
         source: &ID3D11Texture2D,
-        subresource: u32,
         width: u32,
         height: u32,
     ) -> Result<Option<Frame>> {
@@ -397,9 +436,8 @@ impl TexturePool {
         let format = match source_desc.Format {
             DXGI_FORMAT_B8G8R8A8_UNORM => PixelFormat::Bgra8,
             DXGI_FORMAT_R10G10B10A2_UNORM => PixelFormat::Rgba10,
-            DXGI_FORMAT_NV12 => PixelFormat::Nv12,
             other => bail!(
-                "copy source format {other:?}: valid formats are B8G8R8A8_UNORM, R10G10B10A2_UNORM and NV12"
+                "copy source format {other:?}: valid formats are B8G8R8A8_UNORM and R10G10B10A2_UNORM"
             ),
         };
         if owner != *self.device.raw()
@@ -408,22 +446,15 @@ impl TexturePool {
             || width > source_desc.Width
             || height > source_desc.Height
             || source_desc.MipLevels != 1
-            || subresource >= source_desc.ArraySize
+            || source_desc.ArraySize != 1
             || source_desc.SampleDesc.Count != 1
             || source_desc.SampleDesc.Quality != 0
             || source_desc.Usage != D3D11_USAGE_DEFAULT
             || source_desc.CPUAccessFlags != 0
         {
             bail!(
-                "copy source must be same-device, GPU-only default usage, single mip/sample with a valid array subresource and nonzero copy dimensions within the texture"
+                "copy source must be same-device, GPU-only default usage, single mip/slice/sample with nonzero copy dimensions within the texture"
             );
-        }
-        if format == PixelFormat::Nv12
-            && [width, height, source_desc.Width, source_desc.Height]
-                .iter()
-                .any(|size| !size.is_multiple_of(2))
-        {
-            bail!("NV12 copy source and visible dimensions must be even");
         }
         let completed = self.device.completed()?;
         // Discard only idle old-size/format textures; retained pictures keep
@@ -473,7 +504,7 @@ impl TexturePool {
                 0,
                 0,
                 source,
-                subresource,
+                0,
                 Some(&bounds),
             );
             submit.context.Signal(&self.device.0.fence, value)?;

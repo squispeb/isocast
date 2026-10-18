@@ -3224,6 +3224,7 @@ dependencies = [
  "isocast-engine",
  "isocast-platform-macos",
  "isocast-platform-stub",
+ "isocast-platform-windows",
  "isocast-protocol",
  "serde_json",
  "wgpu",
@@ -3286,7 +3287,9 @@ version = "0.0.7"
 dependencies = [
  "anyhow",
  "cc",
+ "isocast-diagnostics",
  "isocast-engine",
+ "isocast-mux",
  "isocast-protocol",
  "parking_lot",
  "wgpu",
