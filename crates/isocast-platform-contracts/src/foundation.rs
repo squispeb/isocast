@@ -10,8 +10,7 @@
 //!   once per frame, a frame stays out of the pool until every clone is
 //!   dropped, pressure returns `None` without drawing, one freed slot lets
 //!   exactly one frame through, pools and frames move across threads, and
-//!   frames outlive their pool. Opens no capture devices (native pools may
-//!   allocate GPU resources). Pixels are not read back:
+//!   frames outlive their pool. Opens nothing. Pixels are not read back:
 //!   frames have no public pixel API (the GPU contract reads them).
 //! - `gpu`: visible pixels, alias effects and lifetime through the GPU API.
 //!   This does not measure whether an importer performs internal copies. A CPU-drawn

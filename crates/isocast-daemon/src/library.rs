@@ -21,6 +21,9 @@ use crate::{Daemon, State, content_size, devices, now, relative_folder};
 
 /// A scene collection or profile in hand.
 #[derive(Debug, Clone)]
+// Administrative I/O only, not a media queue. Keeping these owned documents
+// inline avoids boxing every library read just for the profile's small policy.
+#[allow(clippy::large_enum_variant)]
 enum Document {
     Collection(Collection),
     Profile(Profile),
@@ -363,7 +366,13 @@ impl Daemon {
                     let (width, height) = canvas.unwrap_or((1920, 1080));
                     Document::Collection(Collection::blank(&name, width, height))
                 }
-                LibraryKind::Profile => Document::Profile(Profile::starter(&name)),
+                LibraryKind::Profile => {
+                    let mut profile = Profile::starter(&name);
+                    if let Some(machine) = crate::this_machine() {
+                        profile.canvas.fps = isocast_protocol::init::starting_fps(machine);
+                    }
+                    Document::Profile(profile)
+                }
             },
         };
         document.set_name(&name);
@@ -728,7 +737,7 @@ impl Daemon {
             }
         }
         .restore(&setup);
-        let vertical_before = crate::vertical_link(&state);
+        let vertical_before = crate::canvas_links(&state);
         // The live engine runs the new pair from its next frame: sources
         // open and close as for any change.
         if let Some(engine) = &state.engine {
@@ -760,7 +769,8 @@ impl Daemon {
         let preview = state.preview.clone();
         // A new collection's vertical canvas starts from its restored main
         // scene and preview: ids the one before chose may mean other scenes.
-        let vertical_events = crate::sync_vertical(&mut state, vertical_before, collection_changed);
+        let vertical_events =
+            crate::sync_canvases(&mut state, &vertical_before, collection_changed);
         drop(state);
         {
             let _files = self.saved.lock();

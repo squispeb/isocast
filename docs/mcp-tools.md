@@ -10,7 +10,7 @@ a client, for example:
 claude mcp add isocast -- isocast mcp
 ```
 
-105 tools. Arguments marked required must be given; ids, not names,
+108 tools. Arguments marked required must be given; ids, not names,
 address sources, scenes and clips. Errors name the field and list the
 valid options.
 
@@ -57,6 +57,44 @@ Generate a sanitized offline bug-report zip or preview every included file. Incl
 | `preview` | boolean | Return the file index, ISSUE and redaction report without writing a zip. Use report_file with the returned preview_id to page through contents. |
 | `preview_id` | string (optional) | With `submit`: send exactly this preview (from an earlier `preview`) instead of collecting again. |
 | `submit` | boolean | Also send the report: the zip is written, then its ISSUE.md becomes a public GitHub issue and the zip is kept privately for maintainers. Never implied; if sending fails the zip is kept and `submit_error` says why. |
+
+## canvas_add
+
+Add a canvas (#84) to stream or record another shape of the show at once, like 9:16 for Shorts/TikTok beside a 16:9 main canvas: canvas "vertical" turns on the [vertical] canvas, any other id adds a [[canvases]] entry. Optional name, width/height (default 1080x1920), fps (else main's), follow_main (default true: shows the main scene, letterboxed unless a scene has an arrangement for it under scenes[].canvases.<id>; false: it switches its own scenes with switch_scene/preview/take and canvas), record. Then add its stream destinations with stream_destination_add and canvas set to its id (each destination its own key, bitrate, size, rate control, keyframes and audio bitrate; equal ones share one encoder). Returns every canvas.
+
+| Argument | Type | Description |
+|---|---|---|
+| `canvas` (required) | CanvasId | Which canvas: `vertical`, or a `[[canvases]]` id (lowercase letters, digits and dashes). |
+| `clear` | list of string | Fields to reset: `name`, `fps` (to the main canvas's) and `stream` (no stream of its own). |
+| `follow_main` | boolean (optional) | Show the main canvas's scene (true), or pick its own (false). |
+| `fps` | integer (optional) | Its own frame rate; the main canvas's if absent. |
+| `height` | integer (optional) |  |
+| `name` | string (optional) | Display label, like "YouTube Shorts". |
+| `record` | boolean (optional) | Record its program with each recording (true: a `recording` with default settings unless it has one; false: none). |
+| `width` | integer (optional) | Size: give both (each even, 16 to 8192). |
+
+## canvas_remove
+
+Remove a canvas with its scene arrangements, recording and stream destinations (not while it records or streams; its keys stay in the Keychain). Returns every canvas left.
+
+| Argument | Type | Description |
+|---|---|---|
+| `canvas` (required) | CanvasId | The canvas: "vertical" or a [[canvases]] id, from get_status's canvases. |
+
+## canvas_set
+
+Change a canvas ("vertical" or a [[canvases]] id): name, width/height, fps, follow_main, record, or `clear` some of name, fps, stream. Size and frame rate wait while it records or streams. Returns every canvas.
+
+| Argument | Type | Description |
+|---|---|---|
+| `canvas` (required) | CanvasId | Which canvas: `vertical`, or a `[[canvases]]` id (lowercase letters, digits and dashes). |
+| `clear` | list of string | Fields to reset: `name`, `fps` (to the main canvas's) and `stream` (no stream of its own). |
+| `follow_main` | boolean (optional) | Show the main canvas's scene (true), or pick its own (false). |
+| `fps` | integer (optional) | Its own frame rate; the main canvas's if absent. |
+| `height` | integer (optional) |  |
+| `name` | string (optional) | Display label, like "YouTube Shorts". |
+| `record` | boolean (optional) | Record its program with each recording (true: a `recording` with default settings unless it has one; false: none). |
+| `width` | integer (optional) | Size: give both (each even, 16 to 8192). |
 
 ## check_setup
 
@@ -106,7 +144,7 @@ Make a scene collection (one empty scene on the canvas in use) or a profile (60 
 
 | Argument | Type | Description |
 |---|---|---|
-| `copy_of` | string (optional) | Copy this one (by id) instead of starting blank (OBS's Duplicate). A blank collection has one empty scene on the current canvas; a blank profile records 60 fps HEVC with ISO files to ~/Movies/Isocast. |
+| `copy_of` | string (optional) | Copy this one (by id) instead of starting blank (OBS's Duplicate). A blank collection has one empty scene on the current canvas; a blank profile records HEVC with ISO files to ~/Movies/Isocast, at 30 fps on <=8-core or <=8-GB machines and 60 fps otherwise. |
 | `id` | string (optional) | Its id (lowercase letters, digits and dashes); made from the name if absent. |
 | `kind` (required) | LibraryKind |  |
 | `name` (required) | string | Its name. |
@@ -338,7 +376,7 @@ Make a good starting setup from this Mac's devices: the main display, the best r
 | `camera` | string (optional) | The camera: an id, a name or part of one from `isocast devices`, or "none". If absent, the best real camera: a USB or other external camera, else Continuity Camera, else the built-in one; virtual cameras (OBS, NDI) and Desk View only if there is nothing else. |
 | `display` | string (optional) | The display to capture: "main", or an id or name from `isocast devices`. The main display if absent. |
 | `folder` | string (optional) | Where recordings go; `~/Movies/Isocast` if absent. |
-| `fps` | integer (optional) | Canvas frame rate: 60 if absent (or the display's, if it refreshes more slowly). |
+| `fps` | integer (optional) | Canvas frame rate: the daemon defaults to 30 on <=8-core or <=8-GB machines, otherwise 60 (or the display's slower refresh rate). |
 | `height` | integer (optional) |  |
 | `layout` | Layout | Where the camera goes in the "Screen + Camera" scene. |
 | `microphone` | string (optional) | The microphone: "default" (the system's default input, if absent), an id, a name or part of one, or "none". |
@@ -446,11 +484,12 @@ Open a project file (`<name>.isoprj`, in every project folder) or a project fold
 
 ## open_projector
 
-Open a projector: the program, studio mode's preview, a scene (`scene` id), a video source (`source` id) or a multiview grid (`layout`: top-8, 3x3 or 2x2; preview, program and scenes with labels and tally; `vertical` true puts the vertical program in its last tile), with `canvas` "vertical" the vertical canvas's program, preview or scene, full screen on a display (`fullscreen`, `display`: main, an id or a name from list_projectors) or in a window (`fullscreen` false, optional `frame` in points). The Isocast app shows it, and opens it when it next starts if it isn't running (`shown` says whether a window shows it). Opening a view that is already open moves it. Absent placement: where that view was last.
+Open a projector: the program, studio mode's preview, a scene (`scene` id), a video source (`source` id) or a multiview grid (`layout`: top-8, 3x3 or 2x2; preview, program and scenes with labels and tally; `vertical` true puts the vertical program in its last tile, `canvases` [ids] puts those extra canvases' programs in its last tiles), with `canvas` "vertical" or a [[canvases]] id that canvas's program, preview or scene, full screen on a display (`fullscreen`, `display`: main, an id or a name from list_projectors) or in a window (`fullscreen` false, optional `frame` in points). The Isocast app shows it, and opens it when it next starts if it isn't running (`shown` says whether a window shows it). Opening a view that is already open moves it. Absent placement: where that view was last.
 
 | Argument | Type | Description |
 |---|---|---|
-| `canvas` | string (optional) | The canvas: `main` (the default), or `vertical` (the live setup's vertical canvas; views program, preview and scene). |
+| `canvas` | string (optional) | The canvas: `main` (the default), `vertical` (the live setup's vertical canvas) or one of its `[[canvases]]` ids (#120); views program, preview and scene. |
+| `canvases` | array (optional) | For `view = multiview`: extra canvases (`vertical` or `[[canvases]]` ids) whose programs fill the grid's last tiles in place of scenes, in order (#120); at most half the grid's scene tiles (one in `2x2`). Absent: as the open multiview has it, else none; empty: none. |
 | `display` | string (optional) | `main`, a display's id or its name (`isocast devices`). |
 | `frame` | Frame | The window's place (not full screen). Absent: where the same view was last, else the app picks. |
 | `fullscreen` | boolean (optional) | `true`: full screen on `display` (the main display if absent); `false`: in a window. Absent: where the same view was last (a window the first time), or full screen if `display` is given. |
@@ -779,11 +818,14 @@ Add a stream destination to the live setup: a service (twitch, youtube, kick, fa
 
 | Argument | Type | Description |
 |---|---|---|
-| `canvas` | CanvasId | Which canvas's destinations: `main` (the default, `[stream]`) or `vertical` (`[vertical.stream]`, in a `[vertical]` canvas the live setup must have). |
-| `clear` | list of string | Fields to reset: `server` (to the service's), `video_bitrate_kbps` and `size` (to the main destination's; for `main`, the defaults). |
+| `audio_bitrate_kbps` | integer (optional) | Its own AAC bitrate. |
+| `canvas` | CanvasId | Which canvas's destinations: `main` (the default, `[stream]`), `vertical` (`[vertical.stream]`) or a `[[canvases]]` id (its `stream`), a canvas the live setup must have. |
+| `clear` | list of string | Fields to reset: `server` (to the service's), `video_bitrate_kbps`, `size`, `rate_control`, `keyframe_interval_seconds` and `audio_bitrate_kbps` (to the main destination's; for `main`, the defaults). |
 | `enabled` | boolean (optional) |  |
 | `height` | integer (optional) |  |
 | `id` | string (optional) | The destination's id. For `add`, made from the service if absent (`youtube`, `youtube-2`); required for `set`. |
+| `keyframe_interval_seconds` | integer (optional) | Its own seconds between keyframes. |
+| `rate_control` | RateControl | Its own rate control (#84); the main destination's if absent. |
 | `server` | string (optional) |  |
 | `service` | StreamService | Required for `add`. |
 | `video_bitrate_kbps` | integer (optional) |  |
@@ -800,15 +842,18 @@ Remove a stream destination by id (not main: turn it off with stream_destination
 
 ## stream_destination_set
 
-Change a stream destination by id (main is the [stream] section): service, server, enabled, video_bitrate_kbps, width/height, or `clear` some of server, video_bitrate_kbps, size. Takes effect at its next start. Returns every destination's status.
+Change a stream destination by id (main is the [stream] section): service, server, enabled, video_bitrate_kbps, width/height, rate_control, keyframe_interval_seconds, audio_bitrate_kbps, or `clear` some of those. With canvas, that canvas's destinations (vertical or a [[canvases]] id). Takes effect at its next start. Returns every destination's status.
 
 | Argument | Type | Description |
 |---|---|---|
-| `canvas` | CanvasId | Which canvas's destinations: `main` (the default, `[stream]`) or `vertical` (`[vertical.stream]`, in a `[vertical]` canvas the live setup must have). |
-| `clear` | list of string | Fields to reset: `server` (to the service's), `video_bitrate_kbps` and `size` (to the main destination's; for `main`, the defaults). |
+| `audio_bitrate_kbps` | integer (optional) | Its own AAC bitrate. |
+| `canvas` | CanvasId | Which canvas's destinations: `main` (the default, `[stream]`), `vertical` (`[vertical.stream]`) or a `[[canvases]]` id (its `stream`), a canvas the live setup must have. |
+| `clear` | list of string | Fields to reset: `server` (to the service's), `video_bitrate_kbps`, `size`, `rate_control`, `keyframe_interval_seconds` and `audio_bitrate_kbps` (to the main destination's; for `main`, the defaults). |
 | `enabled` | boolean (optional) |  |
 | `height` | integer (optional) |  |
 | `id` | string (optional) | The destination's id. For `add`, made from the service if absent (`youtube`, `youtube-2`); required for `set`. |
+| `keyframe_interval_seconds` | integer (optional) | Its own seconds between keyframes. |
+| `rate_control` | RateControl | Its own rate control (#84); the main destination's if absent. |
 | `server` | string (optional) |  |
 | `service` | StreamService | Required for `add`. |
 | `video_bitrate_kbps` | integer (optional) |  |

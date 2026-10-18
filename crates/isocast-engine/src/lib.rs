@@ -15,10 +15,12 @@ pub mod doctor;
 pub(crate) mod draw_list;
 pub mod estimate;
 pub mod filter;
+pub mod governor;
 pub mod gpu;
 pub mod hotkeys;
 pub mod layout;
 pub mod machine_profile;
+mod mask;
 mod pacing;
 mod picture;
 pub mod project;
@@ -179,14 +181,6 @@ pub trait Platform: Clone + Send + Sync + 'static {
     /// what encoders take as is, at under half the size of BGRA.
     fn ycbcr_frame_pool(&self, width: u32, height: u32) -> anyhow::Result<Self::FramePool>;
 
-    /// What the program and ISO stages hand H.264 and HEVC encoders:
-    /// Y'CbCr from [`Platform::ycbcr_frame_pool`] (converted on the GPU),
-    /// or BGRA from [`Platform::frame_pool`] for backends that accept RGB
-    /// frames and own their conversion.
-    fn encoder_frame_format(&self) -> EncoderFrameFormat {
-        EncoderFrameFormat::Ycbcr
-    }
-
     /// Ask the OS to run the calling thread ahead of background work: it
     /// paces frames or audio in real time (the program, a file's frame
     /// clock, an audio reader, the mix, a file writer).
@@ -197,6 +191,11 @@ pub trait Platform: Clone + Send + Sync + 'static {
     /// Returns what was set, for the profile's notes; `None` where the
     /// platform doesn't lower it.
     fn calibration_priority(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Read the existing sampler's latest non-consuming headroom observation.
+    fn governor_headroom(&self) -> Option<governor::Headroom> {
         None
     }
 
@@ -355,16 +354,6 @@ pub trait Platform: Clone + Send + Sync + 'static {
     }
 }
 
-/// The frames a platform's encoders want drawn for them (see
-/// [`Platform::encoder_frame_format`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EncoderFrameFormat {
-    /// 8-bit BGRA, as drawn: conversion belongs to the encoder backend.
-    Bgra,
-    /// 8-bit 4:2:0 Y'CbCr, converted by the engine.
-    Ycbcr,
-}
-
 /// What a live H.264 encoder makes: constant-ish bitrate, High profile,
 /// no B-frames, Rec. 709 tags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -419,6 +408,12 @@ pub struct ParameterSets {
 pub trait VideoEncoder: Send {
     type Frame;
 
+    /// Cumulative intentional admission refusals included in `dropped()`.
+    /// They remain losses in public accounting, but aren't new overloads.
+    fn intentional_video_drops(&self) -> u64 {
+        0
+    }
+
     /// Rank the canvas's live output ahead of ISO encodes; main comes first.
     fn prioritize_video(&mut self, _canvas: isocast_protocol::CanvasId) {}
 
@@ -436,6 +431,13 @@ pub trait VideoEncoder: Send {
 
     /// Frames the encoder dropped so far instead of encoding them.
     fn dropped(&self) -> u64;
+
+    /// A refused rate change could not be rolled back completely. The last
+    /// acknowledged rate is not proof of the current native properties;
+    /// requesting that rate again must still attempt restoration.
+    fn rate_uncertain(&self) -> bool {
+        false
+    }
 
     /// From the next frame, expect `fps` frames a second and aim for
     /// `bitrate_kbps` on average (a monitor changing its rate), keeping the
@@ -717,6 +719,12 @@ pub trait FramePool: Send {
 /// tracks, all timed on the master clock.
 pub trait FileWriter: Send {
     type Frame;
+
+    /// Cumulative deliberate admission refusals. Read around append_video
+    /// so a later policy restoration cannot reclassify a refused picture.
+    fn intentional_video_drops(&self) -> u64 {
+        0
+    }
 
     /// Protect this program output ahead of optional ISO encodes when the
     /// platform's shared encoder hardware is overloaded.

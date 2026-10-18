@@ -22,10 +22,8 @@ use isocast_protocol::api::{
     AudioLevel, ChannelLevel, EngineInfo, ScenesInfo, SourceRun, SourceStatus,
 };
 use isocast_protocol::manifest::SessionStatus;
-use isocast_protocol::projector::VERTICAL_SCENE_PREFIX;
 use isocast_protocol::{
     Canvas, CanvasId, Codec, Monitoring, PROGRAM, Setup, SourceKind, Transition, TransitionKind,
-    VERTICAL_PROGRAM,
 };
 
 use super::disk::{DiskMeter, DiskProbe};
@@ -190,13 +188,18 @@ impl<F: Clone> Routes<F> {
 
     /// Send a frame to every output. One that has fallen behind misses it
     /// rather than holding up the others.
-    pub(crate) fn video(&self, frame: &F, pts: Time) {
+    pub(crate) fn video(&self, frame: &F, pts: Time, canvas: Option<CanvasId>) {
         for route in self.list.read().iter() {
             if pts >= route.from {
                 let sent = route.output.try_send(Packet::Video {
                     frame: frame.clone(),
                     pts,
                 });
+                if matches!(&sent, Err(TrySendError::Full(_)))
+                    && let Some(canvas) = canvas
+                {
+                    crate::governor::protected_loss(canvas, 1);
+                }
                 if let (Err(TrySendError::Full(_)), Some(missed)) = (sent, &route.missed) {
                     missed.fetch_add(1, Ordering::Relaxed);
                 }
@@ -312,7 +315,7 @@ impl<P: Platform> ProgramTapSource<P> {
         let _state = inner.state.lock();
         let output = inner
             .output(self.1)
-            .ok_or_else(|| anyhow::anyhow!("vertical: canvas is not enabled"))?;
+            .ok_or_else(|| anyhow::anyhow!("{}", canvas_off(self.1)))?;
         let from = inner.platform.now();
         let missed_frames = Arc::new(AtomicU64::new(0));
         let (tx, packets) = super::tap::channel(depth, missed_frames.clone());
@@ -370,15 +373,14 @@ struct Inner<P: Platform> {
     opening: Mutex<HashSet<String>>,
     wake: Condvar,
     main: CanvasOutput<P>,
-    /// Created only when a setup enables it. Its source slots and audio mix
-    /// belong to the same engine; only composition and output are separate.
-    vertical: OnceLock<CanvasOutput<P>>,
+    /// The extra canvases' outputs (`[vertical]`, `[[canvases]]`, #84),
+    /// each created when a setup first enables it. Their source slots and
+    /// audio mix belong to the same engine; only composition and output
+    /// are separate.
+    extras: ExtraOutputs<P>,
     /// Scenes drawn for monitors on air or not (`scene:ID` targets:
     /// projectors and the multiview), off the program's thread.
     scene_feeds: Arc<SceneFeeds<P::Frame>>,
-    /// The same for the vertical canvas's arrangements of the scenes
-    /// (`vertical-scene:ID`: vertical scene projectors, #96).
-    vertical_scene_feeds: Arc<SceneFeeds<P::Frame>>,
     /// A camera-only source is needed only while that output is running.
     camera_source: Mutex<Option<String>>,
     program_audio: Arc<Routes<P::Frame>>,
@@ -399,6 +401,105 @@ struct Inner<P: Platform> {
     audio_stop_changes: AtomicU64,
     /// Measured write speeds by folder, and when.
     speeds: Mutex<HashMap<PathBuf, (Time, f64)>>,
+}
+
+/// The most extra canvases an engine makes outputs for in its life (a
+/// canvas turned off keeps its output, as ids stay put).
+const MAX_ENGINE_CANVASES: usize = 2 * isocast_protocol::MAX_EXTRA_CANVASES;
+
+/// The engine's extra canvases' outputs, by id. Insert-only, so a
+/// reference to one lives as long as the engine: a canvas turned off keeps
+/// its output, disabled, and gets it back when it is turned on again.
+struct ExtraOutputs<P: Platform>([OnceLock<ExtraOutput<P>>; MAX_ENGINE_CANVASES]);
+
+struct ExtraOutput<P: Platform> {
+    id: CanvasId,
+    output: CanvasOutput<P>,
+    /// Its arrangements of the scenes drawn for monitors
+    /// (`<id>-scene:ID`: scene projectors on this canvas, #96).
+    scene_feeds: Arc<SceneFeeds<P::Frame>>,
+}
+
+impl<P: Platform> ExtraOutputs<P> {
+    fn new() -> Self {
+        Self(std::array::from_fn(|_| OnceLock::new()))
+    }
+
+    /// Canvas `id`'s output, enabled or not, if it was ever made.
+    fn get(&self, id: CanvasId) -> Option<&ExtraOutput<P>> {
+        self.0
+            .iter()
+            .map_while(OnceLock::get)
+            .find(|extra| extra.id == id)
+    }
+
+    /// Canvas `id`'s output, made by `make` if it has none yet.
+    fn get_or_init(
+        &self,
+        id: CanvasId,
+        make: impl Fn() -> ExtraOutput<P>,
+    ) -> Result<&ExtraOutput<P>, String> {
+        for slot in &self.0 {
+            let extra = slot.get_or_init(&make);
+            if extra.id == id {
+                return Ok(extra);
+            }
+        }
+        Err(format!(
+            "canvas {id:?}: this engine has made outputs for {MAX_ENGINE_CANVASES} canvases \
+             already; restart the engine to use more"
+        ))
+    }
+
+    /// Every extra canvas's output made so far.
+    fn iter(&self) -> impl Iterator<Item = &ExtraOutput<P>> {
+        self.0.iter().map_while(OnceLock::get)
+    }
+}
+
+/// How messages name canvas `canvas`: "vertical canvas", "canvas \"x\"".
+pub(crate) fn canvas_words(canvas: CanvasId) -> String {
+    match canvas {
+        CanvasId::Main => "main canvas".into(),
+        CanvasId::Vertical => "vertical canvas".into(),
+        other => format!("canvas {other:?}"),
+    }
+}
+
+/// How messages name canvas `canvas`'s program: "program", "vertical
+/// program", "canvas \"x\"'s program".
+pub(crate) fn canvas_program_words(canvas: CanvasId) -> String {
+    match canvas {
+        CanvasId::Main => "program".into(),
+        CanvasId::Vertical => "vertical program".into(),
+        other => format!("canvas {other:?}'s program"),
+    }
+}
+
+/// Why canvas `canvas` has no output: it isn't on.
+pub(crate) fn canvas_off(canvas: CanvasId) -> String {
+    match canvas {
+        CanvasId::Vertical => "vertical: canvas is not enabled".to_string(),
+        other => format!("canvas: canvas {other:?} is not enabled"),
+    }
+}
+
+/// The worker name of canvas `canvas`'s compositor: `compositor`,
+/// `vertical compositor`, `<id> compositor`.
+pub fn compositor_worker(canvas: CanvasId) -> String {
+    match canvas {
+        CanvasId::Main => "compositor".into(),
+        other => format!("{other} compositor"),
+    }
+}
+
+/// The canvas whose compositor the worker `name` is (see
+/// [`compositor_worker`]).
+pub fn compositor_canvas(name: &str) -> Option<CanvasId> {
+    if name == "compositor" {
+        return Some(CanvasId::Main);
+    }
+    CanvasId::parse(name.strip_suffix(" compositor")?).ok()
 }
 
 /// One composition of the engine's captured sources. Each output size needs
@@ -444,7 +545,8 @@ struct State<P: Platform> {
     stingers: HashMap<String, (source::Opened<P>, Duration)>,
     mixer: Option<MixerRun<P::Frame>>,
     compositor: Option<CompositorRun>,
-    vertical_compositor: Option<CompositorRun>,
+    /// The extra canvases' compositors, by canvas.
+    extra_compositors: BTreeMap<CanvasId, CompositorRun>,
     /// Sources a recording uses, which keep running as they are until it
     /// ends.
     pins: Vec<String>,
@@ -532,11 +634,10 @@ impl<P: Platform> CanvasOutput<P> {
                     if let Some(on_event) = &on_event {
                         on_event(EngineEvent::WorkerFailed {
                             name: if canvas.is_main() {
-                                "scenes"
+                                "scenes".to_string()
                             } else {
-                                "vertical scenes"
-                            }
-                            .into(),
+                                format!("{canvas} scenes")
+                            },
                             message,
                             // This scene thread belongs only to its canvas;
                             // the compositor observes poison and closes it.
@@ -596,12 +697,39 @@ impl<P: Platform> Inner<P> {
         }
     }
 
+    /// The canvas a program or preview target shows (see
+    /// [`CanvasId::from_target`]), if it is the main one or an extra
+    /// canvas the engine has an output for: a source may be called
+    /// `screen-preview`.
+    fn canvas_target(&self, target: &str) -> Option<(CanvasId, bool)> {
+        CanvasId::from_target(target)
+            .filter(|(canvas, _)| canvas.is_main() || self.extras.get(*canvas).is_some())
+    }
+
+    /// The same for a scene target (see [`CanvasId::from_scene_target`]).
+    fn scene_target<'a>(&self, target: &'a str) -> Option<(CanvasId, &'a str)> {
+        CanvasId::from_scene_target(target)
+            .filter(|(canvas, _)| canvas.is_main() || self.extras.get(*canvas).is_some())
+    }
+
+    /// Canvas `canvas`'s scene feeds (the main canvas's if it has none).
+    fn feeds(&self, canvas: CanvasId) -> &Arc<SceneFeeds<P::Frame>> {
+        match canvas {
+            CanvasId::Main => &self.scene_feeds,
+            other => self
+                .extras
+                .get(other)
+                .map_or(&self.scene_feeds, |extra| &extra.scene_feeds),
+        }
+    }
+
     fn output(&self, canvas: CanvasId) -> Option<&CanvasOutput<P>> {
         match canvas {
             CanvasId::Main => Some(&self.main),
-            CanvasId::Vertical => self
-                .vertical
-                .get()
+            other => self
+                .extras
+                .get(other)
+                .map(|extra| &extra.output)
                 .filter(|v| v.enabled.load(Ordering::SeqCst)),
         }
     }
@@ -626,18 +754,16 @@ impl<P: Platform> Inner<P> {
                 self.main
                     .program_fps
                     .store(0.0f64.to_bits(), Ordering::Relaxed);
-            } else if name == "vertical compositor"
-                && let Some(output) = self.vertical.get()
+            } else if let Some(canvas) = compositor_canvas(name)
+                && let Some(extra) = self.extras.get(canvas)
             {
+                let output = &extra.output;
                 output.program.stop(message.clone());
                 output
                     .program_fps
                     .store(0.0f64.to_bits(), Ordering::Relaxed);
-                self.timeline.set_on_air(
-                    CanvasId::Vertical,
-                    std::iter::empty(),
-                    self.platform.now(),
-                );
+                self.timeline
+                    .set_on_air(canvas, std::iter::empty(), self.platform.now());
             }
             self.event(EngineEvent::WorkerFailed {
                 name: name.into(),
@@ -658,9 +784,11 @@ impl<P: Platform> Inner<P> {
                     .preview_wanted
                     .fetch_max(fps.max(1), Ordering::SeqCst);
             }
-            VERTICAL_PROGRAM | "vertical-preview" => {
-                if let Some(output) = self.output(CanvasId::Vertical) {
-                    if target == VERTICAL_PROGRAM {
+            other => {
+                if let Some((canvas, preview)) = self.canvas_target(other)
+                    && let Some(output) = self.output(canvas)
+                {
+                    if !preview {
                         output.control.want_program(fps);
                     } else {
                         output
@@ -669,7 +797,6 @@ impl<P: Platform> Inner<P> {
                     }
                 }
             }
-            _ => {}
         }
     }
 
@@ -735,10 +862,9 @@ impl<P: Platform> Engine<P> {
                 control.clone(),
                 &on_event,
             ),
-            vertical: OnceLock::new(),
+            extras: ExtraOutputs::new(),
             control,
             scene_feeds: Arc::new(SceneFeeds::new(timeline.clone())),
-            vertical_scene_feeds: Arc::new(SceneFeeds::new(timeline.clone())),
             timeline,
             epoch: AtomicI64::new(i64::MIN),
             on_event,
@@ -749,7 +875,7 @@ impl<P: Platform> Engine<P> {
                 stingers: HashMap::new(),
                 mixer: None,
                 compositor: None,
-                vertical_compositor: None,
+                extra_compositors: BTreeMap::new(),
                 pins: Vec::new(),
                 revision: 0,
             }),
@@ -881,11 +1007,11 @@ impl<P: Platform> Engine<P> {
         for thread in self.threads.lock().drain(..) {
             let _ = thread.join();
         }
-        let (compositor, vertical_compositor, mixer, sources, stingers) = {
+        let (compositor, extra_compositors, mixer, sources, stingers) = {
             let mut state = inner.state.lock();
             (
                 state.compositor.take(),
-                state.vertical_compositor.take(),
+                std::mem::take(&mut state.extra_compositors),
                 state.mixer.take(),
                 std::mem::take(&mut state.sources),
                 std::mem::take(&mut state.stingers),
@@ -894,13 +1020,13 @@ impl<P: Platform> Engine<P> {
         if let Some(compositor) = compositor {
             stop_compositor(compositor);
         }
-        if let Some(compositor) = vertical_compositor {
+        for compositor in extra_compositors.into_values() {
             stop_compositor(compositor);
         }
         inner.main.scenes.stop();
-        if let Some(output) = inner.vertical.get() {
-            output.scenes.stop();
-            output.program_video.clear();
+        for extra in inner.extras.iter() {
+            extra.output.scenes.stop();
+            extra.output.program_video.clear();
         }
         if let Some(mixer) = mixer {
             stop_mixer(inner, mixer, &BTreeMap::new());
@@ -934,9 +1060,15 @@ impl<P: Platform> Engine<P> {
         ));
         main.or_else(|| {
             let setup = self.inner.state.read().setup.clone();
-            setup.vertical.as_ref()?.recording.as_ref().filter(|recording| recording.enabled)?;
-            self.inner.output(CanvasId::Vertical)?.program.stopped().map(|reason| {
-                format!("vertical program output has failed: {reason}; stop the recording and restart the live engine")
+            setup.extra_canvas_ids().into_iter().find_map(|canvas| {
+                setup
+                    .extra_canvas(canvas)?
+                    .recording
+                    .as_ref()
+                    .filter(|recording| recording.enabled)?;
+                self.inner.output(canvas)?.program.stopped().map(|reason| {
+                    format!("{} output has failed: {reason}; stop the recording and restart the live engine", canvas_program_words(canvas))
+                })
             })
         })
     }
@@ -964,15 +1096,20 @@ impl<P: Platform> Engine<P> {
         if inner.recording.load(Ordering::SeqCst) {
             held_by.push("recording".to_string());
         }
-        EngineInfo {
-            vertical: state.setup.vertical.as_ref().and_then(|vertical| {
-                let output = inner.output(CanvasId::Vertical)?;
+        let canvases: Vec<isocast_protocol::api::CanvasEngineInfo> = state
+            .setup
+            .extra_canvas_ids()
+            .into_iter()
+            .filter_map(|id| {
+                let vertical = state.setup.extra_canvas(id)?;
+                let output = inner.output(id)?;
                 let mut compositor = output.timings.lock().info();
-                if let Some(clock) = clocks.iter().find(|clock| clock.id == VERTICAL_PROGRAM) {
+                if let Some(clock) = clocks.iter().find(|clock| clock.id == id.program()) {
                     compositor.wake_lateness_us = clock.wake_lateness_us;
                 }
                 let (raster_us, content, content_mb) = output.scenes.content();
                 Some(isocast_protocol::api::CanvasEngineInfo {
+                    id,
                     canvas: vertical.canvas(&state.setup.canvas),
                     program_frames: output.frames_drawn.load(Ordering::Relaxed),
                     missed_frames: output.frames_missed.load(Ordering::Relaxed),
@@ -986,7 +1123,18 @@ impl<P: Platform> Engine<P> {
                         content_mb,
                     },
                 })
-            }),
+            })
+            .collect();
+        EngineInfo {
+            vertical: canvases
+                .iter()
+                .find(|c| c.id.is_vertical())
+                .cloned()
+                .map(|info| isocast_protocol::api::CanvasEngineInfo {
+                    id: CanvasId::Main,
+                    ..info
+                }),
+            canvases,
             clocks,
             worker_errors: self
                 .inner
@@ -997,9 +1145,9 @@ impl<P: Platform> Engine<P> {
                 .chain(self.inner.main.scenes.failure())
                 .chain(
                     self.inner
-                        .vertical
-                        .get()
-                        .and_then(|output| output.scenes.failure()),
+                        .extras
+                        .iter()
+                        .filter_map(|extra| extra.output.scenes.failure()),
                 )
                 .collect(),
             uptime_seconds: inner.epoch().map_or(0.0, |epoch| {
@@ -1074,7 +1222,7 @@ impl<P: Platform> Engine<P> {
         let output = self
             .inner
             .output(canvas)
-            .ok_or("vertical: canvas is not enabled")?;
+            .ok_or_else(|| canvas_off(canvas))?;
         if let Some(id) = &scene
             && !self
                 .inner
@@ -1095,13 +1243,29 @@ impl<P: Platform> Engine<P> {
         }
         *staged = scene.clone();
         drop(staged);
-        if canvas == CanvasId::Main
-            && self
+        if canvas == CanvasId::Main {
+            let followers: Vec<CanvasId> = self
                 .inner
-                .output(CanvasId::Vertical)
-                .is_some_and(|output| output.follow_main.load(Ordering::SeqCst))
-        {
-            self.set_canvas_preview(CanvasId::Vertical, scene.map(|scene| scene.to_string()))?;
+                .extras
+                .iter()
+                .filter(|extra| {
+                    extra.output.enabled.load(Ordering::SeqCst)
+                        && extra.output.follow_main.load(Ordering::SeqCst)
+                })
+                .map(|extra| extra.id)
+                .collect();
+            // Every follower gets it, even if one refuses.
+            let mut first_error = None;
+            for follower in followers {
+                if let Err(error) =
+                    self.set_canvas_preview(follower, scene.as_ref().map(|scene| scene.to_string()))
+                {
+                    first_error.get_or_insert(error);
+                }
+            }
+            if let Some(error) = first_error {
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -1130,19 +1294,20 @@ impl<P: Platform> Engine<P> {
         let output = self
             .inner
             .output(canvas)
-            .ok_or("vertical: canvas is not enabled")?;
-        if canvas == CanvasId::Vertical && output.follow_main.load(Ordering::SeqCst) {
-            return Err(
-                "vertical.follow_main: set false to switch the vertical canvas independently"
-                    .into(),
-            );
+            .ok_or_else(|| canvas_off(canvas))?;
+        if !canvas.is_main() && output.follow_main.load(Ordering::SeqCst) {
+            return Err(format!(
+                "{}.follow_main: set false to switch the {} independently",
+                state.setup.canvas_field(canvas),
+                canvas_words(canvas)
+            ));
         }
         let placed = output
             .control
             .switch_scene(at, scene, transition)
             .ok()
             .flatten();
-        if canvas == CanvasId::Vertical {
+        if !canvas.is_main() {
             let mut main = self.inner.control.state.lock();
             main.changed = true;
             return Ok(main.check_end(at).ok().and_then(|()| main.place(at)));
@@ -1170,11 +1335,8 @@ impl<P: Platform> Engine<P> {
         // The program and the preview are drawn only while someone asks:
         // an idle one has no picture until its next frame.
         Ok(match target {
-            PROGRAM | "preview" | VERTICAL_PROGRAM | "vertical-preview" => wait_for_frame(&slot),
-            scene
-                if scene.starts_with(scene_feeds::PREFIX)
-                    || scene.starts_with(VERTICAL_SCENE_PREFIX) =>
-            {
+            target if self.inner.canvas_target(target).is_some() => wait_for_frame(&slot),
+            scene if self.inner.scene_target(scene).is_some() => {
                 let deadline = std::time::Instant::now() + super::FRESH_FRAME_WAIT;
                 let mut from = Time::from_nanos(i64::MIN);
                 loop {
@@ -1238,7 +1400,7 @@ impl<P: Platform> Engine<P> {
                 let (jpeg, width, height) = platform
                     .encode_jpeg(&frame, max_width, quality)
                     .map_err(|err| format!("{err:#}"))?;
-                let stamp = target_canvas(target)
+                let stamp = target_canvas(&self.inner, target)
                     .and_then(|canvas| self.inner.output(canvas))
                     .and_then(|output| frame_stream::stamp_at(&output.drawn, at));
                 return Ok(Some(JpegFrame {
@@ -1304,13 +1466,14 @@ impl<P: Platform> Engine<P> {
     ) -> Result<SharedFeed<P::SharedSurface>, String> {
         let fps = fps.clamp(1, 60);
         slot_of_sized(&self.inner, target, fps, max_size)?;
-        let filters = (filtered && target_canvas(target).is_none()).then(|| {
+        let filters = (filtered && target_canvas(&self.inner, target).is_none()).then(|| {
             let (inner, id) = (self.inner.clone(), target.to_string());
             Box::new(move || {
                 let setup = inner.state.read().setup.clone();
-                setup
+                let filters = setup
                     .source(&id)
-                    .map_or_else(Vec::new, |s| s.filters.clone())
+                    .map_or_else(Vec::new, |s| s.filters.clone());
+                (filters, inner.epoch())
             }) as shared_frames::LiveFilters
         });
         let inner = self.inner.clone();
@@ -1349,8 +1512,9 @@ impl<P: Platform> Engine<P> {
                 "virtual_camera.target: preview is empty; stage a scene with isocast preview ID, or choose program, scene or source"
             );
         }
-        if settings.target == Target::Vertical {
-            vertical_camera_slot(&self.inner, fps).map_err(anyhow::Error::msg)?;
+        let extra = settings.target_canvas();
+        if let Some(canvas) = extra {
+            canvas_camera_slot(&self.inner, canvas, fps).map_err(anyhow::Error::msg)?;
         }
         let status = VirtualCameraStatus {
             settings: settings.clone(),
@@ -1384,18 +1548,20 @@ impl<P: Platform> Engine<P> {
                         super::virtual_camera::Input::Scene(scenes, settings.scene.clone().unwrap())
                     }));
                 }
-                let target = match settings.target {
-                    Target::Program => PROGRAM,
-                    Target::Preview => "preview",
-                    Target::Source => settings.source.as_deref().unwrap(),
-                    Target::Vertical => VERTICAL_PROGRAM,
-                    Target::Scene => unreachable!(),
-                };
-                let slot = match settings.target {
-                    // A contained vertical failure fails the camera, saying
-                    // why, rather than dropping every frame quietly.
-                    Target::Vertical => vertical_camera_slot(&inner, fps),
-                    _ => slot_of(&inner, target, fps),
+                let slot = match (settings.target, extra) {
+                    // A contained failure of the extra canvas fails the
+                    // camera, saying why, rather than dropping every frame
+                    // quietly.
+                    (_, Some(canvas)) => canvas_camera_slot(&inner, canvas, fps),
+                    (Target::Program, None) => slot_of(&inner, PROGRAM, fps),
+                    (Target::Preview, None) => slot_of(&inner, "preview", fps),
+                    (Target::Source, None) => {
+                        slot_of(&inner, settings.source.as_deref().unwrap(), fps)
+                    }
+                    (Target::Scene | Target::Vertical | Target::Canvas, None) => Err(
+                        "virtual_camera.canvas: give an extra canvas's id for target = canvas"
+                            .to_string(),
+                    ),
                 };
                 let slot = match slot {
                     Ok(slot) => slot,
@@ -1438,7 +1604,7 @@ impl<P: Platform> Engine<P> {
 
     pub(crate) fn canvas_tap_source(&self, canvas: CanvasId) -> Result<ProgramTapSource<P>> {
         if self.inner.output(canvas).is_none() {
-            bail!("vertical: canvas is not enabled");
+            bail!("{}", canvas_off(canvas));
         }
         Ok(ProgramTapSource(self.inner.clone(), canvas))
     }
@@ -1455,7 +1621,7 @@ impl<P: Platform> Engine<P> {
         self.inner
             .output(canvas)
             .map(|output| &output.encoders)
-            .ok_or_else(|| anyhow::anyhow!("vertical: canvas is not enabled"))
+            .ok_or_else(|| anyhow::anyhow!("{}", canvas_off(canvas)))
     }
 
     pub fn stream_canvas(
@@ -1548,10 +1714,15 @@ fn statuses<P: Platform>(state: &State<P>) -> Vec<SourceStatus> {
 fn needed_sources(setup: &Setup) -> Vec<String> {
     let mut ids: Vec<&str> = Vec::new();
     ids.extend(setup.scenes.iter().flat_map(|s| s.all_sources()));
-    // Vertical layouts use the very same opened sources and frame slots.
-    let vertical = setup.for_canvas(CanvasId::Vertical);
-    if let Some(vertical) = &vertical {
-        ids.extend(vertical.scenes.iter().flat_map(|s| s.all_sources()));
+    // Other canvases' layouts use the very same opened sources and frame
+    // slots.
+    let extras: Vec<Setup> = setup
+        .extra_canvas_ids()
+        .into_iter()
+        .filter_map(|canvas| setup.for_canvas(canvas))
+        .collect();
+    for extra in &extras {
+        ids.extend(extra.scenes.iter().flat_map(|s| s.all_sources()));
     }
     ids.extend(setup.recording.program.audio.iter().map(String::as_str));
     ids.extend(sidechain_sources(setup));
@@ -1571,6 +1742,12 @@ fn needed_sources(setup: &Setup) -> Vec<String> {
             .filter(|s| s.kind.has_audio() && s.audio.monitor != Monitoring::Off)
             .map(|s| s.id.as_str()),
     );
+    // What sources' masks show runs while they do (#115).
+    let mut masks = setup.mask_needs(&ids);
+    for extra in &extras {
+        masks.extend(extra.mask_needs(&ids));
+    }
+    ids.extend(masks);
     let mut unique: Vec<String> = Vec::new();
     for id in ids {
         if setup.source(id).is_some() && !unique.iter().any(|u| u == id) {
@@ -1598,32 +1775,69 @@ fn setup_refusal<P: Platform>(
     current: &Setup,
     new: &Setup,
 ) -> Option<isocast_protocol::Issue> {
+    // Outputs are made once per canvas id for the engine's life: a setup
+    // whose new canvases don't fit is refused here, not skipped later
+    // (#84 review M6).
+    let free = MAX_ENGINE_CANVASES - inner.extras.iter().count();
+    let fresh: Vec<CanvasId> = new
+        .extra_canvas_ids()
+        .into_iter()
+        .filter(|id| inner.extras.get(*id).is_none())
+        .collect();
+    if fresh.len() > free {
+        return Some(isocast_protocol::Issue {
+            path: new.canvas_field(fresh[free]),
+            message: format!(
+                "this live engine has made outputs for {} canvases already, the most it \
+                 holds; restart the engine once nothing records or streams (`isocast \
+                 restart`), then apply this again",
+                MAX_ENGINE_CANVASES - free
+            ),
+        });
+    }
     if let Some(message) = canvas_refusal(inner, &current.canvas, &new.canvas) {
         return Some(isocast_protocol::Issue {
             path: "canvas".into(),
             message,
         });
     }
-    let vertical_size = |setup: &Setup| setup.vertical.as_ref().map(|v| v.canvas(&setup.canvas));
-    if vertical_size(current) != vertical_size(new)
-        && (inner.vertical.get().is_some_and(|output| !output.program_video.is_empty())
-            // Recording has snapshotted its formats before routes are added
-            // (source opens, disk checks and encoder placement may still run).
-            || inner.recording.load(Ordering::SeqCst) && current.vertical.is_some())
-    {
-        return Some(isocast_protocol::Issue {
-            path: "vertical".into(),
-            message: "the canvas stays at its current size and fps while recording, streaming or keeping a replay buffer; change it once they stop".into(),
-        });
+    let mut ids = current.extra_canvas_ids();
+    for id in new.extra_canvas_ids() {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
     }
-    if inner.recording.load(Ordering::SeqCst)
-        && current.vertical.as_ref().map(|v| v.follow_main)
-            != new.vertical.as_ref().map(|v| v.follow_main)
-    {
-        return Some(isocast_protocol::Issue {
-            path: "vertical.follow_main".into(),
-            message: "change scene linking once the recording stops".into(),
-        });
+    for id in ids {
+        let size = |setup: &Setup| setup.extra_canvas(id).map(|v| v.canvas(&setup.canvas));
+        let field = if current.has_canvas(id) {
+            current.canvas_field(id)
+        } else {
+            new.canvas_field(id)
+        };
+        if size(current) != size(new)
+            && (inner
+                .extras
+                .get(id)
+                .is_some_and(|extra| !extra.output.program_video.is_empty())
+                // Recording has snapshotted its formats before routes are
+                // added (source opens, disk checks and encoder placement
+                // may still run).
+                || inner.recording.load(Ordering::SeqCst) && current.has_canvas(id))
+        {
+            return Some(isocast_protocol::Issue {
+                path: field,
+                message: "the canvas stays at its current size and fps while recording, streaming or keeping a replay buffer; change it once they stop".into(),
+            });
+        }
+        if inner.recording.load(Ordering::SeqCst)
+            && current.extra_canvas(id).map(|v| v.follow_main)
+                != new.extra_canvas(id).map(|v| v.follow_main)
+        {
+            return Some(isocast_protocol::Issue {
+                path: format!("{field}.follow_main"),
+                message: "change scene linking once the recording stops".into(),
+            });
+        }
     }
     None
 }
@@ -2072,17 +2286,32 @@ fn publish<P: Platform>(inner: &Arc<Inner<P>>, state: &mut State<P>) {
         slots: program_slots.clone(),
     });
 
-    if let Some(vertical_setup) = setup.for_canvas(CanvasId::Vertical) {
-        let output = inner.vertical.get_or_init(|| {
-            CanvasOutput::new(
-                CanvasId::Vertical,
+    for canvas in setup.extra_canvas_ids() {
+        let Some(canvas_setup) = setup.for_canvas(canvas) else {
+            continue;
+        };
+        let made = inner.extras.get_or_init(canvas, || ExtraOutput {
+            id: canvas,
+            output: CanvasOutput::new(
+                canvas,
                 &inner.platform,
                 &inner.timeline,
                 Arc::new(SessionControl::with_data(inner.control.data().clone())),
                 &inner.on_event,
-            )
+            ),
+            scene_feeds: Arc::new(SceneFeeds::new(inner.timeline.clone())),
         });
-        let follow = setup.vertical.as_ref().expect("vertical setup").follow_main;
+        let output = match made {
+            Ok(extra) => &extra.output,
+            Err(message) => {
+                inner.event(EngineEvent::Warning(message));
+                continue;
+            }
+        };
+        let follow = setup
+            .extra_canvas(canvas)
+            .expect("extra canvas setup")
+            .follow_main;
         let was_following = output.follow_main.swap(follow, Ordering::SeqCst);
         if output
             .control
@@ -2112,17 +2341,19 @@ fn publish<P: Platform>(inner: &Arc<Inner<P>>, state: &mut State<P>) {
             }
         }
         output.scenes.submit(SceneInput {
-            setup: Arc::new(vertical_setup),
+            setup: Arc::new(canvas_setup),
             revision: state.revision,
-            slots: program_slots,
+            slots: program_slots.clone(),
         });
     }
 
     let control = &inner.control;
     let mut frames = slots;
     frames.push((PROGRAM.to_string(), inner.main.program.clone()));
-    if let Some(output) = inner.output(CanvasId::Vertical) {
-        frames.push((VERTICAL_PROGRAM.to_string(), output.program.clone()));
+    for canvas in setup.extra_canvas_ids() {
+        if let Some(output) = inner.output(canvas) {
+            frames.push((canvas.program().to_string(), output.program.clone()));
+        }
     }
     control.set_frames(frames);
     *control.browsers.lock() = state
@@ -2148,7 +2379,7 @@ fn publish<P: Platform>(inner: &Arc<Inner<P>>, state: &mut State<P>) {
     if inner.epoch().is_some() && !inner.stopping.load(Ordering::SeqCst) {
         ensure_mixer(inner, state);
         ensure_compositor(inner, state);
-        ensure_vertical_compositor(inner, state);
+        ensure_extra_compositors(inner, state);
     }
 }
 
@@ -2307,23 +2538,36 @@ fn stop_compositor(mut run: CompositorRun) {
     }
 }
 
-fn ensure_vertical_compositor<P: Platform>(inner: &Arc<Inner<P>>, state: &mut State<P>) {
+/// Run (or stop) each extra canvas's compositor as the setup wants it.
+fn ensure_extra_compositors<P: Platform>(inner: &Arc<Inner<P>>, state: &mut State<P>) {
+    let mut canvases: Vec<CanvasId> = inner.extras.iter().map(|extra| extra.id).collect();
+    for id in state.extra_compositors.keys() {
+        if !canvases.contains(id) {
+            canvases.push(*id);
+        }
+    }
+    for canvas in canvases {
+        ensure_extra_compositor(inner, state, canvas);
+    }
+}
+
+fn ensure_extra_compositor<P: Platform>(inner: &Arc<Inner<P>>, state: &mut State<P>, id: CanvasId) {
     let wanted = state
         .setup
-        .vertical
-        .as_ref()
+        .extra_canvas(id)
         .map(|v| v.canvas(&state.setup.canvas));
-    if let (Some(run), Some(canvas)) = (&state.vertical_compositor, &wanted)
+    if let (Some(run), Some(canvas)) = (state.extra_compositors.get(&id), &wanted)
         && run.canvas == (canvas.width, canvas.height, canvas.fps)
     {
         return;
     }
-    if let Some(old) = state.vertical_compositor.take() {
+    if let Some(old) = state.extra_compositors.remove(&id) {
         stop_compositor(old);
     }
-    let Some(output) = inner.vertical.get() else {
+    let Some(extra) = inner.extras.get(id) else {
         return;
     };
+    let output = &extra.output;
     let Some(canvas) = wanted else {
         output.enabled.store(false, Ordering::SeqCst);
         output.program.clear();
@@ -2334,7 +2578,7 @@ fn ensure_vertical_compositor<P: Platform>(inner: &Arc<Inner<P>>, state: &mut St
             .store(0.0f64.to_bits(), Ordering::Relaxed);
         inner
             .timeline
-            .set_on_air(CanvasId::Vertical, std::iter::empty(), inner.platform.now());
+            .set_on_air(id, std::iter::empty(), inner.platform.now());
         return;
     };
     // Broken canvas-local scene state would fail a new compositor at once:
@@ -2346,9 +2590,12 @@ fn ensure_vertical_compositor<P: Platform>(inner: &Arc<Inner<P>>, state: &mut St
             .is_some_and(|w| w.contains("scene state is broken"))
         {
             let why = why.map(|w| format!(" ({w})")).unwrap_or_default();
+            let whose = match id {
+                CanvasId::Vertical => "the vertical canvas's".to_string(),
+                other => format!("canvas {other:?}'s"),
+            };
             output.program.replace_stop(format!(
-                "the vertical canvas's scene state is broken{why}; only restarting the engine \
-                 recovers it"
+                "{whose} scene state is broken{why}; only restarting the engine recovers it"
             ));
         }
         return;
@@ -2356,7 +2603,10 @@ fn ensure_vertical_compositor<P: Platform>(inner: &Arc<Inner<P>>, state: &mut St
     let compositor = match Compositor::new(&inner.platform, (canvas.width, canvas.height)) {
         Ok(compositor) => compositor,
         Err(err) => {
-            let message = format!("could not set up the GPU for the vertical program: {err:#}");
+            let message = format!(
+                "could not set up the GPU for the {}: {err:#}",
+                canvas_program_words(id)
+            );
             output.program.stop(message.clone());
             inner.event(EngineEvent::Warning(message));
             return;
@@ -2372,24 +2622,23 @@ fn ensure_vertical_compositor<P: Platform>(inner: &Arc<Inner<P>>, state: &mut St
         let stop = stop.clone();
         let fps = canvas.fps;
         move || {
-            let _ = inner.worker("vertical compositor", || {
-                run_program(&inner, CanvasId::Vertical, compositor, fps, &stop)
+            let _ = inner.worker(&compositor_worker(id), || {
+                run_program(&inner, id, compositor, fps, &stop)
             });
         }
     });
-    state.vertical_compositor = Some(CompositorRun {
-        stop,
-        thread: Some(thread),
-        canvas: (canvas.width, canvas.height, canvas.fps),
-    });
+    state.extra_compositors.insert(
+        id,
+        CompositorRun {
+            stop,
+            thread: Some(thread),
+            canvas: (canvas.width, canvas.height, canvas.fps),
+        },
+    );
 }
 
-fn target_canvas(target: &str) -> Option<CanvasId> {
-    match target {
-        PROGRAM | "preview" => Some(CanvasId::Main),
-        VERTICAL_PROGRAM | "vertical-preview" => Some(CanvasId::Vertical),
-        _ => None,
-    }
+fn target_canvas<P: Platform>(inner: &Inner<P>, target: &str) -> Option<CanvasId> {
+    inner.canvas_target(target).map(|(canvas, _)| canvas)
 }
 
 /// Minimum raster for a one-off scene picture. Live tiles may have left a
@@ -2399,13 +2648,7 @@ fn scene_frame_size<P: Platform>(
     target: &str,
     max_width: Option<u32>,
 ) -> Option<(u32, u32)> {
-    let canvas = if target.starts_with(scene_feeds::PREFIX) {
-        CanvasId::Main
-    } else if target.starts_with(VERTICAL_SCENE_PREFIX) {
-        CanvasId::Vertical
-    } else {
-        return None;
-    };
+    let (canvas, _) = inner.scene_target(target)?;
     let scenes = inner.output(canvas)?.scenes.latest()?;
     Some(shared_frames::fitted(
         scenes.compiled.canvas,
@@ -2427,9 +2670,11 @@ fn stream_source<P: Platform>(
         return Err("the live engine stopped".into());
     }
     let mut slot = slot_of_sized(inner, target, fps, max_size)?;
-    let canvas = target_canvas(target);
+    let canvas = target_canvas(inner, target);
     if rgb
-        && matches!(target, PROGRAM | VERTICAL_PROGRAM)
+        && inner
+            .canvas_target(target)
+            .is_some_and(|(_, preview)| !preview)
         && let Some(output) = canvas.and_then(|canvas| inner.output(canvas))
     {
         slot = output.program_rgb.clone();
@@ -2437,10 +2682,10 @@ fn stream_source<P: Platform>(
     let grid = canvas.and_then(|canvas| {
         let state = inner.state.lock();
         let run = match canvas {
-            CanvasId::Main => &state.compositor,
-            CanvasId::Vertical => &state.vertical_compositor,
+            CanvasId::Main => state.compositor.as_ref(),
+            other => state.extra_compositors.get(&other),
         };
-        inner.epoch().zip(run.as_ref().map(|run| run.canvas.2))
+        inner.epoch().zip(run.map(|run| run.canvas.2))
     });
     let drawn = canvas.and_then(|canvas| inner.output(canvas).map(|output| output.drawn.clone()));
     Ok(frame_stream::Source { slot, grid, drawn })
@@ -2450,14 +2695,24 @@ fn stream_source<P: Platform>(
 /// vertical), or why it has none: the canvas is off, or its program
 /// stopped (a contained vertical failure: `engine.vertical.stopped` says
 /// how it comes back).
-fn vertical_camera_slot<P: Platform>(
+/// The program slot of extra canvas `canvas` for the virtual camera
+/// (target = vertical or canvas), or why it can't show it.
+fn canvas_camera_slot<P: Platform>(
     inner: &Arc<Inner<P>>,
+    canvas: CanvasId,
     fps: u32,
 ) -> Result<Arc<FrameSlot<P::Frame>>, String> {
-    let slot = slot_of(inner, VERTICAL_PROGRAM, fps).map_err(|_| {
-        "virtual_camera.target: vertical needs the vertical canvas; turn it on ([vertical]) \
-         or give program, preview, scene or source"
-            .to_string()
+    let slot = slot_of(inner, &canvas.program_target(), fps).map_err(|_| {
+        if canvas.is_vertical() {
+            "virtual_camera.target: vertical needs the vertical canvas; turn it on ([vertical]) \
+             or give program, preview, scene or source"
+                .to_string()
+        } else {
+            format!(
+                "virtual_camera.canvas: the canvas {canvas:?} isn't on; add it ([[canvases]]) \
+                 or give another target"
+            )
+        }
     })?;
     if let Some(why) = slot.stopped() {
         let recovery = if why.contains("scene state is broken")
@@ -2465,10 +2720,10 @@ fn vertical_camera_slot<P: Platform>(
         {
             "restart the engine"
         } else {
-            "after recording stops, turn the vertical canvas off and on, or restart the engine"
+            "after recording stops, turn the canvas off and on, or restart the engine"
         };
         return Err(format!(
-            "virtual_camera: the vertical program stopped ({why}); {recovery}, then start \
+            "virtual_camera: the {canvas} program stopped ({why}); {recovery}, then start \
              the camera again, or give program"
         ));
     }
@@ -2495,8 +2750,8 @@ fn slot_of_sized<P: Platform>(
     if let Some(id) = target.strip_prefix(scene_feeds::PREFIX) {
         return scene_slot(inner, CanvasId::Main, id, fps, max_size);
     }
-    if let Some(id) = target.strip_prefix(VERTICAL_SCENE_PREFIX) {
-        return scene_slot(inner, CanvasId::Vertical, id, fps, max_size);
+    if let Some((canvas, id)) = CanvasId::from_scene_target(target) {
+        return scene_slot(inner, canvas, id, fps, max_size);
     }
     // The program and the preview are drawn while they are asked for.
     inner.want(target, fps);
@@ -2508,13 +2763,14 @@ fn slot_of_sized<P: Platform>(
             }
             Ok(inner.main.preview.clone())
         }
-        VERTICAL_PROGRAM | "vertical-preview" => {
-            let output = inner
-                .output(CanvasId::Vertical)
-                .ok_or("vertical: canvas is not enabled")?;
-            if target == "vertical-preview" {
+        target if inner.canvas_target(target).is_some() => {
+            let (canvas, preview) = inner.canvas_target(target).expect("checked");
+            let output = inner.output(canvas).ok_or_else(|| canvas_off(canvas))?;
+            if preview {
                 if output.preview_scene.lock().is_none() {
-                    return Err("nothing is staged in vertical preview; stage a scene with `preview --canvas vertical`".into());
+                    return Err(format!(
+                        "nothing is staged in {canvas} preview; stage a scene with `preview --canvas {canvas}`"
+                    ));
                 }
                 Ok(output.preview.clone())
             } else {
@@ -2527,6 +2783,13 @@ fn slot_of_sized<P: Platform>(
             match state.sources.get(id).and_then(|live| live.video.as_ref()) {
                 Some(video) => Ok(video.slot.clone()),
                 None => {
+                    // A canvas target (`vertical-program`) of a canvas
+                    // that's off.
+                    if !state.sources.contains_key(id)
+                        && let Some((canvas, _)) = CanvasId::from_target(id)
+                    {
+                        return Err(canvas_off(canvas));
+                    }
                     let ids: Vec<&str> = state
                         .sources
                         .iter()
@@ -2565,10 +2828,7 @@ fn scene_slot<P: Platform>(
     fps: u32,
     max_size: (Option<u32>, Option<u32>),
 ) -> Result<Arc<FrameSlot<P::Frame>>, String> {
-    let prefix = match canvas {
-        CanvasId::Main => scene_feeds::PREFIX,
-        CanvasId::Vertical => VERTICAL_SCENE_PREFIX,
-    };
+    let prefix = canvas.scene_prefix();
     {
         let state = inner.state.lock();
         if !state.setup.scenes.iter().any(|scene| scene.id == id) {
@@ -2582,13 +2842,19 @@ fn scene_slot<P: Platform>(
                 }
             ));
         }
-        if canvas == CanvasId::Vertical && state.setup.vertical.is_none() {
-            return Err("vertical: canvas is not enabled".into());
+        if !state.setup.has_canvas(canvas) {
+            return Err(canvas_off(canvas));
         }
     }
     let watched = match canvas {
         CanvasId::Main => &inner.scene_feeds,
-        CanvasId::Vertical => &inner.vertical_scene_feeds,
+        other => {
+            &inner
+                .extras
+                .get(other)
+                .ok_or_else(|| canvas_off(other))?
+                .scene_feeds
+        }
     };
     let (slot, start) = watched.want(id, fps, max_size)?;
     if start {
@@ -2598,16 +2864,16 @@ fn scene_slot<P: Platform>(
         let platform = inner.platform.clone();
         let epoch = inner.epoch().unwrap_or_else(|| platform.now());
         let spawned = isocast_diagnostics::spawn(
-            if canvas.is_main() {
-                "scene feeds"
+            &if canvas.is_main() {
+                "scene feeds".to_string()
             } else {
-                "vertical scene feeds"
+                format!("{canvas} scene feeds")
             },
             move || {
                 let scenes = || {
                     weak.upgrade().and_then(|inner| match canvas {
                         CanvasId::Main => inner.main.scenes.latest(),
-                        CanvasId::Vertical => inner.output(CanvasId::Vertical)?.scenes.latest(),
+                        other => inner.output(other)?.scenes.latest(),
                     })
                 };
                 let stop = || {
@@ -2667,10 +2933,7 @@ fn run_program<P: Platform>(
             .flatten()
             .and_then(|value| {
                 let (target, seconds) = value.split_once('=')?;
-                let matches = match canvas {
-                    CanvasId::Main => target == "main",
-                    CanvasId::Vertical => target == "vertical",
-                };
+                let matches = target == canvas.as_str();
                 matches
                     .then(|| seconds.parse::<f64>().ok())
                     .flatten()
@@ -2681,14 +2944,7 @@ fn run_program<P: Platform>(
     let poison_after = fault("ISOCAST_SCENES_POISON_AFTER");
     let frame = Duration::from_secs(1) / fps;
     // The version of the compiled scenes the compositor draws.
-    let mut clock = inner.timeline.clocks.start(
-        match canvas {
-            CanvasId::Main => PROGRAM,
-            CanvasId::Vertical => VERTICAL_PROGRAM,
-        }
-        .into(),
-        frame,
-    );
+    let mut clock = inner.timeline.clocks.start(canvas.program(), frame);
     let mut version = 0;
     let mut warned = false;
     let mut retry_gpu = std::time::Instant::now();
@@ -2718,6 +2974,9 @@ fn run_program<P: Platform>(
         // even though a new scene viewer could already obtain a healthy one.
         if compositor.device_lost() {
             output.frames_missed.fetch_add(1, Ordering::Relaxed);
+            if !output.program_video.is_empty() {
+                crate::governor::protected_loss(canvas, 1);
+            }
             if std::time::Instant::now() < retry_gpu {
                 continue;
             }
@@ -2796,6 +3055,9 @@ fn run_program<P: Platform>(
         if now > tick + 3 * frame {
             if outputs || monitored {
                 output.frames_missed.fetch_add(1, Ordering::Relaxed);
+                if outputs {
+                    crate::governor::protected_loss(canvas, 1);
+                }
             }
             continue;
         }
@@ -2830,11 +3092,7 @@ fn run_program<P: Platform>(
                         // Publish the stamp and pixels together, only after
                         // the GPU has finished with this tick's inputs.
                         frame_stream::drawn(&output.drawn, tick, stamp);
-                        let feeds = if canvas.is_main() {
-                            &inner.scene_feeds
-                        } else {
-                            &inner.vertical_scene_feeds
-                        };
+                        let feeds = inner.feeds(canvas);
                         if let Some(scene) = scene {
                             feeds.publish(
                                 &scene,
@@ -2850,7 +3108,7 @@ fn run_program<P: Platform>(
                             output.program_rgb.push(rgb, tick);
                         }
                         output.program.push(image.clone(), tick);
-                        output.program_video.video(&image, tick);
+                        output.program_video.video(&image, tick, Some(canvas));
                         output.frames_drawn.fetch_add(1, Ordering::Relaxed);
                         output
                             .timings
@@ -2860,9 +3118,15 @@ fn run_program<P: Platform>(
                 }
                 Ok(None) => {
                     output.frames_missed.fetch_add(1, Ordering::Relaxed);
+                    if outputs {
+                        crate::governor::protected_loss(canvas, 1);
+                    }
                 }
                 Err(err) => {
                     output.frames_missed.fetch_add(1, Ordering::Relaxed);
+                    if outputs {
+                        crate::governor::protected_loss(canvas, 1);
+                    }
                     if !std::mem::replace(&mut warned, true) {
                         inner.event(EngineEvent::Warning(format!(
                             "the {canvas:?} program could not draw a frame: {err:#}"
@@ -2875,11 +3139,7 @@ fn run_program<P: Platform>(
             // Nothing wants the program: let its canvas go back to the pool.
             output.program.clear();
             output.program_rgb.clear();
-            let feeds = if canvas.is_main() {
-                &inner.scene_feeds
-            } else {
-                &inner.vertical_scene_feeds
-            };
+            let feeds = inner.feeds(canvas);
             feeds.clear_reuse(Feed::Program);
             compositor.forget(Feed::Program);
         }
@@ -2895,11 +3155,7 @@ fn run_program<P: Platform>(
                     let slot = output.preview.clone();
                     let inner = inner.clone();
                     image.then(move |(rgb, _), _| {
-                        let feeds = if canvas.is_main() {
-                            &inner.scene_feeds
-                        } else {
-                            &inner.vertical_scene_feeds
-                        };
+                        let feeds = inner.feeds(canvas);
                         feeds.publish(
                             &staged.scene,
                             version,
@@ -2914,11 +3170,7 @@ fn run_program<P: Platform>(
             Some(_) => {}
             None => {
                 output.preview.clear();
-                let feeds = if canvas.is_main() {
-                    &inner.scene_feeds
-                } else {
-                    &inner.vertical_scene_feeds
-                };
+                let feeds = inner.feeds(canvas);
                 feeds.clear_reuse(Feed::Preview);
                 compositor.forget(Feed::Preview);
             }
@@ -2948,7 +3200,8 @@ fn program_errors<P: Platform>(
     plans: &[Arc<FilePlan>],
     errors: &mut Vec<String>,
 ) {
-    for canvas in [CanvasId::Main, CanvasId::Vertical] {
+    let canvases = std::iter::once(CanvasId::Main).chain(inner.extras.iter().map(|e| e.id));
+    for canvas in canvases {
         if plans.iter().any(|plan| plan.source == canvas.program())
             && let Some(reason) = inner
                 .output(canvas)
@@ -3107,11 +3360,13 @@ struct IsoRunner<P: Platform> {
     /// The files' frame size.
     size: (u32, u32),
     fps: u32,
-    /// Its files' encoders take only Y'CbCr (H.264, HEVC on a platform
-    /// whose encoders want Y'CbCr).
+    /// Its files' encoders take only Y'CbCr (H.264, HEVC).
     ycbcr_only: bool,
     /// Every source's filters, if the files record this one filtered.
     filters: Option<SourceFilters>,
+    /// When the engine's clock started: mask animations on `clock` run
+    /// from it, as in the program (#115).
+    epoch: Time,
     /// Where frames are filtered or converted, made when the first frame
     /// needs it.
     stage: Option<Box<IsoFrames<P>>>,
@@ -3138,10 +3393,7 @@ type IsoGpu = Mutex<Option<Gpu>>;
 impl<P: Platform> IsoRunner<P> {
     /// Whether `image` must go through the stage before the files take it.
     fn needs_stage(&self, platform: &P, image: &P::Frame) -> bool {
-        self.filters.is_some()
-            || (self.ycbcr_only && !platform.frame_is_ycbcr(image))
-            || (platform.encoder_frame_format() == crate::EncoderFrameFormat::Bgra
-                && platform.frame_size(image) != self.size)
+        self.filters.is_some() || (self.ycbcr_only && !platform.frame_is_ycbcr(image))
     }
 
     /// The stage, made if it isn't yet. Setting one up takes a while (a
@@ -3159,10 +3411,15 @@ impl<P: Platform> IsoRunner<P> {
                     None => gpu.insert(Gpu::for_platform(platform)?).clone(),
                 }
             };
-            let stage = IsoFrames::new(platform, gpu, &self.id, self.size, self.filters.clone())
-                .with_context(|| {
-                    format!("could not prepare {:?}'s frames for its file", self.id)
-                })?;
+            let stage = IsoFrames::new(
+                platform,
+                gpu,
+                &self.id,
+                self.size,
+                self.filters.clone(),
+                self.epoch,
+            )
+            .with_context(|| format!("could not prepare {:?}'s frames for its file", self.id))?;
             self.stage = Some(Box::new(stage));
             isocast_diagnostics::diagnostic!("debug"; "{}: opened ISO GPU stage", self.id);
         }
@@ -3244,6 +3501,7 @@ fn run_iso<P: Platform>(
     let fps = runner.fps;
     let frame = Duration::from_secs(1) / fps;
     let mut last_gpu: Option<Completion> = None;
+    let governor_pin = crate::governor::iso_pin(&runner.id);
     let mut retry_gpu = std::time::Instant::now();
     for n in 0.. {
         let tick = epoch.add_ticks(n, fps);
@@ -3289,7 +3547,10 @@ fn run_iso<P: Platform>(
         // Encoder admission first, so a refused tick is never drawn.
         let mut admitted = false;
         for output in &mut runner.outputs {
-            output.admitted = tick.as_nanos() >= output.wanted.from() || output.credit.admit();
+            output.admitted = tick.as_nanos() >= output.wanted.from()
+                || output
+                    .credit
+                    .admit(crate::governor::iso_ceiling(&governor_pin));
             admitted |= output.admitted;
         }
         let image = if admitted {
@@ -3421,18 +3682,60 @@ fn record<P: Platform>(engine: &Engine<P>, options: &RecordOptions) -> Result<Re
     let mut warnings = Vec::new();
     let iso = &setup.recording.iso;
     let program = &setup.recording.program;
-    let vertical_setup = setup.for_canvas(CanvasId::Vertical);
-    let vertical_enabled = vertical_setup
-        .as_ref()
-        .is_some_and(|s| s.recording.program.enabled);
-    let vertical_output = inner.output(CanvasId::Vertical);
-    let vertical_control = vertical_enabled.then(|| {
-        if setup.vertical.as_ref().expect("vertical setup").follow_main {
-            &**control
-        } else {
-            &*vertical_output.expect("vertical output").control
+    // The extra canvases whose programs are recorded (`[vertical]`'s and
+    // `[[canvases]]`'), each with its output and the control whose scene
+    // timeline its files follow: main's while it follows main, else its
+    // own.
+    let mut extras_recorded: Vec<(CanvasId, &CanvasOutput<P>, &SessionControl)> = Vec::new();
+    for canvas in setup.extra_canvas_ids() {
+        let recorded = setup
+            .for_canvas(canvas)
+            .is_some_and(|s| s.recording.program.enabled);
+        if !recorded {
+            continue;
         }
-    });
+        let output = inner
+            .output(canvas)
+            .ok_or_else(|| anyhow::anyhow!("{}", canvas_off(canvas)))?;
+        let follows = setup
+            .extra_canvas(canvas)
+            .expect("extra canvas setup")
+            .follow_main;
+        extras_recorded.push((
+            canvas,
+            output,
+            if follows {
+                &**control
+            } else {
+                &*output.control
+            },
+        ));
+    }
+    let extras_recorded = extras_recorded;
+    let vertical_enabled = !extras_recorded.is_empty();
+    // Each control a recorded extra canvas follows once (main's aside):
+    // they record their scene timelines.
+    let mut extra_controls: Vec<&SessionControl> = Vec::new();
+    for (_, _, extra) in &extras_recorded {
+        if !std::ptr::eq(*extra, &**control)
+            && !extra_controls.iter().any(|c| std::ptr::eq(*c, *extra))
+        {
+            extra_controls.push(extra);
+        }
+    }
+    let extra_controls = extra_controls;
+    // The manifest's scene timelines of the extra canvases.
+    let canvas_controls: Vec<(CanvasId, &SessionControl)> = extras_recorded
+        .iter()
+        .map(|(canvas, _, control)| (*canvas, *control))
+        .collect();
+    let canvas_controls = &canvas_controls[..];
+    let extra_output = |source: &str| {
+        extras_recorded
+            .iter()
+            .find(|(canvas, _, _)| canvas.program() == source)
+            .map(|(_, output, _)| *output)
+    };
     if program.enabled
         && let Some(reason) = inner.main.program.stopped()
     {
@@ -3440,10 +3743,13 @@ fn record<P: Platform>(engine: &Engine<P>, options: &RecordOptions) -> Result<Re
             "program output has failed: {reason}; stop the recording and restart the live engine"
         );
     }
-    if vertical_enabled
-        && let Some(reason) = vertical_output.and_then(|output| output.program.stopped())
-    {
-        bail!("vertical program output has failed: {reason}; restart the live engine");
+    for (canvas, output, _) in &extras_recorded {
+        if let Some(reason) = output.program.stopped() {
+            bail!(
+                "{} output has failed: {reason}; restart the live engine",
+                canvas_program_words(*canvas)
+            );
+        }
     }
     let iso_enabled = iso.enabled && !iso.sources.is_empty();
     if !iso_enabled && !program.enabled && !vertical_enabled {
@@ -3726,42 +4032,46 @@ fn record<P: Platform>(engine: &Engine<P>, options: &RecordOptions) -> Result<Re
     let _warm_destinations =
         crate::stream::warm_destinations(engine, setup, &options.stop, &mut warnings);
     let _warm_vertical = crate::stream::warm_vertical(engine, setup, &options.stop, &mut warnings);
-    // The vertical replay may join later too (#68), including with its
-    // default settings and no stream. Place it before the writers; a
-    // stream of the same format shares this session, not a second encoder.
-    let _warm_vertical_replay = setup.vertical.as_ref().and_then(|vertical| {
-        let result = (|| {
-            let canvas = CanvasId::Vertical;
-            let spec = crate::replay::canvas_encoder_spec(
-                engine,
-                canvas,
-                &setup.recording.replay,
-                vertical.stream.as_ref(),
-            )?;
-            engine
-                .canvas_encoders(canvas)?
-                .warm_canvas(engine, canvas, &spec, &options.stop)
-        })();
-        match result {
-            Ok(subscription) => Some(subscription),
-            Err(error) => {
-                warnings.push(format!(
-                    "could not prepare the vertical replay encoder before recording: {error:#}"
-                ));
-                None
+    // Every other canvas's replay may join later too (#68, #84), including
+    // with its default settings and no stream. Place each before the
+    // writers; a stream of the same format shares that session, not a
+    // second encoder.
+    let _warm_canvas_replays: Vec<_> = setup
+        .extra_canvas_ids()
+        .into_iter()
+        .filter_map(|canvas| {
+            let result = (|| {
+                let spec = crate::replay::canvas_encoder_spec(
+                    engine,
+                    canvas,
+                    &setup.recording.replay,
+                    setup.stream_of(canvas),
+                )?;
+                engine
+                    .canvas_encoders(canvas)?
+                    .warm_canvas(engine, canvas, &spec, &options.stop)
+            })();
+            match result {
+                Ok(subscription) => Some(subscription),
+                Err(error) => {
+                    warnings.push(format!(
+                        "could not prepare the {} replay encoder before recording: {error:#}",
+                        canvas_words(canvas)
+                    ));
+                    None
+                }
             }
-        }
-    });
+        })
+        .collect();
     if options.stop.load(Ordering::SeqCst) {
         bail!("the recording was stopped before it started, so nothing was recorded");
     }
     // Each ISO source's frame clock, with the stage its frames go through
     // set up now if its frames need one: that takes a few frames' time.
     let iso_gpu = IsoGpu::default();
-    let ycbcr_only = platform.encoder_frame_format() == crate::EncoderFrameFormat::Ycbcr
-        && matches!(iso.encoder.codec, Codec::H264 | Codec::Hevc);
+    let ycbcr_only = matches!(iso.encoder.codec, Codec::H264 | Codec::Hevc);
     let mut runners: BTreeMap<String, IsoRunner<P>> = BTreeMap::new();
-    for plan in plans.iter().filter(|plan| !is_program(&plan.source)) {
+    for plan in plans.iter().filter(|plan| !is_program(plan)) {
         let id = plan.source.as_str();
         if runners.contains_key(id) {
             continue;
@@ -3778,6 +4088,7 @@ fn record<P: Platform>(engine: &Engine<P>, options: &RecordOptions) -> Result<Re
             fps,
             ycbcr_only,
             filters: filtered.contains(&id).then(|| control.filters.clone()),
+            epoch: inner.epoch().expect("the engine clock has started"),
             stage: None,
             outputs: Vec::new(),
         };
@@ -3822,8 +4133,8 @@ fn record<P: Platform>(engine: &Engine<P>, options: &RecordOptions) -> Result<Re
         if plan.source == PROGRAM {
             let key = inner.main.program_video.add(tx.clone(), 0, epoch, None);
             routes.0.push((inner.main.program_video.clone(), key));
-        } else if plan.source == VERTICAL_PROGRAM {
-            let video = &vertical_output.expect("vertical output").program_video;
+        } else if let Some(output) = extra_output(&plan.source) {
+            let video = &output.program_video;
             let key = video.add(tx.clone(), 0, epoch, None);
             routes.0.push((video.clone(), key));
         } else if let Some(runner) = runners.get_mut(plan.source.as_str()) {
@@ -3875,17 +4186,14 @@ fn record<P: Platform>(engine: &Engine<P>, options: &RecordOptions) -> Result<Re
     // Frames captured before the recording don't count in its report.
     let mut counted: Vec<(String, Arc<FrameSlot<P::Frame>>)> = plans
         .iter()
-        .filter(|p| !is_program(&p.source))
+        .filter(|p| !is_program(p))
         .map(|p| (p.source.clone(), slots[&p.source].clone()))
         .collect();
     if program.enabled {
         counted.push((PROGRAM.to_string(), inner.main.program.clone()));
     }
-    if vertical_enabled {
-        counted.push((
-            VERTICAL_PROGRAM.to_string(),
-            vertical_output.expect("vertical output").program.clone(),
-        ));
+    for (canvas, output, _) in &extras_recorded {
+        counted.push((canvas.program().to_string(), output.program.clone()));
     }
     let captured_before: Vec<u64> = counted
         .iter()
@@ -3895,22 +4203,21 @@ fn record<P: Platform>(engine: &Engine<P>, options: &RecordOptions) -> Result<Re
     // Before the start is announced, so a split asked for as soon as it
     // is goes to this recording.
     control.begin_recording(epoch, clock.clone());
-    if let Some(vertical) = vertical_control
-        && !std::ptr::eq(vertical, &**control)
-    {
-        vertical.begin_recording(epoch, clock.clone());
+    for extra in &extra_controls {
+        extra.begin_recording(epoch, clock.clone());
     }
     if let Some(duration) = options.duration {
         control.end_recording(epoch + duration);
-        if let Some(vertical) = vertical_control {
-            vertical.end_recording(epoch + duration);
+        for extra in &extra_controls {
+            extra.end_recording(epoch + duration);
         }
     }
     // However the recording ends, a split asked for meanwhile is answered.
     let _finish = FinishRecording(control);
-    let _vertical_finish = vertical_control
-        .filter(|vertical| !std::ptr::eq(*vertical, &**control))
-        .map(FinishRecording);
+    let _extra_finish: Vec<FinishRecording> = extra_controls
+        .iter()
+        .map(|extra| FinishRecording(extra))
+        .collect();
     if let Some(on_start) = options.on_start {
         let paths: Vec<PathBuf> = plans.iter().map(|p| p.spec.path.clone()).collect();
         on_start(&paths, &first.manifest_path);
@@ -3930,7 +4237,7 @@ fn record<P: Platform>(engine: &Engine<P>, options: &RecordOptions) -> Result<Re
                 errors,
                 &stops(),
                 Some(control),
-                vertical_control,
+                canvas_controls,
             ),
         )
     };
@@ -3961,7 +4268,9 @@ fn record<P: Platform>(engine: &Engine<P>, options: &RecordOptions) -> Result<Re
                 // split handoffs whose first frame can never arrive.
                 let source = match plan.source.as_str() {
                     PROGRAM => Some(inner.main.program.clone()),
-                    VERTICAL_PROGRAM => vertical_output.map(|output| output.program.clone()),
+                    id if extra_output(id).is_some() => {
+                        extra_output(id).map(|output| output.program.clone())
+                    }
                     id => slots.get(id).cloned(),
                 };
                 scope.spawn(move || {
@@ -4061,7 +4370,7 @@ fn record<P: Platform>(engine: &Engine<P>, options: &RecordOptions) -> Result<Re
                                 errors,
                                 &stops(),
                                 Some(control),
-                                vertical_control,
+                                canvas_controls,
                             ),
                         )
                     } else {
@@ -4321,7 +4630,7 @@ fn record<P: Platform>(engine: &Engine<P>, options: &RecordOptions) -> Result<Re
                             &errors,
                             &stops,
                             Some(control),
-                            vertical_control,
+                            canvas_controls,
                         );
                         let _ = write_manifest(&take.manifest_path, &manifest);
                         take.manifest = Some(manifest);
@@ -4370,8 +4679,8 @@ fn record<P: Platform>(engine: &Engine<P>, options: &RecordOptions) -> Result<Re
                 let end = shared.end();
                 if end != Time::MAX {
                     control.end_recording(end);
-                    if let Some(vertical) = vertical_control {
-                        vertical.end_recording(end);
+                    for extra in &extra_controls {
+                        extra.end_recording(end);
                     }
                 }
                 if now >= end {
@@ -4496,7 +4805,7 @@ fn record<P: Platform>(engine: &Engine<P>, options: &RecordOptions) -> Result<Re
                 &take_errors,
                 &stops,
                 Some(control),
-                vertical_control,
+                canvas_controls,
             );
             if let Err(err) = write_manifest(&take.manifest_path, &manifest) {
                 file_errors.push(format!("{err:#}"));
@@ -4706,12 +5015,12 @@ mod tests {
         let (quiet, _quiet_rx) = sync_channel(1);
         routes.add(quiet, 0, Time::from_nanos(0), None);
         for n in 0..5 {
-            routes.video(&n, Time::from_nanos(i64::from(n)));
+            routes.video(&n, Time::from_nanos(i64::from(n)), None);
         }
         assert_eq!(missed.load(Ordering::Relaxed), 3);
         assert_eq!(rx.try_iter().count(), 2);
         // Frames from before an output's start aren't missed.
-        routes.video(&9, Time::from_nanos(-1));
+        routes.video(&9, Time::from_nanos(-1), None);
         assert_eq!(missed.load(Ordering::Relaxed), 3);
         // Audio taps use the same non-blocking route and count each chunk.
         let samples: Arc<[f32]> = vec![0.0; 960].into();
@@ -4758,7 +5067,7 @@ mod tests {
                 .find(|frame| Arc::strong_count(frame) == 1)
                 .expect("a stalled stream must leave frames for recording");
             let pts = Time::from_nanos(n);
-            routes.video(frame, pts);
+            routes.video(frame, pts, None);
             audio_routes.audio(&samples, pts);
             assert!(matches!(recorded.try_recv(), Ok(Packet::Video { pts: at, .. }) if at == pts));
         }

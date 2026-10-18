@@ -120,7 +120,7 @@ pub(crate) fn encoder_start_rank(canvas: Option<CanvasId>, width: u32, height: u
     (
         match canvas {
             Some(CanvasId::Main) => 0,
-            Some(CanvasId::Vertical) => 1,
+            Some(_) => 1,
             None => 2,
         },
         u32::MAX - width.saturating_mul(height),
@@ -376,6 +376,12 @@ impl AssetWriter {
 
 impl FileWriter for AssetWriter {
     type Frame = PixelBuffer;
+
+    fn intentional_video_drops(&self) -> u64 {
+        self.priority
+            .as_ref()
+            .map_or(0, |priority| priority.refused())
+    }
 
     fn prioritize_video(&mut self, canvas: CanvasId) {
         self.priority

@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::devices::Devices;
-use crate::stream::{AUDIO_BITRATES, StreamSettings};
+use crate::stream::{AUDIO_BITRATES, StreamService, StreamSettings};
 use crate::*;
 
 /// What [`import`] made of a scene collection.
@@ -111,6 +111,36 @@ pub struct Profile {
     /// Hotkeys with keys bound: the action and its keys, like
     /// `("OBSBasic.StartRecording", "F16")`.
     pub hotkeys: Vec<(String, String)>,
+    /// Aitum Multistream's extra outputs for this profile
+    /// (`plugin_config/aitum-multistream/config.json`), without keys.
+    pub multistream: Vec<PluginOutput>,
+    /// Aitum Vertical Canvas's canvases
+    /// (`plugin_config/vertical-canvas/config.json`), without keys.
+    pub plugin_canvases: Vec<PluginCanvas>,
+}
+
+/// A stream output of an OBS plugin (Aitum Multistream, Vertical Canvas),
+/// without its key.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PluginOutput {
+    pub name: String,
+    pub server: String,
+    pub enabled: bool,
+    pub video_kbps: Option<u32>,
+    /// Its own size (Multistream's "scale").
+    pub size: Option<(u32, u32)>,
+}
+
+/// One of Aitum Vertical Canvas's canvases.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PluginCanvas {
+    pub width: u32,
+    pub height: u32,
+    pub video_kbps: Option<u32>,
+    pub audio_kbps: Option<u32>,
+    /// Its scenes, by name (the plugin's own; not imported).
+    pub scenes: usize,
+    pub outputs: Vec<PluginOutput>,
 }
 
 /// An OBS profile's stream settings, without the key.
@@ -131,6 +161,7 @@ impl Profile {
     /// (`streamEncoder.json`). The stream key in `service.json` is not
     /// kept.
     fn read_stream(&mut self, folder: &Path) {
+        self.read_plugins(folder);
         let read = |name: &str| -> Option<Value> {
             serde_json::from_str(&std::fs::read_to_string(folder.join(name)).ok()?).ok()
         };
@@ -153,6 +184,115 @@ impl Profile {
             video_kbps: video,
             audio_kbps: self.stream_audio_kbps,
         });
+    }
+
+    /// Aitum Multistream's outputs for this profile and Vertical Canvas's
+    /// canvases (#84), from OBS's `plugin_config` (three folders above the
+    /// profile's: `basic/profiles/<name>`). Keys are never kept.
+    fn read_plugins(&mut self, folder: &Path) {
+        let Some(root) = folder
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+        else {
+            return;
+        };
+        let read = |path: &str| -> Option<Value> {
+            serde_json::from_str(&std::fs::read_to_string(root.join(path)).ok()?).ok()
+        };
+        let kbps = |value: &Value, key: &str| {
+            int(value, key)
+                .and_then(|n| u32::try_from(n).ok())
+                .filter(|n| *n > 0)
+        };
+        let output = |item: &Value| -> Option<PluginOutput> {
+            let server = text(item, "stream_server")?.trim().to_string();
+            if server.is_empty() {
+                return None;
+            }
+            let advanced = item.get("advanced").and_then(Value::as_bool) == Some(true);
+            let size = (item.get("scale").and_then(Value::as_bool) == Some(true))
+                .then(|| {
+                    let w = u32::try_from(int(item, "width")?).ok()?;
+                    let h = u32::try_from(int(item, "height")?).ok()?;
+                    Some((w, h))
+                })
+                .flatten();
+            Some(PluginOutput {
+                name: text(item, "name").unwrap_or_default().to_string(),
+                server,
+                enabled: item.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+                video_kbps: advanced
+                    .then(|| kbps(item.get("video_encoder_settings")?, "bitrate"))
+                    .flatten(),
+                size,
+            })
+        };
+        let dir = folder
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        if let Some(config) = read("plugin_config/aitum-multistream/config.json") {
+            let name = self.name.clone();
+            let profile = config
+                .get("profiles")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .find(|p| text(p, "name").is_some_and(|n| n == name || n == dir));
+            self.multistream = profile
+                .and_then(|p| p.get("outputs")?.as_array().cloned())
+                .unwrap_or_default()
+                .iter()
+                .filter_map(output)
+                .collect();
+        }
+        if let Some(config) = read("plugin_config/vertical-canvas/config.json") {
+            for canvas in config
+                .get("canvas")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let (Some(width), Some(height)) = (
+                    int(canvas, "width").and_then(|n| u32::try_from(n).ok()),
+                    int(canvas, "height").and_then(|n| u32::try_from(n).ok()),
+                ) else {
+                    continue;
+                };
+                let mut outputs: Vec<PluginOutput> = canvas
+                    .get("stream_outputs")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(output)
+                    .collect();
+                // Before stream_outputs: one server of its own.
+                if outputs.is_empty()
+                    && let Some(single) = output(canvas)
+                {
+                    outputs.push(PluginOutput {
+                        name: "main".into(),
+                        video_kbps: None,
+                        size: None,
+                        ..single
+                    });
+                }
+                self.plugin_canvases.push(PluginCanvas {
+                    width,
+                    height,
+                    video_kbps: kbps(canvas, "streaming_video_bitrate")
+                        .or_else(|| kbps(canvas, "video_bitrate")),
+                    audio_kbps: kbps(canvas, "audio_bitrate"),
+                    scenes: canvas
+                        .get("scenes")
+                        .and_then(Value::as_array)
+                        .map_or(0, Vec::len),
+                    outputs,
+                });
+            }
+        }
     }
 
     /// Read a profile's `basic.ini`.
@@ -261,6 +401,8 @@ impl Profile {
             filename: get("Output", "FilenameFormatting"),
             tracks,
             stream: None,
+            multistream: Vec::new(),
+            plugin_canvases: Vec::new(),
             stream_video_kbps,
             stream_audio_kbps,
             reconnect,
@@ -481,6 +623,192 @@ fn stream_settings(profile: &Profile, findings: &mut Findings) -> Option<StreamS
     Some(stream)
 }
 
+/// A plugin output's service and server: a preset when its server is one
+/// of the services' (Twitch, YouTube, Kick, Facebook), else custom. None
+/// for what isn't RTMP or RTMPS (WHIP, SRT).
+fn plugin_service(server: &str) -> Option<(StreamService, Option<String>)> {
+    let lower = server.to_ascii_lowercase();
+    if !(lower.starts_with("rtmp://") || lower.starts_with("rtmps://")) {
+        return None;
+    }
+    Some(
+        if lower.contains("twitch.tv") || lower.contains("live-video.net") {
+            (StreamService::Twitch, None)
+        } else if lower.contains("youtube.com") {
+            (StreamService::Youtube, None)
+        } else if lower.contains("facebook.com") {
+            (StreamService::Facebook, None)
+        } else if lower.contains("kick") {
+            (StreamService::Kick, Some(server.to_string()))
+        } else {
+            (StreamService::Custom, Some(server.to_string()))
+        },
+    )
+}
+
+/// Plugin outputs as destinations of `stream` (made, with the first as
+/// its main destination, if there is none): Aitum Multistream's onto
+/// the main canvas's `[stream]`, Vertical Canvas's onto a canvas's.
+/// `what` names them in findings. Keys stay in OBS.
+fn plugin_destinations(
+    outputs: &[PluginOutput],
+    stream: &mut Option<StreamSettings>,
+    defaults: (Option<u32>, Option<u32>),
+    what: &str,
+    findings: &mut Findings,
+) {
+    use crate::stream::{MAX_DESTINATIONS, StreamDestination};
+    let mut imported = 0;
+    for output in outputs {
+        let Some((service, server)) = plugin_service(&output.server) else {
+            findings.unsupported(
+                format!("{what} output {:?}", output.name),
+                "stream_server",
+                "only RTMP and RTMPS outputs are available (not WHIP or SRT)",
+            );
+            continue;
+        };
+        let size = output.size.filter(|(w, h)| {
+            (16..=4096).contains(w)
+                && (16..=4096).contains(h)
+                && w.is_multiple_of(2)
+                && h.is_multiple_of(2)
+        });
+        let kbps = output
+            .video_kbps
+            .or(defaults.0)
+            .filter(|k| (200..=50_000).contains(k));
+        match stream {
+            None => {
+                let mut settings = serde_json::json!({ "service": service.id() });
+                if let Some(server) = &server {
+                    settings["server"] = server.as_str().into();
+                }
+                if let Some(kbps) = kbps {
+                    settings["video_bitrate_kbps"] = kbps.into();
+                }
+                if let Some(kbps) = defaults.1.filter(|k| AUDIO_BITRATES.contains(k)) {
+                    settings["audio_bitrate_kbps"] = kbps.into();
+                }
+                if let Some((w, h)) = size {
+                    settings["width"] = w.into();
+                    settings["height"] = h.into();
+                }
+                let Ok(mut made) = serde_json::from_value::<StreamSettings>(settings) else {
+                    continue;
+                };
+                made.enabled = output.enabled;
+                *stream = Some(made);
+                imported += 1;
+            }
+            Some(stream) => {
+                if stream.destinations.len() + 1 >= MAX_DESTINATIONS {
+                    findings.unsupported(
+                        format!("{what} output {:?}", output.name),
+                        "outputs",
+                        format!("at most {MAX_DESTINATIONS} destinations per canvas"),
+                    );
+                    continue;
+                }
+                let taken = stream.destination_ids();
+                let base = crate::library::slug(&output.name, service.id());
+                let base = if base == crate::stream::MAIN_DESTINATION {
+                    format!("{base}-2")
+                } else {
+                    base
+                };
+                let id = (1..)
+                    .map(|n| {
+                        if n == 1 {
+                            base.clone()
+                        } else {
+                            format!("{base}-{n}")
+                        }
+                    })
+                    .find(|id| !taken.contains(id))
+                    .expect("a free id");
+                stream.destinations.push(StreamDestination {
+                    id,
+                    service,
+                    server,
+                    enabled: output.enabled,
+                    video_bitrate_kbps: output.video_kbps.filter(|k| (200..=50_000).contains(k)),
+                    width: size.map(|s| s.0),
+                    height: size.map(|s| s.1),
+                    rate_control: None,
+                    keyframe_interval_seconds: None,
+                    audio_bitrate_kbps: None,
+                });
+                imported += 1;
+            }
+        }
+    }
+    if imported > 0 {
+        findings.notes.push(format!(
+            "{what}'s {imported} output(s) became stream destinations; their keys stay in OBS: \
+             set each with `isocast stream key set --destination ID` (MCP: set_stream_key)"
+        ));
+    }
+}
+
+/// Aitum Vertical Canvas's canvases as Isocast canvases: the first as
+/// `[vertical]`, more as `[[canvases]]` (`vertical-2`…), each following
+/// the main scene (letterboxed until scenes get arrangements for it) with
+/// its outputs as its stream destinations.
+fn plugin_canvases(
+    profile: &Profile,
+    findings: &mut Findings,
+) -> (Option<crate::VerticalCanvas>, Vec<crate::VerticalCanvas>) {
+    let mut vertical = None;
+    let mut canvases = Vec::new();
+    for (i, plugin) in profile.plugin_canvases.iter().enumerate() {
+        let even = |n: u32| (16..=8192).contains(&n) && n.is_multiple_of(2);
+        if !even(plugin.width) || !even(plugin.height) {
+            findings.unsupported(
+                format!("Vertical Canvas {}", i + 1),
+                "width",
+                format!(
+                    "{}×{} isn't an even size from 16 to 8192",
+                    plugin.width, plugin.height
+                ),
+            );
+            continue;
+        }
+        let mut canvas = if i == 0 {
+            crate::VerticalCanvas::default()
+        } else {
+            crate::VerticalCanvas::with_id(&format!("vertical-{}", i + 1))
+        };
+        canvas.width = plugin.width;
+        canvas.height = plugin.height;
+        let what = format!("Vertical Canvas {}", i + 1);
+        plugin_destinations(
+            &plugin.outputs,
+            &mut canvas.stream,
+            (plugin.video_kbps, plugin.audio_kbps),
+            &what,
+            findings,
+        );
+        if plugin.scenes > 0 {
+            findings.unsupported(
+                format!("{what} scenes"),
+                "scenes",
+                format!(
+                    "its {} scene(s) of its own aren't imported: the canvas follows the main \
+                     scenes, letterboxed, until each gets an arrangement for it",
+                    plugin.scenes
+                ),
+            );
+        }
+        if i == 0 {
+            vertical = Some(canvas);
+        } else {
+            canvases.push(canvas);
+        }
+    }
+    (vertical, canvases)
+}
+
 /// A profile's reconnect settings (onto `stream`, if it streams) and
 /// monitoring device.
 fn profile_extras(
@@ -551,6 +879,32 @@ fn profile_from(
     let mut stream = stream_settings(obs, &mut findings);
     let mut audio = AudioSetup::default();
     profile_extras(obs, &mut stream, &mut audio, &mut findings);
+    plugin_destinations(
+        &obs.multistream,
+        &mut stream,
+        (None, None),
+        "Aitum Multistream",
+        &mut findings,
+    );
+    // Vertical Canvas: the profile keeps the outputs; the scene collection
+    // decides whether the canvases are there.
+    let (vertical, canvases) = plugin_canvases(obs, &mut findings);
+    let split = |canvas: crate::VerticalCanvas| crate::library::ProfileVertical {
+        id: canvas.id,
+        fps: canvas.fps,
+        recording: canvas.recording,
+        stream: canvas.stream,
+    };
+    if vertical.is_some() {
+        findings.notes.push(
+            "Vertical Canvas's outputs are the profile's; a scene collection without its \
+             canvases gets them with `isocast canvas add vertical --size WxH` (MCP: canvas_add)"
+                .into(),
+        );
+    }
+    let profile_vertical = vertical.map(split);
+    let profile_canvases: Vec<crate::library::ProfileVertical> =
+        canvases.into_iter().map(split).collect();
     let tracks = obs.tracks.max(1);
     if tracks.count_ones() > 1 {
         let numbers: Vec<String> = (0..6)
@@ -585,6 +939,7 @@ fn profile_from(
     let profile = crate::library::Profile {
         hotkeys: Default::default(),
         developer: Default::default(),
+        governor: Default::default(),
         version: SETUP_VERSION,
         name,
         canvas: ProfileCanvas { fps },
@@ -616,7 +971,8 @@ fn profile_from(
             open_editor: false,
         },
         stream,
-        vertical: None,
+        vertical: profile_vertical,
+        canvases: profile_canvases,
     };
     (profile, findings)
 }
@@ -1477,6 +1833,7 @@ impl<'a, 'v> Importer<'a, 'v> {
                 items: Vec::new(),
                 transition: None,
                 vertical: None,
+                canvases: Default::default(),
             });
         }
     }
@@ -2484,6 +2841,7 @@ impl<'a, 'v> Importer<'a, 'v> {
                     delay_ms: delay.min(500) as u32,
                 })
             }
+            "advanced_masks_filter" => return self.advanced_mask(where_, s),
             _ => {
                 return Err(format!(
                     "Isocast has no {:?} filter (a plugin or another system's kind)",
@@ -2491,6 +2849,195 @@ impl<'a, 'v> Importer<'a, 'v> {
                 ));
             }
         })
+    }
+
+    /// The Advanced Masks plugin's filter (#115) as a mask filter. Its
+    /// settings are read as its scene collections store them (only those
+    /// changed from its defaults); the numbering of its menus follows the
+    /// order its interface lists them in, which the collections we have
+    /// seen agree with. What doesn't map is said in a note.
+    fn advanced_mask(&mut self, where_: &str, s: &Value) -> Result<FilterKind, String> {
+        let float = |key: &str| number(s, key).map(|v| v as f32);
+        if int(s, "mask_effect").unwrap_or(1) == 2 {
+            return Err(
+                "it is an adjustment mask (colour changes through a mask), which Isocast \
+                        doesn't have; only alpha masks are imported"
+                    .into(),
+            );
+        }
+        // Its positions are in the masked source's pixels, whose size it
+        // keeps with them; else the canvas's.
+        let (w, h) = match (float("mask_source_width"), float("mask_source_height")) {
+            (Some(w), Some(h)) if w > 0.0 && h > 0.0 => (w, h),
+            _ => {
+                self.notes.push(format!(
+                    "{where_}: the masked picture's size isn't saved with the mask; its \
+                     position and size are read against the canvas"
+                ));
+                (self.to.0 as f32, self.to.1 as f32)
+            }
+        };
+        if flag(s, "shape_relative") == Some(true) {
+            self.notes.push(format!(
+                "{where_}: its Scene View Transformation (positions in the scene) isn't \
+                 imported; the mask is placed on the source's own picture"
+            ));
+        }
+        match int(s, "mask_type").unwrap_or(1) {
+            1 => {}
+            2 => {
+                let channel = match int(s, "mask_source_mask_properties_list").unwrap_or(1) {
+                    1 => MaskChannel::Alpha,
+                    2 | 3 => MaskChannel::Luminance,
+                    _ => {
+                        self.notes.push(format!(
+                            "{where_}: its custom channel mix became the mask's luminance"
+                        ));
+                        MaskChannel::Luminance
+                    }
+                };
+                if int(s, "mask_source_compression_list").unwrap_or(1) != 1 {
+                    self.notes.push(format!(
+                        "{where_}: its threshold or range compression isn't imported; set the \
+                         mask's threshold and softness"
+                    ));
+                }
+                let Some(name) = text(s, "mask_source").filter(|n| !n.is_empty()) else {
+                    return Err("no mask source chosen".into());
+                };
+                let (mask_source, mask_scene) =
+                    match self.by_name.get(name).map(|&i| self.targets[i].clone()) {
+                        Some(Target::Source {
+                            id, video: true, ..
+                        }) => (Some(id), None),
+                        Some(Target::Scene(id)) => (None, Some(id)),
+                        _ => {
+                            return Err(format!(
+                                "its mask source {name:?} isn't an imported source or scene with \
+                                 a picture"
+                            ));
+                        }
+                    };
+                return Ok(FilterKind::SourceMask(SourceMask {
+                    mask_source,
+                    mask_scene,
+                    channel,
+                    ..SourceMask::default()
+                }));
+            }
+            4 => {
+                let position = float("mask_gradient_position").unwrap_or(w / 2.0);
+                let width = float("mask_gradient_width").unwrap_or(w / 2.0).max(1.0);
+                return Ok(FilterKind::GradientMask(GradientMask {
+                    x: position / w,
+                    angle: float("mask_gradient_rotation").unwrap_or(0.0),
+                    length: width / w,
+                    // From hidden to shown along it.
+                    stops: vec![
+                        GradientStop {
+                            at: 0.0,
+                            opacity: 0.0,
+                        },
+                        GradientStop {
+                            at: 1.0,
+                            opacity: 1.0,
+                        },
+                    ],
+                    invert: flag(s, "mask_gradient_invert").unwrap_or(false),
+                    ..GradientMask::default()
+                }));
+            }
+            3 => {
+                return Err(
+                    "its image masks map to Isocast's image_mask filter; add one with \
+                            the image file"
+                        .into(),
+                );
+            }
+            other => {
+                return Err(format!(
+                    "its mask type {other} (BSM alpha wipe or a newer kind) has no Isocast \
+                     equivalent"
+                ));
+            }
+        }
+        let shape = match int(s, "shape_type").unwrap_or(1) {
+            1 => MaskShape::Rectangle,
+            2 => MaskShape::Circle,
+            3 => MaskShape::Ellipse,
+            4 => MaskShape::Polygon,
+            5 => MaskShape::Star,
+            6 => MaskShape::Heart,
+            _ => {
+                return Err(
+                    "its squircle, superellipse or superformula shape has no Isocast equivalent"
+                        .into(),
+                );
+            }
+        };
+        let (bw, bh) = match shape {
+            MaskShape::Rectangle => (
+                float("rectangle_width").unwrap_or(w * 0.8),
+                float("rectangle_height").unwrap_or(h * 0.8),
+            ),
+            MaskShape::Circle => {
+                let r = float("circle_radius").unwrap_or(w.min(h) * 0.4);
+                (2.0 * r, 2.0 * r)
+            }
+            MaskShape::Ellipse => (
+                float("shape_ellipse_a").unwrap_or(w * 0.8),
+                float("shape_ellipse_b").unwrap_or(h * 0.8),
+            ),
+            MaskShape::Heart => {
+                let size = float("heart_size").unwrap_or(w.min(h) * 0.8);
+                (size, size)
+            }
+            MaskShape::Polygon | MaskShape::Star => {
+                self.notes.push(format!(
+                    "{where_}: its polygon or star size, sides and points aren't read; Isocast's \
+                     defaults are used"
+                ));
+                (w * 0.8, h * 0.8)
+            }
+        };
+        let radius = match (shape, int(s, "rectangle_corner_type").unwrap_or(1)) {
+            (MaskShape::Rectangle, 2) => Radius::Each([
+                float("rectangle_corner_radius_tl").unwrap_or(0.0),
+                float("rectangle_corner_radius_tr").unwrap_or(0.0),
+                float("rectangle_corner_radius_br").unwrap_or(0.0),
+                float("rectangle_corner_radius_bl").unwrap_or(0.0),
+            ]),
+            (MaskShape::Rectangle, _) => {
+                Radius::All(float("rectangle_corner_radius").unwrap_or(0.0))
+            }
+            (MaskShape::Star, _) => Radius::All(float("star_corner_radius").unwrap_or(0.0)),
+            _ => Radius::All(0.0),
+        };
+        let feather = match int(s, "shape_feather_type").unwrap_or(1) {
+            1 => 0.0,
+            kind => {
+                if kind != 3 {
+                    self.notes.push(format!(
+                        "{where_}: its inner or outer feather is centred on the edge in Isocast"
+                    ));
+                }
+                float("shape_feather_amount")
+                    .unwrap_or(0.0)
+                    .clamp(0.0, 1000.0)
+            }
+        };
+        Ok(FilterKind::ShapeMask(ShapeMask {
+            shape,
+            x: float("shape_center_x").unwrap_or(w / 2.0) / w,
+            y: float("shape_center_y").unwrap_or(h / 2.0) / h,
+            width: (bw / w).clamp(0.0, 10.0),
+            height: (bh / h).clamp(0.0, 10.0),
+            rotation: float("shape_rotation").unwrap_or(0.0),
+            radius,
+            feather,
+            invert: flag(s, "shape_invert").unwrap_or(false),
+            ..ShapeMask::default()
+        }))
     }
 
     /// The Source Record plugin's filter: the source is recorded to its own
@@ -3247,6 +3794,13 @@ impl<'a, 'v> Importer<'a, 'v> {
         };
         let mut stream = stream_settings(profile, &mut self.profile);
         profile_extras(profile, &mut stream, &mut audio, &mut self.profile);
+        plugin_destinations(
+            &profile.multistream,
+            &mut stream,
+            (None, None),
+            "Aitum Multistream",
+            &mut self.profile,
+        );
         (stream, audio)
     }
 
@@ -3254,6 +3808,10 @@ impl<'a, 'v> Importer<'a, 'v> {
         let transition = self.transition();
         let recording = self.recording();
         let (stream, audio) = self.stream_and_audio();
+        let (vertical, canvases) = match self.options.profile {
+            Some(profile) => plugin_canvases(profile, &mut self.profile),
+            None => (None, Vec::new()),
+        };
         if self
             .collection
             .get("canvases")
@@ -3263,7 +3821,8 @@ impl<'a, 'v> Importer<'a, 'v> {
             self.unsupported(
                 "canvases",
                 "canvas",
-                "extra canvases (like a vertical one) aren't available yet",
+                "OBS's own extra canvases aren't imported; Aitum Vertical Canvas's are (with \
+                 the profile), or add one with `isocast canvas add ID --size WxH`",
             );
         }
         // A setup starts on its first scene; OBS kept the one on air.
@@ -3286,6 +3845,7 @@ impl<'a, 'v> Importer<'a, 'v> {
         let setup = Setup {
             virtual_camera: Default::default(),
             developer: Default::default(),
+            governor: Default::default(),
             version: SETUP_VERSION,
             name: text(self.collection, "name")
                 .filter(|n| !n.is_empty())
@@ -3303,7 +3863,8 @@ impl<'a, 'v> Importer<'a, 'v> {
             audio,
             recording,
             stream,
-            vertical: None,
+            vertical,
+            canvases,
             hotkeys: Default::default(),
         };
         self.counts.scenes = setup.scenes.len();
@@ -3870,6 +4431,62 @@ mod tests {
             (imported.counts.obs_filters, imported.counts.filters),
             (12, 9)
         );
+        assert!(imported.problems.is_empty(), "{:?}", imported.problems);
+    }
+
+    #[test]
+    fn advanced_masks_filters_become_mask_filters() {
+        // As the plugin's collections store them (defaults left out).
+        let filters = json!([
+            { "name": "Round", "id": "advanced_masks_filter",
+              "versioned_id": "advanced_masks_filter_v2",
+              "settings": { "mask_source_width": 1920, "mask_source_height": 1080,
+                            "shape_center_x": 960.0, "shape_center_y": 540.0,
+                            "rectangle_width": 1152.0, "rectangle_height": 540.0,
+                            "rectangle_corner_radius": 20.0, "rectangle_corner_type": 1,
+                            "shape_feather_type": 1 } },
+            { "name": "Heart", "id": "advanced_masks_filter",
+              "settings": { "mask_type": 1, "mask_source_width": 1920,
+                            "mask_source_height": 1080, "shape_type": 6, "heart_size": 540,
+                            "shape_center_x": 480.0, "shape_center_y": 270.0,
+                            "shape_rotation": 24.0, "shape_invert": true } },
+            { "name": "Cutout", "id": "advanced_masks_filter",
+              "settings": { "mask_type": 2, "mask_source": "Logo",
+                            "mask_source_mask_properties_list": 1 } },
+            { "name": "Formula", "id": "advanced_masks_filter",
+              "settings": { "shape_type": 7 } },
+            { "name": "Grade", "id": "advanced_masks_filter",
+              "settings": { "mask_effect": 2 } },
+        ]);
+        let imported = run(collection(json!([
+            { "name": "Cam", "id": "image_source", "settings": { "file": "/img/a.png" },
+              "filters": filters },
+            { "name": "Logo", "id": "image_source", "settings": { "file": "/img/logo.png" } },
+        ])));
+        let filters = &imported.setup.sources[0].filters;
+        let FilterKind::ShapeMask(round) = &filters[0].kind else {
+            panic!("{filters:?}")
+        };
+        assert_eq!(round.shape, MaskShape::Rectangle);
+        assert_eq!(
+            (round.x, round.y, round.width, round.height),
+            (0.5, 0.5, 0.6, 0.5)
+        );
+        assert_eq!(round.radius, Radius::All(20.0));
+        let FilterKind::ShapeMask(heart) = &filters[1].kind else {
+            panic!("{filters:?}")
+        };
+        assert_eq!(heart.shape, MaskShape::Heart);
+        assert_eq!((heart.x, heart.y, heart.rotation), (0.25, 0.25, 24.0));
+        assert!(heart.invert);
+        let FilterKind::SourceMask(cutout) = &filters[2].kind else {
+            panic!("{filters:?}")
+        };
+        let logo = &imported.setup.sources[1].id;
+        assert_eq!(cutout.mask_source.as_ref(), Some(logo));
+        assert_eq!(cutout.channel, MaskChannel::Alpha);
+        assert_eq!(filters.len(), 3);
+        assert_eq!(imported.unsupported.len(), 2, "{:?}", imported.unsupported);
         assert!(imported.problems.is_empty(), "{:?}", imported.problems);
     }
 

@@ -4,7 +4,7 @@
 
 use parking_lot::{Condvar, Mutex};
 use std::collections::VecDeque;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::thread;
@@ -35,6 +35,7 @@ pub(super) struct DiskProbe {
 struct ProbeState {
     at_start: Option<Duration>,
     latest: Option<Duration>,
+    latest_at: Option<u64>,
     wanted: bool,
     done: bool,
 }
@@ -48,7 +49,6 @@ impl DiskProbe {
         // Detached, so a write that never returns (a network share gone
         // away) can't hold up the end of the recording.
         let failed = state.clone();
-        #[cfg(not(windows))]
         let failed_path = path.clone();
         let _ = isocast_diagnostics::spawn(
             "disk probe",
@@ -59,7 +59,6 @@ impl DiskProbe {
                     ..Default::default()
                 };
                 failed.1.notify_all();
-                #[cfg(not(windows))]
                 let _ = std::fs::remove_file(failed_path);
             },
         );
@@ -74,10 +73,10 @@ impl DiskProbe {
     }
 
     /// The test write times at the start and lately, in ms.
-    fn latencies(&self) -> (Option<f64>, Option<f64>) {
+    fn latencies(&self) -> (Option<f64>, Option<f64>, Option<u64>) {
         let state = self.state.0.lock();
         let ms = |d: Option<Duration>| d.map(|d| d.as_secs_f64() * 1000.0);
-        (ms(state.at_start), ms(state.latest))
+        (ms(state.at_start), ms(state.latest), state.latest_at)
     }
 }
 
@@ -89,7 +88,7 @@ impl Drop for DiskProbe {
     }
 }
 
-fn probe<P: Platform>(platform: &P, path: &Path, shared: &(Mutex<ProbeState>, Condvar)) {
+fn probe<P: Platform>(platform: &P, path: &PathBuf, shared: &(Mutex<ProbeState>, Condvar)) {
     let measure = || {
         let mut times: Vec<Duration> = (0..PROBES)
             .filter_map(|_| platform.write_latency(path))
@@ -112,13 +111,13 @@ fn probe<P: Platform>(platform: &P, path: &Path, shared: &(Mutex<ProbeState>, Co
             guard.wanted = false;
         }
         let latest = measure();
-        state.lock().latest = latest;
+        {
+            let mut state = state.lock();
+            state.latest = latest;
+            state.latest_at = latest.map(|_| crate::governor::clock_ms());
+        }
         thread::sleep(PROBE_INTERVAL);
     }
-    // Windows has no latency-write implementation yet: it has never owned
-    // this pathname. A future native probe must clean up its owned HANDLE,
-    // not let a pathname-only unlink remove an existing or replaced file.
-    #[cfg(not(windows))]
     let _ = std::fs::remove_file(path);
 }
 
@@ -152,7 +151,7 @@ impl DiskMeter {
         }
         let (then, before) = self.samples[0];
         let seconds = now.saturating_since(then).as_secs_f64();
-        let (latency_at_start_ms, latency_ms) = probe.latencies();
+        let (latency_at_start_ms, latency_ms, measured_at_ms) = probe.latencies();
         LiveDisk {
             write_bytes_per_second: if seconds > 0.0 {
                 (bytes - before) as f64 / seconds
@@ -161,6 +160,7 @@ impl DiskMeter {
             },
             latency_at_start_ms,
             latency_ms,
+            measured_at_ms,
         }
     }
 }

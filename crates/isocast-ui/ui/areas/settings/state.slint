@@ -7,7 +7,7 @@
 // `set-number` or `set-flag` with the field's name (settings.rs maps the
 // names to the setup). Apply (or OK) sends what changed as one patch.
 
-import { DropdownOption, NavTab } from "../../kit.slint";
+import { DropdownOption, NavTab, Segment } from "../../kit.slint";
 
 // A streaming service to choose (Stream, before streaming is set up).
 export struct ServiceChoice {
@@ -166,6 +166,9 @@ export global SettingsArea {
     // the choice shows only with a vertical canvas.
     in-out property <string> stream-canvas: "main";
     in-out property <bool> stream-canvas-choice;
+    // Every canvas whose streams the Stream page can show (#84): main,
+    // vertical and the setup's [[canvases]].
+    in-out property <[Segment]> stream-canvas-options: [{ value: "main", label: "Main Canvas" }, { value: "vertical", label: "Vertical Canvas" }];
     in-out property <bool> has-stream;
     in-out property <[ServiceChoice]> services;
     // Custom and Kick need a server first: which one is asking ("" for
@@ -285,6 +288,16 @@ export global SettingsArea {
     in-out property <float> vertical-height: 1920;
     in-out property <bool> vertical-follow: true;
     in-out property <bool> vertical-record;
+    // Canvases besides the main one (#84): the vertical canvas and the
+    // setup's [[canvases]], as rows (id, label, summary). `edit-canvas` is
+    // the open one (its id; "" for none); the vertical-* fields above are
+    // its.
+    in-out property <[DropdownOption]> canvas-rows;
+    in-out property <string> edit-canvas;
+    in-out property <string> canvas-fps: "main";
+    in-out property <[DropdownOption]> canvas-fps-options;
+    in-out property <[DropdownOption]> canvas-presets;
+
     // Recording now: scene linking keeps until it stops (#96).
     in-out property <bool> recording;
 
@@ -338,6 +351,25 @@ export global SettingsArea {
     in-out property <bool> developer-auto-off;
     // "Turn Off After 24 Hours", or the profile's own hours.
     in-out property <string> developer-auto-off-label: "Turn Off After 24 Hours";
+    // Automatic quality (the setup's `governor`, T.2): on unless turned
+    // off, and what it may never lower (its pins, by field path, changed
+    // through `set-flag("pin:PATH", on)`): the preview's refresh, every
+    // ISO file's frame rate or one source's, the vertical canvas's frame
+    // rate and the stream's bitrate.
+    in-out property <bool> governor-on: true;
+    // The user's explicit choice to let it skip ISO pictures under
+    // pressure (`governor.allow_iso_thinning`, off by default). Off, ISO
+    // files are never thinned by it, so the ISO pins only matter when on.
+    in-out property <bool> iso-thinning;
+    in-out property <bool> pin-preview;
+    in-out property <bool> pin-iso;
+    in-out property <bool> pin-vertical;
+    in-out property <bool> pin-stream;
+    // The ISO files recorded now, each kept at its frame rate when `on`
+    // (`id` is the source's).
+    in-out property <[IsoTrack]> pin-iso-sources;
+    // What it is doing now, in plain words ("" while nothing is lowered).
+    in-out property <string> governor-now;
 
     // ---- Welcome (no setup yet) and the failed state
     // Which choice is working ("obs", "file"; "" for none).

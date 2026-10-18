@@ -25,7 +25,7 @@ pub mod speed;
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -139,11 +139,9 @@ impl StreamSpec {
             return Ok(Self::of(engine, settings));
         }
         let setup = engine.setup();
-        let vertical = setup
-            .vertical
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("vertical: canvas is not enabled"))?;
-        let canvas = vertical.canvas(&setup.canvas);
+        let canvas = setup
+            .canvas_of(canvas)
+            .ok_or_else(|| anyhow::anyhow!("{}", crate::record::canvas_off(canvas)))?;
         let (width, height) = settings.output_size((canvas.width, canvas.height));
         Ok(Self {
             settings,
@@ -189,40 +187,50 @@ pub(crate) fn warm_destinations<P: Platform>(
     out
 }
 
-/// Vertical destinations cannot share a main-canvas encode even at equal
-/// dimensions: they contain different pictures. Place their own format groups
-/// before either program writer, with the same parking policy as main.
+/// Other canvases' destinations (`[vertical]`'s, `[[canvases]]`') cannot
+/// share a main-canvas encode even at equal dimensions: they contain
+/// different pictures. Place each canvas's own format groups before any
+/// program writer, with the same parking policy as main.
 pub(crate) fn warm_vertical<P: Platform>(
     engine: &Engine<P>,
     setup: &isocast_protocol::Setup,
     stop: &AtomicBool,
     warnings: &mut Vec<String>,
 ) -> Vec<Subscription> {
-    let Some(stream) = setup.vertical.as_ref().and_then(|v| v.stream.as_ref()) else {
-        return Vec::new();
-    };
-    let mut placed = Vec::new();
     let mut out = Vec::new();
-    for destination in stream.resolve().into_iter().filter(|d| d.enabled) {
-        let result = (|| {
-            let spec =
-                StreamSpec::of_canvas(engine, CanvasId::Vertical, destination.settings)?.encoder();
-            if placed.contains(&spec) {
-                return Ok(None);
+    for canvas in setup.extra_canvas_ids() {
+        let Some(stream) = setup.stream_of(canvas) else {
+            continue;
+        };
+        let mut placed = Vec::new();
+        for destination in stream.resolve().into_iter().filter(|d| d.enabled) {
+            let result = (|| {
+                let spec = StreamSpec::of_canvas(engine, canvas, destination.settings)?.encoder();
+                if placed.contains(&spec) {
+                    return Ok(None);
+                }
+                placed.push(spec);
+                engine
+                    .canvas_encoders(canvas)?
+                    .warm_canvas(engine, canvas, &spec, stop)
+                    .map(Some)
+            })();
+            match result {
+                Ok(Some(subscription)) => out.push(subscription),
+                Ok(None) => {}
+                Err(error) => warnings.push(match canvas {
+                    CanvasId::Vertical => format!(
+                        "could not prepare vertical stream destination {} before recording: \
+                         {error:#}",
+                        destination.id
+                    ),
+                    other => format!(
+                        "could not prepare canvas {other:?}'s stream destination {} before \
+                         recording: {error:#}",
+                        destination.id
+                    ),
+                }),
             }
-            placed.push(spec);
-            engine
-                .canvas_encoders(CanvasId::Vertical)?
-                .warm_canvas(engine, CanvasId::Vertical, &spec, stop)
-                .map(Some)
-        })();
-        match result {
-            Ok(Some(subscription)) => out.push(subscription),
-            Ok(None) => {}
-            Err(error) => warnings.push(format!(
-                "could not prepare vertical stream destination {} before recording: {error:#}",
-                destination.id
-            )),
         }
     }
     out
@@ -245,6 +253,8 @@ struct Shared {
     subscription: Mutex<Option<Subscription>>,
     /// Mix chunks the tap lost, once the stream has left the encoder.
     tap_audio_dropped: AtomicU64,
+    /// The encoder's acknowledged video bitrate, once the stream has left it.
+    video_kbps: AtomicU32,
     /// Frames the video encoder dropped.
     encoder_dropped: AtomicU64,
     /// Video frames and bytes (protocol included) sent, over every
@@ -289,6 +299,8 @@ impl Shared {
         if let Some(subscription) = subscription {
             self.tap_audio_dropped
                 .store(subscription.tap_audio_dropped(), Ordering::Relaxed);
+            self.video_kbps
+                .store(subscription.video_kbps(), Ordering::Relaxed);
             // Dropped outside the lock: the last output waits for the
             // encoder's thread, which may be handing this stream media.
             drop(subscription);
@@ -299,6 +311,15 @@ impl Shared {
         match self.subscription.lock().as_ref() {
             Some(subscription) => subscription.tap_audio_dropped(),
             None => self.tap_audio_dropped.load(Ordering::Relaxed),
+        }
+    }
+
+    /// The video bitrate the shared encoder acknowledged: the settings'
+    /// until the governor retunes it.
+    fn video_kbps(&self) -> u32 {
+        match self.subscription.lock().as_ref() {
+            Some(subscription) => subscription.video_kbps(),
+            None => self.video_kbps.load(Ordering::Relaxed),
         }
     }
 
@@ -346,6 +367,7 @@ impl Shared {
         status.dropped_frames = dropped + self.encoder_dropped.load(Ordering::Relaxed);
         status.frames_sent = self.frames_sent.load(Ordering::Relaxed);
         status.bytes_sent = self.bytes_sent.load(Ordering::Relaxed);
+        status.target_video_kbps = self.video_kbps();
         if status.is_active() {
             status.elapsed_seconds = self.started.elapsed().as_secs_f64();
         }
@@ -384,6 +406,18 @@ impl Stream {
         let mut status = self.shared.status.lock().clone();
         self.shared.snapshot(&mut status);
         status
+    }
+
+    /// How backed up sending is now, 0 to 1, for the governor: read fresh
+    /// from the queue without taking the peak `status` reports, so the
+    /// status's congestion is unchanged.
+    pub fn governor_congestion(&self) -> f64 {
+        self.shared.queue.lock().congestion()
+    }
+
+    /// Lifecycle probe without cloning strings or gathering full statistics.
+    pub fn governor_state(&self) -> StreamState {
+        self.shared.status.lock().state
     }
 
     /// Stop sending, close the connection and return the final status.
@@ -468,6 +502,7 @@ pub fn start_canvas<P: Platform>(
         queued: Condvar::new(),
         subscription: Mutex::new(None),
         tap_audio_dropped: AtomicU64::new(0),
+        video_kbps: AtomicU32::new(settings.video_bitrate_kbps),
         encoder_dropped: AtomicU64::new(0),
         frames_sent: AtomicU64::new(0),
         bytes_sent: AtomicU64::new(0),
@@ -801,7 +836,8 @@ fn publish(connection: &mut rtmp::Connection, shared: &Shared, spec: &StreamSpec
         width: spec.width,
         height: spec.height,
         fps: spec.fps,
-        video_kbps: settings.video_bitrate_kbps,
+        // What the encoder makes now; a later retune isn't re-announced.
+        video_kbps: shared.video_kbps(),
         audio_kbps: settings.audio_bitrate_kbps,
         sample_rate: SAMPLE_RATE,
         channels: CHANNELS,
@@ -911,7 +947,10 @@ impl Rate {
         let kbps = |bytes: u64| bytes as f64 * 8.0 / seconds / 1000.0;
         let total = shared.bytes_sent.load(Ordering::Relaxed);
         let congestion = shared.queue.lock().take_peak();
+        let target = shared.video_kbps();
         let mut status = shared.status.lock();
+        // Overshoot is measured against what the encoder was told.
+        status.target_video_kbps = target;
         status.video_kbps = kbps(self.video);
         status.audio_kbps = kbps(self.audio);
         if let Some(before) = self.total {

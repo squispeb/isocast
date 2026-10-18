@@ -131,8 +131,8 @@ impl Area for PermissionsStep {
             let missing = report
                 .details
                 .iter()
-                .any(|d| needed[index(d.permission)] && !settled(d.state));
-            app.permissions.take(app, report);
+                .any(|d| needed[index(d.permission)] && d.state != Permission::Granted);
+            *app.permissions.report.borrow_mut() = Some(report);
             if missing {
                 app.permissions.open(app, first);
             }
@@ -491,12 +491,6 @@ impl PermissionsStep {
             needed(app, report.as_ref())
         };
         area.set_checked(report.is_some());
-        area.set_unknown_access(report.as_ref().is_some_and(|report| {
-            report
-                .details
-                .iter()
-                .any(|d| d.state == Permission::Unknown)
-        }));
         area.set_first_launch(self.first_launch.get());
         area.set_helper_shown(helper);
         let Some(report) = report.as_ref() else {
@@ -515,7 +509,7 @@ impl PermissionsStep {
             report
                 .details
                 .iter()
-                .all(|d| !needed[index(d.permission)] || settled(d.state)),
+                .all(|d| !needed[index(d.permission)] || d.state == Permission::Granted),
         );
         let busy = self.busy.get();
         area.set_items(model(report.details.iter().map(|d| {
@@ -591,23 +585,6 @@ fn row(d: &PermissionDetail, needed: bool, busy: Option<&str>) -> PermissionItem
             Permission::NotDetermined => {
                 ("not-asked", "Not asked yet", String::new(), "ask", "Allow…")
             }
-            // Neutral: neither allowed nor refused, and nothing to ask.
-            Permission::Unknown => {
-                let (action, label) = if d.action == PermissionAction::OpenSettings {
-                    ("open", "Open Settings")
-                } else {
-                    ("", "")
-                };
-                (
-                    "not-asked",
-                    "Unknown",
-                    d.next_step.clone().unwrap_or_else(|| {
-                        "It can’t be checked without using it, so recording tries it.".into()
-                    }),
-                    action,
-                    label,
-                )
-            }
             Permission::Restricted => (
                 "blocked",
                 "Blocked",
@@ -635,9 +612,7 @@ fn row(d: &PermissionDetail, needed: bool, busy: Option<&str>) -> PermissionItem
         }
     };
     // System audio is never required (screen recording records it too).
-    let purpose = if d.state == Permission::Unknown {
-        d.needed_for.clone()
-    } else if needed || d.permission == PermissionKind::SystemAudio {
+    let purpose = if needed || d.permission == PermissionKind::SystemAudio {
         purpose.to_string()
     } else {
         format!("{purpose} This setup doesn’t use it.")
@@ -677,12 +652,6 @@ fn shown_name(d: &PermissionDetail) -> &str {
     } else {
         &d.app
     }
-}
-
-/// Nothing left to do before recording: granted, or unknown (it can only
-/// be found out by recording, which tries it).
-fn settled(state: Permission) -> bool {
-    matches!(state, Permission::Granted | Permission::Unknown)
 }
 
 fn index(kind: PermissionKind) -> usize {

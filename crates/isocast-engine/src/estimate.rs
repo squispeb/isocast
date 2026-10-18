@@ -11,7 +11,7 @@ use isocast_protocol::api::{
     OutputKind,
 };
 use isocast_protocol::change::merge_patch;
-use isocast_protocol::{CanvasId, Codec, PROGRAM, Setup, SourceKind, VERTICAL_PROGRAM};
+use isocast_protocol::{CanvasId, Codec, PROGRAM, Setup, SourceKind};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -101,6 +101,8 @@ pub struct Chip {
     pub overload_iso_efficiency: f64,
     /// Bitrate-limited live H.264 has a different cost from a quality file.
     pub stream_h264_cost: f64,
+    /// Live H.264's per-picture cost must not inherit a recording-only fit.
+    pub stream_frame_overhead: f64,
     pub basis: String,
 }
 
@@ -117,6 +119,7 @@ pub fn chip(name: &str) -> Chip {
             frame_overhead: row.frame_overhead_pixels,
             overload_iso_efficiency: row.overload_iso_efficiency.unwrap_or(1.0),
             stream_h264_cost: row.stream_h264_cost.unwrap_or(table.codec_cost.h264),
+            stream_frame_overhead: row.frame_overhead_pixels,
             basis: row.basis.clone(),
         };
     }
@@ -142,6 +145,7 @@ pub fn chip(name: &str) -> Chip {
             frame_overhead: 0.0,
             overload_iso_efficiency: 1.0,
             stream_h264_cost: table.codec_cost.h264,
+            stream_frame_overhead: 0.0,
             basis: format!(
                 "assumed: {engines} encode engine(s) as on other {} chips, each as fast as \
                  measured on other {generation} chips; not measured on this chip",
@@ -162,6 +166,7 @@ pub fn chip(name: &str) -> Chip {
                 frame_overhead: 0.0,
                 overload_iso_efficiency: 1.0,
                 stream_h264_cost: table.codec_cost.h264,
+                stream_frame_overhead: 0.0,
                 basis: format!(
                     "assumed: a newer chip than any measured, taken to be as fast as the newest \
                      measured generation, with {engines} encode engine(s)"
@@ -175,6 +180,7 @@ pub fn chip(name: &str) -> Chip {
             frame_overhead: 0.0,
             overload_iso_efficiency: 1.0,
             stream_h264_cost: table.codec_cost.h264,
+            stream_frame_overhead: 0.0,
             basis: "assumed: a chip with no measured data, judged cautiously".into(),
         },
     }
@@ -199,7 +205,8 @@ pub struct Inputs<'a> {
     /// Running (or probed) sources' formats; a camera's or test pattern's
     /// own fields in the setup win.
     pub formats: Formats<'a>,
-    /// Streaming on [main, vertical], independently for a live estimate.
+    /// Streaming on [main, the other canvases (`[vertical]`, `[[canvases]]`)],
+    /// independently for a live estimate.
     pub streaming: [bool; 2],
     /// `tune`'s measurements, and this Mac's key in them.
     pub memory: Option<(&'a Memory, &'a str)>,
@@ -226,17 +233,29 @@ fn calibrated_chip(inputs: &Inputs) -> Chip {
                     .value()
     };
     let recording = &inputs.setup.recording;
-    if recording.program.enabled && !covered(&recording.program.encoder)
+    let format_covered = |w: u32, h: u32, fps: u32| {
+        w.max(h) <= 3840 && u64::from(w) * u64::from(h) <= 3840 * 2160 && fps <= 60
+    };
+    let program_covered = |setup: &Setup| {
+        let program = &setup.recording.program;
+        let (w, h) = program.size(&setup.canvas);
+        !program.enabled || covered(&program.encoder) && format_covered(w, h, setup.canvas.fps)
+    };
+    if !program_covered(inputs.setup)
         || recording.iso.enabled
             && !recording.iso.sources.is_empty()
             && !covered(&recording.iso.encoder)
-        || inputs.setup.canvas.fps > 60
-        || inputs.setup.canvas.width.max(inputs.setup.canvas.height) > 3840
-        || inputs.setup.vertical.is_some()
-        || recording.iso.sources.iter().any(|id| {
-            let (w, h, fps, _) = iso_format(inputs.setup, inputs.formats, id);
-            w.max(h) > 3840 || fps > 60
-        })
+        || inputs
+            .setup
+            .extra_canvas_ids()
+            .into_iter()
+            .filter_map(|canvas| inputs.setup.for_canvas(canvas))
+            .any(|setup| !program_covered(&setup))
+        || recording.iso.enabled
+            && recording.iso.sources.iter().any(|id| {
+                let (w, h, fps, _) = iso_format(inputs.setup, inputs.formats, id);
+                !format_covered(w, h, fps)
+            })
     {
         return chip;
     }
@@ -250,8 +269,8 @@ fn calibrated_chip(inputs: &Inputs) -> Chip {
                     && e.width == width
                     && e.fps == fps
                     && e.sessions == sessions
-                    && e.frames >= 8 * u64::from(sessions)
-                    && e.seconds >= 0.5
+                    && e.certifies_fit()
+                    && e.backend == "videotoolbox"
             })
             .map(|e| e.frames_per_second)
             .min_by(f64::total_cmp)
@@ -283,6 +302,7 @@ fn calibrated_chip(inputs: &Inputs) -> Chip {
     // A recording-codec test is not a live H.264 test. Keep the latter's
     // existing normalized cost rather than pretending it was measured.
     chip.stream_h264_cost *= rate / chip.rate;
+    chip.stream_frame_overhead *= rate / chip.rate;
     chip.rate = rate;
     chip.frame_overhead = overhead;
     chip.basis = format!(
@@ -332,9 +352,13 @@ fn codec_cost(codec: Codec) -> Option<f64> {
     }
 }
 
-/// Whether the setup has a vertical stream section.
+/// Whether the setup has a stream section on a canvas other than the main
+/// one.
 fn has_vertical_stream(setup: &Setup) -> bool {
-    setup.vertical.as_ref().is_some_and(|v| v.stream.is_some())
+    setup
+        .extra_canvas_ids()
+        .into_iter()
+        .any(|canvas| setup.stream_of(canvas).is_some())
 }
 
 /// Whether streaming streams the main canvas: its `[stream]`, or (with no
@@ -361,7 +385,22 @@ fn vertical_outputs(
     streaming: bool,
     push: &mut impl FnMut(String, OutputKind, (u32, u32, u32), Codec, bool),
 ) {
-    let Some(vertical) = setup.for_canvas(CanvasId::Vertical) else {
+    // Every canvas besides the main one (#84), in order: each its own
+    // program file and stream encodes.
+    for canvas in setup.extra_canvas_ids() {
+        canvas_outputs(setup, canvas, streaming, push);
+    }
+}
+
+/// `vertical_outputs` for one canvas: outputs named `<id>-program`,
+/// `<id>-stream` and `<id>-stream:<destination>`.
+fn canvas_outputs(
+    setup: &Setup,
+    canvas: CanvasId,
+    streaming: bool,
+    push: &mut impl FnMut(String, OutputKind, (u32, u32, u32), Codec, bool),
+) {
+    let Some(vertical) = setup.for_canvas(canvas) else {
         return;
     };
     let fps = vertical.canvas.fps;
@@ -369,7 +408,7 @@ fn vertical_outputs(
     if program.enabled {
         let (w, h) = program.size(&vertical.canvas);
         push(
-            VERTICAL_PROGRAM.into(),
+            canvas.program(),
             OutputKind::Program,
             (w, h, fps),
             program.encoder.codec,
@@ -377,12 +416,12 @@ fn vertical_outputs(
         );
     }
     if streaming && let Some(stream) = &vertical.stream {
-        let canvas = (vertical.canvas.width, vertical.canvas.height);
-        for (i, encode) in stream.encodes(canvas).iter().enumerate() {
+        let size = (vertical.canvas.width, vertical.canvas.height);
+        for (i, encode) in stream.encodes(size).iter().enumerate() {
             let name = if i == 0 {
-                "vertical-stream".to_string()
+                format!("{canvas}-stream")
             } else {
-                format!("vertical-stream:{}", encode.ids[0])
+                format!("{canvas}-stream:{}", encode.ids[0])
             };
             push(
                 name,
@@ -420,12 +459,12 @@ fn judge(
             codec,
             protected: kind != OutputKind::Iso,
             pixels_per_second: codec_cost(codec).map_or(0.0, |cost| {
-                let cost = if kind == OutputKind::Stream {
-                    chip.stream_h264_cost
+                let (cost, overhead) = if kind == OutputKind::Stream {
+                    (chip.stream_h264_cost, chip.stream_frame_overhead)
                 } else {
-                    cost
+                    (cost, chip.frame_overhead)
                 };
-                pixels * cost + f64::from(fps) * chip.frame_overhead
+                pixels * cost + f64::from(fps) * overhead
             }),
             assumed,
         });
@@ -583,10 +622,14 @@ fn percent(load: f64) -> String {
 
 fn summary(judgement: &Judgement) -> String {
     let busiest = percent(judgement.load);
-    let vertical = judgement
-        .outputs
-        .iter()
-        .any(|o| o.output.starts_with("vertical-"));
+    // Outputs of canvases besides the main one: a protected output that
+    // isn't the main program's or stream's.
+    let vertical = judgement.outputs.iter().any(|o| {
+        o.protected
+            && o.output != PROGRAM
+            && o.output != "stream"
+            && !o.output.starts_with("stream:")
+    });
     match judgement.capacity {
         Capacity::Fits => format!(
             "this Mac's encoders keep up with these files (the busiest engine at about {busiest})"
@@ -599,7 +642,7 @@ fn summary(judgement: &Judgement) -> String {
         Capacity::CannotKeepUp => {
             let iso = judgement.outputs.iter().any(|o| !o.protected);
             let priority = if vertical {
-                "vertical outputs shed next to protect main, which can still drop if its own workload is too high"
+                "other canvases' outputs shed next to protect main, which can still drop if its own workload is too high"
             } else {
                 "those can also drop if their own workload is too high"
             };
@@ -612,7 +655,7 @@ fn summary(judgement: &Judgement) -> String {
                 )
             } else {
                 let priority = if vertical {
-                    "vertical outputs shed before main; main can still drop if its own workload is too high"
+                    "other canvases' outputs shed before main; main can still drop if its own workload is too high"
                 } else {
                     "the program and stream will drop frames"
                 };
@@ -624,6 +667,14 @@ fn summary(judgement: &Judgement) -> String {
         }
     }
 }
+
+/// Automatic quality's ISO frame thinning is the user's choice, never part
+/// of a fit: estimates and their suggestions don't count it, and nothing
+/// turns it on for them. Native overload shedding is separate.
+pub const ISO_THINNING_NOTE: &str = "Allowing ISO frame thinning (Settings › Advanced › \
+     Automatic Quality, `governor.allow_iso_thinning`) is your choice, off by default: it lets \
+     automatic quality skip ISO pictures under pressure, lost from those files for good, and \
+     isn't counted as making these files fit";
 
 /// One change to try.
 #[derive(Debug, Clone)]
@@ -772,7 +823,9 @@ fn options(setup: &Setup, formats: Formats, streaming: [bool; 2]) -> Vec<Option_
             off: true,
         });
     }
-    out.extend(vertical_options(setup, streaming[1]));
+    for canvas in setup.extra_canvas_ids() {
+        out.extend(vertical_options(setup, canvas, streaming[1]));
+    }
     let fps = setup.canvas.fps;
     if fps >= 48 && fps.is_multiple_of(2) {
         out.push(Option_ {
@@ -787,13 +840,36 @@ fn options(setup: &Setup, formats: Formats, streaming: [bool; 2]) -> Vec<Option_
     out
 }
 
-/// Changes to the vertical canvas's own encodes, as patches of its
-/// `vertical` fields: its program's codec and size, its stream's size and
-/// its frame rate.
-fn vertical_options(setup: &Setup, streaming: bool) -> Vec<Option_> {
+/// A patch of extra canvas `canvas`'s fields: `{"vertical": change}`, or
+/// `{"canvases": [{"id": …, …change}]}` (merged by id).
+fn canvas_patch(setup: &Setup, canvas: CanvasId, change: Value) -> Option<Value> {
+    if canvas.is_vertical() {
+        return Some(json!({ "vertical": change }));
+    }
+    setup.extra_canvas(canvas)?;
+    // `[[canvases]]` merges item by item, by id (`change::merge_patch`).
+    let mut entry = change;
+    entry
+        .as_object_mut()?
+        .insert("id".into(), canvas.as_str().into());
+    Some(json!({ "canvases": [entry] }))
+}
+
+/// Changes to an extra canvas's own encodes, as patches of its fields
+/// (`vertical`, or its `canvases` entry): its program's codec and size, its
+/// stream's size and its frame rate.
+fn vertical_options(setup: &Setup, canvas: CanvasId, streaming: bool) -> Vec<Option_> {
     let mut out = Vec::new();
-    let Some(vertical) = setup.for_canvas(CanvasId::Vertical) else {
+    let Some(vertical) = setup.for_canvas(canvas) else {
         return out;
+    };
+    let words = match canvas {
+        CanvasId::Vertical => "the vertical".to_string(),
+        other => format!("canvas {other:?}'s"),
+    };
+    let canvas_words = match canvas {
+        CanvasId::Vertical => "the vertical canvas".to_string(),
+        other => format!("canvas {other:?}"),
     };
     let program = &vertical.recording.program;
     if program.enabled {
@@ -805,13 +881,15 @@ fn vertical_options(setup: &Setup, streaming: bool) -> Vec<Option_> {
         };
         if let Some((to, name)) = to {
             out.push(Option_ {
-                description: format!("record the vertical program as {name}"),
-                patch: Some(json!({
-                    "vertical": { "recording": { "encoder": { "codec": to } } }
-                })),
+                description: format!("record {words} program as {name}"),
+                patch: canvas_patch(
+                    setup,
+                    canvas,
+                    json!({ "recording": { "encoder": { "codec": to } } }),
+                ),
                 method: None,
                 cost: COST_ISO_CODEC,
-                target: "vertical-program-codec".into(),
+                target: format!("{canvas}-program-codec"),
                 off: false,
             });
         }
@@ -821,13 +899,15 @@ fn vertical_options(setup: &Setup, streaming: bool) -> Vec<Option_> {
         for (step, side) in SIDES.iter().filter(|s| **s < w.min(h)).take(2).enumerate() {
             let (nw, nh) = (scaled(cw, *side, short), scaled(ch, *side, short));
             out.push(Option_ {
-                description: format!("record the vertical program at {nw}×{nh}"),
-                patch: Some(json!({
-                    "vertical": { "recording": { "width": nw, "height": nh } }
-                })),
+                description: format!("record {words} program at {nw}×{nh}"),
+                patch: canvas_patch(
+                    setup,
+                    canvas,
+                    json!({ "recording": { "width": nw, "height": nh } }),
+                ),
                 method: None,
                 cost: COST_PROGRAM_SIZE * (step as u32 + 1),
-                target: VERTICAL_PROGRAM.into(),
+                target: canvas.program(),
                 off: false,
             });
         }
@@ -838,30 +918,36 @@ fn vertical_options(setup: &Setup, streaming: bool) -> Vec<Option_> {
         if short > 720 {
             let (nw, nh) = (scaled(w, 720, short), scaled(h, 720, short));
             out.push(Option_ {
-                description: format!("stream the vertical canvas at {nw}×{nh}"),
-                patch: Some(json!({ "vertical": { "stream": { "width": nw, "height": nh } } })),
+                description: format!("stream {canvas_words} at {nw}×{nh}"),
+                patch: canvas_patch(
+                    setup,
+                    canvas,
+                    json!({ "stream": { "width": nw, "height": nh } }),
+                ),
                 method: None,
                 cost: COST_STREAM_SIZE,
-                target: "vertical-stream".into(),
+                target: format!("{canvas}-stream"),
                 off: false,
             });
         }
     }
     // Only a rate of its own: one it inherits halves with the main canvas's.
-    let own = setup.vertical.as_ref().and_then(|v| v.fps);
+    let own = setup.extra_canvas(canvas).and_then(|v| v.fps);
     if let Some(fps) = own
         && fps >= 48
         && fps.is_multiple_of(2)
     {
         out.push(Option_ {
-            description: format!("record and stream the vertical canvas at {} fps", fps / 2),
-            patch: Some(json!({ "vertical": { "fps": fps / 2 } })),
+            description: format!("record and stream {canvas_words} at {} fps", fps / 2),
+            patch: canvas_patch(setup, canvas, json!({ "fps": fps / 2 })),
             method: None,
             cost: COST_CANVAS_RATE,
-            target: "vertical-canvas".into(),
+            target: format!("{canvas}-canvas"),
             off: false,
         });
     }
+    // A canvas-array patch that couldn't be made is no option.
+    out.retain(|option| option.patch.is_some());
     out
 }
 
@@ -889,8 +975,16 @@ fn try_options(
         for b in &options[i + 1..] {
             // A method (stop the stream) stands alone: a client applies a
             // patch or calls a method, not both.
+            // Two `canvases` patches merge by id, but stay single changes
+            // so each suggestion names one canvas.
+            let both_canvases = |o: &Option_| {
+                o.patch
+                    .as_ref()
+                    .is_some_and(|p| p.get("canvases").is_some())
+            };
             let clash = a.method.is_some()
                 || b.method.is_some()
+                || both_canvases(a) && both_canvases(b)
                 || a.target == b.target && (a.off || b.off || a.description == b.description);
             // Two sizes of one thing aren't a pair.
             let same_kind = a.target == b.target
@@ -933,10 +1027,11 @@ fn try_options(
         }
         let touches = |key: &str| patch.as_ref().is_some_and(|p| p.get(key).is_some());
         // A canvas's rate holds while it streams.
-        let vertical_rate = patch
-            .as_ref()
-            .and_then(|p| p.get("vertical"))
-            .is_some_and(|v| v.get("fps").is_some());
+        let vertical_rate = patch.as_ref().is_some_and(|p| {
+            p.get("vertical").is_some_and(|v| v.get("fps").is_some())
+                || p.get("canvases")
+                    .is_some_and(|c| serde_json::to_value(&setup.canvases).ok().as_ref() != Some(c))
+        });
         let after_take = recording && patch.is_some()
             || (touches("canvas") && streaming[0] || vertical_rate && streaming[1])
                 && method.is_none();
@@ -1223,6 +1318,11 @@ pub fn check(estimate: &CapacityEstimate) -> Option<isocast_protocol::api::Check
         estimate.encode_engines,
         estimate.basis.split(':').next().unwrap_or("")
     ));
+    if estimate.capacity != Capacity::Fits
+        && estimate.outputs.iter().any(|o| o.kind == OutputKind::Iso)
+    {
+        detail.push_str(&format!(". {ISO_THINNING_NOTE}"));
+    }
     let fix = estimate.suggestions.first().map(|s| match &s.change {
         Some(change) => format!("{}: isocast plan --patch '{change}'", s.description),
         None => s.description.clone(),
@@ -1394,5 +1494,93 @@ mod tests {
         };
         let admitted = estimate(&inputs, Some("cam2")).unwrap().admission.unwrap();
         assert!(admitted.on && !admitted.as_is, "{admitted:?}");
+    }
+
+    #[test]
+    fn calibration_covers_canvas_files_without_changing_assumed_stream_cost() {
+        use isocast_protocol::machine::{MEASUREMENT_VERSION, MachineProfile, PROFILE_SCHEMA};
+        let m = machine("Apple M2");
+        let cells = [
+            (1920, 1080, 60, 2, 200),
+            (1920, 1080, 60, 4, 240),
+            (3840, 2160, 30, 4, 100),
+        ]
+        .into_iter()
+        .map(|(width, height, fps, sessions, frames)| {
+            json!({ "resource": "recording_writer", "backend": "videotoolbox",
+                    "evidence": "fit", "rate_control": "constant_quality", "quality": 70,
+                    "codec": "hevc", "bit_depth": 8, "width": width, "height": height,
+                    "fps": fps, "sessions": sessions, "frames": frames, "seconds": 1.0,
+                    "frames_per_second": frames })
+        })
+        .collect::<Vec<_>>();
+        let profile: MachineProfile = serde_json::from_value(json!({
+            "schema_version": PROFILE_SCHEMA, "measurement_version": MEASUREMENT_VERSION,
+            "app_version": env!("CARGO_PKG_VERSION"), "app_build": "test", "measured_at": "test",
+            "machine": m, "seconds": 3.0, "encoders": cells, "graphics": [], "notes": [],
+            "skipped": [], "complete": true
+        }))
+        .unwrap();
+        let setup = soak(&[("screen", 1920, 1080)], true);
+        let mut value = serde_json::to_value(&setup).unwrap();
+        value["canvases"] = json!([{ "id": "shorts", "width": 1080, "height": 1920,
+            "fps": 30, "recording": { "encoder": { "codec": "hevc" } } }]);
+        let setup = Setup::from_value(value.clone()).unwrap();
+        let none = |_: &str| None;
+        let inputs = Inputs {
+            machine: &m,
+            setup: &setup,
+            formats: &none,
+            streaming: [true; 2],
+            memory: None,
+            recording: false,
+            profile: Some(&profile),
+        };
+        let measured = estimate(&inputs, None).unwrap();
+        let fallback = estimate(
+            &Inputs {
+                profile: None,
+                ..inputs
+            },
+            None,
+        )
+        .unwrap();
+        assert!(measured.basis.starts_with("measured:"));
+        let shorts = measured
+            .outputs
+            .iter()
+            .find(|o| o.output == "shorts-program")
+            .unwrap();
+        assert_eq!((shorts.width, shorts.height, shorts.fps), (1080, 1920, 30));
+        let stream_cost = |e: &CapacityEstimate| {
+            e.outputs
+                .iter()
+                .find(|o| o.output == "stream")
+                .unwrap()
+                .pixels_per_second
+                / e.engine_pixels_per_second
+        };
+        assert!((stream_cost(&measured) - stream_cost(&fallback)).abs() < 1e-10);
+        // An uncovered file on any canvas retains the table, even though
+        // the main canvas itself is covered. Oversized file overrides count.
+        for encoder in [
+            json!({ "codec": "h264" }),
+            json!({ "codec": "hevc", "bit_depth": 10 }),
+        ] {
+            value["canvases"][0]["recording"]["encoder"] = encoder;
+            let setup = Setup::from_value(value.clone()).unwrap();
+            assert!(
+                !estimate(
+                    &Inputs {
+                        setup: &setup,
+                        ..inputs
+                    },
+                    None
+                )
+                .unwrap()
+                .basis
+                .starts_with("measured:")
+            );
+        }
     }
 }

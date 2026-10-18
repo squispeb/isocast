@@ -119,6 +119,11 @@ the API and in MCP ([mcp-tools.md](mcp-tools.md)).
     - [`isocast stream key set`](#isocast-stream-key-set)
     - [`isocast stream key clear`](#isocast-stream-key-clear)
   - [`isocast stream speed-test`](#isocast-stream-speed-test)
+- [`isocast canvas`](#isocast-canvas)
+  - [`isocast canvas list`](#isocast-canvas-list)
+  - [`isocast canvas add`](#isocast-canvas-add)
+  - [`isocast canvas set`](#isocast-canvas-set)
+  - [`isocast canvas remove`](#isocast-canvas-remove)
 - [`isocast replay`](#isocast-replay)
   - [`isocast replay start`](#isocast-replay-start)
   - [`isocast replay stop`](#isocast-replay-stop)
@@ -198,6 +203,7 @@ Commands:
   plan           Show what a change to the live setup would do, without doing it: a whole setup FILE, or --patch with a JSON merge patch (lists of sources, scenes and items merge by id)
   apply          Make a change to the live setup, if it is still at --revision (from `plan` or `get`; 0 when there is no live setup yet)
   stream         Stream the program live over RTMP or RTMPS to the live setup's [stream] service, and keep its stream key in the Keychain
+  canvas         Canvases besides the main one (#84): the vertical canvas and `[[canvases]]`, each with its own size, frame rate, scene (or the main one's), recording and stream destinations
   replay         The replay buffer: keep the last seconds of the program in memory, and save them to a file on demand
   websocket      The obs-websocket v5 server, so OBS tools (Stream Deck, Touch Portal, Streamer.bot, scripts) drive Isocast. Off until enabled
   projector      Projectors: the program, the preview, a scene, a source or a multiview grid, full screen on a display or in a window (the app shows them)
@@ -1942,6 +1948,12 @@ Options:
           Its own size sent (with --height; else main's)
       --height <HEIGHT>
           Its own height sent (with --width)
+      --rate-control <RATE_CONTROL>
+          Its own rate control: constant or average (else main's)
+      --keyframe-interval-seconds <KEYFRAME_INTERVAL_SECONDS>
+          Its own seconds between keyframes (else main's)
+      --audio-bitrate-kbps <AUDIO_BITRATE_KBPS>
+          Its own AAC bitrate in kb/s (else main's)
       --disabled
           Add it turned off (`stream start` skips it unless --only names it)
       --canvas <CANVAS>
@@ -1989,10 +2001,16 @@ Options:
           Its own size sent (with --height; else main's)
       --height <HEIGHT>
           Its own height sent (with --width)
+      --rate-control <RATE_CONTROL>
+          Its own rate control: constant or average (else main's)
+      --keyframe-interval-seconds <KEYFRAME_INTERVAL_SECONDS>
+          Its own seconds between keyframes (else main's)
+      --audio-bitrate-kbps <AUDIO_BITRATE_KBPS>
+          Its own AAC bitrate in kb/s (else main's)
       --enabled <ENABLED>
           Turn it on or off for `stream start` [possible values: true, false]
       --clear <FIELD>
-          Reset a field: server, video_bitrate_kbps or size (a destination then uses main's; main the defaults). Repeat for several
+          Reset a field: server, video_bitrate_kbps, size, rate_control, keyframe_interval_seconds or audio_bitrate_kbps (a destination then uses main's; main the defaults). Repeat for several
       --canvas <CANVAS>
           Which canvas: main ([stream]), or vertical ([vertical.stream], with its own destinations and keys) [default: main]
       --json
@@ -2063,6 +2081,93 @@ Options:
       --seconds <SECONDS>          Seconds to send for, 3 to 20 (8 by default)
       --json                       
   -h, --help                       Print help
+```
+
+## isocast canvas
+
+```text
+Canvases besides the main one (#84): the vertical canvas and `[[canvases]]`, each with its own size, frame rate, scene (or the main one's), recording and stream destinations
+
+Usage: isocast canvas <COMMAND>
+
+Commands:
+  list    Every canvas: size, frame rate, scene, recording and streams
+  add     Add a canvas: `vertical` (the [vertical] canvas) or a new id (lowercase letters, digits and dashes), 1080×1920 following the main scene unless said otherwise. Add its streams next: `isocast stream destination add SERVICE --canvas ID`
+  set     Change a canvas
+  remove  Remove a canvas with its arrangements, recording and streams (not while it records or streams)
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+```
+
+## isocast canvas list
+
+```text
+Every canvas: size, frame rate, scene, recording and streams
+
+Usage: isocast canvas list [OPTIONS]
+
+Options:
+      --json  
+  -h, --help  Print help
+```
+
+## isocast canvas add
+
+```text
+Add a canvas: `vertical` (the [vertical] canvas) or a new id (lowercase letters, digits and dashes), 1080×1920 following the main scene unless said otherwise. Add its streams next: `isocast stream destination add SERVICE --canvas ID`
+
+Usage: isocast canvas add [OPTIONS] <CANVAS>
+
+Arguments:
+  <CANVAS>  
+
+Options:
+      --name <NAME>                Display label, like "YouTube Shorts"
+      --size <SIZE>                Size as WIDTHxHEIGHT, optionally @FPS (1080x1920, 1080x1080@30)
+      --fps <FPS>                  Its own frame rate (else the main canvas's)
+      --follow-main <FOLLOW_MAIN>  Show the main canvas's scene (true) or pick its own (false) [possible values: true, false]
+      --record <RECORD>            Record its program with each recording (true or false) [possible values: true, false]
+      --json                       
+  -h, --help                       Print help
+```
+
+## isocast canvas set
+
+```text
+Change a canvas
+
+Usage: isocast canvas set [OPTIONS] <CANVAS>
+
+Arguments:
+  <CANVAS>  
+
+Options:
+      --name <NAME>                Display label, like "YouTube Shorts"
+      --size <SIZE>                Size as WIDTHxHEIGHT, optionally @FPS (1080x1920, 1080x1080@30)
+      --fps <FPS>                  Its own frame rate (else the main canvas's)
+      --follow-main <FOLLOW_MAIN>  Show the main canvas's scene (true) or pick its own (false) [possible values: true, false]
+      --record <RECORD>            Record its program with each recording (true or false) [possible values: true, false]
+      --clear <FIELD>              Reset a field: name, fps (to the main canvas's) or stream (no stream of its own). Repeat for several
+      --no-stream                  Shorthand for --clear stream
+      --json                       
+  -h, --help                       Print help
+```
+
+## isocast canvas remove
+
+```text
+Remove a canvas with its arrangements, recording and streams (not while it records or streams)
+
+Usage: isocast canvas remove [OPTIONS] <CANVAS>
+
+Arguments:
+  <CANVAS>  
+
+Options:
+      --json  
+  -h, --help  Print help
 ```
 
 ## isocast replay
@@ -2226,8 +2331,9 @@ Options:
       --window             In a window (where this view was last, unless --frame)
       --frame <X,Y,W,H>    The window's place: X,Y,WIDTH,HEIGHT in points from the main display's top left
       --layout <LAYOUT>    The multiview's grid: top-8 (the default), 3x3 or 2x2 [possible values: top-8, 3x3, 2x2]
-      --canvas <CANVAS>    The canvas: main (the default), or vertical (the setup's vertical canvas: its program, preview or a scene as it arranges it) [possible values: main, vertical]
+      --canvas <CANVAS>    The canvas: main (the default), vertical (the setup's vertical canvas) or a [[canvases]] id (`isocast canvas list`): its program, preview or a scene as it arranges it
       --vertical [<BOOL>]  A multiview's last tile shows the vertical canvas's program instead of a scene (--vertical=false takes it back out) [possible values: true, false]
+      --canvases [<ID,…>]  A multiview's last tiles show these extra canvases' programs instead of scenes: ids, comma-separated (`isocast canvas list`); --canvases= takes them back out
       --json               
   -h, --help               Print help
 ```
