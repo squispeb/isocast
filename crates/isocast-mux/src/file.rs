@@ -6,10 +6,16 @@
 //! process-lifetime guarantees, not directory-entry/power-loss guarantees.
 
 use std::ffi::OsStr;
+#[cfg(windows)]
+use std::ffi::OsString;
 use std::fs::{File, Metadata};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+#[cfg(windows)]
+use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(windows)]
+use std::sync::Mutex;
 
 use anyhow::{Context, Result, bail};
 
@@ -28,6 +34,8 @@ enum OpenMode {
     Repair,
     Read,
     Lock,
+    #[cfg(windows)]
+    MetadataTemp,
 }
 
 /// An anchored recording (shared) or repair (exclusive) folder lease.
@@ -44,6 +52,8 @@ struct DirectoryInner {
     directory: File,
     _lock: File,
     repairing: bool,
+    #[cfg(windows)]
+    enumeration: Mutex<()>,
 }
 
 impl Directory {
@@ -76,6 +86,8 @@ impl Directory {
                 directory,
                 _lock: lock,
                 repairing,
+                #[cfg(windows)]
+                enumeration: Mutex::new(()),
             }),
         })
     }
@@ -102,6 +114,40 @@ impl Directory {
     /// This does not lock media bytes or acquire writable media ownership.
     pub fn open_for_read(&self, name: &OsStr) -> Result<MediaFile> {
         self.open_media(name, OpenMode::Read)
+    }
+
+    /// Newest named manifests in the pinned folder, retaining at most `limit`
+    /// names while scanning. This is not a snapshot: validate names on open.
+    #[cfg(windows)]
+    pub fn manifest_names(&self, limit: usize) -> Result<Vec<OsString>> {
+        // Windows keeps the enumeration cursor on the shared directory handle.
+        let _enumeration = self
+            .inner
+            .enumeration
+            .lock()
+            .map_err(|_| anyhow::anyhow!("recording folder enumeration lock is poisoned"))?;
+        platform::manifest_names(&self.inner.directory, limit)
+            .context("could not enumerate recording folder")
+    }
+
+    /// The pinned folder's current normalized path, for reporting only. It can
+    /// change immediately after this call; never use it to open children.
+    #[cfg(windows)]
+    pub fn path(&self) -> Result<PathBuf> {
+        platform::path(&self.inner.directory).context("could not name pinned recording folder")
+    }
+
+    /// Publish complete metadata under either a recording or repair lease.
+    /// Readers that hold the destination open can cause a sharing error; close
+    /// them before retrying. Durable mode flushes the same file before and after
+    /// its handle-relative rename, not the directory. This is no power-loss or
+    /// directory-entry durability guarantee. A post-publish flush error leaves
+    /// the complete new file published and must not be treated as a rollback.
+    #[cfg(windows)]
+    pub fn replace_metadata(&self, name: &OsStr, bytes: &[u8], durable: bool) -> Result<()> {
+        validate_name(name)?;
+        platform::replace_metadata(&self.inner.directory, name, bytes, durable)
+            .with_context(|| format!("could not replace metadata {}", name.to_string_lossy()))
     }
 
     fn open_media(&self, name: &OsStr, mode: OpenMode) -> Result<MediaFile> {

@@ -9,6 +9,8 @@
 pub mod file;
 pub mod mp4;
 mod packet;
+#[cfg(windows)]
+pub mod recovery;
 
 pub use packet::{
     AudioConfig, Config, Framing, Progress, VideoCodec, VideoConfig, VideoPacket, Writer,

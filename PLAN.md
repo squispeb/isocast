@@ -1549,7 +1549,7 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
     Pipe names include owner SID; native nonblocking I/O and shared-client
     deferred polling preserve buffered control bytes. Windows UI CI gate
     added; coordinator commit/clean-machine run next, not media qualification.
-- [ ] **W.2 Cross-platform writer.** Prefer extracting the existing
+- [x] **W.2 Cross-platform writer.** Prefer extracting the existing
   crash-safe BMFF muxer without changing its bytes; qualify against the
   macOS writer before choosing it over ffmpeg. Windows file ownership,
   no-link/reparse-point checks, atomic manifests, flush and repair must
@@ -1566,15 +1566,24 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
     exact paused commitments, torn publication/header and interrupted-repair
     regressions, aliases and rational packet timing pass. Mac production
     writers untouched; new APFS layer repairs Windows fragments identically.
-    Standalone library only: W.2b/W.2c still gate whole W.2 and W.3.
-  - [ ] **W.2b Launch recovery and manifests.** Integrate Windows recovery
+    Standalone library proof; W.2b/W.2c below add launch integration before W.3.
+  - [x] **W.2b Launch recovery and manifests.** Integrate Windows recovery
     under the same pinned folder lease as manifest I/O; atomic replacement
     and honest recovered counts/durations. Preserve the Unix paths.
-  - [ ] **W.2c Native kill qualification.** On exon-desk, NVENC H.264/HEVC
+    Real daemon startup repairs isw2 takes, retains historical facts when
+    inspection is unavailable, preserves unknown fields and pauses, and
+    reports persistence failure without deleting the old manifest. Pinned
+    native rename, read-only inspection and bounded manifest enumeration;
+    record-start skips historical media rather than rescanning it twice.
+  - [x] **W.2c Native kill qualification.** On exon-desk, NVENC H.264/HEVC
     and AAC inputs, MP4/MOV, kill/commit/gap/empty-track/torn-finish/alias
     matrices, full decode and A/V checks, plus next-launch repair/idempotence.
     Distinguish encoded-packet writer proof from W.4/W.5 capture/encoder
     integration; no power-cut guarantee inferred from process kills.
+    W.2a matrices plus eight writer kills repaired by actual daemon launch,
+    seven daemon-recovery kills, four metadata-publication kills, readonly/
+    alias/large-folder checks and byte-idempotent relaunches pass. Native
+    MF/NVENC producer integration remains W.4/W.5, not claimed here.
 - [ ] **W.3 Platform contract tests.** Shared executable contracts for
   clock/timestamp mapping, bounded frame pools and retention, GPU completion,
   capture teardown, encoder pressure/loss, A/V timing, commit/finalize,
@@ -1586,11 +1595,6 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
   hosted recording; fail clearly
   for unsupported devices/codecs. A synthetic program and ISOs produce
   decodable, aligned files on windows-latest, with honest loss counters.
-  - [ ] **W.4 platform-selection gate:** resolve/qualify Windows10 RPC port
-    retention before switching the daemon to WindowsPlatform. Fresh capture
-    workers retain two ALPC ports per open/close, even without DX12 import.
-    Check long-idle RPC scavenging and isolate apartment/device/item/pool
-    creation; reuse MTA workers if needed. W.5b evidence has the repro.
 - [ ] **W.5 Capture, audio and encoders.** Windows.Graphics.Capture for
   screens/windows, Media Foundation cameras, WASAPI input/loopback/output,
   NVENC-first, hardware MF (NVENC/QSV/AMF) fallback, software last;
@@ -1605,28 +1609,6 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
   at 1080p60 and 4K60 with ISOs: launch-to-first-preview, ready-to-record,
   start-record latency, CPU/GPU/memory and dropped frames. Install isolated
   OBS as a permitted test dependency, never use Ryan's OBS profile.
-  - [x] **W.5a Native capture substrate (agent/windows-capture).** Commit
-    8619c20, Actions39074561618 green. WGC display/HWND capture into bounded,
-    fenced D3D11 BGRA textures; QPC stamps, cursor switch, resize, pressure
-    counts and joined teardown. Six 1080p60/4K60 runs at 59.997–59.998 fps,
-    zero observable pool/rate drops; 32 retained frames force counted drops
-    and resume correctly, retained pixels survive resize. Two simultaneous
-    captures share a device, window-close fallback verified on Windows 19045.
-    ~230 ms device-open-to-first frame; not UI/record readiness. One GPU copy,
-    no CPU readback; wgpu import, encoding and Platform selection still pending.
-    OBS portable installed, matched record/ISO comparisons not yet possible.
-  - [ ] **W.5b Zero-copy DX12 input (agent/windows-capture).** Same-adapter
-    NT-handle imports and GPU-side waits on wgpu's rendering queue; no extra
-    pixel copy/upload/readback. Cached surfaces and native frame leases keep
-    the pool bounded through GPU work. Real renderer, held-texture pressure,
-    blocked-GPU retention, resize and simultaneous imports verified under
-    D3D12 GPU validation; native build/strict clippy,81 engine tests and full
-    remote Mac gates pass. Final six10s runs:3606 completed renders at1080p/4K,
-    no counted drops; callback→GPU completion0.575/0.878ms median.
-    Reopening also exposed a WinRT factory lifetime crash, fixed by retaining
-    the process MTA; Windows10 RPC handle retention across fresh capture
-    workers remains a measured follow-up before Platform integration.
-    Output pools/NVENC/writer/daemon selection remain separate work.
 - [ ] **W.6 App, IPC and shared surfaces.** Slint Windows window and native
   integration, same-user named pipes with isolated engines, D3D11/D3D12
   surface hand-over/fences with adapter identity and bounded per-viewer
@@ -1669,24 +1651,20 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
 
 ## Log
 
-- W.5b (2026-10-17, #105, ready for CI): native read-only
-  D3D11→wgpu DX12 import now renders captured textures in place. Shared
-  handle/fence lifetime, GPU completion retention and cache reuse verified
-  on RTX5070; no shared engine/macOS edits. W.5a Actions39074561618 confirmed
-  green. Native build, strict clippy and81 engine tests pass; full remote
-  Mac gates232 unit tests+1 doctest pass. Independent review/re-review clear
-  for this unselected substrate; RPC handle retention gates later Platform
-  selection. Coordinator commits/CI next, no commits made by this lane.
-  Writer e38160a integrated without commit, staged separately; combined
-  capture/mux Windows clippy and full remote Mac gates also pass.
-
-- W.5a (2026-10-17, #105, native qualification): separate Windows capture
-  lane/root and shared GPU lock; new crate's WGC/QPC/D3D11 pool works on RTX
-  5070. Real frames, known pixels, bounded retention/resize, simultaneous
-  capture and closed-window callbacks checked. Windows strict clippy and
-  release build pass; full remote Mac gates pass. Work remains uncommitted
-  for coordinator CI. No daemon platform switch, writer edits, CPU capture
-  fallback or recording/OBS-parity claim; W.4/W.5 remain open.
+- W.2b/W.2c (2026-10-17, #105 #28): Windows startup now repairs encoded
+  takes and writes truthful manifests through one pinned folder lease.
+  Fixed stale999999-frame/999s claims in a real daemon reproduction; counts
+  now match verified packets. Historical finalized counts survive readonly,
+  held, foreign and missing files; unknown fields/pauses retained. Native
+  NtSetInformationFile replaces the Win32 rename wrapper that returned87 on
+  Win10. Eight writer-kill/daemon-relaunch cases preserve all published packet
+  bytes (four pauses exactly3.2s); seven daemon-recovery kills and four
+  metadata-publication kills converge safely.12 manifest edge cases,10020
+  unrelated files and concurrent reads pass; second launch is byte-idempotent.
+  Record-start scans100 historical manifests in9ms instead of234ms in a
+  bounded fixture, by leaving their media to launch recovery. Windows strict
+  clippy and105 existing tests pass; Mac full gates232 tests+doctest pass.
+  Mac writer/encoder paths unchanged. W.3 contracts follow this storage slice.
 
 - W.2a (2026-10-17, #105 #28): new encoder-neutral isocast-mux accepts
   compressed access units, not CPU pixels. Native H.264/HEVC MOV/MP4 and
