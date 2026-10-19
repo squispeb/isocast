@@ -398,6 +398,7 @@ impl Canvas {
             match incoming {
                 Incoming::Frame(frame) => preview.frame(frame),
                 Incoming::Lost(why) => preview.lost(why),
+                Incoming::Unavailable(_) => preview.unavailable(),
             }
         }
     }

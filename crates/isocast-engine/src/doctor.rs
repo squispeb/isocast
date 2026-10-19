@@ -19,7 +19,9 @@ type Delivers<'a> = (&'a str, Option<(u32, u32, u32)>, Option<u32>);
 /// Check this machine, and `setup` if given: permissions, hardware
 /// encoders, the setup's devices and the recording disk.
 pub fn doctor<P: Platform>(platform: &P, setup: Option<&Setup>, folder: Option<&Path>) -> Doctor {
-    let machine = platform.machine();
+    let mut machine = platform.machine();
+    let encoders = platform.video_encoders();
+    machine.hardware_encoders = encoders.hardware;
     let mut checks = Vec::new();
     let check = |name: &str, status, detail: String, fix: Option<&str>| Check {
         name: name.into(),
@@ -77,7 +79,11 @@ pub fn doctor<P: Platform>(platform: &P, setup: Option<&Setup>, folder: Option<&
                     (Permission::NotDetermined, _) => check(
                         &name,
                         CheckStatus::Warning,
-                        "not asked yet; macOS asks the first time it is needed".into(),
+                        isocast_protocol::platform_text::select(
+                            "not asked yet; macOS asks the first time it is needed",
+                            "not checked yet; review Windows privacy access for desktop apps",
+                        )
+                        .into(),
                         fix,
                     ),
                     // Never a problem: recording still tries it.
@@ -120,7 +126,7 @@ pub fn doctor<P: Platform>(platform: &P, setup: Option<&Setup>, folder: Option<&
         checks.push(check(
             "frame budget",
             if !invariant { CheckStatus::Problem } else if refused { CheckStatus::Warning } else { CheckStatus::Ok },
-            format!("distinct-buffer invariant {}; reserves: production {}, recording {}, auxiliary {}, composition {}; refusals {} (since daemon start)",
+            format!("distinct-buffer invariant {}; base reserves: production {}, recording {}, auxiliary {}, composition {}; refusals {} (since daemon start)",
                 if invariant { "holds" } else { "FAILED" }, budget["production_reserve"], budget["recording_reserve"], budget["auxiliary_limit"], budget["composition_reserve"], budget["refused"]),
             refused.then_some("reduce auxiliary viewers/outputs; status.diagnostics.frame_budget identifies the exhausted domain"),
         ));
@@ -135,8 +141,13 @@ pub fn doctor<P: Platform>(platform: &P, setup: Option<&Setup>, folder: Option<&
         } else {
             CheckStatus::Warning
         },
-        if machine.hardware_encoders.is_empty() {
+        if machine.hardware_encoders.is_empty() && encoders.software.is_empty() {
             "none found; encoding falls back to the CPU".into()
+        } else if machine.hardware_encoders.is_empty() {
+            format!(
+                "none found; encoding falls back to the CPU: {}",
+                encoders.software.join(", ")
+            )
         } else {
             machine.hardware_encoders.join(", ")
         },
@@ -169,7 +180,7 @@ pub fn doctor<P: Platform>(platform: &P, setup: Option<&Setup>, folder: Option<&
     // Files in folders macOS guards: reading them waits for its prompt.
     let home = std::env::var("HOME").unwrap_or_default();
     let guarded = guarded_files(setup, &home);
-    if !guarded.is_empty() {
+    if !cfg!(windows) && !guarded.is_empty() {
         checks.push(check(
             "folder access",
             CheckStatus::Warning,

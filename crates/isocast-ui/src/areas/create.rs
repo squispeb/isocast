@@ -1093,7 +1093,7 @@ impl Create {
                             format!("Exported for {}", exported.app.title()),
                             detail,
                         )
-                        .action("Show in Finder", move |_| {
+                        .action(isocast_protocol::platform_text::SHOW_IN_FILES, move |_| {
                             crate::platform::reveal(&shown.display().to_string())
                         }),
                     );
@@ -1140,7 +1140,7 @@ impl Create {
         let menu = MenuBuilder::new()
             .item("editor", "Open in Editor")
             .separator()
-            .item("reveal", "Show in Finder")
+            .item("reveal", isocast_protocol::platform_text::SHOW_IN_FILES)
             .disabled(!file);
         let menu = match offline {
             true => menu.item("relink", "Relink…"),
@@ -1790,6 +1790,8 @@ impl Create {
                 raise => raise,
             };
             editor.show()?;
+            #[cfg(windows)]
+            crate::chrome_windows::style_windows_soon();
             raised(app, editor, raise);
         }
         if !opened {
@@ -2546,7 +2548,7 @@ impl Create {
                             mm_ss(seconds)
                         ),
                     )
-                    .action("Show in Finder", move |_| {
+                    .action(isocast_protocol::platform_text::SHOW_IN_FILES, move |_| {
                         crate::platform::reveal(&shown.display().to_string())
                     }),
                 );

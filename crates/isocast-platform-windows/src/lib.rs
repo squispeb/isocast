@@ -11,6 +11,7 @@ mod camera;
 mod capture;
 mod clock;
 mod convert;
+mod credentials;
 mod devices;
 mod encoder;
 mod frames;
@@ -36,7 +37,8 @@ pub use broker::{
     IsolatedCapture, IsolatedCaptureStats, capture_helper_main, isolated_capture_screen,
 };
 pub use camera::{
-    CameraCapture, CameraCaptureStats, CameraDevice, CameraFormat, camera_devices, capture_camera,
+    CameraCapture, CameraCaptureStats, CameraDevice, CameraFormat, CameraPixelFormat,
+    camera_devices, capture_camera,
 };
 pub use capture::{CaptureStats, CaptureTarget, DisplayCapture, capture_monitor, capture_screen};
 pub use clock::{now, sleep_until};
@@ -46,7 +48,9 @@ pub use gpu::Dx12Importer;
 pub use mf::{MfEncoder, MfEncoderInfo, MfMode, mf_encoders, mf_encoders_for};
 pub use native::{RecordingPowerGuard, audio_thread, video_thread};
 pub use nvenc::{
-    EncodeStats, NvencBudgetOutput, NvencBudgetPlan, NvencBudgetProfile, NvencEncoder,
+    EncodeStats, NVENC_NATIVE_IN_FLIGHT, NVENC_PENDING_READY_LIMIT, NvencAccounted, NvencAdmission,
+    NvencBudgetOutput, NvencBudgetPlan, NvencBudgetProfile, NvencClosing, NvencEncoder,
+    NvencReservation,
 };
 pub use output::OutputPool;
 pub use platform::{Capture, Unsupported, WindowsPlatform};

@@ -1488,6 +1488,10 @@ impl Daemon {
         }
         let shutdown = request.method == Method::Shutdown;
         let result = match request.method {
+            Method::GpuAdapter => native()
+                .gpu_adapter_luid()
+                .map_err(failed)
+                .and_then(to_json),
             Method::MachineProfile => to_json(self.machine_status(true)),
             Method::MachineCalibrate => self.machine_calibrate().and_then(to_json),
             Method::MachineCancel => self.machine_cancel().and_then(to_json),
@@ -3401,7 +3405,7 @@ impl Daemon {
         let session_takes = options.3.clone();
         thread::spawn(move || {
             let (stop, files, live, takes) = options;
-            let on_start = |paths: &[PathBuf], manifest: &Path| {
+            let on_start = |paths: &[PathBuf], manifest: &Path, opened: &[String]| {
                 *takes.current.lock() = timeline::TakeNow {
                     number: 1,
                     files: paths.to_vec(),
@@ -3410,7 +3414,7 @@ impl Daemon {
                 };
                 daemon.take_began(&takes, 1, manifest);
                 *files.lock() = Some(paths.to_vec());
-                let _ = started_tx.send(Ok(paths.to_vec()));
+                let _ = started_tx.send(Ok((paths.to_vec(), opened.to_vec())));
                 if project.created
                     && let Some(file) = isocast_protocol::project::read(&project.folder)
                 {
@@ -3493,7 +3497,9 @@ impl Daemon {
         });
 
         match started_rx.recv_timeout(START_TIMEOUT) {
-            Ok(Ok(files)) => {
+            Ok(Ok((files, opened))) => {
+                // How the files' encoders were admitted (the platform's plan).
+                notes.extend(opened);
                 // Said up front, where OBS says "encoding overloaded" mid-take.
                 if let Some(message) = self.capacity_warning(&*recording) {
                     self.publish(Event::Warning {
@@ -4036,7 +4042,8 @@ impl Daemon {
             }
         }
         let exporter = Exporter::shared().map_err(|err| RpcError {
-            code: RpcError::FAILED,
+            // Not a passing failure: viewers stop asking and say so.
+            code: RpcError::UNSUPPORTED,
             message: format!(
                 "shared frames can't be handed over here ({err:#}); use `frames` (H.264) instead"
             ),
@@ -5490,7 +5497,7 @@ fn import_obs(params: ImportObsParams) -> Result<Imported, RpcError> {
         return Err(invalid("fps must be between 1 and 240"));
     }
     let devices = devices();
-    let home = std::env::var("HOME").ok();
+    let home = library::home_text();
     let options = obs::Options {
         canvas,
         fps: params.fps,

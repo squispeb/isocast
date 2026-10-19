@@ -51,6 +51,34 @@ type RenderingGpu = Mutex<Option<(wgpu::Device, wgpu::Queue)>>;
 #[cfg(all(windows, feature = "wgpu"))]
 static RENDERING_GPU: std::sync::OnceLock<RenderingGpu> = std::sync::OnceLock::new();
 
+/// Select and pin the daemon's actual adapter before constructing a Windows
+/// renderer (including engine::Gpu in the CLI). Only an older/unsupported
+/// engine may use local selection so its UI can still open without previews.
+#[cfg(all(windows, feature = "wgpu"))]
+pub fn adapter(client: &mut Client, instance: &wgpu::Instance) -> Result<wgpu::Adapter> {
+    use isocast_protocol::api::RpcError;
+
+    let luid = match client.call::<Option<(u32, i32)>>(Method::GpuAdapter) {
+        Ok(luid) => {
+            Some(luid.context("the daemon did not provide a Windows graphics adapter LUID")?)
+        }
+        Err(error)
+            if error
+                .downcast_ref::<crate::DaemonError>()
+                .is_some_and(|error| {
+                    matches!(
+                        error.code(),
+                        RpcError::METHOD_NOT_FOUND | RpcError::UNSUPPORTED
+                    )
+                }) =>
+        {
+            None
+        }
+        Err(error) => return Err(error),
+    };
+    isocast_surfaces::dx12_adapter(instance, luid)
+}
+
 /// Register the actual rendering queue before receiving Windows previews.
 /// Slint/Skia and the app must submit through this same queue. A frame must
 /// remain alive until no future render will reference its image; its drop

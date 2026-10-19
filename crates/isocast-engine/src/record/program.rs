@@ -226,10 +226,33 @@ impl<P: Platform> Compositor<P> {
         size: (u32, u32),
         gpu: Gpu,
     ) -> Result<Self> {
-        let renderer = Renderer::new(&gpu, wgpu::TextureFormat::Bgra8Unorm);
-        let mut filters = Filters::new(&gpu, renderer.format(), true);
+        // DX12 compiles these independent shader families at pipeline creation.
+        // Overlap that startup work, but join it before returning: a recording
+        // must never pay for an unprepared filter/transition on a frame tick.
+        #[cfg(windows)]
+        let (renderer, mut filters, transitions) = std::thread::scope(|scope| {
+            let filters = scope.spawn(|| Filters::new(&gpu, wgpu::TextureFormat::Bgra8Unorm, true));
+            let transitions =
+                scope.spawn(|| Transitions::new(&gpu, wgpu::TextureFormat::Bgra8Unorm));
+            let renderer = Renderer::new(&gpu, wgpu::TextureFormat::Bgra8Unorm);
+            (
+                renderer,
+                filters
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+                transitions
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+            )
+        });
+        #[cfg(not(windows))]
+        let (renderer, mut filters, transitions) = {
+            let renderer = Renderer::new(&gpu, wgpu::TextureFormat::Bgra8Unorm);
+            let filters = Filters::new(&gpu, renderer.format(), true);
+            let transitions = Transitions::new(&gpu, renderer.format());
+            (renderer, filters, transitions)
+        };
         filters.use_masks(true);
-        let transitions = Transitions::new(&gpu, renderer.format());
         let importer = platform.frame_importer(&gpu)?;
         let (pool, to_ycbcr) = match platform.encoder_frame_format() {
             EncoderFrameFormat::Ycbcr => (
@@ -1031,11 +1054,12 @@ impl<P: Platform> Compositor<P> {
             // starts again.
             (Some(playing), Some((id, _))) if playing.id == id => None,
             (_, Some((id, began))) => {
-                // Frames of an earlier play must not show in this one.
+                // Frames of an earlier activation must not show in this
+                // one, but another canvas may still be playing this file.
                 if let Some(inputs) = &self.inputs
                     && let Some((_, slot)) = inputs.all.iter().find(|(slot, _)| *slot == id)
                 {
-                    slot.clear();
+                    slot.clear_if_inactive(&id);
                 }
                 Some(Playing {
                     id,

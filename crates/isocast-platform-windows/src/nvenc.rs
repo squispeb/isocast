@@ -49,10 +49,261 @@ pub struct NvencBudgetOutput {
 #[derive(Debug, Clone)]
 pub struct NvencBudgetPlan {
     pub presets: std::collections::BTreeMap<String, u32>,
+    /// Includes `accounted_load`.
     pub estimated_load: f64,
+    /// Load of already-open accounted sessions this batch runs beside, at
+    /// their fixed actual presets (0 for `plan`).
+    pub accounted_load: f64,
+    /// Accounted open sessions included in `accounted_load`.
+    pub accounted_sessions: usize,
+    /// Earlier-take sessions this batch replaces at a split's cut: they
+    /// still hold sessions, but stop receiving pictures where these start.
+    pub handed_over_sessions: usize,
     pub calibration_key: String,
     pub calibrated: bool,
 }
+
+/// One session this process opened through the platform, with the
+/// configuration its native session was opened and validated with (never
+/// only the requested one). `recording`/`take` are 0 for sessions outside a
+/// recording (live encoders, single writers).
+#[derive(Debug, Clone)]
+pub struct NvencAccounted {
+    /// The engine's per-recording identity: split handover never crosses it.
+    pub recording: u64,
+    pub take: u32,
+    /// Stable role/source of a recording output, e.g. `iso/camera`; no
+    /// display names or path suffixes.
+    pub output: String,
+    pub codec: Codec,
+    pub bit_depth: u8,
+    pub width: u32,
+    pub height: u32,
+    /// For a CQP recording session, its exact fixed rate. For a live
+    /// session, a reserved throughput ceiling, not the SDK's current
+    /// configuration: it only rises (see `NvencAdmission::raise_fps`).
+    pub fps: u32,
+    /// `None` for an MF hardware session: it shares the engine but has no
+    /// NVENC preset, so it cannot be priced and planned work fails closed.
+    pub preset: Option<u32>,
+    /// Opened through native/nvenc.cpp, so counted by `active_sessions`.
+    pub native: bool,
+    /// The native constant QP of an NVENC recording session; `None` for
+    /// bitrate-controlled live sessions and MF sessions, which no CQP
+    /// calibration describes.
+    pub qp: Option<u32>,
+    pub input: PixelFormat,
+    /// Admitted against a priced budget (planned batch or gated open).
+    /// Unpriced (legacy) opens are refused while any planned session lives.
+    pub planned: bool,
+}
+
+impl NvencAccounted {
+    /// The same recording's earlier-take session of an output in this
+    /// batch: the engine's split hands each output's video over at the cut
+    /// (pictures before it go to the old file, from it to the new one, on
+    /// the same writer thread), so only the old file's bounded backlog (its
+    /// writer's pending pictures, NVENC's in-flight pictures and any tail
+    /// repeats) still encodes after the new one starts.
+    pub fn handed_over(
+        &self,
+        recording: u64,
+        take: u32,
+        outputs: &std::collections::BTreeSet<&str>,
+    ) -> bool {
+        recording != 0
+            && self.recording == recording
+            && self.take != 0
+            && self.take < take
+            && outputs.contains(self.output.as_str())
+    }
+}
+
+struct Entry {
+    accounted: NvencAccounted,
+    /// Its owner has begun dropping the encoder: the native session may
+    /// already be closed, so counts are uncertain until the entry goes.
+    closing: bool,
+}
+
+struct Ledger {
+    next: u64,
+    active: std::collections::BTreeMap<u64, Entry>,
+}
+
+static LEDGER: Mutex<Ledger> = parking_lot::const_mutex(Ledger {
+    next: 0,
+    active: std::collections::BTreeMap::new(),
+});
+static ADMISSION: Mutex<()> = parking_lot::const_mutex(());
+
+/// Serializes plan-and-open, and every other platform encoder open, across
+/// this process: two batches can never both plan against an empty ledger.
+/// Hold it from planning until every encoder of the batch is open and
+/// accounted (or released after a partial failure). Releasing a session
+/// takes only the ledger's own lock, never this one.
+pub struct NvencAdmission {
+    _serial: parking_lot::MutexGuard<'static, ()>,
+}
+
+impl NvencAdmission {
+    pub fn begin() -> Self {
+        Self {
+            _serial: ADMISSION.lock(),
+        }
+    }
+
+    /// Account an open session. The owner must drop `NvencClosing` before
+    /// its encoder and `NvencReservation` after it: a session retained by a
+    /// failed close then remains a native-count mismatch, never freed budget.
+    pub fn reserve(&self, accounted: NvencAccounted) -> (NvencClosing, NvencReservation) {
+        let mut ledger = LEDGER.lock();
+        ledger.next += 1;
+        let key = ledger.next;
+        ledger.active.insert(
+            key,
+            Entry {
+                accounted,
+                closing: false,
+            },
+        );
+        (NvencClosing { key }, NvencReservation { key })
+    }
+
+    /// Whether any session admitted against a priced budget is open.
+    pub fn planned_active(&self) -> bool {
+        LEDGER
+            .lock()
+            .active
+            .values()
+            .any(|entry| entry.accounted.planned)
+    }
+
+    /// Every accounted session, when ownership is certain right now: no
+    /// session is closing and the native count equals the accounted native
+    /// sessions. Never waits (admission may run on a recording's
+    /// coordinator): a close in progress is a retryable refusal, a session
+    /// retained without an owner is not.
+    pub fn settled(&self) -> Result<Vec<NvencAccounted>> {
+        Ok(self
+            .settled_keyed()?
+            .into_iter()
+            .map(|(_, accounted)| accounted)
+            .collect())
+    }
+
+    /// `settled`, with each session's ledger key.
+    fn settled_keyed(&self) -> Result<Vec<(u64, NvencAccounted)>> {
+        let (active, closing, native) = {
+            let ledger = LEDGER.lock();
+            (
+                ledger
+                    .active
+                    .iter()
+                    .map(|(key, entry)| (*key, entry.accounted.clone()))
+                    .collect::<Vec<_>>(),
+                ledger.active.values().filter(|entry| entry.closing).count(),
+                // A close must mark its entry under this same lock before
+                // releasing the native session. Sample both counts together
+                // so a concurrent close cannot mask an unaccounted session.
+                NvencEncoder::active_sessions() as usize,
+            )
+        };
+        let accounted = active.iter().filter(|(_, session)| session.native).count();
+        if closing > 0 {
+            bail!(
+                "encoder.budget: encoder resources closing ({closing} session(s) still finishing); retry shortly"
+            );
+        }
+        if native > accounted {
+            bail!(
+                "encoder.budget: {native} NVENC sessions are open but {accounted} are accounted (a session retained by a failed close or quarantine, or opened outside admission); restart the engine before admitting more encoders"
+            );
+        }
+        if native < accounted {
+            bail!(
+                "encoder.budget: encoder resources closing ({native} native NVENC sessions, {accounted} accounted); retry shortly"
+            );
+        }
+        Ok(active)
+    }
+
+    /// Raise one live session's reserved fps ceiling before its native rate
+    /// changes; never lower it. While planned work is open the session is
+    /// repriced at its fixed configuration with the reference figures, its
+    /// new charge replacing (not adding to) its old one, under the same
+    /// exact ownership checks as a batch; refused above 85% or when it
+    /// cannot be priced. Without planned work (or a profile) the ceiling is
+    /// still raised so later batches charge it. Hold this admission through
+    /// the native rate change too.
+    pub fn raise_fps(
+        &self,
+        device: &GraphicsDevice,
+        reservation: &NvencReservation,
+        fps: u32,
+    ) -> Result<()> {
+        let current = LEDGER
+            .lock()
+            .active
+            .get(&reservation.key)
+            .map(|entry| entry.accounted.fps)
+            .context("encoder.budget: this session is no longer accounted")?;
+        if fps <= current {
+            return Ok(());
+        }
+        if self.planned_active() {
+            let profile = NvencBudgetProfile::reference(device).context(
+                "encoder.budget: planned NVENC sessions are open, but this adapter has no profile to price a rate increase",
+            )?;
+            let mut load = 0.0;
+            for (key, mut session) in self.settled_keyed()? {
+                if key == reservation.key {
+                    session.fps = fps;
+                }
+                load += profile.charge(&session)?;
+            }
+            if load > 0.85 {
+                bail!(
+                    "encoder.budget: {fps} fps would put the single-NVENC estimate at {:.0}%, above 85% (reference figures)",
+                    load * 100.0
+                );
+            }
+        }
+        if let Some(entry) = LEDGER.lock().active.get_mut(&reservation.key) {
+            entry.accounted.fps = entry.accounted.fps.max(fps);
+        }
+        Ok(())
+    }
+}
+
+/// Marks its session closing on drop: declare before the encoder.
+pub struct NvencClosing {
+    key: u64,
+}
+
+impl Drop for NvencClosing {
+    fn drop(&mut self) {
+        if let Some(entry) = LEDGER.lock().active.get_mut(&self.key) {
+            entry.closing = true;
+        }
+    }
+}
+
+/// Releases one accounted session on drop: declare after the encoder.
+pub struct NvencReservation {
+    key: u64,
+}
+
+impl Drop for NvencReservation {
+    fn drop(&mut self) {
+        LEDGER.lock().active.remove(&self.key);
+    }
+}
+
+/// The admission constants a calibration cache must have been measured
+/// with; a cache from a different queue policy is not this encoder's.
+pub const NVENC_NATIVE_IN_FLIGHT: usize = IN_FLIGHT;
+pub const NVENC_PENDING_READY_LIMIT: usize = READY_PACKETS;
 
 /// Per-driver throughput in 1080p-equivalent frames/s, for P1/P3/P5.
 /// Reference values are NVIDIA SDK13's *low-latency* single-engine table,
@@ -125,6 +376,119 @@ impl NvencBudgetProfile {
                 "encoder.budget: existing NVENC workload is not included in this batch; plan all outputs before opening any encoder"
             );
         }
+        self.select(outputs, allow_lighter_program, 0.0, 0, 0)
+    }
+
+    /// `plan` beside the sessions already open in this process: each is
+    /// charged at its fixed configuration (never replanned or lowered),
+    /// except the same recording's earlier-take session of an output in this
+    /// batch, which a split's cut hands over. `active` is the snapshot from
+    /// `NvencAdmission::settled` under this same `admission`. Fails closed
+    /// when an open session cannot be priced (MF hardware, 10-bit, a preset
+    /// outside P1/P3/P5).
+    pub fn plan_accounted(
+        &self,
+        device: &GraphicsDevice,
+        _admission: &NvencAdmission,
+        active: &[NvencAccounted],
+        (recording, take): (u64, u32),
+        outputs: &[(NvencBudgetOutput, String)],
+        allow_lighter_program: bool,
+    ) -> Result<NvencBudgetPlan> {
+        if budget_identity(device)?.0 != self.key {
+            bail!("encoder.budget: adapter/driver changed since profiling; replan");
+        }
+        let handover: std::collections::BTreeSet<&str> =
+            outputs.iter().map(|(_, output)| output.as_str()).collect();
+        let (mut fixed, mut sessions, mut handed_over) = (0.0, 0, 0);
+        for session in active {
+            if session.handed_over(recording, take, &handover) {
+                handed_over += 1;
+                continue;
+            }
+            fixed += self.charge(session)?;
+            sessions += 1;
+        }
+        let outputs: Vec<_> = outputs.iter().map(|(output, _)| output.clone()).collect();
+        self.select(
+            &outputs,
+            allow_lighter_program,
+            fixed,
+            sessions,
+            handed_over,
+        )
+    }
+
+    /// Gate one fixed-configuration open (a live encoder or single writer)
+    /// beside every accounted session, before its native session exists.
+    /// Returns the estimated load including it; nothing is reconfigured.
+    pub fn admit_fixed(
+        &self,
+        device: &GraphicsDevice,
+        admission: &NvencAdmission,
+        candidate: &NvencAccounted,
+    ) -> Result<f64> {
+        if budget_identity(device)?.0 != self.key {
+            bail!("encoder.budget: adapter/driver changed since profiling; replan");
+        }
+        let mut load = self.charge(candidate)?;
+        for session in admission.settled()? {
+            load += self.charge(&session)?;
+        }
+        if load > 0.85 {
+            bail!(
+                "encoder.budget: opening {} (P{} fixed) would put the single-NVENC estimate at {:.0}%, above 85%; stop another output first (no running encoder was changed)",
+                candidate.output,
+                candidate.preset.unwrap_or(0),
+                load * 100.0
+            );
+        }
+        Ok(load)
+    }
+
+    /// One session's share of the engine at its fixed configuration.
+    fn charge(&self, session: &NvencAccounted) -> Result<f64> {
+        let name = format!("{}/{}/{}", session.recording, session.take, session.output);
+        let index = match session.preset {
+            Some(1) => 0,
+            Some(3) => 1,
+            Some(5) => 2,
+            Some(preset) => bail!(
+                "encoder.budget.active: session {name} uses P{preset}, which this P1/P3/P5 profile cannot price"
+            ),
+            None => bail!(
+                "encoder.budget.active: session {name} is a Media Foundation hardware encoder without an NVENC preset; it cannot be priced"
+            ),
+        };
+        if session.bit_depth != 8 {
+            bail!(
+                "encoder.budget.active: {}-bit session {name} is not priced by this 8-bit profile",
+                session.bit_depth
+            );
+        }
+        let rates = match session.codec {
+            Codec::H264 => self.h264,
+            Codec::Hevc => self.hevc,
+            _ => {
+                bail!("encoder.budget.active: session {name} has a codec this profile cannot price")
+            }
+        };
+        let pixels = u64::from(session.width)
+            .checked_mul(u64::from(session.height))
+            .and_then(|area| area.checked_mul(u64::from(session.fps)))
+            .context("encoder.budget: pixel-rate overflow")? as f64
+            / (1920.0 * 1080.0);
+        Ok(pixels / rates[index])
+    }
+
+    fn select(
+        &self,
+        outputs: &[NvencBudgetOutput],
+        allow_lighter_program: bool,
+        fixed: f64,
+        accounted_sessions: usize,
+        handed_over_sessions: usize,
+    ) -> Result<NvencBudgetPlan> {
         // A deliberate bound on this planner, not NVIDIA's licensing limit.
         // In particular, the qualified 5070/617.42 admits 12 sessions, not the
         // older SDK note's eight. Native open still validates driver capacity.
@@ -190,11 +554,12 @@ impl NvencBudgetProfile {
                 .map(|output| if output.iso { 1 } else { *program })
                 .collect();
             for next in 0..=isos.len() {
-                let load: f64 = costs
-                    .iter()
-                    .zip(&selected)
-                    .map(|(cost, &preset)| cost[preset])
-                    .sum();
+                let load: f64 = fixed
+                    + costs
+                        .iter()
+                        .zip(&selected)
+                        .map(|(cost, &preset)| cost[preset])
+                        .sum::<f64>();
                 if load <= 0.85 {
                     return Ok(NvencBudgetPlan {
                         presets: outputs
@@ -203,6 +568,9 @@ impl NvencBudgetProfile {
                             .map(|(output, &preset)| (output.id.clone(), [1, 3, 5][preset]))
                             .collect(),
                         estimated_load: load,
+                        accounted_load: fixed,
+                        accounted_sessions,
+                        handed_over_sessions,
                         calibration_key: self.key.clone(),
                         calibrated: self.calibrated,
                     });
@@ -212,9 +580,14 @@ impl NvencBudgetProfile {
                 }
             }
         }
-        bail!(
-            "encoder.budget: requested outputs exceed 85% of the single-NVENC estimate; reduce outputs/resolution/fps or explicitly allow lighter program presets (codec/quality were not changed)"
-        )
+        let message = "encoder.budget: requested outputs exceed 85% of the single-NVENC estimate; reduce outputs/resolution/fps or explicitly allow lighter program presets (codec/quality were not changed)";
+        if accounted_sessions > 0 {
+            bail!(
+                "{message}; {accounted_sessions} already-open accounted session(s) use an estimated {:.0}%, at their fixed presets",
+                fixed * 100.0
+            );
+        }
+        bail!("{message}")
     }
 }
 

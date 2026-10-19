@@ -30,12 +30,12 @@ impl Gpu {
             },
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
+        #[cfg(windows)]
+        let adapter = isocast_client::shared::adapter(&mut crate::daemon::connect()?, &instance)
+            .context("could not select the daemon's preview adapter")?;
+        #[cfg(not(windows))]
         let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: if cfg!(windows) {
-                wgpu::PowerPreference::HighPerformance
-            } else {
-                wgpu::PowerPreference::LowPower
-            },
+            power_preference: wgpu::PowerPreference::LowPower,
             ..Default::default()
         }))
         .context("no GPU found")?;

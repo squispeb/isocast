@@ -13,6 +13,7 @@ pub mod critical;
 pub mod data;
 pub mod doctor;
 pub(crate) mod draw_list;
+pub mod encoder_calibration;
 pub mod estimate;
 pub mod filter;
 pub mod governor;
@@ -49,6 +50,16 @@ use isocast_protocol::devices::{Devices, PermissionKind, PermissionsReport};
 use isocast_protocol::{Canvas, Container, Encoder, SourceKind};
 
 pub use time::Time;
+
+/// The video encoders found by [`Platform::video_encoders`], by name, in
+/// the order a recording tries them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VideoEncoders {
+    /// On a GPU or media engine.
+    pub hardware: Vec<String>,
+    /// On the CPU: where recording falls back to without hardware.
+    pub software: Vec<String>,
+}
 
 /// Audio inside the engine is 48 kHz, 32-bit float, interleaved.
 pub const SAMPLE_RATE: u32 = 48_000;
@@ -92,6 +103,13 @@ pub trait Platform: Clone + Send + Sync + 'static {
     /// A picture in GPU memory other processes can show without copying
     /// (on macOS an IOSurface): monitors in native clients' windows.
     type SharedSurface: Clone + Send + Sync + 'static;
+
+    /// Adapter identity clients must select before opening shared previews.
+    /// Windows returns its capture/compositor LUID (low, high); platforms
+    /// without an explicit adapter-selection contract return None.
+    fn gpu_adapter_luid(&self) -> anyhow::Result<Option<(u32, i32)>> {
+        Ok(None)
+    }
 
     /// Open the installed virtual camera's bounded, IOSurface-backed sink.
     fn virtual_camera_sink(
@@ -171,6 +189,16 @@ pub trait Platform: Clone + Send + Sync + 'static {
 
     /// The chip, memory, OS and hardware encoders.
     fn machine(&self) -> Machine;
+
+    /// The video encoders a recording here would use, looked for in full
+    /// (`doctor`): what `machine` lists, unless finding them is too slow
+    /// for it (Windows opens encoder sessions to know).
+    fn video_encoders(&self) -> VideoEncoders {
+        VideoEncoders {
+            hardware: self.machine().hardware_encoders,
+            software: Vec::new(),
+        }
+    }
 
     /// Find the device a source would record, and the format it would
     /// record in, without opening it. `None` for synthetic sources; an
@@ -311,6 +339,38 @@ pub trait Platform: Clone + Send + Sync + 'static {
     ) -> anyhow::Result<Self::Writer> {
         let _ = frame;
         self.create_writer(spec)
+    }
+
+    /// Create every file of one take together (the whole coalesced
+    /// workload: main and named programs and ISOs), so a platform with a
+    /// shared encoder budget can admit the batch before opening any of it.
+    /// On error nothing of the batch remains open: writers already created
+    /// are cancelled. By default each file is created in order exactly as
+    /// [`Platform::create_writer`] / [`Platform::create_writer_for_frame`],
+    /// waiting for an input's first frame just before its file.
+    fn create_writer_batch(
+        &self,
+        files: &[WriterRequest<'_, Self::Frame>],
+    ) -> anyhow::Result<(Vec<Self::Writer>, Option<EncoderAdmission>)> {
+        let mut writers = Vec::with_capacity(files.len());
+        for file in files {
+            let writer = match file.input {
+                Some(input) => {
+                    input().and_then(|frame| self.create_writer_for_frame(file.spec, &frame))
+                }
+                None => self.create_writer(file.spec),
+            };
+            match writer {
+                Ok(writer) => writers.push(writer),
+                Err(err) => {
+                    writers.into_iter().for_each(FileWriter::cancel);
+                    return Err(
+                        err.context(format!("could not create {}", file.spec.path.display()))
+                    );
+                }
+            }
+        }
+        Ok((writers, None))
     }
 
     /// Finish the file `name` in `folder` that an interrupted recording
@@ -1004,4 +1064,71 @@ pub struct VideoTrackSpec {
 #[derive(Debug, Clone)]
 pub struct AudioTrackSpec {
     pub channels: u32,
+}
+
+/// One file of a batch for [`Platform::create_writer_batch`].
+pub struct WriterRequest<'a, F> {
+    pub spec: &'a WriterSpec,
+    /// The engine's identity for one recording (all its takes), so a split
+    /// is never confused with another recording; never a path or name.
+    pub recording: u64,
+    /// The take the file belongs to, from 1.
+    pub take: u32,
+    /// Stable role and source within a take (`iso/<source>` or
+    /// `program/<source>`): the same output in the next take has the same
+    /// value. Never a display name or path.
+    pub output: String,
+    /// An ISO source's file, not a canvas program (main or named): programs
+    /// keep their priority and are never relabelled as ISOs.
+    pub iso: bool,
+    /// For a file that takes a source's frames as captured: waits for one
+    /// of them (see [`Platform::create_writer_for_frame`]).
+    pub input: Option<&'a dyn Fn() -> anyhow::Result<F>>,
+}
+
+/// How a platform admitted one batch of files against a shared encoder
+/// budget, for the recording's structured diagnostics.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EncoderAdmission {
+    /// `planned` (presets selected before any file opened) or `unplanned`
+    /// (each file opened with its provider's default; see `reason`).
+    pub mode: &'static str,
+    /// Why the batch is unplanned, or why a calibration was not applied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Where the throughput figures came from: `calibrated` or `reference`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<&'static str>,
+    pub calibrated: bool,
+    /// The adapter/driver key the figures belong to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// The calibration cache's path and what became of it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_status: Option<String>,
+    /// Estimated share of the encoder, including already-open sessions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_load: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accounted_load: Option<f64>,
+    pub accounted_sessions: usize,
+    pub handed_over_sessions: usize,
+    pub outputs: Vec<EncoderAdmissionOutput>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EncoderAdmissionOutput {
+    pub take: u32,
+    pub output: String,
+    pub path: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub planned_preset: Option<u32>,
+    /// The preset the native session was opened and validated with (the
+    /// opened configuration, as the SDK accepted it), not an independent
+    /// readback of the running session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied_preset: Option<u32>,
+    pub backend: String,
 }

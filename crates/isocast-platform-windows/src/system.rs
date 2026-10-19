@@ -29,7 +29,7 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::System::IO::IO_STATUS_BLOCK;
 use windows::Win32::System::Ioctl::{FILE_DEVICE_DFS, FILE_DEVICE_NETWORK_FILE_SYSTEM};
-use windows::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW};
+use windows::Win32::System::Registry::{HKEY, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW};
 use windows::Win32::System::SystemInformation::{
     GlobalMemoryStatusEx, MEMORYSTATUSEX, OSVERSIONINFOEXW, OSVERSIONINFOW,
 };
@@ -126,11 +126,17 @@ fn os_version() -> Option<String> {
 /// key for writing. `None` if missing, not a string, too long, or holding
 /// a NUL inside it.
 fn registry_string(subkey: PCWSTR, value: PCWSTR) -> Option<String> {
+    registry_string_in(HKEY_LOCAL_MACHINE, subkey, value)
+}
+
+/// [`registry_string`] under `root` (`HKEY_CURRENT_USER` for this user's
+/// settings).
+pub(crate) fn registry_string_in(root: HKEY, subkey: PCWSTR, value: PCWSTR) -> Option<String> {
     let mut bytes = 0u32;
     // SAFETY: a size query (no buffer) into a live u32.
     let status = unsafe {
         RegGetValueW(
-            HKEY_LOCAL_MACHINE,
+            root,
             subkey,
             value,
             RRF_RT_REG_SZ,
@@ -149,7 +155,7 @@ fn registry_string(subkey: PCWSTR, value: PCWSTR) -> Option<String> {
     // between the calls fails with ERROR_MORE_DATA, and is skipped).
     let status = unsafe {
         RegGetValueW(
-            HKEY_LOCAL_MACHINE,
+            root,
             subkey,
             value,
             RRF_RT_REG_SZ,

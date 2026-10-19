@@ -9,8 +9,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use isocast_protocol::api::{Candidate, Capacity, TunedStream, Tuning, Variant};
+use isocast_protocol::api::{Candidate, Capacity, SkippedSource, TunedStream, Tuning, Variant};
 use isocast_protocol::change::merge_patch;
+use isocast_protocol::platform_text::MACHINE;
 use isocast_protocol::{
     CanvasId, Codec, Encoder, EncoderQuality, PROGRAM, QualityPreset, Setup, SourceKind,
 };
@@ -45,8 +46,10 @@ const MAX_VARIANTS: usize = 8;
 const HOPELESS: f64 = 0.9;
 /// How far frames' windows into the texture shift.
 const TEXTURE_MARGIN: usize = 64;
-/// Distinct frames each stream cycles through.
-const CYCLE: usize = 16;
+/// Distinct frames each stream cycles through. Each one holds a
+/// production permit for the whole benchmark, so this stays under the frame
+/// budget's production reserve (8 per pool), with room for the encoder.
+const CYCLE: usize = 6;
 /// The program file sizes tried, by their short side, when the setup
 /// doesn't fit.
 const PROGRAM_SIDES: [u32; 3] = [1440, 1080, 720];
@@ -89,8 +92,15 @@ pub fn tune<P: Platform>(
         bail!("the setup is not valid:\n  {}", lines.join("\n  "));
     }
     let mut formats = Formats::new();
-    let loads = setup_loads(platform, setup, &mut formats)?;
+    let (loads, skipped) = setup_loads(platform, setup, &mut formats)?;
     if loads.is_empty() {
+        if let Some(first) = skipped.first() {
+            bail!(
+                "source {:?}: could not open it, and nothing else in the setup records video: {}",
+                first.source,
+                first.reason
+            );
+        }
         bail!(
             "the setup records no video: enable recording.program, or list sources in \
              recording.iso.sources"
@@ -102,6 +112,9 @@ pub fn tune<P: Platform>(
     std::fs::create_dir_all(&folder)
         .with_context(|| format!("could not create {}", folder.display()))?;
     let scratch = folder.join(".isocast-tune");
+    // Files an earlier run left behind (it was killed or panicked) would
+    // fail every benchmark that writes to the same name.
+    let _ = std::fs::remove_dir_all(&scratch);
     std::fs::create_dir_all(&scratch)?;
     let tuner = Tuner {
         platform,
@@ -115,6 +128,19 @@ pub fn tune<P: Platform>(
     let result = tuner.run(&loads, &folder);
     let _ = std::fs::remove_dir_all(&scratch);
     let (mut tuning, measured) = result?;
+    // A source that can't be opened (a camera in another mode, unplugged)
+    // doesn't stop the rest from being measured: it is named, with why.
+    for skip in &skipped {
+        tuning.notes.insert(
+            0,
+            format!(
+                "source {:?} couldn't be opened, so its ISO file wasn't measured (the rest \
+                 were; with it the encoders have more to do): {}",
+                skip.source, skip.reason
+            ),
+        );
+    }
+    tuning.skipped = skipped;
     if let Some(path) = memory {
         let fix = tuning.change.as_ref().map(|change| Fix {
             description: tuning.recommendation.clone().unwrap_or_default(),
@@ -220,28 +246,37 @@ fn estimate(loads: &[Load]) -> f64 {
 }
 
 /// ISO sources' formats by id and canvas frame rate (a display or camera
-/// follows the canvas's), so each is probed once.
-type Formats = HashMap<(String, u32), (u32, u32, u32)>;
+/// follows the canvas's), so each is probed once: or why it couldn't be
+/// opened, so it isn't tried again for every change.
+type Formats = HashMap<(String, u32), Result<(u32, u32, u32), String>>;
 
 /// The files' video: each ISO source at its device's format, then the
 /// program at its file's size, then the vertical program (if a vertical
 /// canvas records) at its own.
+/// ISO sources that can't be opened are left out, each with why.
 fn setup_loads<P: Platform>(
     platform: &P,
     setup: &Setup,
     formats: &mut Formats,
-) -> Result<Vec<Load>> {
+) -> Result<(Vec<Load>, Vec<SkippedSource>)> {
     let mut loads = Vec::new();
+    let mut skipped = Vec::new();
     let iso = &setup.recording.iso;
     let ids = if iso.enabled { &iso.sources[..] } else { &[] };
     for id in ids {
         let key = (id.clone(), setup.canvas.fps);
-        let (width, height, fps) = match formats.get(&key) {
-            Some(format) => *format,
-            None => {
-                let format = iso_format(platform, setup, id)?;
-                formats.insert(key, format);
-                format
+        let format = formats
+            .entry(key)
+            .or_insert_with(|| iso_format(platform, setup, id).map_err(|e| format!("{e:#}")))
+            .clone();
+        let (width, height, fps) = match format {
+            Ok(format) => format,
+            Err(reason) => {
+                skipped.push(SkippedSource {
+                    source: id.clone(),
+                    reason,
+                });
+                continue;
             }
         };
         loads.push(Load {
@@ -291,7 +326,7 @@ fn setup_loads<P: Platform>(
             });
         }
     }
-    Ok(loads)
+    Ok((loads, skipped))
 }
 
 /// An ISO source's size and rate: its device's format (or the test
@@ -655,7 +690,7 @@ impl<P: Platform> Tuner<'_, P> {
         let mut notes = Vec::new();
         notes.push(match own.capacity {
             Some(Capacity::Fits) if own.feasible => format!(
-                "this Mac keeps up with the setup: {:.2}× real time on hard content",
+                "this {MACHINE} keeps up with the setup: {:.2}× real time on hard content",
                 own.realtime_factor
             ),
             Some(Capacity::Fits) => format!(
@@ -665,13 +700,13 @@ impl<P: Platform> Tuner<'_, P> {
                 own.reason.as_deref().unwrap_or("doesn't fit the disk")
             ),
             Some(Capacity::NoMargin) => format!(
-                "this Mac keeps up with the setup with no margin: {:.2}× real time on hard \
+                "this {MACHINE} keeps up with the setup with no margin: {:.2}× real time on hard \
                  content, so anything else using the encoders (a stream, a call, an export) may \
                  cost frames",
                 own.realtime_factor
             ),
             Some(Capacity::CannotKeepUp) => format!(
-                "this Mac can't keep up with the setup: the encoders run at {:.2}× real time on \
+                "this {MACHINE} can't keep up with the setup: the encoders run at {:.2}× real time on \
                  hard content, so a recording would drop about {:.0}% of its frames",
                 own.realtime_factor,
                 (1.0 - own.realtime_factor) * 100.0
@@ -714,7 +749,7 @@ impl<P: Platform> Tuner<'_, P> {
                 if variants.len() >= MAX_VARIANTS {
                     break;
                 }
-                let Ok(changed) = setup_loads(self.platform, &change.setup, &mut self.formats)
+                let Ok((changed, _)) = setup_loads(self.platform, &change.setup, &mut self.formats)
                 else {
                     continue;
                 };
@@ -914,6 +949,7 @@ impl<P: Platform> Tuner<'_, P> {
             recommendation: (!recommendation.is_empty()).then_some(recommendation),
             change,
             notes,
+            skipped: Vec::new(),
         };
         Ok((tuning, measured))
     }
@@ -987,8 +1023,23 @@ fn benchmark<P: Platform>(platform: &P, loads: &[Load], scratch: &Path) -> Resul
 /// Encode one stream of moving, hard-to-compress frames of `input` size
 /// (scaled to the file's, if it differs). Returns how long the timed part
 /// took (after the warm-up, until the encoder took its last frame; frames
-/// in flight cancel out at both ends), and the file's size.
+/// in flight cancel out at both ends), and the file's size. A failed stream
+/// removes its file, which would otherwise make the next candidate's fail
+/// with "File exists".
 fn encode_stream<P: Platform>(
+    platform: &P,
+    spec: &WriterSpec,
+    input: (u32, u32),
+    barrier: &Barrier,
+) -> Result<(Duration, u64)> {
+    let result = encode_stream_to(platform, spec, input, barrier);
+    if result.is_err() {
+        let _ = std::fs::remove_file(&spec.path);
+    }
+    result
+}
+
+fn encode_stream_to<P: Platform>(
     platform: &P,
     spec: &WriterSpec,
     input: (u32, u32),

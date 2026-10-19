@@ -91,6 +91,9 @@ impl App {
         mode: Mode,
         canvas: areas::canvas::Canvas,
     ) -> Rc<Self> {
+        window
+            .global::<crate::PlatformText>()
+            .set_windows(cfg!(windows));
         let app = Rc::new(Self {
             window: window.as_weak(),
             tx,
@@ -1251,7 +1254,13 @@ impl App {
                 app.session.borrow_mut().devices = Some(devices);
                 app.changed(Changed::DEVICES);
             }
-            Err(error) => app.failed("Couldn’t list this Mac’s devices", &error),
+            Err(error) => app.failed(
+                isocast_protocol::platform_text::select(
+                    "Couldn’t list this Mac’s devices",
+                    "Couldn’t list this PC’s devices",
+                ),
+                &error,
+            ),
         });
     }
 
@@ -1642,7 +1651,16 @@ impl App {
             "minimize" => window.window().set_minimized(true),
             "fullscreen" => {
                 let w = window.window();
-                w.set_fullscreen(!w.is_fullscreen());
+                let full = !w.is_fullscreen();
+                w.set_fullscreen(full);
+                // Windows: no menu bar in full screen, as F11 full screen
+                // goes there (Windows draws a borderless window's menu bar
+                // unthemed); F11 leaves (ui/app.slint's keys).
+                #[cfg(windows)]
+                if !self.mode.offscreen {
+                    window.set_native_menu(!full);
+                    crate::chrome_windows::style_windows_soon();
+                }
             }
             "zoom" => {
                 let w = window.window();

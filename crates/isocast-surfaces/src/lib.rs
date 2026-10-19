@@ -27,10 +27,10 @@ pub use mac::{Exporter, Surface, fetch, host_now, retained_surfaces};
 
 #[cfg(windows)]
 mod windows;
-#[cfg(all(windows, feature = "wgpu"))]
-pub use windows::check_render_queue;
 #[cfg(windows)]
 pub use windows::{Exporter, Surface, fetch, host_now};
+#[cfg(all(windows, feature = "wgpu"))]
+pub use windows::{check_render_queue, dx12_adapter, dx12_adapter_luid};
 #[cfg(all(windows, feature = "wgpu"))]
 pub use windows::{retire, retirement_failed};
 

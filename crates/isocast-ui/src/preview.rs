@@ -386,8 +386,14 @@ impl Preview {
                 canvas.set_waiting(waiting);
                 canvas.set_picture_error(error.into());
             }
-            Role::Program => canvas.set_program_waiting(waiting),
-            Role::Extra => canvas.set_extra_waiting(waiting),
+            Role::Program => {
+                canvas.set_program_waiting(waiting);
+                canvas.set_program_error("".into());
+            }
+            Role::Extra => {
+                canvas.set_extra_waiting(waiting);
+                canvas.set_extra_error("".into());
+            }
         }
     }
 
@@ -442,6 +448,24 @@ impl Preview {
             self.set_waiting(&app, false, &format!("No picture: {why}"));
         }
         self.stats.last_lost = Some(why);
+    }
+
+    /// This engine can't share its pictures here: say so plainly on the
+    /// monitor, once, instead of a broken picture (it isn't asked again
+    /// until the target changes).
+    pub fn unavailable(&mut self) {
+        self.lost("preview not available".into());
+        let Some(app) = self.app.upgrade() else {
+            return;
+        };
+        let text = "Preview not available\nThis engine can’t show its picture here. Recording \
+                    and streaming aren’t affected.";
+        let canvas = app.global::<CanvasArea>();
+        match self.role {
+            Role::Editor => canvas.set_picture_error(text.into()),
+            Role::Program => canvas.set_program_error(text.into()),
+            Role::Extra => canvas.set_extra_error(text.into()),
+        }
     }
 
     /// The items' boxes (by path) in scene `scene` at setup `revision`:

@@ -159,8 +159,11 @@ fn receive(target: &str, stop: &AtomicBool, newest: &Slot) {
             }
             Ok(())
         });
-        if result.is_ok() {
-            break;
+        // Ended, or this engine can't share pictures here (the preview
+        // stays empty rather than asking every few seconds).
+        match result {
+            Err(error) if !crate::frames::unsupported(&error) => {}
+            _ => break,
         }
         thread::sleep(delay);
         delay = (delay * 2).min(Duration::from_secs(5));

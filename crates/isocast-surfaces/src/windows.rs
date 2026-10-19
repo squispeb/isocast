@@ -37,6 +37,60 @@ const MAX_BYTES: u64 = 512 * 1024 * 1024;
 static BYTES: AtomicU64 = AtomicU64::new(0);
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 
+/// One adapter identity for every native device in this process. The daemon
+/// chooses among wgpu-compatible DX12 adapters, not DXGI's unfiltered first
+/// adapter. Clients supply the daemon's LUID before creating their renderer.
+/// Keep the identity across device loss: switching GPUs would invalidate live
+/// capture devices and other processes' shared allocations.
+#[cfg(feature = "wgpu")]
+pub fn dx12_adapter(
+    instance: &wgpu::Instance,
+    requested: Option<(u32, i32)>,
+) -> Result<wgpu::Adapter> {
+    static ADAPTER: Mutex<Option<(u32, i32)>> = Mutex::new(None);
+    let mut selected = ADAPTER.lock().unwrap();
+    if let (Some(current), Some(requested)) = (*selected, requested) {
+        ensure!(
+            current == requested,
+            "daemon adapter {requested:?} differs from this process's adapter {current:?}; restart the client"
+        );
+    }
+    let adapter = match requested.or(*selected) {
+        Some(luid) => block_on(instance.enumerate_adapters(wgpu::Backends::DX12))
+            .into_iter()
+            .find(|adapter| dx12_adapter_luid(adapter).ok() == Some(luid))
+            .with_context(|| format!("DX12 adapter {luid:?} is unavailable; restart Isocast"))?,
+        None => block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            ..Default::default()
+        }))
+        .context("no compatible DX12 adapter found")?,
+    };
+    *selected = Some(dx12_adapter_luid(&adapter)?);
+    Ok(adapter)
+}
+
+#[cfg(feature = "wgpu")]
+pub fn dx12_adapter_luid(adapter: &wgpu::Adapter) -> Result<(u32, i32)> {
+    let raw = unsafe { adapter.as_hal::<wgpu::hal::api::Dx12>() }
+        .context("Windows graphics require a DX12 adapter")?;
+    let desc = unsafe { raw.raw_adapter().GetDesc2() }?;
+    Ok((desc.AdapterLuid.LowPart, desc.AdapterLuid.HighPart))
+}
+
+/// Native wgpu adapter requests complete synchronously.
+#[cfg(feature = "wgpu")]
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    loop {
+        if let std::task::Poll::Ready(output) = future.as_mut().poll(&mut context) {
+            return output;
+        }
+        std::thread::yield_now();
+    }
+}
+
 struct Handle(#[cfg_attr(not(feature = "wgpu"), allow(dead_code))] Owned<HANDLE>);
 // NT handles are process-owned, not apartment-affine. Arc owns their closure.
 unsafe impl Send for Handle {}

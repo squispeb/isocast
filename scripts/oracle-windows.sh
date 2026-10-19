@@ -13,8 +13,9 @@
 # named pipe with synthetic sources only. Default scenarios: record, iso,
 # split, scenes (test patterns and the tone), win_record (program, ISOs,
 # vertical and square canvases), win_takes (split, pause), win_scenes (cut,
-# fade, slide), oracle_canvases and oracle_masks. What Windows doesn't do yet
-# (previews, streaming, the replay buffer, media files) is PENDING, never a
+# fade, slide), stream, vertical, oracle_canvases and oracle_masks. Stream and
+# vertical use matching canvas/encoder sizes. What Windows doesn't do yet
+# (previews, scaled streaming, the replay buffer, media files) is PENDING, never a
 # pass. Results (report, per-scenario lines, kept failures with contact
 # sheets; ORACLE_WINDOWS_KEEP=--keep keeps everything) come back to
 # $ISOCAST_ORACLE_OUT. Exit 0: no scenario failed (some
@@ -78,7 +79,7 @@ if [ "${1:-}" = --engine ]; then
     [ "$1" = --only ] && [ $# -ge 2 ] || { echo "oracle-windows: --engine [REF] [--only NAME]..." >&2; exit 2; }
     only="$only --only $2"; shift 2
   done
-  [ -n "$only" ] || only=" --only record --only iso --only split --only scenes --only win_record --only win_takes --only win_scenes --only oracle_canvases --only oracle_masks"
+  [ -n "$only" ] || only=" --only record --only iso --only split --only scenes --only win_record --only win_takes --only win_scenes --only stream --only vertical --only oracle_canvases --only oracle_masks"
   sha="$(git rev-parse --verify "$ref^{commit}")" || exit 2
   stamp="$(date +%Y%m%d-%H%M%S)-$$"
   out="${ISOCAST_ORACLE_OUT:-/Volumes/IsocastBuild/oracle-windows/scratch/engine-$stamp}"

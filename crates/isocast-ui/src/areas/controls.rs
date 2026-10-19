@@ -10,6 +10,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use isocast_protocol::api::{Capacity, EngineState, Event, LiveFile, Method, Overload};
+use isocast_protocol::platform_text as wording;
 use isocast_protocol::replay::{ReplaySaved, ReplayState, ReplayStatus};
 use isocast_protocol::stream::{StreamService, StreamState, StreamStatus};
 use isocast_protocol::timeline::{RecordTarget, RecordTargetParams, RecordingInto};
@@ -591,8 +592,8 @@ impl Area for Controls {
                     clips: if arg == "new" { 1 } else { 4 },
                 };
                 let report: isocast_protocol::api::Report = match serde_json::from_value(json!({
-                    "folder": "/Users/you/Movies/Isocast/2026-10-17 19-27-03 Untitled",
-                    "manifest": "/Users/you/Movies/Isocast/2026-10-17 19-27-03 Untitled/2026-10-17 19-27-03.session.json",
+                    "folder": wording::select("/Users/you/Movies/Isocast/2026-10-17 19-27-03 Untitled", r"C:\Users\you\Videos\Isocast\2026-10-17 19-27-03 Untitled"),
+                    "manifest": wording::select("/Users/you/Movies/Isocast/2026-10-17 19-27-03 Untitled/2026-10-17 19-27-03.session.json", r"C:\Users\you\Videos\Isocast\2026-10-17 19-27-03 Untitled\2026-10-17 19-27-03.session.json"),
                     "duration_seconds": 12.0,
                     "files": [],
                 })) {
@@ -669,7 +670,11 @@ impl Area for Controls {
                 "saved" => replay_saved(
                     app,
                     &ReplaySaved {
-                        path: "~/Movies/Isocast/Replay 2026-10-15 14-32-18.mov".into(),
+                        path: wording::select(
+                            "~/Movies/Isocast/Replay 2026-10-15 14-32-18.mov",
+                            "~/Videos/Isocast/Replay 2026-10-15 14-32-18.mov",
+                        )
+                        .into(),
                         seconds: 30.4,
                         frames: 1824,
                         bytes: 46_100_000,
@@ -687,7 +692,10 @@ impl Area for Controls {
                 app.toast(
                     ToastKind::Error,
                     "Couldn’t start recording",
-                    "Not enough free space on Macintosh HD: 3.2 GB free, 20 GB needed.",
+                    wording::select(
+                        "Not enough free space on Macintosh HD: 3.2 GB free, 20 GB needed.",
+                        "Not enough free space on C: 3.2 GB free, 20 GB needed.",
+                    ),
                 );
                 app.toast(
                     ToastKind::Warning,
@@ -697,7 +705,7 @@ impl Area for Controls {
                 app.toast(
                     ToastKind::Success,
                     "Recording saved",
-                    "3 files in ~/Movies/Isocast",
+                    wording::select("3 files in ~/Movies/Isocast", "3 files in ~/Videos/Isocast"),
                 );
                 app.show_toast(
                     Toast::new(ToastKind::Info, "Removed “Intro Clip”", "").action("Undo", |_| {}),
@@ -792,7 +800,7 @@ fn sample_overload(fits: bool) -> Overload {
         protected_dropping: false,
         reason: String::new(),
         estimate: Some(CapacityEstimate {
-            chip: "Apple M2".into(),
+            chip: wording::select("Apple M2", "Sample Windows PC").into(),
             encode_engines: 1,
             engine_pixels_per_second: 8e8,
             basis: "measured".into(),
@@ -1872,13 +1880,7 @@ fn clock(seconds: u64) -> String {
 
 /// A folder as people write it: `~` for the home folder.
 fn home_short(folder: &str) -> String {
-    let home = std::env::var("HOME").unwrap_or_default();
-    match folder.strip_prefix(&home) {
-        Some(rest) if !home.is_empty() && (rest.is_empty() || rest.starts_with('/')) => {
-            format!("~{rest}")
-        }
-        _ => folder.to_string(),
-    }
+    crate::platform::abbreviate_home(folder)
 }
 
 /// A count with digit grouping (22,620).
@@ -2171,7 +2173,14 @@ fn split(app: &Rc<App>) {
     });
 }
 
+/// Show a file or folder in the Finder (File Explorer on Windows).
+#[cfg(windows)]
+fn reveal(path: &str) {
+    crate::platform::reveal(path);
+}
+
 /// Show a file or folder in the Finder.
+#[cfg(not(windows))]
 fn reveal(path: &str) {
     #[cfg(target_os = "macos")]
     let result = std::process::Command::new("/usr/bin/open")
@@ -2697,11 +2706,11 @@ fn sample_vcam(app: &Rc<App>, which: &str) -> anyhow::Result<VirtualCameraStatus
     match which {
         "missing" => {
             status.state = VirtualCameraState::Failed;
-            status.last_error = Some("virtual_camera: Isocast Virtual Camera is not installed/approved; run scripts/vcam-install.sh (a development engine never installs it)".into());
+            status.last_error = Some(wording::select("virtual_camera: Isocast Virtual Camera is not installed/approved; run scripts/vcam-install.sh (a development engine never installs it)", "virtual_camera: Windows virtual camera installation is not available in this build").into());
         }
         "approval" => {
             status.state = VirtualCameraState::Failed;
-            status.last_error = Some("virtual_camera: allow Isocast Virtual Camera in System Settings › General › Login Items & Extensions › Camera Extensions (macOS asks once); it starts as soon as you do".into());
+            status.last_error = Some(wording::select("virtual_camera: allow Isocast Virtual Camera in System Settings › General › Login Items & Extensions › Camera Extensions (macOS asks once); it starts as soon as you do", "virtual_camera: Windows virtual camera installation is not available in this build").into());
         }
         "running" => {
             status.state = VirtualCameraState::Running;
@@ -2886,7 +2895,7 @@ pub fn replay_saved(app: &Rc<App>, saved: &ReplaySaved) {
     let shown = saved.path.clone();
     app.show_toast(
         Toast::new(ToastKind::Success, "Replay saved", message)
-            .action("Show in Finder", move |_| reveal(&shown)),
+            .action(wording::SHOW_IN_FILES, move |_| reveal(&shown)),
     );
 }
 
@@ -2907,9 +2916,10 @@ fn vertical_stream_state(s: &crate::session::Session) -> (bool, bool, Option<&'s
     let problem = if !configured || all_off {
         None
     } else if enabled.is_empty() || enabled.iter().any(|x| !x.key_set) {
-        Some(
+        Some(wording::select(
             "Add the vertical canvas’s stream key. It’s kept in the Keychain, apart from the main canvas’s.",
-        )
+            "Add the vertical canvas’s stream key. It’s kept in the Credential Manager, apart from the main canvas’s.",
+        ))
     } else if enabled.iter().any(|x| x.key_problem.is_some()) {
         Some(
             "The vertical canvas’s saved stream key can’t be read. Settings › Stream says how to fix it.",
@@ -3027,7 +3037,10 @@ fn toggle_stream(app: &Rc<App>) {
         let missing = if s.setup.as_ref().is_some_and(|x| x.stream.is_none()) {
             Some("Choose where to stream first.")
         } else if s.stream.as_ref().is_some_and(|x| !x.key_set) {
-            Some("Add your stream key first. It’s kept in the Keychain, never in the setup.")
+            Some(wording::select(
+                "Add your stream key first. It’s kept in the Keychain, never in the setup.",
+                "Add your stream key first. It’s kept in the Credential Manager, never in the setup.",
+            ))
         } else if s.stream.as_ref().is_some_and(|x| x.key_problem.is_some()) {
             Some("The saved stream key can’t be read. Settings › Stream says how to fix it.")
         } else {
@@ -3165,7 +3178,10 @@ pub(crate) fn governor_words(
         parts.push("kept settings stop it lowering more".to_string());
     }
     Some(if parts.is_empty() {
-        "Automatic quality is watching this Mac’s load".to_string()
+        format!(
+            "Automatic quality is watching this {}’s load",
+            wording::MACHINE
+        )
     } else {
         format!("Automatic quality: {}", parts.join(", "))
     })
@@ -3263,9 +3279,10 @@ fn sample_stream(which: &str) -> anyhow::Result<StreamStatus> {
         "key-problem" => json!({
             "state": "offline", "service": "twitch", "server": "live.twitch.tv",
             "key_set": true,
-            "key_problem": "The saved key was stored by a differently signed copy of this \
+            "key_problem": wording::select("The saved key was stored by a differently signed copy of this \
                 Isocast, and macOS lets only that copy use or replace it. Open Keychain Access, \
-                delete the “dev.isocast.release.stream” item, then paste the key and press Save Key."
+                delete the “dev.isocast.release.stream” item, then paste the key and press Save Key.",
+                "The saved key could not be read from Credential Manager. Open Credential Manager › Windows Credentials and check the Isocast entry, then paste the key and press Save Key.")
         }),
         other => anyhow::bail!(
             "no sample stream {other:?}; one of live, reconnecting, connecting, short, \
@@ -3552,7 +3569,7 @@ fn saved_toast(
                 format!("{}{more} · {files} kept", crate::app::sentence(first)),
             )
             .key("recording-saved")
-            .action("Show in Finder", move |_| reveal(&shown)),
+            .action(wording::SHOW_IN_FILES, move |_| reveal(&shown)),
         );
         return;
     }
@@ -3561,7 +3578,7 @@ fn saved_toast(
         app.show_toast(
             Toast::new(ToastKind::Success, "Recording saved", files)
                 .key("recording-saved")
-                .action("Show in Finder", move |_| reveal(&shown)),
+                .action(wording::SHOW_IN_FILES, move |_| reveal(&shown)),
         );
         return;
     };

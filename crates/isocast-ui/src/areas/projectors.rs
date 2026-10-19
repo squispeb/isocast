@@ -696,6 +696,8 @@ impl Projectors {
         // native window).
         self.place(app, &shown);
         shown.window.show()?;
+        #[cfg(windows)]
+        crate::chrome_windows::style_windows_soon();
         self.watch_window(app, &shown, &id);
         self.shown.borrow_mut().insert(id.clone(), shown.clone());
         // Shown, and where it ended up, once it has settled.
@@ -1150,7 +1152,9 @@ impl Projectors {
                                     arrived.frame = Some(frame);
                                     arrived.lost = None;
                                 }
-                                Incoming::Lost(why) => arrived.lost = Some(why),
+                                Incoming::Lost(why) | Incoming::Unavailable(why) => {
+                                    arrived.lost = Some(why)
+                                }
                             }
                         }
                         if !woken {
