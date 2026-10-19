@@ -5,6 +5,120 @@ each section. Delete entries that stop being true.
 
 ## Environment
 
+- 2026-10-19 (#105, NVENC reconcile): pinned capturee726ff44 merged into
+  writeref80263a with --no-commit; conflicts resolved, A/V tail patch preserved.
+  Capture acknowledged the4native/8pending+ready contract through REPORT.
+  Accepted frames retain their source until the shared completion worker proves
+  the copy query, then unlocks/unmaps output. Rejected attempts wait for query
+  proof before release; proved pre-encode failures drain/close/reopen without
+  adapter poison. Unproved copy/encode/cleanup/deadline failures still quarantine.
+  No rejected frame becomes accepted. Fault replay: e726 safe retention but
+  permanent poison; final candidate safe source release,3/3 prefix,9/9 peer,
+  30/30 reopen; timeout still quarantines. Inline healthy-query wait showed
+  11–15ms stalls and was replaced by worker-side proof:150healthy submits
+  max1.47ms, no>5ms; completions max4.9ms. No global timer/spin/pool change.
+  Native strictClippy/111unit+1doc, Mac250incldoc/1hardwareignore, and7native
+  media contracts pass. Full sources/hashes/raw limits in windows/scratch/
+  w15-nvenc-reconcile/REPORT.md. Merged real A/V take passes56checks:361frames
+  each, endpoint spread247samples/5.146ms (under1024/48k), no trimming/loss.
+  UI idle gate blocked window checks; native shared-frame program/source pixel
+  checks65+65 passed, not a window-render claim. Fresh one-burst WaveXLR proof
+  passes12checks:996.826Hz/−53.48dBFS, A/V−8.333ms,180frames/no gaps or losses,
+  no device/volume changes. w16-merged-av andw13-audible retain evidence.
+  Merge still uncommitted, A/Vtail hunk unstaged; don't replace NVENC wholesale.
+  Next: planner-backed camera-free OBS comparison. Budget API ISOs beginP3,
+  notP5; aggregate writer wiring still needed before claiming planned presets.
+
+- 2026-10-19 (#105, Stop re-review): CLI/app now fall back to blocking Stop
+  only on structured METHOD_NOT_FOUND. Actual old0.0.7daemon a232cc90 stays
+  alive across the mixed-version test: BEFORE reproduces failure40/40; final
+  AFTER43/43 returns real completed Reports and stops both CLI/app takes.
+  Idle Stop still errors. UI keeps finishing/busy through old-server replies;
+  Create/main/status/LCD/footer consistently show Finishing. Actual offscreen
+  image verified, not just source: w14-stop-compat/evidence/sc14-after-6be3d3/
+  out/finishing.png. Native strictClippy/build pass; Mac250incldoc/oneexisting
+  ignore pass. Source/binary/cleanup receipts are in windows/scratch/REPORT.md.
+  All work remains uncommitted. A/V tail writer.rs is a separate qualified
+  change; fresh audible proof is staged but NOT played, OBS/planner deferred.
+
+- 2026-10-18 (#105, Stop ACK ready for CI): additive request_stop returns a
+  StopAccepted snapshot; old RPC Stop/Shutdown and foreground recording still
+  wait for the durable Report. CLI stop now acknowledges, --wait preserves
+  report/error behavior; MCP exposes both. App shows Finalizing, rejects stale
+  status replies and reports finalization errors instead of a success toast.
+  Stopped is enqueued after state update but before releasing/waking Stop or
+  Shutdown; diagnostics stay outside the state lock. Actual20 normal stops,
+  1080p60program+4K60screenISO: ACKp50=0.13425ms,p99=0.1822ms (nearest-rank,
+  observed max, not population-tail guarantee). Durable completion remains
+  31.70–134.59ms. Four edge cases also pass;48files/5266frames fully decode,
+  zero reported loss,881checks. Video-only; A/V tail error remains separate.
+  Native strictClippy/213tests and Mac250incldoc/one hardwareignore pass; ProRes
+  capacity test is green natively. Regular Windows UI build completed16m42s
+  after the earlier combined-run timeout; receipt0d983bb3, UI SHAeb2673ec….
+  Evidence: windows/scratch/w11-stop/REPORT.md and w11-stop-percentiles.json.
+  No claim of cold-CLI/UI latency or observed transient UI state. Uncommitted;
+  audio proof then camera-free OBS comparison remain the next ordered items.
+
+- 2026-10-18 (#105, Windows disk capacity): `space::device` now reads a local
+  volume's GUID + format serial from an opened closest ancestor, following
+  links and refusing dangling/inaccessible targets instead of guessing a disk.
+  Platform free space uses GetDiskFreeSpaceExW caller-available bytes on the
+  handle-derived GUID root; GUID-less shares keep the previous handle query.
+  Windows estimates now use the recorder's USERPROFILE-aware home resolver.
+  Previously failing ProRes capacity test now passes:85/85 native engine tests,
+  strict native Clippy, full Mac gates250 incldoc/one hardwareignore, and native
+  51/51 volume checks +6/6 driver checks. Existing C:/G: identities differ;
+  aliases/Unicode/missing children agree; free space matches WinAPI exactly;
+  HOME-unset synthetic calibration gives Fits only for the matching disk.
+  No settings changes or calibration backfill. UNC/denied mounts not runtime
+  qualified; GUID-less shares stay uncalibrated. Old Windows profiles with no
+  disk identity need fresh calibration. Evidence: windows/scratch/w10-volume/
+  v10-20261018T193825Z-292c5185dc19.driver.json and REPORT.md. Ready for CI,
+  uncommitted; next slice is immediate Stop acknowledgement, then audio/OBS.
+
+- 2026-10-18 (#105, REVIEW-W6 B1): NVENC now retains attempted source leases
+  before its private GPU copy, including failed mapping. Four preallocated
+  EVENT queries prove completion before release/reuse; unprovable copies retain
+  their leases through bounded teardown/quarantine. Rejected attempts never
+  enter accepted-picture accounting. Scratch before/after tests proved pooled
+  early reuse and WGC-helper early Ack on 0c47af4c, neither on the fix; a 5.7s
+  stall verified timeout/Drop quarantine and preserved map + copy errors.
+  Final native media contracts 7/7 and strict all-target Clippy pass. Broad
+  engine tests expose one unchanged Windows ProRes-estimate failure: non-Unix
+  space::device returns None, so unknown disk capacity yields NoMargin rather
+  than the test's Fits. Real A/V take hit the separately observed audio-end
+  finalization issue (159 accepted samples past video end); no audio workaround
+  in B1. Evidence: windows/scratch/w9-nvenc-lifetime/REPORT.md. No production
+  injection hooks, macOS changes, commits or CI launches; tier-1 re-review due.
+  Final video-only daemon take passes37/37: 1080p60program+4K60ISO,361frames
+  each, complete manifest/empty errors/zero reported loss, full decode and
+  owned cleanup. It isolates NVENC; the failed A/V take remains preserved.
+
+- 2026-10-18 (#105, audible-signal proof): explicit WaveXLRrender loopback,
+  neverdefault-LG playback, recordsone0.600s997Hzburst atPCMpeak0.003. Decoded
+  nativeHEVC/AAC3s file has180/180frames/no losses, FFT996.826Hz, −53.48dBFS;
+  audioonset0.875s vsclockedvisual0.900s gives−25ms (declared±40ms). Defaults,
+  mute andglobal/sessionvolume untouched; all152160capturedframes accounted
+  as6024preroll+144000inrange+2136postend. Zero gap/timestamp/writer losses;
+  oneaggregate discontinuity isnotindependentlyattributedperpacket. Native
+  selected-endpoint API proof withsyntheticmarker, NOTselected-output CLI,
+  WGC oracoustic-latencyproof. Production96-samplejitterpolicy preservesall
+  accepted samples; firstdirect-writerprobe failedone-sampleoverlap, second
+  hadgenuine384-framegap, bothretained. Finalcapturethread usesproduction
+  real_time_thread hook; no causalMMCSS-fixclaim fromonepass. Sources/hashes/
+  commands: windows/scratch/w7-audio-proof/corrected-c/REPORT.md. No moretones.
+
+- 2026-10-18 (#105 transport): large Windowslaunch couldstall BEFOREworker/
+  watchdog; lastjob329a4259 hadstagingbutnoactive/result andwasdisarmed.
+  windows-remote.sh now uses a finite newline/base64 ReadLine frame andlocal
+  transporttimeouts, not EOFdependentReadToEnd foritsmainlaunch. Rootcause
+  remainsunproven; wallcapsboundevenpre-shimstalls. Alltimeoutcallsuse
+  --foreground afterreviewcaughtdeferredCtrl-C; localpgrpSIGINTtrap0.302s.
+  Nativeechoexit0, explicitexit1,5sbudgetSleep30exit124/cleanup andfullnative
+  3binbuild pass. Logs/scripts only; no defaultdevices/locks/otherlanes touched.
+  Source/nativebuild b7be2655, signalproof6e5f755b, finaltransportechoac6ac39d.
+  Nativecontractworker refreshedfororacle: SHAbe76331b99fd4d4eb440ee08dbff05d60275070d6836c8317e716b4adbfe9c96,
+  receipt54b9caa3, HEAD0c47af4c+transportonly. OracleownsitsGPU-lockedruntime.
 - 2026-10-18 (#105 W.6 shared previews): Windows uses owner-ACL random named
   DX12 allocations and authenticated one-shot offers, same login session and
   exact adapter LUID only. Register the rendering queue before opening a

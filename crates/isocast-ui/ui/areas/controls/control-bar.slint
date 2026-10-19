@@ -122,7 +122,7 @@ export component ControlBar inherits Rectangle {
                     seconds: ControlsArea.rec-seconds;
                     // Paused: the take's time stands still, and the cell
                     // says so in the warning colour.
-                    label: ControlsArea.paused ? "PAUSED" : "REC";
+                    label: ControlsArea.record-state == "stopping" ? "FINISHING" : ControlsArea.paused ? "PAUSED" : "REC";
                     tone: ControlsArea.paused ? LcdTone.warning : root.recording ? LcdTone.recording : LcdTone.normal;
                     description: ControlsArea.rec-tooltip;
                     Tooltip {
@@ -215,7 +215,7 @@ export component ControlBar inherits Rectangle {
                         kind: TransportKind.record;
                         active: root.recording || ControlsArea.record-state == "starting";
                         enabled: Ui.has-setup && !ControlsArea.busy-record;
-                        label: ControlsArea.record-state == "starting" ? "Starting…" : ControlsArea.record-state == "stopping" ? "Stopping…" : root.recording ? "Stop Recording" : "Start Recording";
+                        label: ControlsArea.record-state == "starting" ? "Starting…" : ControlsArea.record-state == "stopping" ? "Finishing…" : root.recording ? "Stop Recording" : "Start Recording";
                         clicked => { ControlsArea.toggle-record(); }
                     }
                 }

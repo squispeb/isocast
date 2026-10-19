@@ -427,7 +427,10 @@ impl App {
                     crate::areas::controls::replay_saved(self, saved);
                 }
             }
-            Event::Started { .. } => self.refresh_status(true),
+            Event::Started { .. } => {
+                self.session.borrow_mut().record_epoch += 1;
+                self.refresh_status(true);
+            }
             // Plugin-facing context; the app refreshes on `started` and
             // `stopped`.
             Event::TakeFinished { .. }
@@ -533,6 +536,9 @@ impl App {
                 }
             }
             Event::Stopped { error, report, .. } => {
+                // A newer recording may already have started. Only a fresh
+                // status can say whether we're idle now.
+                self.session.borrow_mut().record_epoch += 1;
                 self.refresh_status(true);
                 if let Some(report) = report {
                     self.audio_stops(report);
@@ -1156,10 +1162,23 @@ impl App {
     /// Read the engine's status (`quiet`: no toast if it fails).
     pub fn refresh_status(self: &Rc<Self>, quiet: bool) {
         let asked = crate::clock::now();
+        let epoch = self.session.borrow().record_epoch;
         self.call_as::<Status>(Method::Status, move |app, result| match result {
-            Ok(status) => {
+            Ok(mut status) => {
                 {
                     let mut s = app.session.borrow_mut();
+                    if s.record_epoch != epoch
+                        || s.status_applied_from.is_some_and(|newer| asked < newer)
+                    {
+                        return;
+                    }
+                    s.status_applied_from = Some(asked);
+                    // An older daemon omits finalizing. Its blocking Stop
+                    // fallback still owns this window's busy state until the
+                    // reply; a queued status read must not erase that intent.
+                    if s.busy_record && s.finalizing() {
+                        status.finalizing = true;
+                    }
                     s.running = status
                         .engine
                         .as_ref()

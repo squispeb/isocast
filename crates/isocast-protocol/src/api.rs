@@ -73,6 +73,14 @@ pub enum Method {
     /// Stop recording and finish the files. Returns the session's
     /// [`Report`].
     Stop,
+    /// Ask the running session to stop (or cancel one still starting) and
+    /// answer at once, without waiting for its files to be finished.
+    /// Returns [`StopAccepted`]: an acknowledgement, not a finished
+    /// recording. Until the files are done, `status` says `finalizing`
+    /// and a new `start` is refused; the [`Event::Stopped`] event (and
+    /// `status`'s `last` or `last_error`) then gives the outcome. Asking
+    /// again while finalizing answers the same way; refused when idle.
+    RequestStop,
     /// Split the running recording into a new take at the next whole
     /// second, without stopping any device: the current files end there and
     /// new ones (with their own manifest) begin. Returns the new take's
@@ -1616,6 +1624,21 @@ impl Notification {
     }
 }
 
+/// [`Method::RequestStop`]'s answer: the stop was asked for, nothing more.
+/// The files are still being finished; wait for [`Event::Stopped`] (or a
+/// `status` no longer `finalizing`) to learn whether they were.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct StopAccepted {
+    /// The session asked to stop (this isocastd's own count).
+    pub session_id: u64,
+    /// The session was finishing its files when the request was taken (a
+    /// snapshot: it may have finished since).
+    pub finalizing: bool,
+    /// The files it was writing, as known then (empty while still
+    /// starting); provisional until it has stopped.
+    pub files: Vec<PathBuf>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Started {
     pub files: Vec<PathBuf>,
@@ -1650,6 +1673,14 @@ pub struct LoadWarning {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Status {
     pub state: EngineState,
+    /// A stop has been requested for the running session (or its start
+    /// cancelled) and it hasn't ended yet. This says the request was
+    /// accepted, not where the files were cut or that they are on disk.
+    /// Until it ends, `start`, `pause`, `resume` and `split` are refused;
+    /// then `last` (or `last_error`) and the `stopped` event give the
+    /// outcome.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub finalizing: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub governor: Option<crate::governor::GovernorStatus>,
     /// A compact calibration summary; machine_profile returns the measurements.

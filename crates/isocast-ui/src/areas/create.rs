@@ -751,12 +751,16 @@ impl Create {
 
     fn header_into(&self, app: &Rc<App>, area: &CreateArea) {
         let timeline = self.timeline.borrow();
-        let (state, busy, has_setup) = {
+        let (state, busy, has_setup, finishing) = {
             let s = app.session.borrow();
+            let state = s.status.as_ref().map(|x| x.state);
             (
-                s.status.as_ref().map(|x| x.state),
-                s.busy_record,
+                state,
+                s.record_busy(),
                 s.setup.is_some(),
+                // As the main controls' "stopping": its files are being
+                // finished after a stop (even one asked while starting).
+                s.finalizing() || (state == Some(EngineState::Recording) && s.busy_record),
             )
         };
         let recording = state == Some(EngineState::Recording);
@@ -807,6 +811,10 @@ impl Create {
         );
 
         let (title, detail) = match &*timeline {
+            _ if finishing => (
+                "Finishing…".to_string(),
+                " · waiting for the recording to finish".to_string(),
+            ),
             None => (
                 "No timeline".to_string(),
                 " · takes are recorded but not added to one".to_string(),
@@ -905,7 +913,7 @@ impl Create {
     }
 
     fn retake(&self, app: &Rc<App>) {
-        if self.retake_since.get().is_some() {
+        if self.retake_since.get().is_some() || app.session.borrow().record_busy() {
             return;
         }
         self.retake_since.set(Some(crate::clock::now()));

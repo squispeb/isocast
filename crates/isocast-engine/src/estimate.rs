@@ -866,6 +866,11 @@ fn prores_resources(
             2,
         );
     }
+    // Use the recording path on Windows too: its home normally comes from
+    // USERPROFILE, not HOME. Otherwise a valid volume calibration is ignored.
+    #[cfg(windows)]
+    let folder = Some(crate::record::expand_home(&setup.recording.folder));
+    #[cfg(not(windows))]
     let folder = if let Some(rest) = setup.recording.folder.strip_prefix("~/") {
         std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(rest))
     } else {

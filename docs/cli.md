@@ -179,7 +179,7 @@ Commands:
   record         Record a setup's ISO sources, each to its own file, until --seconds runs out or Ctrl-C. Without a setup file, record --source specs
   start          Start recording in the background (in isocastd, launched if needed) and return once every file is created. Same options as `record`; with neither a setup nor --source, records the live setup. A setup or --source given here becomes the live setup
   record-target  Where the next recording goes, or choose it: `new` (each recording starts a new project with its own timeline; the default) or a timeline's id (its next take). Kept across restarts; a recording running keeps its own
-  stop           Stop the background recording and print its report
+  stop           Ask the background recording to stop and return at once, while isocastd finishes its files (`status` says finalizing until it has; the files aren't done yet). With --wait, wait until they are and print the report. An older daemon without acknowledgement support also waits and returns the completed report
   pause          Pause this take without closing its files; streaming continues
   resume         Resume the paused take into the same files
   status         Show whether isocastd is recording, with live counters
@@ -1452,11 +1452,12 @@ Options:
 ## isocast stop
 
 ```text
-Stop the background recording and print its report
+Ask the background recording to stop and return at once, while isocastd finishes its files (`status` says finalizing until it has; the files aren't done yet). With --wait, wait until they are and print the report. An older daemon without acknowledgement support also waits and returns the completed report
 
 Usage: isocast stop [OPTIONS]
 
 Options:
+      --wait  Wait for the files to be finished and print the report; exits with failure if the recording had errors
       --json  
   -h, --help  Print help
 ```
@@ -2109,7 +2110,7 @@ Every canvas: size, frame rate, scene, recording and streams
 Usage: isocast canvas list [OPTIONS]
 
 Options:
-      --json
+      --json  
   -h, --help  Print help
 ```
 
@@ -2121,7 +2122,7 @@ Add a canvas: `vertical` (the [vertical] canvas) or a new id (lowercase letters,
 Usage: isocast canvas add [OPTIONS] <CANVAS>
 
 Arguments:
-  <CANVAS>
+  <CANVAS>  
 
 Options:
       --name <NAME>                Display label, like "YouTube Shorts"
@@ -2129,7 +2130,7 @@ Options:
       --fps <FPS>                  Its own frame rate (else the main canvas's)
       --follow-main <FOLLOW_MAIN>  Show the main canvas's scene (true) or pick its own (false) [possible values: true, false]
       --record <RECORD>            Record its program with each recording (true or false) [possible values: true, false]
-      --json
+      --json                       
   -h, --help                       Print help
 ```
 
@@ -2141,7 +2142,7 @@ Change a canvas
 Usage: isocast canvas set [OPTIONS] <CANVAS>
 
 Arguments:
-  <CANVAS>
+  <CANVAS>  
 
 Options:
       --name <NAME>                Display label, like "YouTube Shorts"
@@ -2151,7 +2152,7 @@ Options:
       --record <RECORD>            Record its program with each recording (true or false) [possible values: true, false]
       --clear <FIELD>              Reset a field: name, fps (to the main canvas's) or stream (no stream of its own). Repeat for several
       --no-stream                  Shorthand for --clear stream
-      --json
+      --json                       
   -h, --help                       Print help
 ```
 
@@ -2163,10 +2164,10 @@ Remove a canvas with its arrangements, recording and streams (not while it recor
 Usage: isocast canvas remove [OPTIONS] <CANVAS>
 
 Arguments:
-  <CANVAS>
+  <CANVAS>  
 
 Options:
-      --json
+      --json  
   -h, --help  Print help
 ```
 

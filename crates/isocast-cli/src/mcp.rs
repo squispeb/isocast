@@ -2243,6 +2243,26 @@ impl Isocast {
     }
 
     #[tool(
+        description = "Ask the recording to stop and return at once, while the files are \
+                       still being finished. Returns the session id, `finalizing` and the \
+                       files known so far (provisional): not a finished recording. get_status \
+                       says `finalizing` until the files are done (a new recording is refused \
+                       until then); then `last` (or `last_error`) and the `stopped` event give \
+                       the report. Asking again while finalizing returns the same; use \
+                       stop_recording to wait for the report instead.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    async fn request_stop_recording(
+        &self,
+    ) -> Result<Json<isocast_protocol::api::StopAccepted>, String> {
+        self.call(Method::RequestStop).await
+    }
+
+    #[tool(
         description = "Pause the same recording files on a shared video/audio boundary. Streaming continues. Markers land at the paused playhead; resume before split or retake.",
         annotations(
             read_only_hint = false,

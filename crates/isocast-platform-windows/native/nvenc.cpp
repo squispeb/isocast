@@ -43,6 +43,8 @@ struct Resource {
 struct Slot {
     NV_ENC_OUTPUT_PTR buffer = nullptr;
     HANDLE event = nullptr;
+    ID3D11Query *copy = nullptr;
+    bool copying = false;
     bool registered = false, completed = false, locked = false;
     Resource input;
 };
@@ -61,6 +63,9 @@ struct Encoder {
     bool eos_registered = false, submitted = false, flushing = false, flushed = false;
     bool counted = false;
     bool recording = false;
+    // Only a proved rejection before encode (or a clean BUSY unmap) may be
+    // recovered without quarantining the native session.
+    bool rejected = false;
     unsigned head = 0, count = 0;
     char error[512] = {};
     uint8_t headers[4096] = {};
@@ -124,9 +129,49 @@ struct Encoder {
         return 0;
     }
 
+    int copy_ready(Slot &slot) {
+        if (!slot.copying) return 0;
+        BOOL complete = FALSE;
+        HRESULT result = context->GetData(slot.copy, &complete, sizeof(complete),
+                                          D3D11_ASYNC_GETDATA_DONOTFLUSH);
+        if (result == S_OK && complete) {
+            slot.copying = false;
+            return 0;
+        }
+        if (FAILED(result)) {
+            std::snprintf(error, sizeof(error), "complete NVENC GPU input copy: HRESULT 0x%08lx", static_cast<unsigned long>(result));
+            return internal_error;
+        }
+        return again;
+    }
+
+    int wait_copy(uint32_t timeout_ms) {
+        const auto deadline = GetTickCount64() + timeout_ms;
+        // Rejections may also prove preceding accepted copies early. Their
+        // source leases still remain in the pending FIFO until encoded output.
+        for (auto &slot : slots) {
+            while (slot.copying) {
+                int result = copy_ready(slot);
+                if (result != again) {
+                    if (result) return result;
+                    break;
+                }
+                if (GetTickCount64() >= deadline) {
+                    std::snprintf(error, sizeof(error), "NVENC GPU input copy did not finish within %u ms", timeout_ms);
+                    return internal_error;
+                }
+                Sleep(1);
+            }
+        }
+        return 0;
+    }
+
     // Only called with no GPU input outstanding (or before any submission).
     // A caller with a stalled GPU must retain this object, not free its inputs.
     int release() {
+        // An unaccepted copy is still GPU work, even if mapping or EOS failed.
+        int copied = wait_copy(0);
+        if (copied) return copied;
         if (session) {
             for (auto &slot : slots) {
                 int status = unregister(slot.input);
@@ -165,7 +210,10 @@ struct Encoder {
             session = nullptr;
             if (counted) { --sessions; counted = false; }
         }
-        for (auto &slot : slots) if (slot.event) CloseHandle(slot.event);
+        for (auto &slot : slots) {
+            if (slot.copy) slot.copy->Release();
+            if (slot.event) CloseHandle(slot.event);
+        }
         if (eos) CloseHandle(eos);
         if (context) context->Release();
         if (library) FreeLibrary(library);
@@ -357,6 +405,12 @@ struct Encoder {
         for (auto &slot : slots) {
             result = resource(graphics, slot.input);
             if (result) return result;
+            D3D11_QUERY_DESC query = { D3D11_QUERY_EVENT, 0 };
+            HRESULT created = graphics->CreateQuery(&query, &slot.copy);
+            if (FAILED(created)) {
+                std::snprintf(error, sizeof(error), "create NVENC GPU copy query: HRESULT 0x%08lx", static_cast<unsigned long>(created));
+                return internal_error;
+            }
             NV_ENC_CREATE_BITSTREAM_BUFFER output = {};
             output.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
             status = api.nvEncCreateBitstreamBuffer(session, &output);
@@ -399,15 +453,21 @@ const uint8_t *isocast_nvenc_headers(Encoder *encoder, uint32_t *size) {
 // NVENC forbids client access while a resource is mapped. Capture/program
 // frames also feed compositors, monitors and other encoders, so copy on GPU
 // into this encoder's private slot before mapping it. Never map a shared
-// source frame in place. MapInputResource synchronizes preceding D3D11 work.
+// source frame in place. A failed MapInputResource need not synchronize the
+// copy: the caller must retain its source lease until wait_copy succeeds.
 int isocast_nvenc_submit(Encoder *encoder, ID3D11Texture2D *texture, uint64_t pts, uint32_t keyframe) {
-    if (encoder->count == slots_count) return again;
+    encoder->rejected = false;
+    if (encoder->count == slots_count) {
+        encoder->rejected = true;
+        return again;
+    }
     auto &slot = encoder->slots[(encoder->head + encoder->count) % slots_count];
     auto &input = slot.input;
-    if (input.mapped) {
-        std::snprintf(encoder->error, sizeof(encoder->error), "NVENC input slot is still mapped");
+    if (input.mapped || slot.copying) {
+        std::snprintf(encoder->error, sizeof(encoder->error), "NVENC input slot is still mapped or copying");
         return internal_error;
     }
+    encoder->rejected = true;
     D3D11_TEXTURE2D_DESC desc = {};
     texture->GetDesc(&desc);
     if (desc.Width != encoder->init.encodeWidth || desc.Height != encoder->init.encodeHeight
@@ -417,6 +477,8 @@ int isocast_nvenc_submit(Encoder *encoder, ID3D11Texture2D *texture, uint64_t pt
         return internal_error;
     }
     encoder->context->CopyResource(input.texture, texture);
+    encoder->context->End(slot.copy);
+    slot.copying = true;
     encoder->context->Flush();
     NV_ENC_MAP_INPUT_RESOURCE map = {};
     map.version = NV_ENC_MAP_INPUT_RESOURCE_VER;
@@ -437,17 +499,27 @@ int isocast_nvenc_submit(Encoder *encoder, ID3D11Texture2D *texture, uint64_t pt
     picture.completionEvent = slot.event;
     if (keyframe || !encoder->submitted)
         picture.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR | NV_ENC_PIC_FLAG_OUTPUT_SPSPPS;
+    encoder->rejected = false;
     status = encoder->api.nvEncEncodePicture(encoder->session, &picture);
     if (status != NV_ENC_SUCCESS && status != NV_ENC_ERR_NEED_MORE_INPUT) {
         auto unmapped = encoder->api.nvEncUnmapInputResource(encoder->session, input.mapped);
         if (unmapped != NV_ENC_SUCCESS) return encoder->fail("unmap refused input", unmapped);
         input.mapped = nullptr;
+        encoder->rejected = status == NV_ENC_ERR_ENCODER_BUSY;
         return status == NV_ENC_ERR_ENCODER_BUSY ? again : encoder->fail("submit video frame", status);
     }
     slot.completed = false;
     ++encoder->count;
     encoder->submitted = true;
     return 0;
+}
+
+int isocast_nvenc_wait_copy(Encoder *encoder, uint32_t timeout_ms) {
+    return encoder->wait_copy(timeout_ms);
+}
+
+uint32_t isocast_nvenc_rejected(Encoder *encoder) {
+    return encoder->rejected ? 1 : 0;
 }
 
 // Borrowed handles. Only the completion worker consumes these auto-reset
@@ -485,6 +557,10 @@ int isocast_nvenc_lock(Encoder *encoder, Packet *packet) {
     if (!encoder->count) return again;
     auto &slot = encoder->slots[encoder->head];
     if (!slot.completed) return again;
+    // A successful submit keeps its source in Rust's pending FIFO. Prove the
+    // copy here before that lease can retire, without stalling admission.
+    int copied = encoder->copy_ready(slot);
+    if (copied) return copied;
     NV_ENC_LOCK_BITSTREAM output = {};
     output.version = NV_ENC_LOCK_BITSTREAM_VER;
     output.outputBitstream = slot.buffer;

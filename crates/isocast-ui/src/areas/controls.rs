@@ -1005,6 +1005,9 @@ impl Controls {
         let recording = state == Some(EngineState::Recording);
         area.set_record_state(
             match (state, s.busy_record) {
+                // Finishing its files after a stop (even one asked while
+                // it was still starting).
+                (Some(_), _) if s.finalizing() => "stopping",
                 (Some(EngineState::Starting), _) => "starting",
                 (Some(EngineState::Recording), true) => "stopping",
                 (Some(EngineState::Recording), false) => "recording",
@@ -1012,7 +1015,7 @@ impl Controls {
             }
             .into(),
         );
-        area.set_busy_record(s.busy_record);
+        area.set_busy_record(s.record_busy());
         let live = s.status.as_ref().and_then(|x| x.live.as_ref());
         self.recording
             .set(recording.then(|| live.map_or(0.0, |l| l.elapsed_seconds)));
@@ -1049,7 +1052,9 @@ impl Controls {
             SharedString::new()
         });
         area.set_rec_tooltip(
-            if paused {
+            if s.finalizing() || (recording && s.busy_record) {
+                "Finishing recording files. Waiting for the completed outcome.".to_string()
+            } else if paused {
                 format!(
                     "Paused: the take stands at this time, its {} file{} still open. Resume to carry on in the same files.",
                     files.len(),
@@ -1282,6 +1287,15 @@ impl Controls {
         let load_warning = s.status.as_ref().and_then(|s| s.load_warning.as_ref());
         let mut line = if !link.is_empty() && s.status.is_none() {
             link.to_string()
+        } else if s.finalizing() || (recording && s.busy_record) {
+            format!(
+                "Finishing recording files{isos}{}",
+                if streaming {
+                    " · the stream carries on"
+                } else {
+                    ""
+                }
+            )
         } else if recording && live.is_some_and(|l| l.paused) {
             format!(
                 "Paused for {} · the take’s files stay open in {folder}{}",
@@ -2141,6 +2155,9 @@ fn add_marker(app: &Rc<App>, label: &str) {
 }
 
 fn split(app: &Rc<App>) {
+    if app.session.borrow().record_busy() {
+        return;
+    }
     app.call(Method::Split, |app, result| match result {
         Ok(started) => {
             let files = started["files"].as_array().map_or(0, Vec::len);
@@ -2176,15 +2193,23 @@ fn reveal(path: &str) {
 fn toggle_recording(app: &Rc<App>) {
     let recording = {
         let mut s = app.session.borrow_mut();
-        if s.busy_record {
+        if s.record_busy() {
             return;
         }
         s.busy_record = true;
+        // Status reads asked before this say nothing newer.
+        s.record_epoch += 1;
         let recording = s
             .status
             .as_ref()
             .is_some_and(|x| matches!(x.state, EngineState::Recording | EngineState::Starting));
-        if !recording {
+        if recording {
+            // Shown as finalizing at once; only a status read or the
+            // `stopped` event ends it, never the stop's acknowledgement.
+            if let Some(status) = s.status.as_mut() {
+                status.finalizing = true;
+            }
+        } else {
             // Shown as starting at once (the engine may take a moment).
             match s.status.as_mut() {
                 Some(status) => status.state = EngineState::Starting,
@@ -2202,12 +2227,45 @@ fn toggle_recording(app: &Rc<App>) {
         app.refresh_status(true);
     };
     if recording {
-        app.call(Method::Stop, move |app, result| {
+        let epoch = app.session.borrow().record_epoch;
+        let failed = move |app: &Rc<App>, error: &crate::daemon::CallError| {
+            {
+                let mut session = app.session.borrow_mut();
+                if session.record_epoch == epoch
+                    && let Some(status) = session.status.as_mut()
+                {
+                    status.finalizing = false;
+                }
+            }
+            app.failed("Couldn’t stop recording", error);
+        };
+        // Answered at once: the files are still being finished (the
+        // status's `finalizing`) until the `stopped` event.
+        app.call(Method::RequestStop, move |app, result| {
             match result {
                 // The `stopped` event's toast says where it went (#114),
                 // for this window's stop and any other alike.
                 Ok(_) => {}
-                Err(error) => app.failed("Couldn’t stop recording", &error),
+                Err(error) if error.is_unknown_method() => {
+                    // Updates can leave an older engine recording. Only its
+                    // structured capability refusal permits this fallback;
+                    // keep busy/finishing until the completed Report arrives.
+                    app.call_as::<isocast_protocol::api::Report>(
+                        Method::Stop,
+                        move |app, result| {
+                            match result {
+                                Ok(report) if !report.errors.is_empty() => {
+                                    saved_toast(app, &report, None);
+                                }
+                                Ok(_) => {}
+                                Err(error) => failed(app, &error),
+                            }
+                            done(app);
+                        },
+                    );
+                    return;
+                }
+                Err(error) => failed(app, &error),
             }
             done(app);
         });
@@ -2241,7 +2299,7 @@ fn toggle_recording(app: &Rc<App>) {
 /// Pause the recording (its files stay open, a stream carries on) or
 /// resume it.
 fn toggle_pause(app: &Rc<App>) {
-    if app.controls.busy_pause.get() {
+    if app.controls.busy_pause.get() || app.session.borrow().record_busy() {
         return;
     }
     let paused = app
@@ -3479,6 +3537,25 @@ fn saved_toast(
         "{files} file{} in {folder}",
         if files == 1 { "" } else { "s" }
     );
+    // Problems while recording: not "saved" (as `isocast stop` fails on
+    // them). The files it lists were still finished; say where they are.
+    if let Some(first) = report.errors.first() {
+        let more = match report.errors.len() - 1 {
+            0 => String::new(),
+            n => format!(" (and {n} more)"),
+        };
+        let shown = report.manifest.display().to_string();
+        app.show_toast(
+            Toast::new(
+                ToastKind::Error,
+                "The recording had errors",
+                format!("{}{more} · {files} kept", crate::app::sentence(first)),
+            )
+            .key("recording-saved")
+            .action("Show in Finder", move |_| reveal(&shown)),
+        );
+        return;
+    }
     let Some(into) = into.filter(|into| into.takes > 0) else {
         let shown = report.manifest.display().to_string();
         app.show_toast(

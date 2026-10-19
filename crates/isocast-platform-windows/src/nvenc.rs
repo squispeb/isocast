@@ -280,6 +280,8 @@ unsafe extern "C" {
         pts: u64,
         keyframe: u32,
     ) -> i32;
+    fn isocast_nvenc_wait_copy(encoder: *mut c_void, timeout_ms: u32) -> i32;
+    fn isocast_nvenc_rejected(encoder: *mut c_void) -> u32;
     fn isocast_nvenc_wait_event(encoder: *mut c_void, kind: *mut u32) -> *mut c_void;
     fn isocast_nvenc_event_ready(encoder: *mut c_void, kind: u32) -> i32;
     fn isocast_nvenc_lock(encoder: *mut c_void, packet: *mut Packet) -> i32;
@@ -345,8 +347,8 @@ impl Native {
 #[derive(Default)]
 struct State {
     pending: VecDeque<Pending>,
-    // Retain an attempted input even if submission fails with uncertain native
-    // ownership. In particular this must survive a future direct-input path.
+    // An unaccepted attempt still owns its source until the private copy is
+    // proved complete; uncertain failures retain it through quarantine.
     submitting: Option<Pending>,
     ready: VecDeque<Ready>,
     signal: Option<u32>,
@@ -389,6 +391,13 @@ struct Session {
 }
 
 impl Session {
+    fn reject(&self, error: String) {
+        // Ownership is known: report the failed attempt, but let the worker
+        // drain earlier accepted pictures and EOS so this session can close.
+        self.state.lock().failed.get_or_insert(error);
+        self.changed.notify_all();
+    }
+
     fn fail(self: &Arc<Self>, worker: &CompletionWorker, error: String) {
         self.state.lock().failed.get_or_insert(error);
         worker.failed.store(true, Ordering::Release);
@@ -528,7 +537,9 @@ impl CompletionWorker {
             for session in &snapshot {
                 let (signal, output_ready, due) = {
                     let state = session.state.lock();
-                    if state.failed.is_some() || session.detach.load(Ordering::Acquire) {
+                    if session.quarantined.load(Ordering::Acquire)
+                        || session.detach.load(Ordering::Acquire)
+                    {
                         continue;
                     }
                     (state.signal, state.output_ready, state.retry)
@@ -588,7 +599,7 @@ impl CompletionWorker {
                         state.output_ready = false;
                         state.retry = None;
                         match decoded {
-                            Ok(packet) if state.failed.is_none() => {
+                            Ok(packet) if !session.quarantined.load(Ordering::Acquire) => {
                                 state.stats.completed += 1;
                                 state.ready.push_back(Ready {
                                     packet,
@@ -702,7 +713,8 @@ pub struct EncodeStats {
     pub dropped: u64,
     pub in_flight: usize,
     pub ready_packets: usize,
-    /// Time inside the driver submission, including its input synchronization.
+    /// Mapping/submission time; rejected attempts also include copy retirement.
+    /// Accepted pictures prove their copy later on the completion worker.
     pub last_submit_latency: Duration,
     /// Submission to receive, including any delay before the caller polled.
     /// This is not a hardware-only encoder timestamp.
@@ -987,45 +999,79 @@ impl NvencEncoder {
                 u32::from(keyframe),
             )
         };
-        let result = if status == -1 {
-            Ok(())
-        } else {
-            native.check(status)
-        };
-        let mut state = self.session.state.lock();
-        state.stats.last_submit_latency = submitted.elapsed();
-        if result.is_ok() {
+        if status == 0 {
+            // Acceptance already happened. Keep its source in pending until
+            // the worker proves the copy and retires the encoded output.
+            let mut state = self.session.state.lock();
             let pending = state
                 .submitting
                 .take()
                 .expect("reserved before native submission");
-            if status == 0 {
-                state.pending.push_back(pending);
-                state.stats.accepted += 1;
-                self.last_pts = Some(pts);
-            }
+            state.pending.push_back(pending);
+            state.stats.accepted += 1;
+            state.stats.last_submit_latency = submitted.elapsed();
+            self.last_pts = Some(pts);
+            drop(state);
+            drop(native);
+            self.session.changed.notify_all();
+            self.worker.wake.signal();
+            return Ok(true);
         }
-        drop(state);
+        // A rejected attempt has no output-completion event to retire it.
+        // Save its error before waiting for the copy can replace that buffer.
+        let submission = if status == -1 {
+            Ok(())
+        } else {
+            native.check(status)
+        };
+        let rejected = unsafe { isocast_nvenc_rejected(native.raw.as_ptr()) } != 0;
+        let deadline = Instant::now() + FINISH_WAIT;
+        let copied =
+            unsafe { isocast_nvenc_wait_copy(native.raw.as_ptr(), wait_millis(FINISH_WAIT)) };
+        self.session.state.lock().stats.last_submit_latency = submitted.elapsed();
+        let result = match native.check(copied) {
+            Ok(()) => submission,
+            Err(copy_error) => {
+                self.finish_deadline = Some(deadline);
+                match submission {
+                    Ok(()) => Err(copy_error),
+                    Err(error) => Err(anyhow!("{error:#}; additionally, {copy_error:#}")),
+                }
+            }
+        };
+        let result = if copied == 0 && rejected {
+            self.session.state.lock().submitting = None;
+            if let Err(error) = &result {
+                self.session.reject(format!("{error:#}"));
+            }
+            result
+        } else {
+            // Quarantine before releasing the native gate: the worker must
+            // not retire an accepted source whose copy is still unproved.
+            let error = result
+                .err()
+                .unwrap_or_else(|| anyhow!("NVENC submission ownership is uncertain"));
+            self.session.fail(&self.worker, format!("{error:#}"));
+            Err(error)
+        };
         drop(native);
         self.session.changed.notify_all();
         self.worker.wake.signal();
-        if let Err(error) = result {
-            self.session.fail(&self.worker, format!("{error:#}"));
-            return Err(error);
-        }
-        if status == -1 {
-            return Ok(false);
-        }
-        Ok(true)
+        result?;
+        Ok(false)
     }
 
     /// Flush and return every remaining compressed picture, in order. Only a
     /// successful flush permits destroying the input/output GPU resources.
     /// On failure, valid packets remain available through `receive`, followed
     /// by the sticky encoder error once that prefix has been consumed.
+    /// A proved rejection still drains earlier accepted pictures here;
+    /// `receive` may report the error before this final drain has completed.
     pub fn finish(&mut self) -> Result<Vec<EncodedVideo>> {
         if let Err(error) = self.finish_native() {
-            self.session.fail(&self.worker, format!("{error:#}"));
+            if !self.finished {
+                self.session.fail(&self.worker, format!("{error:#}"));
+            }
             return Err(error);
         }
         let mut state = self.session.state.lock();
@@ -1049,10 +1095,13 @@ impl NvencEncoder {
         let mut retry = Instant::now();
         loop {
             let mut state = self.session.state.lock();
-            state.healthy()?;
-            if state.pending.is_empty() && state.flushed {
+            if self.session.quarantined.load(Ordering::Acquire) {
+                state.healthy()?;
+                bail!("NVENC session is quarantined");
+            }
+            if state.pending.is_empty() && (state.flushed || state.stats.accepted == 0) {
                 self.finished = true;
-                return Ok(());
+                return state.healthy();
             }
             if Instant::now() >= deadline {
                 bail!("NVENC did not finish within 5 seconds");

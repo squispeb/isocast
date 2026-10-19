@@ -831,11 +831,17 @@ impl VideoWriter {
             0
         };
         for index in 0..self.audio.len() {
-            if requested_audio_end.is_some_and(|end| self.audio[index].input_frames > end) {
+            // Raw capture can admit a chunk before Stop establishes its cut.
+            // Keep that accepted PCM within the same one-AAC-packet tolerance
+            // as the media contracts, measured from the rounded video end.
+            // This is not encoder padding/priming; those are verified below.
+            let tail = self.audio[index].input_frames.saturating_sub(target);
+            if requested_audio_end.is_some() && tail > audio::BLOCK {
                 note_error(
                     &mut failure,
                     anyhow!(
-                        "audio[{index}].end: precedes accepted input; complete audio is retained, not trimmed"
+                        "audio[{index}].end: precedes accepted input by {tail} sample frames (maximum AAC tail is {}); complete audio is retained, not trimmed",
+                        audio::BLOCK
                     ),
                 );
             }

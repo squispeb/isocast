@@ -11,9 +11,9 @@ use isocast_protocol::api::{
     Applied, ApplyParams, Capacity, CapacityEstimate, CapacityParams, CheckStatus, DoctorParams,
     EngineInfo, EngineState, Event, EventKind, Frame, FrameParams, FramesParams, ImportObsParams,
     Live, Marked, Method, Plan, Refreshed, Report, RpcError, Snapshot, SnapshotParams, SourceRun,
-    StartParams, Started, Status, StreamDestinationParams, StreamDestinations, StreamKey,
-    StreamKeyParams, StreamKeyTarget, StreamStartParams, Streaming, Switched, TuneParams, Tuning,
-    WatchParams,
+    StartParams, Started, Status, StopAccepted, StreamDestinationParams, StreamDestinations,
+    StreamKey, StreamKeyParams, StreamKeyTarget, StreamStartParams, Streaming, Switched,
+    TuneParams, Tuning, WatchParams,
 };
 use isocast_protocol::change::{Change, Difference, DifferenceOp};
 use isocast_protocol::devices::Devices;
@@ -298,8 +298,16 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Stop the background recording and print its report.
+    /// Ask the background recording to stop and return at once, while
+    /// isocastd finishes its files (`status` says finalizing until it has;
+    /// the files aren't done yet). With --wait, wait until they are and
+    /// print the report. An older daemon without acknowledgement support
+    /// also waits and returns the completed report.
     Stop {
+        /// Wait for the files to be finished and print the report; exits
+        /// with failure if the recording had errors.
+        #[arg(long)]
+        wait: bool,
         #[arg(long)]
         json: bool,
     },
@@ -1479,7 +1487,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             json,
         ),
         Command::RecordTarget { target, json } => timeline::record_target(target, json),
-        Command::Stop { json } => stop(json),
+        Command::Stop { wait, json } => stop(wait, json),
         Command::Pause { json } => pause(true, json),
         Command::Resume { json } => pause(false, json),
         Command::Status { json } => status(json),
@@ -2539,39 +2547,72 @@ fn start(
     Ok(ExitCode::SUCCESS)
 }
 
-fn stop(json: bool) -> Result<ExitCode> {
+fn stop(wait: bool, json: bool) -> Result<ExitCode> {
     let Some(mut client) = Client::connect()? else {
         bail!("not recording: isocastd isn't running");
     };
+    if !wait {
+        // Only asked: the files are still being finished.
+        let accepted: Option<StopAccepted> = match client.call(Method::RequestStop) {
+            Ok(accepted) => Some(accepted),
+            Err(err)
+                if err
+                    .downcast_ref::<DaemonError>()
+                    .is_some_and(|err| err.code() == RpcError::METHOD_NOT_FOUND) =>
+            {
+                // The method was not supported, so no stop was accepted. A
+                // transport error is NOT safe to retry this way.
+                isocast_diagnostics::diagnostic!(
+                    "This daemon waits for Stop to finish; requesting the completed report."
+                );
+                None
+            }
+            Err(err) => return Err(not_recording(&mut client, err)),
+        };
+        if let Some(accepted) = accepted {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&accepted)?);
+            } else {
+                println!("Stop requested; finalizing recording.");
+                for file in &accepted.files {
+                    println!("  {}", file.display());
+                }
+            }
+            return Ok(ExitCode::SUCCESS);
+        }
+    }
     let report: Report = match client.call(Method::Stop) {
         Ok(report) => report,
-        Err(err) => {
-            // Not recording: a recording with --seconds stops on its own, so
-            // say how the last one ended. (Other errors are this stop's.)
-            let not_recording = err
-                .downcast_ref::<DaemonError>()
-                .is_some_and(|err| err.code() == RpcError::WRONG_STATE);
-            let status = client
-                .call::<Status>(Method::Status)
-                .ok()
-                .filter(|status| not_recording && status.state == EngineState::Idle);
-            match status {
-                Some(Status {
-                    last_error: Some(error),
-                    ..
-                }) => bail!("{err:#}; the last recording failed: {error}"),
-                Some(Status {
-                    last: Some(last), ..
-                }) => bail!(
-                    "{err:#}; the last recording ({}) is done: {}",
-                    last_summary(&last),
-                    last.manifest.display()
-                ),
-                _ => return Err(err),
-            }
-        }
+        Err(err) => return Err(not_recording(&mut client, err)),
     };
     print_report(&report, json)
+}
+
+/// `stop`'s error `err`, saying how the last recording ended when it was
+/// refused for not recording: a recording with --seconds stops on its own.
+/// (Other errors are this stop's.)
+fn not_recording(client: &mut Client, err: anyhow::Error) -> anyhow::Error {
+    let not_recording = err
+        .downcast_ref::<DaemonError>()
+        .is_some_and(|err| err.code() == RpcError::WRONG_STATE);
+    let status = client
+        .call::<Status>(Method::Status)
+        .ok()
+        .filter(|status| not_recording && status.state == EngineState::Idle);
+    match status {
+        Some(Status {
+            last_error: Some(error),
+            ..
+        }) => anyhow::anyhow!("{err:#}; the last recording failed: {error}"),
+        Some(Status {
+            last: Some(last), ..
+        }) => anyhow::anyhow!(
+            "{err:#}; the last recording ({}) is done: {}",
+            last_summary(&last),
+            last.manifest.display()
+        ),
+        _ => err,
+    }
 }
 
 /// "20.00 s, 3 files, 0 dropped frames" for a finished recording.
@@ -2599,6 +2640,7 @@ fn status(json: bool) -> Result<ExitCode> {
         }
         None => Status {
             state: EngineState::Idle,
+            finalizing: false,
             governor: None,
             machine_profile: None,
             load_warning: None,
@@ -2788,6 +2830,9 @@ fn status(json: bool) -> Result<ExitCode> {
             ),
             (None, None) => println!("Idle"),
         },
+        _ if status.finalizing => {
+            println!("Finalizing: finishing the files; a new recording waits until they're done")
+        }
         (EngineState::Starting, _) => println!("Starting"),
         (EngineState::Recording, None) => println!("Recording"),
         (EngineState::Recording, Some(live)) => {

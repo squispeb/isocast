@@ -47,7 +47,7 @@ cua press_key "{\"pid\":${w#* },\"window_id\":${w% *},\"key\":\"escape\",\"sessi
 # Stop the take.
 sleep 2
 "$isocast" replay stop >/dev/null 2>&1
-"$isocast" stop >/dev/null
+"$isocast" stop --wait >/dev/null
 sleep 2
 
 # A vertical (9:16) canvas, once the take has stopped (it can't be added
