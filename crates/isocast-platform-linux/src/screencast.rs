@@ -316,10 +316,14 @@ fn param_changed(
             fps.to_string()
         }
     );
+    // A variable-rate stream (0/1) is delivered at the take's own rate:
+    // pictures closer than `interval` are dropped. The engine paces by
+    // the rate it is told, so it is told that one, never 0.
+    let asked = (1_000_000_000 / data.interval.as_nanos().max(1)) as u32;
     let _ = data.report.send(Ok(CaptureFormat {
         width,
         height,
-        fps: if fps == 0 { 0 } else { fps },
+        fps: if fps == 0 { asked.max(1) } else { fps },
     }));
 }
 
@@ -486,7 +490,10 @@ fn format_params(fps: u32) -> Result<Vec<u8>> {
                 num: fps.max(1),
                 denom: 1
             },
-            Fraction { num: 1, denom: 1 },
+            // From 0/1: a compositor's screen cast is variable-rate and
+            // says so as 0/1 (XDPH, with a max-framerate beside it); a
+            // range from 1/1 never meets it ("no more input formats").
+            Fraction { num: 0, denom: 1 },
             Fraction {
                 num: fps.max(1) * 4,
                 denom: 1

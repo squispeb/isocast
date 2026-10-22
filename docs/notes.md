@@ -3,6 +3,24 @@
 Short, dated facts a future session needs. Newest entries go at the top of
 each section. Delete entries that stop being true.
 
+## Linux port progress (2026-10-22, L.2 a real desktop take)
+
+- **XDPH's stream is variable-rate:** its EnumFormat says framerate 0/1
+  (with a max-framerate), so a consumer range from 1/1 fails with
+  "no more input formats". The range starts at 0/1 now, and a 0/1
+  stream reports the asked rate (the engine divides by it).
+- **No person at the desk:** the picker can be answered by pointing
+  `custom_picker_binary` in `~/.config/hypr/xdph.conf` at a script that
+  prints `[SELECTION]r/screen:DP-3` (`r` = allow a restore token), then
+  `systemctl --user restart xdg-desktop-portal-hyprland`. Put the file
+  back and restart again afterwards; the token stays in isocastd's
+  secrets file (next to its socket), so a scratch daemon keeps its own.
+- **A sleeping monitor records black:** with DPMS off Hyprland renders
+  nothing, and waking it (`hyprctl dispatch 'hl.dsp.dpms("on")'`, Lua
+  syntax on 0.56) can briefly drop DP-3 for a `FALLBACK` output while
+  the panel relinks. Wait until `hyprctl monitors all` shows DP-3 on
+  for a few seconds, and compare against `grim -o DP-3`.
+
 ## Linux port progress (2026-10-22, L.6b browser page audio)
 
 - **Autoplay:** WebKitGTK keeps a page's `AudioContext` suspended until a

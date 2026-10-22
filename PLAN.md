@@ -2460,6 +2460,17 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
 
 ## Log
 
+- L.2 a real desktop take (2026-10-22): the portal's stream never
+  negotiated ("no more input formats") because the consumer asked for a
+  frame rate from 1/1 while XDPH offers a variable-rate 0/1; the range
+  now starts at 0/1, and such a stream reports the take's own rate to
+  the engine (it divided by 0 and panicked). Verified through the CLI
+  and isocastd (`permissions --request`, then `start`): a 10 s take of
+  DP-3 (2560×1440) plus the C920 composited at 1920×1080: screen
+  300 frames (14 repeated), camera 300 (4), program 300 (0), 0 decode
+  errors; the screen file's mean luma 170.2 equals a grim screenshot's.
+  A monitor asleep (DPMS off) gives black frames: Hyprland renders
+  nothing to share.
 - L.6b browser page audio on Linux (2026-10-22): with the engine's
   audio sink (`control_audio`), a page gets macOS's `audio.js` at
   document start and an `isocastAudio` script-message handler; its

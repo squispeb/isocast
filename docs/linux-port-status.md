@@ -31,8 +31,7 @@ the `PLAN.md` Log and [notes.md](notes.md).
   H.264/AAC encoders feed monitors, the replay buffer and multistream.
   Timeline joins run in-process; obs-websocket, masks, NLE export and
   `.isoprj` projects work.
-- **What doesn't yet:** a verified real desktop take (needs one
-  picker click), the virtual camera,
+- **What doesn't yet:** the virtual camera,
   hotkeys and plugin sandboxing. Editor exports with in points, crops
   or angles, stream destinations with their own size, editor sound and
   machine calibration are refused with a message (section 3). The
@@ -44,7 +43,7 @@ the `PLAN.md` Log and [notes.md](notes.md).
 |---|---|---|---|
 | L.0 Backend skeleton | done | Crate behind `Platform`. ffmpeg-child file writer with one thread per stream (fixes a pipe deadlock). Wgpu/Vulkan importer. JPEG and live monitors in the app. | Program+ISO takes with audio, checked with ffprobe; the deadlock found with gdb and fixed (`d9dfad9`, `ac465a7`). |
 | L.1 Devices, doctor, tune, media | mostly done | `devices` (cameras as capture sees them, Hyprland windows by address), doctor's real hardware encoders and NVENC session cap, media files decoded through ffmpeg. | Real runs on this machine. **Open:** writer exact timestamps and fsynced fragments. |
-| L.2 Screen capture | code complete | xdg-desktop-portal ScreenCast over zbus (`portal.rs`); PipeWire consumer copies frames to BGRA (`screencast.rs`); restore token in the 0600 secrets file. | Handshake and stream exercised. **Open:** one real desktop take (blocked on a picker click). DMA-BUF import is deferred. |
+| L.2 Screen capture | done | xdg-desktop-portal ScreenCast over zbus (`portal.rs`); PipeWire consumer copies frames to BGRA (`screencast.rs`); restore token in the 0600 secrets file. | Handshake and stream exercised. **Open:** one real desktop take (blocked on a picker click). DMA-BUF import is deferred. |
 | L.3 Camera, mic, system and per-app audio | done | V4L2 cameras through ffmpeg (MJPEG/YUYV). Microphones and output monitors over in-process PipeWire. Per-app audio by creating links like `pw-link` does, because WirePlumber refuses capture→playback links. | C920 3 s ISO: 90/90 frames at 30 fps, 0 dropped, live picture by YAVG stats. Audio by raw samples and FFT. |
 | L.4.1–L.4.5 Shared monitor surfaces | done | memfd/descriptor rings in place of Mach ports. The daemon draws rings, the client and app show them. | Release build at 720p30: ~30 fps program viewer, ~38 ms latency, 24–29% of a core, against ~80% for the JPEG poll it replaced. |
 | L.4.6 DMA-BUF zero copy | deferred | — | L.4.5's numbers say the copy is affordable for now. |
