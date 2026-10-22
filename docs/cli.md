@@ -86,6 +86,7 @@ the API and in MCP ([mcp-tools.md](mcp-tools.md)).
 - [`isocast pause`](#isocast-pause)
 - [`isocast resume`](#isocast-resume)
 - [`isocast status`](#isocast-status)
+- [`isocast hello`](#isocast-hello)
 - [`isocast split`](#isocast-split)
 - [`isocast marker`](#isocast-marker)
 - [`isocast refresh`](#isocast-refresh)
@@ -134,6 +135,9 @@ the API and in MCP ([mcp-tools.md](mcp-tools.md)).
   - [`isocast websocket status`](#isocast-websocket-status)
   - [`isocast websocket enable`](#isocast-websocket-enable)
   - [`isocast websocket disable`](#isocast-websocket-disable)
+- [`isocast roots`](#isocast-roots)
+  - [`isocast roots show`](#isocast-roots-show)
+  - [`isocast roots set`](#isocast-roots-set)
 - [`isocast projector`](#isocast-projector)
   - [`isocast projector open`](#isocast-projector-open)
   - [`isocast projector close`](#isocast-projector-close)
@@ -147,6 +151,7 @@ the API and in MCP ([mcp-tools.md](mcp-tools.md)).
   - [`isocast debug on`](#isocast-debug-on)
   - [`isocast debug off`](#isocast-debug-off)
   - [`isocast debug status`](#isocast-debug-status)
+  - [`isocast debug advertise`](#isocast-debug-advertise)
 - [`isocast watch`](#isocast-watch)
 - [`isocast frame`](#isocast-frame)
 - [`isocast frames`](#isocast-frames)
@@ -154,6 +159,7 @@ the API and in MCP ([mcp-tools.md](mcp-tools.md)).
   - [`isocast engine start`](#isocast-engine-start)
   - [`isocast engine stop`](#isocast-engine-stop)
   - [`isocast engine shutdown`](#isocast-engine-shutdown)
+- [`isocast engines`](#isocast-engines)
 - [`isocast mcp`](#isocast-mcp)
 
 ## isocast
@@ -186,6 +192,7 @@ Commands:
   pause          Pause this take without closing its files; streaming continues
   resume         Resume the paused take into the same files
   status         Show whether isocastd is recording, with live counters
+  hello          Show what the engine is: its machine's operating system and name, its identity, build, protocol version and how many methods it offers (all of them with --json)
   split          Split the background recording into a new take at the next whole second, without stopping any device
   marker         Mark this moment in the background recording, with a label
   refresh        Reload a browser source's page in the background recording, bypassing the cache
@@ -209,6 +216,7 @@ Commands:
   canvas         Canvases besides the main one (#84): the vertical canvas and `[[canvases]]`, each with its own size, frame rate, scene (or the main one's), recording and stream destinations
   replay         The replay buffer: keep the last seconds of the program in memory, and save them to a file on demand
   websocket      The obs-websocket v5 server, so OBS tools (Stream Deck, Touch Portal, Streamer.bot, scripts) drive Isocast. Off until enabled
+  roots          The folders other computers can use (remote control and obs-websocket clients): see and, on this machine, choose them
   projector      Projectors: the program, the preview, a scene, a source or a multiview grid, full screen on a display or in a window (the app shows them)
   vcam           Feed a picture to Isocast Virtual Camera (extension approval required once)
   debug          Developer mode, for testing a build locally: verbose logs of every API call and component, and frame timing traces while recording
@@ -216,6 +224,7 @@ Commands:
   frame          Save the live engine's newest frame of the program (the default), studio mode's preview, or a video source as a JPEG. Starts the engine if it isn't running
   frames         Record what a monitor shows: the live engine's low-latency H.264 stream of the program (the default), studio mode's preview or a video source, saved as an H.264 elementary stream (Annex B, which ffprobe and ffplay read). Starts the engine if it isn't running
   engine         Keep the live engine running (`start`), or let it stop once nothing needs it (`stop`). It runs the live setup's sources, program and mix all the time, so recording starts at once; it also runs while recording or while a client shows frames
+  engines        Isocast engines on other computers. For now `--discover` lists the engines advertising on the local network (DNS-SD `_isocast._tcp`, through the system's own responder). What they advertise is unverified until paired
   mcp            Serve the control API to agents over MCP, on stdin and stdout
   help           Print this message or the help of the given subcommand(s)
 
@@ -1472,9 +1481,10 @@ Ask the background recording to stop and return at once, while isocastd finishes
 Usage: isocast stop [OPTIONS]
 
 Options:
-      --wait  Wait for the files to be finished and print the report; exits with failure if the recording had errors
-      --json  
-  -h, --help  Print help
+      --wait               Wait for the files to be finished and print the report; exits with failure if the recording had errors
+      --session <SESSION>  Stop only this recording session (its id, from `isocast record --background --json` or `isocast status --json`): refused if another session is recording now
+      --json               
+  -h, --help               Print help
 ```
 
 ## isocast pause
@@ -1507,6 +1517,18 @@ Options:
 Show whether isocastd is recording, with live counters
 
 Usage: isocast status [OPTIONS]
+
+Options:
+      --json  
+  -h, --help  Print help
+```
+
+## isocast hello
+
+```text
+Show what the engine is: its machine's operating system and name, its identity, build, protocol version and how many methods it offers (all of them with --json)
+
+Usage: isocast hello [OPTIONS]
 
 Options:
       --json  
@@ -2313,6 +2335,50 @@ Options:
   -h, --help  Print help
 ```
 
+## isocast roots
+
+```text
+The folders other computers can use (remote control and obs-websocket clients): see and, on this machine, choose them
+
+Usage: isocast roots <COMMAND>
+
+Commands:
+  show  Show the folders other computers can use: every path a client on another computer (or an obs-websocket client) gives must be inside one, symlinks resolved
+  set   Choose the folders other computers can use, besides this machine's recordings folders and fonts (kept across restarts); --default goes back to Movies or Videos, Pictures, Music, Desktop and Downloads. Only on this machine
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+```
+
+## isocast roots show
+
+```text
+Show the folders other computers can use: every path a client on another computer (or an obs-websocket client) gives must be inside one, symlinks resolved
+
+Usage: isocast roots show [OPTIONS]
+
+Options:
+      --json  
+  -h, --help  Print help
+```
+
+## isocast roots set
+
+```text
+Choose the folders other computers can use, besides this machine's recordings folders and fonts (kept across restarts); --default goes back to Movies or Videos, Pictures, Music, Desktop and Downloads. Only on this machine
+
+Usage: isocast roots set [OPTIONS] [FOLDERS]...
+
+Arguments:
+  [FOLDERS]...  Folders, absolute or ~/...
+
+Options:
+      --default  
+      --json     
+  -h, --help     Print help
+```
+
 ## isocast projector
 
 ```text
@@ -2456,10 +2522,11 @@ Developer mode, for testing a build locally: verbose logs of every API call and 
 Usage: isocast debug <COMMAND>
 
 Commands:
-  on      Turn developer mode on in the current profile: every API call and debug messages logged, and frame timing traced each second while recording, in their own log segments (`isocast logs`). It turns itself off after 24 hours unless --auto-off-hours says otherwise
-  off     Turn developer mode off
-  status  Whether developer mode is on, until when, its logs and the latest trace
-  help    Print this message or the help of the given subcommand(s)
+  on         Turn developer mode on in the current profile: every API call and debug messages logged, and frame timing traced each second while recording, in their own log segments (`isocast logs`). It turns itself off after 24 hours unless --auto-off-hours says otherwise
+  off        Turn developer mode off
+  status     Whether developer mode is on, until when, its logs and the latest trace
+  advertise  Advertise a test engine on the local network until Ctrl-C, so `isocast engines --discover` on another computer has something to find. Development only: nothing listens on the port, and it runs in this process, not the engine
+  help       Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
@@ -2500,6 +2567,22 @@ Usage: isocast debug status [OPTIONS]
 Options:
       --json  
   -h, --help  Print help
+```
+
+## isocast debug advertise
+
+```text
+Advertise a test engine on the local network until Ctrl-C, so `isocast engines --discover` on another computer has something to find. Development only: nothing listens on the port, and it runs in this process, not the engine
+
+Usage: isocast debug advertise [OPTIONS] --name <NAME> --port <PORT>
+
+Options:
+      --name <NAME>        The instance name to advertise
+      --port <PORT>        The TCP port to advertise
+      --id <ID>            The `id` in the TXT record [default: debug]
+      --seconds <SECONDS>  Stop by itself after this many seconds, as Ctrl-C would
+      --json               
+  -h, --help               Print help
 ```
 
 ## isocast watch
@@ -2614,6 +2697,21 @@ Usage: isocast engine shutdown [OPTIONS]
 Options:
       --json  
   -h, --help  Print help
+```
+
+## isocast engines
+
+```text
+Isocast engines on other computers. For now `--discover` lists the engines advertising on the local network (DNS-SD `_isocast._tcp`, through the system's own responder). What they advertise is unverified until paired
+
+Usage: isocast engines [OPTIONS]
+
+Options:
+      --discover           Find engines on the local network
+      --timeout <TIMEOUT>  How long to listen for answers, in seconds (Windows confirms each engine with a fresh query, which can take a few seconds) [default: 5]
+      --watch              With --discover: keep listening and print engines as they appear and go away, until Ctrl-C (JSON lines with --json)
+      --json               
+  -h, --help               Print help
 ```
 
 ## isocast mcp

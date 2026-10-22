@@ -27,6 +27,7 @@ use crate::client::Client;
 mod client;
 mod data;
 mod debug;
+mod engines;
 mod hotkeys;
 mod library;
 mod mcp;
@@ -36,6 +37,7 @@ mod project;
 mod projector;
 mod record;
 mod replay;
+mod roots;
 #[cfg(any(target_os = "macos", windows))]
 mod shared_frames;
 mod timeline;
@@ -316,6 +318,11 @@ enum Command {
         /// with failure if the recording had errors.
         #[arg(long)]
         wait: bool,
+        /// Stop only this recording session (its id, from `isocast record
+        /// --background --json` or `isocast status --json`): refused if
+        /// another session is recording now.
+        #[arg(long)]
+        session: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -331,6 +338,13 @@ enum Command {
     },
     /// Show whether isocastd is recording, with live counters.
     Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show what the engine is: its machine's operating system and name,
+    /// its identity, build, protocol version and how many methods it
+    /// offers (all of them with --json).
+    Hello {
         #[arg(long)]
         json: bool,
     },
@@ -669,6 +683,12 @@ enum Command {
         #[command(subcommand)]
         command: websocket::Command,
     },
+    /// The folders other computers can use (remote control and
+    /// obs-websocket clients): see and, on this machine, choose them.
+    Roots {
+        #[command(subcommand)]
+        command: roots::Command,
+    },
     /// Projectors: the program, the preview, a scene, a source or a
     /// multiview grid, full screen on a display or in a window (the app
     /// shows them).
@@ -790,6 +810,25 @@ enum Command {
         #[command(subcommand)]
         command: EngineCommand,
         #[arg(long, global = true)]
+        json: bool,
+    },
+    /// Isocast engines on other computers. For now `--discover` lists the
+    /// engines advertising on the local network (DNS-SD `_isocast._tcp`,
+    /// through the system's own responder). What they advertise is
+    /// unverified until paired.
+    Engines {
+        /// Find engines on the local network.
+        #[arg(long)]
+        discover: bool,
+        /// How long to listen for answers, in seconds (Windows confirms
+        /// each engine with a fresh query, which can take a few seconds).
+        #[arg(long, default_value_t = 5.0)]
+        timeout: f64,
+        /// With --discover: keep listening and print engines as they
+        /// appear and go away, until Ctrl-C (JSON lines with --json).
+        #[arg(long)]
+        watch: bool,
+        #[arg(long)]
         json: bool,
     },
     /// Serve the control API to agents over MCP, on stdin and stdout.
@@ -1121,6 +1160,7 @@ impl KeyTargetArgs {
             service: self.service,
             server: self.server,
             canvas,
+            revision: None,
         }
     }
 }
@@ -1565,10 +1605,15 @@ fn run(cli: Cli) -> Result<ExitCode> {
             json,
         ),
         Command::RecordTarget { target, json } => timeline::record_target(target, json),
-        Command::Stop { wait, json } => stop(wait, json),
+        Command::Stop {
+            wait,
+            session,
+            json,
+        } => stop(wait, session, json),
         Command::Pause { json } => pause(true, json),
         Command::Resume { json } => pause(false, json),
         Command::Status { json } => status(json),
+        Command::Hello { json } => hello(json),
         Command::Get {
             resolved,
             canvas,
@@ -1836,7 +1881,17 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Command::Projector { command } => projector::run(command),
         Command::Replay { command } => replay::run(command),
         Command::Websocket { command } => websocket::run(command),
+        Command::Roots { command } => roots::run(command),
         Command::Debug { command } => debug::run(command),
+        Command::Engines {
+            discover,
+            timeout,
+            watch,
+            json,
+        } => match watch {
+            true => engines::watch(discover, json),
+            false => engines::run(discover, timeout, json),
+        },
         Command::Canvas { command } => {
             use isocast_protocol::api::Canvases;
             let mut client = Client::connect_or_launch()?;
@@ -2010,6 +2065,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     println!("{}", serde_json::to_string_pretty(&changed)?);
                 } else {
                     print_destinations(&changed.destinations);
+                    for note in &changed.notes {
+                        println!("note: {note}");
+                    }
                 }
                 Ok(ExitCode::SUCCESS)
             }
@@ -2628,13 +2686,17 @@ fn start(
     Ok(ExitCode::SUCCESS)
 }
 
-fn stop(wait: bool, json: bool) -> Result<ExitCode> {
+fn stop(wait: bool, session: Option<String>, json: bool) -> Result<ExitCode> {
     let Some(mut client) = Client::connect()? else {
         bail!("not recording: isocastd isn't running");
     };
+    let params = session.map(|session| isocast_protocol::api::StopParams {
+        session: Some(session),
+    });
     if !wait {
         // Only asked: the files are still being finished.
-        let accepted: Option<StopAccepted> = match client.call(Method::RequestStop) {
+        let accepted: Option<StopAccepted> = match client.call(Method::RequestStop(params.clone()))
+        {
             Ok(accepted) => Some(accepted),
             Err(err)
                 if err
@@ -2662,7 +2724,7 @@ fn stop(wait: bool, json: bool) -> Result<ExitCode> {
             return Ok(ExitCode::SUCCESS);
         }
     }
-    let report: Report = match client.call(Method::Stop) {
+    let report: Report = match client.call(Method::Stop(params)) {
         Ok(report) => report,
         Err(err) => return Err(not_recording(&mut client, err)),
     };
@@ -2712,6 +2774,31 @@ fn last_summary(report: &Report) -> String {
     text
 }
 
+fn hello(json: bool) -> Result<ExitCode> {
+    let hello: isocast_protocol::hello::Hello = Client::connect_or_launch()?.call(Method::Hello)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&hello)?);
+        return Ok(ExitCode::SUCCESS);
+    }
+    let os = serde_json::to_value(hello.os)?;
+    println!("{} ({})", hello.name, os.as_str().unwrap_or("unknown"));
+    let build = &hello.build;
+    println!(
+        "  isocastd {} ({} build, commit {}), protocol {}",
+        build.version,
+        serde_json::to_value(build.provenance)?
+            .as_str()
+            .unwrap_or("unknown"),
+        build.commit,
+        hello.protocol
+    );
+    if let Some(id) = &hello.engine_id {
+        println!("  engine id {id}");
+    }
+    println!("  {} methods", hello.capabilities.len());
+    Ok(ExitCode::SUCCESS)
+}
+
 fn status(json: bool) -> Result<ExitCode> {
     let status = match Client::connect()? {
         Some(mut client) => {
@@ -2727,6 +2814,7 @@ fn status(json: bool) -> Result<ExitCode> {
             load_warning: None,
             scene: None,
             preview: None,
+            session: None,
             live: None,
             files: Vec::new(),
             last: None,
@@ -4150,7 +4238,10 @@ fn watch(levels: bool, kinds: &[String], except: &[String], json: bool) -> Resul
             continue;
         }
         match event {
-            Event::SetupChanged { revision } => println!("setup changed: revision {revision}"),
+            Event::SetupChanged { revision, by } => println!(
+                "setup changed: revision {revision}{}",
+                by.map(|by| format!(" (by {by})")).unwrap_or_default()
+            ),
             Event::Started {
                 files,
                 begins_at,
@@ -4193,7 +4284,7 @@ fn watch(levels: bool, kinds: &[String], except: &[String], json: bool) -> Resul
                 recording.elapsed_seconds,
                 recording.paused_seconds
             ),
-            Event::Stream { stream } => {
+            Event::Stream { stream, .. } => {
                 print!("stream: ");
                 print_stream_lines(&stream);
             }
@@ -4452,6 +4543,14 @@ fn watch(levels: bool, kinds: &[String], except: &[String], json: bool) -> Resul
             Event::RecordTarget { target } => {
                 println!("next recording: {}", timeline::target_words(&target))
             }
+            Event::Refused {
+                method,
+                message,
+                by,
+            } => println!(
+                "refused {method}{}: {message}",
+                by.map(|by| format!(" from {by}")).unwrap_or_default()
+            ),
         }
     }
     // Events end only when isocastd hangs up; a watcher must not mistake

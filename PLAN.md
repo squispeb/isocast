@@ -2042,6 +2042,41 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
   - [ ] **W.5p Windows performance capture/encoder lane (#105).** Follow
     main's docs/windows-performance.md; all changes remain uncommitted until
     coordinator handoff. No silent codec/quality substitutions.
+    - [x] **UI DX12 heap sizing (2026-10-19).** Windows UI uses wgpu's
+      MemoryUsage allocator hint, keeping preview size/rate unchanged.
+      Matched n=3 main/candidate cohorts: private commit1513.85→1335.06MiB
+      at1080,1755.75→1574.85MiB at4K; resident memory essentially unchanged.
+      No CPU-speedup claim.48files fully decode, native zero losses;
+      Windows oracle9pass/2partial-pending, zero losses; UI strict Clippy,
+      fmt and13tests pass. Ready for CI, uncommitted; broader UI CPU open.
+    - [x] **Windows adapter scheduling hooks (2026-10-19).** Cached deadline
+      clock from first tick; Audio MMCSS for capture/AAC/mixer, AboveNormal
+      video workers, recording-scoped power guard with warning-only failure.
+      Native strict Clippy/85engine tests, reviewed; matched native n=3 at
+      both sizes and Windows oracle zero losses. CPU not improved consistently
+      (1080higher,4Klower); performance target remains open. Ready for CI,
+      uncommitted. Win11 power-policy runtime proof remains outstanding.
+    - [x] **DX12 descriptor heaps (2026-10-22).** UI/compositor request65,536
+      live non-sampler bindings instead of1million. Quick paired measurements
+      cut another~55MiB private commit; resident memory unchanged. Reviewed;
+      final matched n=3 and Windows oracle zero losses, strict native Clippy
+      and188tests pass. Ready for CI, uncommitted; not a CPU/RAM-goal win.
+    - [x] **First-packet status (2026-10-22).** Optional output_active marks
+      an actual muxed video fragment, not raw admission. Early publication
+      lowers observed all-active median1162→473ms(1080),1188→502ms(4K),n=3;
+      no claim of accelerated encoding or fsync. Same API for all clients,
+      unknown backends omit it. Reviewed, native checks/oracle pass; ready
+      for CI, uncommitted. Full CPU/preview parity remains open.
+    - [x] **Native48k microphone de-jitter (2026-10-22).** Continuous device
+      positions exposed short QPC spikes causing ISO silence/trim. Five-sample
+      warmed phase median removes the exercised3ISO gaps; corrected4spikes in
+      an80s4K take with0output losses. Microphone only; SRC/loopback/startup and
+      real gaps retain prior timing. Six inline tests/native Clippy pass;
+      final n=3/oracle and portable gates pass with documented partial cases.
+      Ready for CI, uncommitted. Hardware proof preceded microphone-only scope
+      narrowing (same mic path); historical QPC fatal/long soaks unqualified.
+      Final Native CPU26.227/24.279 vsOBS18.356/17.726%onecore at1080/4K;
+      resident299.204/375.903 vs216.044/276.175MiB. Overall goals remain open.
     - [ ] **#1 Aggregate encoder budget.** Native preset/driver-keyed planning
       API and explicit no-provider-fallback factory implemented/reviewed.
       Real2x4K60+1080p60,30swarm+60smeasure: H264P56938/10800 at100%NVENC;
@@ -2198,6 +2233,46 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
   Record loss and full-decode/A/V results; distinguish hosted qualification
   from the real camera/mic/display/GPU/permissions/signing checks still
   needed. Hand Ryan the checklist and one install command for his machine.
+
+### R. Remote engines: any app on any engine (Ryan, 2026-10-22)
+
+Scope: macOS ↔ Windows, Linux later. The design, decisions and done
+conditions are in [docs/remote-engines.md](docs/remote-engines.md); read
+it before any R task. Transport, pairing and remote Start/Stop are
+Tier 1. A remote library (other engines' recordings and projects) is
+future work, outside R. Order follows Windows quality work (W) unless Ryan reorders.
+
+- [ ] **R1 Foundation:** `isocast-remote` (rustls mutual TLS 1.3, raw
+  public keys, no resumption), `Stream` enum with a duplex TLS driver,
+  keepalive and timeouts, engine identity and `hello`, code + SPAKE2
+  pairing opened only locally, client identities (no bearer tokens),
+  caller-origin policy (machine control stays local, obs-websocket
+  included), OS DNS-SD, accept limits, recording session ids, stream-key
+  clearing, attribution, `--engine` for CLI and MCP, loopback mode in the
+  gates. Done when each OS's CLI records on the other OS's engine,
+  survives a pulled network, and a revoked client is cut off.
+  - [x] **R1.d Discovery seam:** `isocast-discovery` (`register`,
+    `browse`, `watch`) over Bonjour and Windows `DnsService*`, TXT only
+    `id`/`proto`/`name`, `NSBonjourServices` in the bundles,
+    `isocast engines --discover [--watch]` and `isocast debug advertise`.
+    The transport lane calls `register` from `remote_enable`.
+- [ ] **R2 App on a remote engine:** Settings → Remote (two switches, off
+  by default, standalone like OBS), engine picker and pairing, the
+  `Engine` handle (local-only flows gated), presence, connection states,
+  wording by the engine's OS, remote permissions, engine file pickers
+  (rooted, listing only), projector ownership, JPEG interim previews.
+- [ ] **R3 Pictures:** shared, capped preview encoders on a size ladder,
+  frames skipped before encoding (viewer-paced), hardware decode into the
+  preview renderer, governor sheds previews first.
+- [ ] **R4 Sound:** monitoring on the app's speakers via Opus, in sync with
+  previews.
+- [ ] **R5 Input:** hotkeys scoped to the engine machine or the app.
+- [ ] **R6 Host mode:** engine at login without the app, updating the
+  other side on a version mismatch.
+- [ ] **R7 Hardening:** security review, fuzzing the pre-auth surface,
+  impairment matrix, user docs.
+- [ ] **R-L Linux (later):** Linux app (decoder, packaging), then the Linux
+  engine backend (PipeWire, V4L2, VAAPI/NVENC).
 
 ### 9. Later (pull into the queue once the above is done)
 
@@ -5752,3 +5827,10 @@ One line per finished task, newest last.
   overlap, two native cases1.58s. No exact presentation/before-after claim.
   Native build/strict Clippy, portable250 tests, oracle7pass/2pending and
   900/900-frame resize/app-kill recording proof pass. Ready for CI; uncommitted.
+- R1.d (2026-10-22): engines advertise and are found through the OS's own
+  DNS-SD (`isocast-discovery`: Bonjour on macOS, `DnsService*` on Windows,
+  unsupported elsewhere); `isocast engines --discover [--watch] [--json]`,
+  `isocast debug advertise`. Verified basebook ↔ exon-desk both ways with
+  exonbook observing: right addresses and port, found in 0.5–2 s, lost
+  within ~1 s of Ctrl-C, kill -9 (Mac) and Stop-Process (Windows); name
+  conflicts renamed on both; no Isocast UDP 5353 rule on Windows.

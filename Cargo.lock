@@ -3089,6 +3089,7 @@ dependencies = [
  "ctrlc",
  "isocast-client",
  "isocast-diagnostics",
+ "isocast-discovery",
  "isocast-engine",
  "isocast-protocol",
  "isocast-surfaces",
@@ -3100,7 +3101,7 @@ dependencies = [
  "tokio",
  "toml",
  "wgpu",
- "windows 0.62.2",
+ "windows",
 ]
 
 [[package]]
@@ -3156,6 +3157,16 @@ dependencies = [
  "serde_json",
  "sha2",
  "zip",
+]
+
+[[package]]
+name = "isocast-discovery"
+version = "0.0.8"
+dependencies = [
+ "anyhow",
+ "isocast-diagnostics",
+ "libc",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

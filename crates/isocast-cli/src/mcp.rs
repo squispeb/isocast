@@ -282,6 +282,15 @@ struct ClearPreviewParams {
     canvas: CanvasId,
 }
 
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct StopRecordingParams {
+    /// Stop only this recording session (`session` from start_recording
+    /// or get_status): refused if another session is recording now, so a
+    /// retried stop never ends a recording someone else started since.
+    /// Any session if absent.
+    session: Option<String>,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 struct TakeParams {
     /// How the preview scene comes on air; its transition (else the
@@ -1474,6 +1483,48 @@ impl Isocast {
     }
 
     #[tool(
+        description = "What this engine is: its machine's operating system (macos, windows, \
+                       linux) and name, its identity (once it has one for remote control), \
+                       its build (version, build, commit), the protocol version and every \
+                       method it offers.",
+        annotations(read_only_hint = true, idempotent_hint = true)
+    )]
+    async fn engine_hello(&self) -> Result<Json<isocast_protocol::hello::Hello>, String> {
+        self.call(Method::Hello).await
+    }
+
+    #[tool(
+        description = "The folders other computers can use: every path a client on another \
+                       computer or an obs-websocket client gives (recording folders, exports, \
+                       images, text and browser files, OBS imports) must be inside one, \
+                       symlinks resolved. Chosen folders (or the defaults: Movies/Videos, \
+                       Pictures, Music, Desktop, Downloads), this machine's recordings \
+                       folders, and fonts (read only).",
+        annotations(read_only_hint = true, idempotent_hint = true)
+    )]
+    async fn folder_roots(&self) -> Result<Json<isocast_protocol::roots::FolderRoots>, String> {
+        self.call(Method::FolderRoots).await
+    }
+
+    #[tool(
+        description = "Choose the folders other computers can use (kept across restarts), or \
+                       leave out `folders` for the defaults. Only on the engine's own machine.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn folder_roots_set(
+        &self,
+        Parameters(Strict(params)): Parameters<
+            Strict<isocast_protocol::roots::FolderRootsSetParams>,
+        >,
+    ) -> Result<Json<isocast_protocol::roots::FolderRoots>, String> {
+        self.call(Method::FolderRootsSet(params)).await
+    }
+
+    #[tool(
         description = wording::description("Turn on the obs-websocket v5 server (off by default; kept across \
                        restarts), optionally setting port (4455), bind (127.0.0.1, this Mac \
                        only; 0.0.0.0 for every network), password (kept in the Keychain) or \
@@ -1632,6 +1683,7 @@ impl Isocast {
                 service: params.service,
                 server: params.server,
                 canvas: params.canvas,
+                revision: None,
             },
         })))
         .await
@@ -1655,6 +1707,7 @@ impl Isocast {
             service: params.service,
             server: params.server,
             canvas: params.canvas,
+            revision: None,
         })))
         .await
     }
@@ -2272,8 +2325,16 @@ impl Isocast {
             idempotent_hint = false
         )
     )]
-    async fn stop_recording(&self) -> Result<Json<Report>, String> {
-        self.call(Method::Stop).await
+    async fn stop_recording(
+        &self,
+        Parameters(Strict(params)): Parameters<Strict<StopRecordingParams>>,
+    ) -> Result<Json<Report>, String> {
+        self.call(Method::Stop(params.session.map(|session| {
+            isocast_protocol::api::StopParams {
+                session: Some(session),
+            }
+        })))
+        .await
     }
 
     #[tool(
@@ -2292,8 +2353,14 @@ impl Isocast {
     )]
     async fn request_stop_recording(
         &self,
+        Parameters(Strict(params)): Parameters<Strict<StopRecordingParams>>,
     ) -> Result<Json<isocast_protocol::api::StopAccepted>, String> {
-        self.call(Method::RequestStop).await
+        self.call(Method::RequestStop(params.session.map(|session| {
+            isocast_protocol::api::StopParams {
+                session: Some(session),
+            }
+        })))
+        .await
     }
 
     #[tool(
