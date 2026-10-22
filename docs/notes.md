@@ -3,6 +3,70 @@
 Short, dated facts a future session needs. Newest entries go at the top of
 each section. Delete entries that stop being true.
 
+## Linux port progress (2026-10-22, L.5.1 the live H.264 encoder)
+
+- **Design** (`crates/isocast-platform-linux/src/stream.rs`): the worker
+  thread owns the `AVCodecContext`; `encode()` clones the `LinuxFrame`
+  onto a bounded `sync_channel(8)` (monitors drop when full, streams
+  poll-try_send every 20 ms up to 400 ms then drop); the `Session`
+  opens lazily on the first encode because pix_fmt follows the pool
+  kind (program canvas `FrameKind::Ycbcr8` → NV12, sources
+  `FrameKind::Bgra` → BGRA; both verified against
+  `avcodec_get_supported_config`); `time_base` 1/1e9 so pts are engine
+  nanoseconds; max_b_frames=0 (S.2c finding); gop_size = the spec's
+  keyframe_interval as a backstop (streams and monitors ask for their
+  own keyframes); rc_max_rate = bit_rate with a 1 s rc_buffer;
+  monitors open p1/ull/vbr, streams p4/hq/cbr-when-constant-bitrate-
+  else-vbr; Rec. 709 video-range tags on context and frames. New
+  dependency `ffmpeg-sys-next = "9.0.1"` (default-features false,
+  feature avcodec; avutil symbols come along), dynamic link to system
+  libavcodec 63 (FFmpeg n9) keeps LGPL fine.
+- **Packet format (probe-verified on this machine):** nvenc emits Annex
+  B (00 00 00 01) with SPS inline on the first keyframe, empty
+  extradata at open, dts == pts with no B-frames, and nanosecond pts
+  pass through untouched. `convert_packet` therefore splits Annex B
+  NALs and re-prefixes each with a 4-byte big-endian length (the
+  `EncodedVideo.data` contract, AVC file layout) and extracts bare
+  SPS (type 7) / PPS (type 8) payloads into `parameter_sets`
+  keyframe-side — matching `isocast-engine/src/stream/flv.rs`'s
+  `avc_decoder_configuration`, which reads sps[1..3] directly.
+- **The bug that made rapid back-to-back `frames` runs return 0 frames
+  (two causes, the second subtle):** (1) `LiveH264Encoder::drop` joined
+  the worker while the struct's own job sender still lived, so a
+  worker parked in `recv` never saw disconnect and the run thread
+  would wedge forever — fix: `jobs: Option`, `take()` before `join`.
+  (2) **nvenc's `forced-idr` defaults to false**: a monitor joining
+  mid-stream asks the engine for a keyframe, the engine writes
+  AV_PICTURE_TYPE_I, and nvenc turns that into a *non-IDR* I frame
+  with no AV_PKT_FLAG_KEY and no inline SPS/PPS — deliver() never
+  syncs the joiner, the CLI records nothing, and attaching runs fail
+  while runs that start their own session (natural first-frame IDR)
+  succeed. Diagnosis how: `ISOCAST_DEBUG_FRAMES`-style eprintln tracing
+  added in `frame_stream.rs` (run/deliver/watch), read out of the
+  daemon's native log; the stamps printed `swap -> keyframe true` on
+  every loop with every returned packet `key Some(false)`. Fix:
+  open with the `forced-idr=1` codec option. **Engine-side takeaway for
+  macOS:** any encoder whose "force keyframe" isn't a real IDR breaks
+  every mid-stream join.
+- **H.264 monitor CPU row (debug daemon, resolves L.4.5's missing H.264
+  leg):** `frames pattern` with the H.264 encoder holds 29.4 fps,
+  ~66 ms lateness, **~5% of one core** on the daemon pair — hardware
+  encode is far cheaper than the shared-surface path's 21–29% and ages
+  below the JPEG poll's ~80%. Re-measure release for a comparable
+  number with S.1b.
+- **`ffmpeg -h encoder=h264_nvenc` is the local ground truth for
+  options** of this FFmpeg build (n9.0.1); `forced-idr` is a boolean
+  default false, `p1..p7`/`ull`/`vbr|cbr` confirmed there too.
+- **Set_rate at runtime** only refreshes ctx fields (bit_rate,
+  rc_max_rate, framerate); whether driver nvenc applies it without a
+  session recreate is unverified — bench it when streams land (L.5.2).
+- **On Linux, `scripts/sign-dev.sh` is a no-op** (no
+  ISOCAST_SIGN_IDENTITY; the macOS grants flow does not apply) — the
+  daemon runs from `target/debug/isocastd` directly; `isocast restart`
+  is enough after a rebuild. Ignore the script's failure here.
+- **`h264_nvenc` prints its own av_log chatter into the daemon's native
+  log** (captured stderr), also on session-open failures; harmless.
+
 ## Linux port progress (2026-10-16, L.4.5 the machine's rows)
 
 - **All rows below are release builds** (`cargo build --release -p

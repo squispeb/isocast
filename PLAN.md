@@ -797,6 +797,18 @@ step live in `docs/notes.md`'s "Linux port WIP" section.
   API) for streams and monitors with the full `VideoEncoder`
   contract (per-frame keyframes, `set_rate`); timeline exports
   through FFmpeg's edit-list-safe concat (the join.rs findings).
+  - [x] **L.5.1 The live H.264 encoder** (`LiveH264Encoder` through the
+    system's libavcodec, `h264_nvenc`, linked in-process so `receive`
+    can hand each frame out the moment it's done): no B-frames,
+    per-frame keyframes, `set_rate` keeping the session, monitors
+    discarding at the in-flight limit. Done when `isocast frames
+    <target>` works on Linux and its elementary stream answers ffprobe
+    correctly (codec, size, rate, timestamps).
+  - [ ] **L.5.2 The live AAC encoder** (`LiveAacEncoder`, libavcodec's
+    AAC-LC), verified through a stream.
+  - [ ] **L.5.3 Joins on Linux** (timeline exports; the join.rs
+    findings: each part fills exactly its clip's length, edit-list
+    entries to skip encoder priming at the joins).
 - [ ] **L.6 Browser sources (WPE WebKit or WebKitGTK), virtual
   camera (v4l2loopback), hotkeys (GlobalShortcuts portal or Hyprland
   binds), plugin sandboxing (SO_PEERCRED + Landlock)** and the S.1
@@ -1601,6 +1613,40 @@ Shipped (v1): 7.1, 7.2, 7.4a, 7.5, 7.6. Next, in order:
 - FilmCraft reads `session.json` to line up ISO files without audio sync.
 
 ## Log
+
+- L.5.1 the live H.264 encoder on Linux (2026-10-22): `LiveH264Encoder`
+  in `isocast-platform-linux` (system libavcodec 63, `h264_nvenc`,
+  dynamic LGPL-safe link through `ffmpeg-sys-next 9.0.1`,
+  default-features off + avcodec) behind the portable `VideoEncoder`
+  contract, plus the H.264 monitor leg live: a worker thread owns the
+  `AVCodecContext`, `encode` frames clone onto a bounded in-flight
+  queue (monitors drop past 8, stall 400 ms then drop), pix_fmt
+  follows the pool kind (canvas NV12, sources BGRA, checked against
+  `avcodec_get_supported_config`), pts are engine nanoseconds
+  (`time_base` 1/1e9), no B-frames, Rec. 709 video-range tags, monitors
+  open with preset p1/tune ull/vbr, streams p4/hq/cbr-when-constant.
+  nvenc packets are Annex B with SPS inline on keyframes and empty
+  extradata (probe-verified); `convert_packet` splits NALs and
+  re-prefixes AVC 4-byte lengths, extracting bare SPS/PPS for the
+  decoder configuration the engine's `avc_decoder_configuration`
+  expects. Verified: `isocast frames pattern/program --seconds N` (BGRA
+  and NV12 paths) writes streams ffprobe calls h264 1280x720 that
+  decode with zero errors, pattern content checked numerically
+  (mean 74.7, std 69.6), one keyframe in a 22 s run at the 60 s backstop
+  and 29.8 fps sustained; the old JPEG-monitor CPU row resolved: the
+  H.264 monitor holds 29.4 fps at ~5% of a core in debug while the
+  shared-surface path is 21-29%. Two engine bugs found on the way
+  (both matter beyond Linux):
+  `LiveH264Encoder::drop` used to join its worker while the encoder's
+  own job-sender was still alive, so a teardown blocked on `recv`
+  forever and each run left a stuck monitor thread until the daemon
+  gave up on its socket - fixed by taking the sender before the join;
+  and nvenc's `forced-idr` defaults to false, so a monitor joining
+  mid-stream got trick I frames without the key flag (or SPS/PPS),
+  could never sync, and rapid back-to-back `frames` runs alternated
+  with "0 frames" - fixed by opening sessions with `forced-idr=1`.
+  Verified back-to-back: six 1-s pattern runs then five mixed
+  pattern/program runs all save 24-28 frames, no threads linger.
 
 - L.4.5 the rows on this machine (2026-10-16): measured with a release
   daemon and release CLI viewers (the earlier debug-build numbers would
