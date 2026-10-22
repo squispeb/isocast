@@ -30,6 +30,7 @@ use isocast_protocol::devices::{Devices, PermissionKind, PermissionsReport};
 use isocast_protocol::{Canvas, Codec, SourceKind};
 
 pub(crate) mod audio;
+pub(crate) mod browser;
 pub(crate) mod camera;
 pub(crate) mod frames;
 pub(crate) mod gpu;
@@ -72,6 +73,8 @@ enum Running {
     /// A microphone, an output's monitor or an app's own streams
     /// (audio.rs).
     Audio { _audio: audio::AudioCapture },
+    /// A web page rendered by WebKitGTK (browser.rs, L.6a).
+    Browser { _page: browser::BrowserCapture },
 }
 
 impl Platform for LinuxPlatform {
@@ -425,21 +428,27 @@ impl Platform for LinuxPlatform {
         )
     }
 
-    /// Browser pages are L.6 (WebKitGTK or WPE).
+    /// L.6a: a web page rendered by WebKitGTK in an offscreen window
+    /// and snapshotted into BGRA frames (browser.rs); page audio is
+    /// L.6b, and a page asked for it is told so.
     fn capture_browser(
         &self,
-        _page: &isocast_engine::BrowserPage<'_>,
-        _video: VideoSink<Self::Frame>,
-        _audio: Option<AudioSink>,
+        page: &isocast_engine::BrowserPage<'_>,
+        video: VideoSink<Self::Frame>,
+        audio: Option<AudioSink>,
     ) -> Result<(
         Self::Capture,
         CaptureFormat,
         Arc<dyn isocast_engine::BrowserControl>,
     )> {
-        bail!(
-            "browser sources are not implemented on Linux yet: they arrive at L.6 of \
-             docs/port-omarchy.md (WebKitGTK or WPE)."
-        )
+        let (capture, format, control) = browser::capture_browser(page, video, audio)?;
+        Ok((
+            Capture {
+                _running: Running::Browser { _page: capture },
+            },
+            format,
+            control,
+        ))
     }
 
     /// L.3: one app's own sound, by linking a capture to the streams the

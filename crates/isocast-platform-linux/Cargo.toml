@@ -46,3 +46,15 @@ wgpu = { version = "=30.0.1", default-features = false, features = [
 # libav's LGPL fine) so `receive` can hand every frame out the moment
 # it is done, which a pipe cannot honour.
 ffmpeg-sys-next = { version = "9.0.1", default-features = false, features = ["avcodec", "avformat", "swresample"] }
+# Browser sources (L.6): a web page rendered by WebKitGTK offscreen
+# (the page's WebKit lives on one dedicated GTK main-loop thread). The
+# `v2_40` feature matches the installed libwebkit2gtk-4.1 (GTK3,
+# libsoup3; up-to-date version on this distro). Its crate's generation
+# is the gtk-rs 0.18 one, so the `gtk` dependency matches webkit2gtk's
+# own.
+webkit2gtk = { version = "2.0.2", features = ["v2_40"] }
+gtk = "0.18"
+# gdk and cairo for WebKit's answers' types (its snapshot is a cairo
+# surface, and the background color speaks gdk RGBA).
+gdk = "0.18"
+cairo-rs = "0.18"

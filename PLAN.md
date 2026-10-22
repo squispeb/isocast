@@ -826,6 +826,33 @@ step live in `docs/notes.md`'s "Linux port WIP" section.
   camera (v4l2loopback), hotkeys (GlobalShortcuts portal or Hyprland
   binds), plugin sandboxing (SO_PEERCRED + Landlock)** and the S.1
   benchmark rows for Linux (an obs-bench port is its own task).
+  - [x] **L.6a Browser sources on Linux: WebKitGTK pages into frames**
+    (an offscreen `WebKitWebView` in a `GtkOffscreenWindow` on one
+    dedicated GTK main-loop thread, `webkit_web_view_snapshot` on a
+    timer at the source's frame rate, the cairo ARGB32 surface into BGRA
+    `Frame`s in the `VideoSink`, transparent where the page is; file and
+    http pages - both verified; the transparent-page composite check
+    gets its real take at L.6d. A capture with an audio sink refused
+    until L.6b, with the task named).
+  - [ ] **L.6b Browser sources on Linux: page audio** (the macOS
+    `audio.js` routing injected as a user script, its base64 posts
+    through the `WebKitUserContentManager` message handler onto the
+    `AudioSink`, stereo at 48 kHz against the host clock).
+  - [ ] **L.6c Browser sources on Linux: `BrowserControl`** (reload,
+    unload/load, tear-down over the GTK thread; the same semantics
+    macOS's pages have).
+  - [ ] **L.6d Browser sources on Linux verified through a real take**
+    (`isocast frames`/a recorded take with a static page checked
+    numerically, then a live page).
+  - [ ] **L.6e Virtual camera (v4l2loopback)** (frames pushed into a
+    loopback device for other apps to read; needs the
+    `v4l2loopback` kernel module, which is not installed - root, one
+    time: waiting on Ryan, see docs/notes.md).
+  - [ ] **L.6f Hotkeys on Linux** (omarchy: Hyprland `bind` IPC, with
+    the global-shortcuts portal as the portable fallback).
+  - [ ] **L.6g Plugin sandboxing (SO_PEERCRED + Landlock)** (plugins
+    run unsandboxed today; their pid from the socket, landlock rules
+    from the manifest).
 
 Continuity Camera (Ryan's iPhone) stays macOS-only; his Linux setup
 uses the UVC camera.
@@ -1627,6 +1654,27 @@ Shipped (v1): 7.1, 7.2, 7.4a, 7.5, 7.6. Next, in order:
 
 ## Log
 
+- L.6a browser sources on Linux (2026-10-22): `browser.rs` in
+  `isocast-platform-linux`: a WebKitGTK `WebView` in a
+  `GtkOffscreenWindow` on one shared GTK main-loop thread (first
+  browser source boots it, later ones share its context; jobs posted
+  with `MainContext::invoke`), snapshotted every frame period into the
+  engine's BGRA pool with straight alpha (cairo premultiplied ARGB32
+  unpremultiplied; WebKit answers in device pixels, so a scaled
+  display's 2× snapshot is nearest-neighbour sampled down). `Linux
+  Platform::capture_browser` wired (was a bail); `Capture` grew a
+  `Running::Browser` arm; pages asked for audio refused with the L.6b
+  task named. `BrowserControl::refresh`/`set_loaded` over the GTK
+  thread work (unload leaves one empty frame), tear-down removes the
+  page and destroys its timer source through the page's own main
+  context (g_source_remove looks only in the global default context).
+  Verified numerically twice, in-process (`record`) and through
+  `isocastd` (`start`/`stop`): a static page (red body, green 100×100
+  square) recorded at 640×480/30 for 2-3 s: 60/90 frames at 30 fps, 0
+  dropped; pixels red body / green corner with the boundary exactly at
+  row/col 100 (RGB (234,0,3)/(20,253,9) - the compositor's
+  limited-range YUV round trip; frame delta ~0.001, max 6, so static
+  true); the same page over http:// matches the file:// take exactly.
 - L.5.3 joins on Linux (2026-10-22): `join.rs` in
   `isocast-platform-linux`, mirrors of macOS's join: parts of mov/mp4
   joined in-process with libavformat/libavcodec, no concat demuxer.

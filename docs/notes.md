@@ -3,6 +3,55 @@
 Short, dated facts a future session needs. Newest entries go at the top of
 each section. Delete entries that stop being true.
 
+## Linux port progress (2026-10-22, L.6a browser sources on Linux)
+
+- **The WebKitGTK page thread** (`crates/isocast-platform-linux/src/browser.rs`):
+  one thread does `gtk::init()` + a `glib::MainLoop` over its own
+  `MainContext`, held thread-default for its whole life via
+  `context.with_thread_default(...)` (the scope never pops; the loop
+  runs on). Jobs go through `MainContext::invoke`. First browser source
+  boots the thread and others share the leaked `'static` context
+  (double-checked with a `Mutex<Option<&'static MainContext>>`).
+- **glib 0.18's `timeout_add_local` does NOT use the thread-default
+  context** - it attaches to the global default (`MainContext::default()`)
+  regardless of the thread it is called on, so a timer built there never
+  fires on the page thread's loop. Use `glib::timeout_source_new(...).attach(Some(&ctx))`
+  instead. That constructor's closure is `Send`-bound, which reshaped
+  the state: `Arc`/`AtomicBool` (a `Cell` is not `Sync`) and no WebKit
+  object captured in the closure - the timer looks its page up by id in
+  the thread-local `PAGES` map at each tick (same single thread runs
+  both).
+- **`SourceId::remove` is wrong for non-global contexts**: it calls
+  `g_source_remove`, which searches the global default context and
+  answers `GLib-CRITICAL: Source ID N was not found` while the source
+  keeps ticking forever. Destroy through the page's own context:
+  `context.find_source_by_id(&id).map(|s| s.destroy())` (the context is
+  kept in `Page` for `Drop`).
+- **WebKitGTK refuses to snapshot an unshown view**: with the
+  `WebView` added to a `GtkOffscreenWindow` but not shown, every
+  snapshot answers `There was an error creating the snapshot` (page
+  loads fine; `WEBKIT_DISABLE_DMABUF_RENDERER` and
+  `WEBKIT_DISABLE_COMPOSITING_MODE` changed nothing). `window.show_all()`
+  must be called - and that is enough; the GTK offscreen window never
+  reaches the screen. Neither WebKit env knob is needed.
+- **Snapshots arrive at the GTK scale factor in device pixels** (a
+  640×480 page on the 2×-scaled display came back 1280×960 ARGB32,
+  premultiplied); `draw` nearest-neighbour samples down to the source's
+  size, then unpremultiplies (same rewrite as macOS's draw).
+- **Verified L.6a** both in-process (`isocast record`, which runs in the
+  CLI process, not isocastd - look for its own stderr/log file, the
+  `-native-` relay journal belongs to isocastd only) and under the
+  daemon (`isocast start`/`stop` after a daemon restart - a stale
+  daemon binary answers with black frames). Static red page with a
+  green 100×100 corner: 60/90 frames at 30 fps, 0 dropped, boundary
+  exactly at row/col 100; recorded RGB (234,0,3) for pure red and
+  (20,253,9) for pure green is the pipeline's limited-range YUV round
+  trip (seen in earlier L.2/L.5 takes too). Frame-to-frame mean abs
+  diff 0.001 (max 6): the static page really is static. A page over
+  `http://127.0.0.1:8123/...` decodes identically to the `file://` one.
+  Scratch: `target/scratch/l6/` (red.html, browser.toml,
+  browser-url.toml, not committed).
+
 ## Linux port progress (2026-10-22, L.5.3 joins on Linux)
 
 - **Joins run in-process with libavformat/libavcodec**
@@ -1228,6 +1277,13 @@ isocast-platform-linux gpu` once the modules exist.
 
 ## Waiting on Ryan
 
+- 2026-10-22 (L.6e virtual camera): the `v4l2loopback` kernel module is
+  not installed on this machine. The virtual camera needs it once, as
+  root: `sudo pacman -S v4l2loopback-dkms && sudo modprobe
+  v4l2loopback devices=1 video_nr=10 card_label="Isocast Camera" &&
+  sudo tee /etc/modules-load.d/isocast-v4l2loopback.conf <<< v4l2loopback`
+  (module auto-load on boot). Retry with
+  `lsmod | grep v4l2loopback`; L.6e can start once it answers.
 - 2026-10-16 (L.2's one real take): the desktop's screen-sharing picker
   needs one click from Ryan, and that is the last step of L.2. A
   source's open is engine-bounded to 8 s (`bounded_open`), which is not
