@@ -17,7 +17,8 @@ use std::time::Duration;
 use anyhow::{Result, anyhow, bail};
 use ffmpeg_sys_next as av;
 use isocast_engine::{
-    AudioEncoder, EncodedVideo, LiveAudioSpec, LiveVideoSpec, ParameterSets, Time, VideoEncoder,
+    AudioEncoder, EncodedVideo, LiveAudioSpec, LiveVideoSpec, ParameterSets, SAMPLE_RATE, Time,
+    VideoEncoder,
 };
 
 use crate::frames::{FrameKind, LinuxFrame};
@@ -650,30 +651,214 @@ unsafe fn convert_packet(packet: *const av::AVPacket) -> Option<EncodedVideo> {
     }
 }
 
-/// A real-time AAC-LC encoder, for streaming: L.5.2's task.
-pub enum LiveAacEncoder {}
+/// An AAC-LC encoder through libavcodec's native `aac` encoder: 48 kHz
+/// interleaved floats in, raw AAC frames of 1024 samples per channel
+/// out. The engine builds the FLV decoder configuration itself, so the
+/// packets need no ADTS header - the same contract as macOS's
+/// AudioToolbox encoder.
+/// Samples per channel in one AAC frame, a fallback if the encoder
+/// downplays none.
+const AAC_FRAME: usize = 1024;
+
+pub struct LiveAacEncoder {
+    channels: usize,
+    /// Samples per channel in one AAC frame, read from the encoder at
+    /// open.
+    frame_size: usize,
+    /// Samples the encoder consumes before its first output frame.
+    delay: u32,
+    ctx: *mut av::AVCodecContext,
+    frame: *mut av::AVFrame,
+    packet: *mut av::AVPacket,
+    /// Samples given to `encode` and not yet a whole frame.
+    pending: Vec<f32>,
+    /// One plane per channel, reused for each frame.
+    planar: Vec<Vec<f32>>,
+    /// Samples handed in so far, per channel: the frames' pts.
+    samples: u64,
+}
+
+unsafe impl Send for LiveAacEncoder {}
 
 impl LiveAacEncoder {
     pub fn new(spec: &LiveAudioSpec) -> Result<Self> {
-        let _ = spec;
-        anyhow::bail!(
-            "real-time AAC encoders arrive at L.5.2 of docs/port-omarchy.md \
-             (in-process libav; an ffmpeg pipe cannot honour the \
-             AudioEncoder contract)"
-        )
+        let channels = spec.channels.clamp(1, 2);
+        unsafe {
+            let codec = av::avcodec_find_encoder(av::AVCodecID::AV_CODEC_ID_AAC);
+            if codec.is_null() {
+                bail!("libavcodec has no AAC encoder");
+            }
+            let formats = supported_sample_formats(codec)?;
+            if !formats.contains(&av::AVSampleFormat::AV_SAMPLE_FMT_FLTP) {
+                let names = formats
+                    .iter()
+                    .filter_map(|format| {
+                        let name = av::av_get_sample_fmt_name(*format);
+                        (!name.is_null()).then(|| {
+                            std::ffi::CStr::from_ptr(name)
+                                .to_string_lossy()
+                                .into_owned()
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                bail!("the AAC encoder takes {names} as samples, not float");
+            }
+            let mut ctx = av::avcodec_alloc_context3(codec);
+            if ctx.is_null() {
+                bail!("libavcodec gave no AAC encoder context");
+            }
+            (*ctx).sample_rate = SAMPLE_RATE as c_int;
+            (*ctx).sample_fmt = av::AVSampleFormat::AV_SAMPLE_FMT_FLTP;
+            av::av_channel_layout_default(&mut (*ctx).ch_layout, channels as c_int);
+            (*ctx).bit_rate = i64::from(spec.bitrate_kbps) * 1000;
+            let result = av::avcodec_open2(ctx, codec, std::ptr::null_mut());
+            if result != 0 {
+                av::avcodec_free_context(&mut ctx);
+                bail!("opening the AAC encoder: {}", av_error(result));
+            }
+            let frame_size = usize::try_from((*ctx).frame_size)
+                .ok()
+                .filter(|n| *n > 0)
+                .unwrap_or(AAC_FRAME);
+            let delay = (*ctx).initial_padding.max(0) as u32;
+            let mut frame = av::av_frame_alloc();
+            let mut packet = av::av_packet_alloc();
+            if frame.is_null() || packet.is_null() {
+                av::av_frame_free(&mut frame);
+                av::av_packet_free(&mut packet);
+                av::avcodec_free_context(&mut ctx);
+                bail!("libavcodec gave no AAC frame or packet");
+            }
+            (*frame).format = (*ctx).sample_fmt as c_int;
+            (*frame).sample_rate = (*ctx).sample_rate;
+            av::av_channel_layout_copy(&mut (*frame).ch_layout, &(*ctx).ch_layout);
+            let mut planar = Vec::with_capacity(channels as usize);
+            for _ in 0..channels as usize {
+                planar.push(Vec::with_capacity(frame_size));
+            }
+            Ok(Self {
+                channels: channels as usize,
+                frame_size,
+                delay,
+                ctx,
+                frame,
+                packet,
+                pending: Vec::new(),
+                planar,
+                samples: 0,
+            })
+        }
+    }
+
+    /// Send one whole frame (its samples sit in `planar`) and take
+    /// every packet the encoder answers with.
+    unsafe fn submit_frame(&mut self) -> Result<Vec<Vec<u8>>> {
+        unsafe {
+            (*self.frame).nb_samples = self.frame_size as c_int;
+            (*self.frame).pts = self.samples as i64;
+            self.samples += self.frame_size as u64;
+            for (plane, data) in self.planar.iter().enumerate() {
+                (*self.frame).data[plane] = data.as_ptr().cast_mut().cast::<u8>();
+                (*self.frame).linesize[plane] = (data.len() * std::mem::size_of::<f32>()) as c_int;
+            }
+            let send = av::avcodec_send_frame(self.ctx, self.frame);
+            if send != 0 {
+                return Err(anyhow!(
+                    "the AAC encoder rejected a frame: {}",
+                    av_error(send)
+                ));
+            }
+            let mut frames = Vec::new();
+            loop {
+                let take = av::avcodec_receive_packet(self.ctx, self.packet);
+                if take == AV_EAGAIN {
+                    break;
+                }
+                if take != 0 {
+                    self.discard_packet();
+                    return Err(anyhow!("the AAC encoder stopped: {}", av_error(take)));
+                }
+                let size = (*self.packet).size.max(0) as usize;
+                let bytes = std::slice::from_raw_parts((*self.packet).data.cast::<u8>(), size);
+                frames.push(bytes.to_vec());
+                self.discard_packet();
+            }
+            Ok(frames)
+        }
+    }
+
+    /// Let the packet's buffers go for reuse.
+    unsafe fn discard_packet(&mut self) {
+        unsafe {
+            av::av_packet_unref(self.packet);
+            (*self.packet).size = 0;
+            (*self.packet).data = std::ptr::null_mut();
+        }
+    }
+}
+
+impl Drop for LiveAacEncoder {
+    fn drop(&mut self) {
+        unsafe {
+            av::av_frame_free(&mut self.frame);
+            av::av_packet_free(&mut self.packet);
+            av::avcodec_free_context(&mut self.ctx);
+        }
     }
 }
 
 impl AudioEncoder for LiveAacEncoder {
-    /// Uninhabited: only `Platform::create_audio_encoder` can make
-    /// one of these, and it always fails first.
-    fn encode(&mut self, _samples: &[f32]) -> Result<Vec<Vec<u8>>> {
-        match *self {}
+    fn encode(&mut self, samples: &[f32]) -> Result<Vec<Vec<u8>>> {
+        self.pending.extend_from_slice(samples);
+        let whole = self.frame_size * self.channels;
+        let mut frames = Vec::new();
+        while self.pending.len() >= whole {
+            // Interleaved float into planar float, one plane a channel.
+            for plane in self.planar.iter_mut() {
+                plane.clear();
+            }
+            let show = &self.pending[..whole];
+            for frame in 0..self.frame_size {
+                for (channel, plane) in self.planar.iter_mut().enumerate() {
+                    plane.push(show[frame * self.channels + channel]);
+                }
+            }
+            frames.extend_from_slice(&unsafe { self.submit_frame() }?);
+            self.pending.drain(..whole);
+        }
+        Ok(frames)
     }
 
-    /// Uninhabited: only `Platform::create_audio_encoder` can make
-    /// one of these, and it always fails first.
     fn delay(&self) -> u32 {
-        match *self {}
+        self.delay
+    }
+}
+
+/// A codec's supported sample formats.
+unsafe fn supported_sample_formats(
+    codec: *const av::AVCodec,
+) -> Result<&'static [av::AVSampleFormat]> {
+    unsafe {
+        let mut out: *const c_void = std::ptr::null();
+        let mut count: c_int = 0;
+        let result = av::avcodec_get_supported_config(
+            std::ptr::null(),
+            codec,
+            av::AVCodecConfig::AV_CODEC_CONFIG_SAMPLE_FORMAT,
+            0,
+            &mut out,
+            &mut count,
+        );
+        if result != 0 {
+            bail!(
+                "asking libavcodec for the AAC sample formats: {}",
+                av_error(result)
+            );
+        }
+        if out.is_null() || count == 0 {
+            return Ok(&[]);
+        }
+        Ok(std::slice::from_raw_parts(out.cast(), count as usize))
     }
 }

@@ -804,7 +804,7 @@ step live in `docs/notes.md`'s "Linux port WIP" section.
     discarding at the in-flight limit. Done when `isocast frames
     <target>` works on Linux and its elementary stream answers ffprobe
     correctly (codec, size, rate, timestamps).
-  - [ ] **L.5.2 The live AAC encoder** (`LiveAacEncoder`, libavcodec's
+  - [x] **L.5.2 The live AAC encoder** (`LiveAacEncoder`, libavcodec's
     AAC-LC), verified through a stream.
   - [ ] **L.5.3 Joins on Linux** (timeline exports; the join.rs
     findings: each part fills exactly its clip's length, edit-list
@@ -1613,6 +1613,33 @@ Shipped (v1): 7.1, 7.2, 7.4a, 7.5, 7.6. Next, in order:
 - FilmCraft reads `session.json` to line up ISO files without audio sync.
 
 ## Log
+
+- L.5.2 the live AAC encoder on Linux (2026-10-22): `LiveAacEncoder` in
+  `isocast-platform-linux` through libavcodec's native `aac` encoder
+  (the same FFmpeg n9 link as L.5.1): 48 kHz interleaved floats in,
+  converted in place to FLTP planar, one 1024-sample frame out per
+  encoder submission (frame size and priming delay read back from the
+  open encoder, sample format checked against
+  `avcodec_get_supported_config`), raw access units with no ADTS
+  header - the FLV/audio-specific-config side is built by the engine,
+  exactly the macOS AudioToolbox contract. Verified through a real
+  stream: `isocast stream start` against a loopback MediaMTX (the
+  recipe already in notes) records H.264 1280x720 plus AAC 48 kHz
+  stereo, the program's 440 Hz tone survives at its frequency (FFT
+  peak 438 Hz numerically), audio dropouts 0 across three runs, and
+  the RTMP wire timestamps captured via a timestamped relay are
+  monotonically increasing (the only repeated value is the leading
+  sequence header and keyframe both at 0, as on macOS). One honest
+  caveat: FFmpeg's native AAC has no constant-bitrate mode, so a pure
+  tone encodes at ~23 kb/s and near-silence at ~2 kb/s against the
+  setup's 160 kb/s target (macOS's AudioToolbox CBR pads silence up;
+  services tolerate VBR audio - noted in notes.md with the numbers).
+  Also root-cause-checked MediaMTX during verification: its
+  "is publishing" log lands ~2 s after our first wire bytes (not an
+  isocast delay; our connect+publish measures under 1 ms), and one
+  fmp4 recording it wrote sporadically upsets ffmpeg's null-muxer dts
+  check while the wire itself is monotonic and the equivalent rerun's
+  file is clean.
 
 - L.5.1 the live H.264 encoder on Linux (2026-10-22): `LiveH264Encoder`
   in `isocast-platform-linux` (system libavcodec 63, `h264_nvenc`,

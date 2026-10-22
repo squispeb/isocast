@@ -3,6 +3,58 @@
 Short, dated facts a future session needs. Newest entries go at the top of
 each section. Delete entries that stop being true.
 
+## Linux port progress (2026-10-22, L.5.2 the live AAC encoder)
+
+- **LiveAacEncoder design** (`crates/isocast-platform-linux/src/stream.rs`):
+  libavcodec's native `aac` encoder (`AV_CODEC_ID_AAC`), `AV_SAMPLE_FMT_FLTP`
+  validated through `avcodec_get_supported_config` (the AAC_VIDEO... audio
+  config enum), 48 kHz, `av_channel_layout_default` for 1-2 channels,
+  `bit_rate` = the spec's kbps × 1000. `encode` buffers interleaved floats
+  and, per whole frame (frame_size read from the open context, the MPEG-4
+  standard's 1024), deinterleaves into reused per-channel `Vec<f32>` planes
+  and submits one `AVFrame`; every packet comes straight out (`receive`
+  loop until EAGAIN, raw access units, no ADTS). `delay()` = the context's
+  `initial_padding` after open. Drop frees frame/packet/context. The
+  engine builds the FLV audio-specific config itself (`flv.rs`), so no
+  magic-cookie equivalent is needed from the platform.
+- **CBR caveat (the one product gap):** FFmpeg's native AAC encoder has no
+  constant-bitrate mode. The `[stream]` contract says audio is "held
+  constant (silence too, as services expect)"; on Linux a 440 Hz tone
+  encodes at ~23 kb/s and a silent mix at ~2 kb/s against a 160 kb/s
+  target (macOS's AudioToolbox pads up in CBR). Services accept VBR AAC
+  in practice (the RTMP spec has no audio bitrate enforcement), but if an
+  ingest rejects it the fallback options are none in this libavcodec
+  build (no libfdk_aac); re-check against a real service.
+- **Verified through a real ingest** (MediaMTX loopback recipe, notes of
+  2026-10-12): with a `[stream]` custom server, a key via
+  `ISOCAST_STREAM_KEY` then `isocast stream key set`, and the tone added
+  to the program mix (`recording.program.audio = ["tone"]` - scene items
+  can't carry audio sources, program-mix membership lives there),
+  MediaMTX recorded H.264 720p + AAC 48 kHz stereo; the tone's 438 Hz
+  FFT peak verified numerically; 0 audio dropouts across three runs;
+  video 5953-6011 kb/s against the 6000 target. The engine still sends
+  the aac sequence header itself; the platform encoder is unaware.
+- **RTMP wire timestamps are clean:** captured through a timestamped
+  python TCP relay (scratch, deleted) - our publish reaches the wire
+  <1 ms after connect, first video frame ~350 ms in (nvenc open in a
+  debug build), all video message timestamps strictly monotonic
+  (33/34 ms steps at 30 fps) with the standard shared-timestamp pair of
+  sequence header + keyframe at 0, audio likewise. Two MediaMTX-side
+  oddities are NOT ours: its "[RTMP] is publishing" log lands ~2 s after
+  our first bytes (same for its "recording N tracks"), and one of its
+  fmp4 recordings (once, not reproducible on an equivalent rerun)
+  triggered ffmpeg's null-muxer non-monotonic dts warnings on demux
+  while the wire is monotonic and ffprobe reads the file's packets in
+  order. Stock ffmpeg into the same MTX recorded a clean file. If a real
+  service reports anything similar, start from these facts.
+- **Machine state for the test (Linux box):** the live setup's `[stream]`
+  section and `recording.program.audio` were patched in and back out
+  (setup is machine-local, now at its pre-test shape), a stream key was
+  set and cleared for both 127.0.0.1:19350 and :19351, MediaMTX v1.15.0
+  ran from `target/scratch/l5/mtx` (record format fmp4 with
+  `%path`-bearing recordPath) and is deleted again; `isocast debug off`
+  turned developer mode back off after the treats.
+
 ## Linux port progress (2026-10-22, L.5.1 the live H.264 encoder)
 
 - **Design** (`crates/isocast-platform-linux/src/stream.rs`): the worker
