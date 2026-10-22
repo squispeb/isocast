@@ -40,7 +40,16 @@ autostart = true
 ```
 
 - It may call only the methods in `permissions.methods`; anything else is
-  refused.
+  refused. Four methods can't be granted at all: `plugin_add` and
+  `plugin_set_enabled`, because with them a plugin could install or enable
+  plugins with more than it has itself; `websocket_enable`, because the
+  obs-websocket server answers its clients with every method, outside any
+  plugin's grant, so a plugin that could turn it on, or change its address
+  or password, could call anything; and `websocket_disable`, because the
+  server's settings are the user's. A manifest that asks for one of them
+  is refused, and a grant saved by an older version is ignored for them.
+  (Any local program that reaches an obs-websocket server already turned
+  on without a password has the same full access; keep a password on it.)
 - It runs in a macOS sandbox: it can write only to its own data folder, has
   no network unless granted, cannot open cameras or microphones, and
   cannot read recordings unless granted (below).
@@ -76,9 +85,37 @@ it). It can only create inside a project folder (one named `<date> <time>
 manifests (`*.session.json`), `*.partial` files or Isocast's own `.isocast*`
 files. No plugin can hard-link a recording, whatever its grant. The
 recordings folders are the live setup's `recording.folder` and those
-recorded into lately, as they are when the plugin's process starts; a
-folder recorded into for the first time is in its sandbox from its next
-start.
+recorded into lately (by the engine or `isocast record`). A sandbox can't
+change while its process runs, so when a recording starts in a folder its
+sandbox doesn't have yet (or, for `write`, a folder named like a project
+but without Isocast's project file has appeared since), Isocast restarts
+the plugin's process with the folders as they are then
+(`plugin_changed`, `restarted`); it may miss that recording's `started`
+and `project_created` events, so read `list_projects` when it starts.
+Isocast also looks at the folders every 5 seconds, so one only a
+standalone `isocast record` used, or a folder named like a project made
+while idle, gets its rules within about 5 seconds.
+
+A plugin can't add a recordings folder, since that would widen its own
+sandbox and every other plugin's. A folder it gives must be a recordings
+folder already, or a project folder in one: `start`'s `folder`, a
+`recording.folder` it sets with `apply`, `start`'s `setup` or
+`init_setup`, the recordings folder of a profile it imports with
+`library_import` or `library_import_obs`, and the path of a hotkey it
+binds or changes (with `hotkeys_set`, `apply`, or in an imported
+profile): `timeline.retake`'s and `timeline.export`'s `args.folder`, and
+the folder of `program.screenshot`'s `args.path`. A hotkey fires later,
+maybe when you press its keys, as your request rather than the plugin's,
+so it is checked when it is saved. Bindings it leaves as they were (yours)
+aren't checked. A hotkey a plugin fires with `hotkeys_input` counts as the
+plugin's request too. Anything else is refused with
+`-32002` (not permitted), and the error lists the folders it may use. The
+paths are compared as written, not resolved, so a link the plugin made in
+its own folder doesn't count as a recordings folder. `~/Movies/Isocast`,
+the default, is always allowed. The CLI, the app and MCP can still record
+anywhere, and a folder they use becomes a recordings folder for the
+plugins too. A plugin may still switch to a profile the user made
+(`library_switch`), whatever folder that profile records to.
 
 ### Projects
 
@@ -91,7 +128,8 @@ is the folder's name after the date and time. `list_projects` lists them;
 `rename_project` (refused while a recording or an export writes into it)
 renames the folder to `<date> <time> <name>` in one step (atomic on APFS
 and HFS+; on exFAT a check and a rename) and moves timelines' references
-(timelines also find a project renamed in the Finder by its id), so a plugin can name a take once `take_finished`
+(timelines also find a project renamed in the Finder by its id, and
+`list_projects` points its export manifests at the new folder), so a plugin can name a take once `take_finished`
 or `stopped` says it is done. Recordings from before project folders stay
 where they are.
 

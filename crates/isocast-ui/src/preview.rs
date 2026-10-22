@@ -3,7 +3,8 @@
 //! box drawn at the layout of the setup revision each frame was drawn
 //! from, so box and picture can't drift apart, even while the item is
 //! dragged. One `Preview` per monitor: the edited one (`program`, or in
-//! Studio Mode `preview`) and Studio Mode's program.
+//! Studio Mode `preview`), Studio Mode's program, and the chosen extra
+//! canvas's program beside them (#86, #120).
 //!
 //! Two ways to put them on screen:
 //! - macOS: Core Animation layers under the interface (`layers.rs`); the
@@ -13,6 +14,8 @@
 //!   are drawn in the same frame. Slint then redraws the window per frame.
 
 use std::cell::Cell;
+#[cfg(target_os = "macos")]
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -21,6 +24,8 @@ use isocast_client::shared::SharedFrame;
 use slint::ComponentHandle;
 use slint::wgpu_30::wgpu;
 
+#[cfg(target_os = "macos")]
+use crate::Theme;
 use crate::frames::Feed;
 #[cfg(target_os = "macos")]
 pub use crate::layers::{BoxShape, BoxStyle};
@@ -158,6 +163,9 @@ pub enum Role {
     Editor,
     /// Studio Mode's program monitor.
     Program,
+    /// The chosen extra canvas's program monitor, beside the others (#86,
+    /// #120).
+    Extra,
 }
 
 /// Where pictures go: the shared layers (macOS), or Slint images.
@@ -254,6 +262,9 @@ pub struct Preview {
     pending_size: Rc<Cell<Option<(u32, u32)>>>,
     size_timer: slint::Timer,
     size_asked_at: Rc<Cell<Option<Instant>>>,
+    /// The size last asked of the daemon (the motion harness waits for
+    /// frames of it).
+    size_asked: Rc<Cell<(u32, u32)>>,
     size_requests: Rc<Cell<u64>>,
     layouts: Layouts,
     /// The box as the pointer has it while a handle is dragged, drawn at
@@ -267,11 +278,6 @@ pub struct Preview {
     previous: Option<SharedFrame>,
     waiting: Option<(SharedFrame, Instant)>,
     last_shown_at: Option<Instant>,
-    /// The pictures' transport without shared surfaces (off macOS): a
-    /// picture has been shown, so the "waiting for a picture" notice is
-    /// already off and isn't set again for every frame.
-    #[cfg(not(target_os = "macos"))]
-    picture_shown: bool,
     check: bool,
     last_rows: Option<u64>,
     repeat_run: u64,
@@ -320,6 +326,7 @@ impl Preview {
             pending_size: Rc::default(),
             size_timer: slint::Timer::default(),
             size_asked_at: Rc::default(),
+            size_asked: Rc::default(),
             size_requests: Rc::default(),
             layouts: Layouts::default(),
             live_box: None,
@@ -328,8 +335,6 @@ impl Preview {
             previous: None,
             waiting: None,
             last_shown_at: None,
-            #[cfg(not(target_os = "macos"))]
-            picture_shown: false,
             check,
             last_rows: None,
             repeat_run: 0,
@@ -385,13 +390,14 @@ impl Preview {
                 canvas.set_picture_error(error.into());
             }
             Role::Program => canvas.set_program_waiting(waiting),
+            Role::Extra => canvas.set_extra_waiting(waiting),
         }
     }
 
     /// A frame from the daemon.
     pub fn frame(&mut self, frame: SharedFrame) {
         self.stats.received += 1;
-        if self.role == Role::Program {
+        if self.role != Role::Editor {
             self.show(frame);
             return;
         }
@@ -400,11 +406,11 @@ impl Preview {
         let held_since = self.waiting.take().map(|(_, since)| since);
         let unknown =
             frame.revision.is_some_and(|r| r > self.layouts.newest()) && self.layouts.newest() > 0;
-        if unknown && held_since.is_none_or(|since| since.elapsed() < LAYOUT_WAIT) {
+        if unknown && held_since.is_none_or(|since| crate::clock::since(since) < LAYOUT_WAIT) {
             // Drawn from a setup this window hasn't read yet: hold it until
             // the layout comes, so the box isn't drawn at the old one.
             self.stats.waited_for_layout += 1;
-            self.waiting = Some((frame, held_since.unwrap_or_else(Instant::now)));
+            self.waiting = Some((frame, held_since.unwrap_or_else(crate::clock::now)));
             return;
         }
         if unknown {
@@ -420,13 +426,14 @@ impl Preview {
         self.waiting = None;
         match &mut self.output {
             #[cfg(target_os = "macos")]
-            Output::Layers(layers) => layers.borrow_mut().clear(self.role == Role::Program),
+            Output::Layers(layers) => layers.borrow_mut().clear(self.role),
             Output::Image(..) => {
                 if let Some(app) = self.app.upgrade() {
                     let canvas = app.global::<CanvasArea>();
                     match self.role {
                         Role::Editor => canvas.set_picture(slint::Image::default()),
                         Role::Program => canvas.set_program_picture(slint::Image::default()),
+                        Role::Extra => canvas.set_extra_picture(slint::Image::default()),
                     }
                 }
             }
@@ -434,11 +441,6 @@ impl Preview {
         self.images.clear();
         self.previous = None;
         self.showing = None;
-        #[cfg(not(target_os = "macos"))]
-        {
-            // The next picture turns the notice off again.
-            self.picture_shown = false;
-        }
         if let Some(app) = self.app.upgrade() {
             self.set_waiting(&app, false, &format!("No picture: {why}"));
         }
@@ -482,7 +484,7 @@ impl Preview {
         self.live_box = match (live, self.live_box.take()) {
             (Some(live), _) => Some(live),
             (None, Some(held)) => Some(LiveBox {
-                ended: held.ended.or(Some(Instant::now())),
+                ended: held.ended.or(Some(crate::clock::now())),
                 ..held
             }),
             (None, None) => None,
@@ -532,6 +534,7 @@ impl Preview {
                 app.get_program_pixel_width(),
                 app.get_program_pixel_height(),
             ),
+            Role::Extra => (app.get_extra_pixel_width(), app.get_extra_pixel_height()),
         };
         let size = (size.0.max(16) as u32, size.1.max(16) as u32);
         if size != self.size {
@@ -556,30 +559,38 @@ impl Preview {
         let due = self
             .size_asked_at
             .get()
-            .is_none_or(|at| at.elapsed() >= RESIZE_EVERY);
+            .is_none_or(|at| crate::clock::since(at) >= RESIZE_EVERY);
         if due {
             self.pending_size.set(None);
             self.size_timer.stop();
-            self.size_asked_at.set(Some(Instant::now()));
+            self.size_asked_at.set(Some(crate::clock::now()));
+            self.size_asked.set(size);
             self.feed.set_size(size.0, size.1);
             self.size_requests.set(self.size_requests.get() + 1);
             return;
         }
         self.pending_size.set(Some(size));
-        let (feed, pending, requests, asked_at) = (
+        let (feed, pending, requests, asked_at, asked) = (
             self.feed.clone(),
             self.pending_size.clone(),
             self.size_requests.clone(),
             self.size_asked_at.clone(),
+            self.size_asked.clone(),
         );
         self.size_timer
             .start(slint::TimerMode::SingleShot, RESIZE_SETTLE, move || {
                 if let Some((width, height)) = pending.take() {
-                    asked_at.set(Some(Instant::now()));
+                    asked_at.set(Some(crate::clock::now()));
+                    asked.set((width, height));
                     feed.set_size(width, height);
                     requests.set(requests.get() + 1);
                 }
             });
+    }
+
+    /// The picture size last asked of the daemon.
+    pub fn size_asked(&self) -> (u32, u32) {
+        self.size_asked.get()
     }
 
     pub fn stats(&self) -> Stats {
@@ -613,7 +624,9 @@ impl Preview {
                 .and_then(|layout| layout.rects.get(selected.as_str()))
                 == Some(&live.shape);
             match live.ended {
-                Some(at) if caught_up || at.elapsed() > LIVE_BOX_HOLD => self.live_box = None,
+                Some(at) if caught_up || crate::clock::since(at) > LIVE_BOX_HOLD => {
+                    self.live_box = None
+                }
                 _ => return Some(live.shape),
             }
         }
@@ -624,61 +637,13 @@ impl Preview {
             .and_then(|layout| layout.rects.get(selected.as_str()).copied())
     }
 
-    /// A picture from the daemon's JPEG frames (other platforms; macOS
-    /// and Linux get shared surfaces in [`Self::show`]): decode it into
-    /// the canvas and draw the selected item's box over it, at the
-    /// revision the picture was drawn from.
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    pub fn picture(&mut self, picture: crate::frames::Picture) {
-        let Some(app) = self.app.upgrade() else {
-            return;
-        };
-        let rect = match self.role {
-            Role::Editor => self.box_rect(&app, picture.revision),
-            Role::Program => None,
-        };
-        if !self.picture_shown {
-            self.picture_shown = true;
-            self.set_waiting(&app, false, "");
-        }
-        let canvas = app.global::<CanvasArea>();
-        let image = slint::Image::from_rgba8(slint::SharedPixelBuffer::clone_from_slice(
-            &picture.rgba,
-            picture.width.max(1),
-            picture.height.max(1),
-        ));
-        match self.role {
-            Role::Editor => canvas.set_picture(image),
-            Role::Program => canvas.set_program_picture(image),
-        }
-        if self.role == Role::Editor {
-            canvas.set_shown_box_visible(rect.is_some());
-            if let Some(BoxShape {
-                rect: [x, y, w, h],
-                rotate,
-            }) = rect
-            {
-                canvas.set_shown_box_x(x);
-                canvas.set_shown_box_y(y);
-                canvas.set_shown_box_w(w);
-                canvas.set_shown_box_h(h);
-                canvas.set_shown_box_rotate(rotate);
-            }
-        }
-        self.stats.shown += 1;
-        let now = Instant::now();
-        if let Some(last) = self.last_shown_at.replace(now) {
-            self.stats.longest_gap = self.stats.longest_gap.max(now - last);
-        }
-    }
-
     fn show(&mut self, frame: SharedFrame) {
         let Some(app) = self.app.upgrade() else {
             return;
         };
         let rect = match self.role {
             Role::Editor => self.box_rect(&app, frame.revision),
-            Role::Program => None,
+            Role::Program | Role::Extra => None,
         };
         if self.check && self.role == Role::Editor {
             self.check_frame(&app, &frame, rect.map(|b| b.rect));
@@ -688,7 +653,7 @@ impl Preview {
         }
         self.put(&app, Some(&frame), rect);
         self.stats.shown += 1;
-        let now = Instant::now();
+        let now = crate::clock::now();
         if let Some(last) = self.last_shown_at.replace(now) {
             self.stats.longest_gap = self.stats.longest_gap.max(now - last);
         }
@@ -702,7 +667,8 @@ impl Preview {
                 let mut layers = layers.borrow_mut();
                 match (self.role, frame) {
                     (Role::Program, Some(frame)) => layers.show_program(frame),
-                    (Role::Program, None) => {}
+                    (Role::Extra, Some(frame)) => layers.show_extra(frame),
+                    (Role::Program | Role::Extra, None) => {}
                     (Role::Editor, _) => layers.show(frame, rect, self.style, geometry(app)),
                 }
             }
@@ -742,6 +708,7 @@ impl Preview {
                     match self.role {
                         Role::Editor => canvas.set_picture(self.images[&key].clone()),
                         Role::Program => canvas.set_program_picture(self.images[&key].clone()),
+                        Role::Extra => canvas.set_extra_picture(self.images[&key].clone()),
                     }
                 }
                 if self.role == Role::Editor {
@@ -853,6 +820,12 @@ fn geometry(app: &AppWindow) -> crate::layers::Geometry {
             app.get_program_width() as f64,
             app.get_program_height() as f64,
         ],
+        extra: [
+            app.get_extra_x() as f64 - ax,
+            app.get_extra_y() as f64 - ay,
+            app.get_extra_width() as f64,
+            app.get_extra_height() as f64,
+        ],
         scale: app.get_canvas_scale() as f64,
         meter: meter_rect(app),
     }
@@ -860,6 +833,7 @@ fn geometry(app: &AppWindow) -> crate::layers::Geometry {
 
 /// The control bar's master level's inside, in window points (its native
 /// layer's place).
+#[cfg(target_os = "macos")]
 pub fn meter_rect(app: &AppWindow) -> [f64; 4] {
     [
         app.get_master_meter_x() as f64,

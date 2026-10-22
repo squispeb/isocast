@@ -1,12 +1,12 @@
 //! Recording sessions: start the sources a setup needs, write one file per
 //! ISO source on the shared clock, and stop cleanly.
 
+use parking_lot::Mutex;
 use std::any::Any;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::thread;
@@ -15,11 +15,11 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Local, SecondsFormat};
 use isocast_protocol::manifest::{
-    MANIFEST_VERSION, ManifestAudio, ManifestFile, Marker, SceneChange, SessionManifest,
+    AudioStop, MANIFEST_VERSION, ManifestAudio, ManifestFile, Marker, SceneChange, SessionManifest,
     SessionStatus,
 };
 use isocast_protocol::{
-    AudioSettings, Container, Filter, PROGRAM, PanLaw, Setup, Transition, TransitionKind,
+    AudioSettings, CanvasId, Container, Filter, PROGRAM, PanLaw, Setup, Transition, TransitionKind,
 };
 
 pub use isocast_protocol::api::{
@@ -36,21 +36,26 @@ mod iso_frames;
 mod mix;
 mod monitor;
 mod pause;
+pub mod pressure;
 mod program;
+mod scene_feeds;
 mod scenes;
 mod shared_frames;
+mod tap;
 mod timings;
 mod virtual_camera;
 pub use virtual_camera::{CameraSink, OnCameraChange, VirtualCamera};
 
 pub use engine::{Engine, EngineEvent, JpegFrame, OnEngineEvent, ProgramTap};
+pub(crate) use engine::{ProgramTapSource, canvas_off};
+pub use engine::{compositor_canvas, compositor_worker};
 pub use frame_stream::{FeedRate, FrameFeed};
 pub use shared_frames::{DEFAULT_SLOTS, SharedControl, SharedEvent, SharedFeed};
 
 use crate::source::{AUDIO_CHUNK, FrameSlot};
 use crate::{
-    AudioTrackSpec, BrowserControl, FileWriter, Platform, SAMPLE_RATE, Time, VideoTrackSpec,
-    WriterSpec,
+    AudioTrackSpec, BrowserControl, CameraMetadataReader, FileWriter, Platform, SAMPLE_RATE, Time,
+    VideoTrackSpec, WriterSpec,
 };
 
 /// How far ahead of "now" the session clock starts, so every source and
@@ -115,6 +120,12 @@ const AUDIO_JITTER: i64 = SAMPLE_RATE as i64 / 500;
 const AUDIO_TAIL: Duration = Duration::from_millis(150);
 /// Audio held for a file that has not received its first frame yet.
 const MAX_PENDING_AUDIO: usize = 500;
+/// How long after a pause cut a crash-safe file waits for the last inputs
+/// before the cut before committing anyway (a stalled track must not hold
+/// the pause reply).
+const COMMIT_WAIT: Duration = Duration::from_millis(500);
+/// How long the pause reply waits for every file's commit, at most.
+const COMMIT_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub struct RecordOptions<'a> {
     /// Write files here instead of `recording.folder`.
@@ -143,6 +154,8 @@ pub struct RecordOptions<'a> {
 #[derive(Default)]
 pub struct SessionControl {
     state: Mutex<ControlState>,
+    #[cfg(windows)]
+    recording_wake: parking_lot::Condvar,
     /// While a recording stops, complete mix blocks through its last frame
     /// boundary may bypass the live jitter delay. Zero keeps normal pacing.
     mix_drain_until: AtomicI64,
@@ -242,6 +255,10 @@ struct ControlState {
     pause_generation: u64,
     saved_pause_generation: u64,
     manifest_error: Option<String>,
+    /// What the commit barrier of the latest pause established, for its
+    /// reply: the generation, the recoverable seconds (if every file
+    /// confirmed) and the files' commit errors.
+    pause_outcome: Option<(u64, Option<f64>, Vec<String>)>,
 }
 
 /// When a split's new take begins.
@@ -269,6 +286,9 @@ pub struct SplitTake {
     /// answered: frames and audio before then go to the take before.
     pub begins_at: DateTime<Local>,
     pub begins_in: Duration,
+    /// Things to know about its files, like one whose source has
+    /// delivered no frames (it is written only once one arrives).
+    pub notes: Vec<String>,
 }
 
 /// Why a split didn't happen.
@@ -277,6 +297,8 @@ pub struct SplitRefused {
     /// The recording is ending (stopping, at its time limit, or the disk
     /// filling) or has ended, so no new take can begin in it.
     pub ending: bool,
+    /// Another split still owns the handover; retry once its files are ready.
+    pub busy: bool,
     pub message: String,
 }
 
@@ -296,7 +318,7 @@ impl ControlState {
         let from = self.takes[i].max(first);
         let seconds = match &self.clock {
             Some(clock) => {
-                let cuts = clock.state.read().unwrap();
+                let cuts = clock.state.read();
                 cuts.map(at).saturating_since(cuts.map(from)).as_secs_f64()
             }
             None => at.saturating_since(from).as_secs_f64(),
@@ -315,12 +337,38 @@ impl ControlState {
 }
 
 impl SessionControl {
+    /// Wake the coordinator after its caller sets the recording's stop flag.
+    /// The same lock guards entering the wait, so the notification cannot be
+    /// lost between checking the atomic flag and sleeping.
+    #[cfg(windows)]
+    pub fn wake_recording(&self) {
+        let _state = self.state.lock();
+        self.recording_wake.notify_all();
+    }
+
+    #[cfg(windows)]
+    fn wait_recording(&self, stop: &AtomicBool, observed_stop: bool) {
+        let mut state = self.state.lock();
+        let interval = Duration::from_millis(10);
+        if observed_stop {
+            // An early Stop still respects the minimum take duration. Don't
+            // spin while waiting for that already-scheduled future boundary.
+            self.recording_wake.wait_for(&mut state, interval);
+        } else {
+            self.recording_wake.wait_while_for(
+                &mut state,
+                |_| !stop.load(Ordering::SeqCst),
+                interval,
+            );
+        }
+    }
+
     /// Schedule a shared recording cut. Hotkeys: `recording.pause`
     /// calls this with true, `recording.resume` with false; the
     /// `recording.pause_toggle` action chooses the opposite of `pause_status`.
     /// The daemon uses this same path for the Pause/Resume methods.
     pub fn set_paused(&self, paused: bool, now: Time, epoch: Time) -> Result<(Time, u64), String> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         if state.epoch != Some(epoch) {
             return Err(
                 "recording: the recording changed before pause/resume; retry on the current take"
@@ -330,10 +378,12 @@ impl SessionControl {
         if state.finished || state.end.is_some_and(|end| now >= end) {
             return Err("recording: stopping or idle; valid action: start".into());
         }
-        if state.splitting
-            || (state.takes.len() > 1 && state.takes.last().is_some_and(|at| *at > now))
-        {
-            return Err("recording: a take is starting; retry pause/resume after it begins".into());
+        if Self::busy(&state, now) {
+            return Err(
+                "recording: a take is starting or the previous take is finishing; retry \
+                 pause/resume after the handover"
+                    .into(),
+            );
         }
         let clock = state
             .clock
@@ -347,12 +397,12 @@ impl SessionControl {
 
     /// Identify the recording while a caller releases its own state lock.
     pub fn recording_epoch(&self) -> Option<Time> {
-        self.state.lock().unwrap().epoch
+        self.state.lock().epoch
     }
 
     /// A pause reply waits for its manifest checkpoint as well as its cut.
     pub fn pause_saved(&self, generation: u64) -> Result<bool, String> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock();
         if let Some(error) = &state.manifest_error {
             return Err(format!(
                 "recording.pauses: the cut was applied, but its manifest could not be saved: {error}"
@@ -361,24 +411,43 @@ impl SessionControl {
         Ok(state.saved_pause_generation >= generation)
     }
 
+    /// A split's handover is under way (see `LiveStatus::handover`).
+    pub fn handover(&self, now: Time) -> bool {
+        Self::busy(&self.state.lock(), now)
+    }
+
+    fn busy(state: &ControlState, now: Time) -> bool {
+        state.splitting || (state.takes.len() > 1 && state.takes.last().is_some_and(|at| *at > now))
+    }
+
     pub fn pause_status(&self, now: Time) -> Option<isocast_protocol::api::RecordingPause> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock();
         let clock = state.clock.as_ref()?;
         Some(
             clock
                 .state
                 .read()
-                .unwrap()
                 .status(now.min(state.end.unwrap_or(Time::MAX))),
         )
     }
 
+    /// The commit barrier's outcome for pause `generation`: the seconds
+    /// every file is on disk up to, and the files' commit errors.
+    pub fn pause_outcome(&self, generation: u64) -> Option<(Option<f64>, Vec<String>)> {
+        let state = self.state.lock();
+        state
+            .pause_outcome
+            .as_ref()
+            .filter(|(g, ..)| *g == generation)
+            .map(|(_, recoverable, errors)| (*recoverable, errors.clone()))
+    }
+
     fn recording_time(&self, at: Time) -> Time {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock();
         state
             .clock
             .as_ref()
-            .map_or(at, |clock| clock.state.read().unwrap().map(at))
+            .map_or(at, |clock| clock.state.read().map(at))
     }
 
     /// A control whose engine shows `data`'s values in bound text.
@@ -399,7 +468,7 @@ impl SessionControl {
     /// clock has started (it then counts as 0 in take 1). A marker after
     /// the recording's end isn't added: the error is where it ended.
     pub fn marker(&self, at: Time, label: String) -> Result<Option<(u32, f64)>, (u32, f64)> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         state.check_end(at)?;
         state.markers.push((at, label));
         state.changed = true;
@@ -415,7 +484,7 @@ impl SessionControl {
         scene: String,
         transition: Transition,
     ) -> Result<Option<(u32, f64)>, (u32, f64)> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         state.scenes.push((at, scene.into(), transition));
         state.changed = true;
         state.check_end(at)?;
@@ -424,7 +493,7 @@ impl SessionControl {
 
     /// The recording ends at `at`, or sooner if it was already going to.
     fn end_recording(&self, at: Time) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         state.end = Some(state.end.map_or(at, |end| end.min(at)));
     }
 
@@ -438,16 +507,12 @@ impl SessionControl {
         };
         let waiting_since = std::time::Instant::now();
         loop {
-            let stingers = self.stingers.lock().unwrap();
+            let stingers = self.stingers.lock();
             if let Some(length) = stingers.get(&stinger.file) {
                 transition.duration_ms = length.as_millis().clamp(1, u128::from(u32::MAX)) as u32;
                 return Ok(());
             }
-            let loading = self
-                .loading_stingers
-                .lock()
-                .unwrap()
-                .contains(&stinger.file);
+            let loading = self.loading_stingers.lock().contains(&stinger.file);
             if loading && waiting_since.elapsed() < STINGER_WAIT {
                 drop(stingers);
                 thread::sleep(Duration::from_millis(10));
@@ -459,7 +524,7 @@ impl SessionControl {
                     stinger.file
                 ));
             }
-            if let Some(reason) = self.failed_stingers.lock().unwrap().get(&stinger.file) {
+            if let Some(reason) = self.failed_stingers.lock().get(&stinger.file) {
                 return Err(format!(
                     "transition.file: the stinger video {:?} couldn't be loaded ({reason}); fix \
                      the file, or switch with another transition",
@@ -484,7 +549,7 @@ impl SessionControl {
     /// Note the stinger videos `files` as being loaded (see
     /// [`SessionControl::prepare`]).
     pub(crate) fn loading_stingers(&self, files: &[String]) {
-        let mut loading = self.loading_stingers.lock().unwrap();
+        let mut loading = self.loading_stingers.lock();
         for file in files {
             if !loading.contains(file) {
                 loading.push(file.clone());
@@ -503,9 +568,8 @@ impl SessionControl {
     ) {
         self.loading_stingers
             .lock()
-            .unwrap()
             .retain(|file| !files.contains(file) && wanted.contains(file));
-        let mut failures = self.failed_stingers.lock().unwrap();
+        let mut failures = self.failed_stingers.lock();
         failures.retain(|file, _| !files.contains(file) && wanted.contains(file));
         failures.extend(failed);
     }
@@ -516,25 +580,30 @@ impl SessionControl {
     /// has ended.
     pub fn split(&self, timing: SplitTiming) -> mpsc::Receiver<SplitReply> {
         let (tx, rx) = mpsc::channel();
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         if state.finished {
             let _ = tx.send(Err(SplitRefused {
                 ending: true,
+                busy: false,
                 message: "the recording has stopped".into(),
             }));
         } else if state
             .clock
             .as_ref()
-            .is_some_and(|clock| clock.state.read().unwrap().requested_pause())
+            .is_some_and(|clock| clock.state.read().requested_pause())
         {
             let _ = tx.send(Err(SplitRefused {
                 ending: false,
+                busy: false,
                 message: "recording.paused: resume before split or retake".into(),
             }));
         } else if state.splitting {
             let _ = tx.send(Err(SplitRefused {
                 ending: false,
-                message: "a split is already on its way".into(),
+                busy: true,
+                message: "recording.split: the previous split is still starting its files or \
+                          finishing the old take; retry once it has finished; recording continues"
+                    .into(),
             }));
         } else {
             state.splitting = true;
@@ -544,17 +613,18 @@ impl SessionControl {
     }
 
     fn take_split(&self) -> Option<(SplitTiming, mpsc::Sender<SplitReply>)> {
-        self.state.lock().unwrap().split.take()
+        self.state.lock().split.take()
     }
 
     /// The recording has ended: a split still waiting is refused, and so is
     /// any asked for from now on (until the next recording begins).
     fn finish_recording(&self) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         state.finished = true;
         if let Some((_, reply)) = state.split.take() {
             let _ = reply.send(Err(SplitRefused {
                 ending: true,
+                busy: false,
                 message: "the recording stopped before it could split".into(),
             }));
         }
@@ -564,23 +634,23 @@ impl SessionControl {
     /// sources, and its pan law, for the program mix (and filtered ISO
     /// audio) from now on. Sync offsets apply from the next recording.
     pub fn set_audio(&self, setup: &Setup) {
-        let mut audio = self.audio.lock().unwrap();
+        let mut audio = self.audio.lock();
         for source in setup.sources.iter().filter(|s| s.kind.has_audio()) {
             audio.insert(source.id.clone(), source.audio);
         }
-        *self.pan_law.lock().unwrap() = setup.audio.pan_law;
+        *self.pan_law.lock() = setup.audio.pan_law;
         self.audio_filters.set(setup);
     }
 
     /// Take `setup`'s sources' filters, for the program from its next frame.
     pub fn set_filters(&self, setup: &Setup) {
-        *self.filters.lock().unwrap() = source_filters(setup);
+        *self.filters.lock() = source_filters(setup);
     }
 
     /// Reload browser source `id`'s page, bypassing the cache. Errors list
     /// the session's browser sources.
     pub fn refresh_browser(&self, id: &str) -> Result<(), String> {
-        let browsers = self.browsers.lock().unwrap();
+        let browsers = self.browsers.lock();
         match browsers.get(id) {
             Some(page) => {
                 page.refresh();
@@ -595,16 +665,16 @@ impl SessionControl {
     }
 
     fn audio_settings(&self, id: &str) -> Option<AudioSettings> {
-        self.audio.lock().unwrap().get(id).copied()
+        self.audio.lock().get(id).copied()
     }
 
     fn pan_law(&self) -> PanLaw {
-        *self.pan_law.lock().unwrap()
+        *self.pan_law.lock()
     }
 
     /// Ids of the video sources the session captures from devices.
     pub fn captured(&self) -> Vec<String> {
-        self.frames.lock().unwrap().ids.clone()
+        self.frames.lock().ids.clone()
     }
 
     /// The newest frame the session captured from source `id`, without
@@ -613,7 +683,7 @@ impl SessionControl {
     /// it ([`PROGRAM`]) when it has none waits a moment for a fresh one.
     pub fn newest_frame<F: Clone + Send + 'static>(&self, id: &str) -> Option<F> {
         let slot = {
-            let frames = self.frames.lock().unwrap();
+            let frames = self.frames.lock();
             let slots = frames.slots.as_ref()?.downcast_ref::<Slots<F>>()?;
             let (_, slot) = slots.iter().find(|(source, _)| source == id)?;
             slot.clone()
@@ -638,14 +708,14 @@ impl SessionControl {
     }
 
     fn set_frames<F: Clone + Send + 'static>(&self, slots: Slots<F>) {
-        let mut frames = self.frames.lock().unwrap();
+        let mut frames = self.frames.lock();
         frames.ids = slots.iter().map(|(id, _)| id.clone()).collect();
         frames.slots = Some(Box::new(slots));
     }
 
     /// A recording starts at `epoch`: its first take, with no markers yet.
     fn begin_recording(&self, epoch: Time, clock: Arc<pause::RecordingClock>) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         state.epoch = Some(epoch);
         state.takes = vec![epoch];
         state.markers.clear();
@@ -657,13 +727,14 @@ impl SessionControl {
         state.pause_generation = 0;
         state.saved_pause_generation = 0;
         state.manifest_error = None;
+        state.pause_outcome = None;
     }
 
     /// What the program shows at `at`: the scene of the last switch at or
     /// before it (or the first scene put on air), and the transition from
     /// the scene before still under way, if any.
     fn on_air(&self, at: Time) -> Option<OnAir> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock();
         let index = state
             .scenes
             .iter()
@@ -691,24 +762,20 @@ impl SessionControl {
     }
 
     fn begin_take(&self, at: Time) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         state.takes.push(at);
-        state.splitting = false;
     }
 
     fn take_changed(&self) -> Option<u64> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         std::mem::take(&mut state.changed).then_some(state.pause_generation)
     }
 
     /// Markers and scene switches of the take running from `from` until
     /// `until`, on its timeline. The scene on air when it starts is at 0.
     fn timeline(&self, from: Time, until: Time) -> (Vec<Marker>, Vec<SceneChange>) {
-        let state = self.state.lock().unwrap();
-        let cuts = state
-            .clock
-            .as_ref()
-            .map(|clock| clock.state.read().unwrap());
+        let state = self.state.lock();
+        let cuts = state.clock.as_ref().map(|clock| clock.state.read());
         let seconds = |at: Time| match &cuts {
             Some(cuts) => cuts.map(at).saturating_since(cuts.map(from)).as_secs_f64(),
             None => at.saturating_since(from).as_secs_f64(),
@@ -783,10 +850,44 @@ struct FilePlan {
     frames: AtomicU64,
     newest: AtomicI64,
     audio_dropouts: AtomicU64,
+    /// Native backend selection: -1 unknown, 0 software, 1 hardware.
+    hardware_accelerated: AtomicI64,
     audio: Vec<String>,
     /// Source timing policy for each audio track (the program is continuous).
     audio_timing: Vec<file::AudioTiming>,
     spec: WriterSpec,
+    /// Crash-safe writers only (see `FileWriter::crash_safe`): how much of
+    /// the file, from its start, is on disk (nanoseconds; -1 unknown), and
+    /// the commit barrier a pause asks for: the generation requested and
+    /// the cut it must cover, then the generation the writer answered.
+    crash_safe: AtomicBool,
+    committed: AtomicI64,
+    commit_requested: AtomicU64,
+    commit_at: AtomicI64,
+    commit_done: AtomicU64,
+    /// The generation whose commit failed, and why: the file is failed
+    /// from then on, and that pause promises nothing for it.
+    commit_failed: AtomicU64,
+    commit_error: Mutex<Option<String>>,
+    /// A finalized movie can be playable even when its source failed. Keep
+    /// its actual duration and tail repeats instead of inferring them later.
+    failed_report: Mutex<Option<FileReport>>,
+}
+
+impl FilePlan {
+    /// Seconds of the take's saved timeline up to which this file is on
+    /// disk, if its writer says so.
+    fn recoverable(&self, epoch: Time, cuts: &pause::Cuts) -> Option<f64> {
+        let committed = self.committed.load(Ordering::Relaxed);
+        let start = self.start.load(Ordering::SeqCst);
+        if committed < 0 || start == i64::MIN {
+            return None;
+        }
+        let offset = cuts
+            .map(Time::from_nanos(start))
+            .saturating_since(cuts.map(epoch));
+        Some(offset.as_secs_f64() + committed as f64 / 1e9)
+    }
 }
 
 /// Where a source sends packets for one file or output.
@@ -804,6 +905,12 @@ pub enum Packet<F> {
         samples: Arc<[f32]>,
         pts: Time,
     },
+    /// An ISO file's frame for `pts` that encoder admission left out
+    /// before it was drawn (see [`pressure::IsoCredit`]): the file counts
+    /// the tick as a refused frame.
+    Skipped {
+        pts: Time,
+    },
 }
 
 /// What the session's opened sources deliver: video size and rate, and
@@ -811,6 +918,10 @@ pub enum Packet<F> {
 struct Formats {
     video: BTreeMap<String, (u32, u32, u32)>,
     audio: BTreeMap<String, u32>,
+    /// Metadata readers of the cameras open when the session started, read
+    /// only when a manifest is written. A device opened later (a changed
+    /// source) isn't one of them, so its counters never mix in.
+    cameras: BTreeMap<String, CameraMetadataReader>,
 }
 
 /// Frame slots by source id.
@@ -838,7 +949,14 @@ impl Shared {
 /// start, or nothing is recorded.
 pub fn record<P: Platform>(platform: &P, setup: &Setup, options: &RecordOptions) -> Result<Report> {
     let iso = &setup.recording.iso;
-    if !(iso.enabled && !iso.sources.is_empty()) && !setup.recording.program.enabled {
+    if !(iso.enabled && !iso.sources.is_empty())
+        && !setup.recording.program.enabled
+        && !setup.extra_canvas_ids().into_iter().any(|canvas| {
+            setup
+                .for_canvas(canvas)
+                .is_some_and(|s| s.recording.program.enabled)
+        })
+    {
         bail!(
             "nothing to record: set recording.program.enabled = true, or set \
              recording.iso.enabled = true and list video sources in recording.iso.sources"
@@ -869,6 +987,8 @@ struct Take {
     finalized: bool,
     /// The final manifest, once made (for [`OnTake`]).
     manifest: Option<SessionManifest>,
+    /// The audio-stop errors its final manifest was made with.
+    audio_errors: Vec<String>,
 }
 
 /// A take's files and manifest name, before it begins.
@@ -891,6 +1011,7 @@ impl Take {
             end: None,
             finalized: false,
             manifest: None,
+            audio_errors: Vec::new(),
         }
     }
 
@@ -952,10 +1073,16 @@ fn plan_take(setup: &Setup, formats: &Formats, folder: &Path, number: u32) -> Re
                 setup.source(id).expect("validated").kind.label(),
                 (width, height, fps),
                 &iso.encoder,
-                iso.audio_for(
-                    setup.source(id).expect("validated"),
-                    formats.audio.contains_key(id),
-                ),
+                {
+                    let mut audio = iso.audio_for(
+                        setup.source(id).expect("validated"),
+                        formats.audio.contains_key(id),
+                    );
+                    // A listed source with no audio track (a media file
+                    // without sound) gets no track; the start warns (#75).
+                    audio.retain(|id| formats.audio.contains_key(id));
+                    audio
+                },
             ));
         }
     }
@@ -970,6 +1097,26 @@ fn plan_take(setup: &Setup, formats: &Formats, folder: &Path, number: u32) -> Re
             &program.encoder,
             program_audio.clone(),
         ));
+    }
+    // Every recorded extra canvas's program (`[vertical]`, `[[canvases]]`).
+    let extras: Vec<(CanvasId, Setup)> = setup
+        .extra_canvas_ids()
+        .into_iter()
+        .filter_map(|canvas| Some((canvas, setup.for_canvas(canvas)?)))
+        .collect();
+    for (canvas, extra) in &extras {
+        let program = &extra.recording.program;
+        if program.enabled {
+            let (width, height) = program.size(&extra.canvas);
+            files.push((
+                file_name(&program.filename, &canvas.program(), &now),
+                canvas.program().to_string(),
+                PROGRAM,
+                (width, height, extra.canvas.fps),
+                &program.encoder,
+                program_audio.clone(),
+            ));
+        }
     }
     let names: Vec<(String, &str)> = files
         .iter()
@@ -991,6 +1138,15 @@ fn plan_take(setup: &Setup, formats: &Formats, folder: &Path, number: u32) -> Re
                     frames: AtomicU64::new(0),
                     newest: AtomicI64::new(i64::MIN),
                     audio_dropouts: AtomicU64::new(0),
+                    hardware_accelerated: AtomicI64::new(-1),
+                    crash_safe: AtomicBool::new(false),
+                    committed: AtomicI64::new(-1),
+                    commit_requested: AtomicU64::new(0),
+                    commit_at: AtomicI64::new(i64::MIN),
+                    commit_done: AtomicU64::new(0),
+                    commit_failed: AtomicU64::new(0),
+                    commit_error: Mutex::new(None),
+                    failed_report: Mutex::new(None),
                     audio: audio.clone(),
                     audio_timing: audio
                         .iter()
@@ -1006,6 +1162,7 @@ fn plan_take(setup: &Setup, formats: &Formats, folder: &Path, number: u32) -> Re
                             encoder: encoder.clone(),
                         },
                         audio: audio_tracks(&audio),
+                        created: now.into(),
                     },
                 })
             },
@@ -1033,14 +1190,36 @@ fn sidechain_sources(setup: &Setup) -> Vec<&str> {
     out
 }
 
-/// A writer for each file, or none if any can't be created.
-fn create_writers<P: Platform>(platform: &P, plans: &[Arc<FilePlan>]) -> Result<Vec<P::Writer>> {
+/// The slots of the ISO sources whose files take their frames as captured,
+/// by source id, for writers that must see one before they open (see
+/// [`Platform::create_writer_for_frame`]).
+type WriterInputs<F> = BTreeMap<String, Arc<FrameSlot<F>>>;
+
+/// A writer for each file, or none if any can't be created. A file whose
+/// source is in `inputs` waits briefly for that source's first frame.
+fn create_writers<P: Platform>(
+    platform: &P,
+    plans: &[Arc<FilePlan>],
+    inputs: &WriterInputs<P::Frame>,
+) -> Result<Vec<P::Writer>> {
     let mut writers = Vec::new();
     for plan in plans {
-        match platform.create_writer(&plan.spec) {
+        let writer = match inputs.get(&plan.source) {
+            Some(slot) => wait_for_frame(slot)
+                .with_context(|| format!("{:?} sent no frame to record", plan.source))
+                .and_then(|(frame, _)| platform.create_writer_for_frame(&plan.spec, &frame)),
+            None => platform.create_writer(&plan.spec),
+        };
+        match writer {
             Ok(mut writer) => {
-                if plan.source == PROGRAM {
-                    writer.prioritize_video();
+                plan.hardware_accelerated.store(
+                    writer.hardware_accelerated().map_or(-1, i64::from),
+                    Ordering::Relaxed,
+                );
+                if let Some(canvas) = program_canvas(plan) {
+                    // Preserve the id for per-canvas pins; native admission
+                    // still puts every non-main canvas in the secondary class.
+                    writer.prioritize_video(canvas);
                 }
                 writers.push(writer);
             }
@@ -1053,6 +1232,22 @@ fn create_writers<P: Platform>(platform: &P, plans: &[Arc<FilePlan>]) -> Result<
     Ok(writers)
 }
 
+/// Whether `plan` writes a canvas's program (not an ISO source).
+fn is_program(plan: &FilePlan) -> bool {
+    plan.kind == PROGRAM
+}
+
+/// The canvas whose program `plan` writes, if it writes one.
+fn program_canvas(plan: &FilePlan) -> Option<CanvasId> {
+    if !is_program(plan) {
+        return None;
+    }
+    match plan.source.as_str() {
+        PROGRAM => Some(CanvasId::Main),
+        source => CanvasId::parse(source.strip_suffix("-program")?).ok(),
+    }
+}
+
 /// Live counters for every file. A frame counts as dropped once a newer
 /// one has reached the file, or once it is [`STALL_AFTER`] overdue (so a
 /// file that stops receiving frames shows up too).
@@ -1063,7 +1258,7 @@ fn live_status(
     now: Time,
     clock: &pause::RecordingClock,
 ) -> LiveStatus {
-    let cuts = clock.state.read().unwrap();
+    let cuts = clock.state.read();
     let overdue = cuts.map((now - STALL_AFTER).min(shared.end()));
     let status = cuts.status(now.min(shared.end()));
     LiveStatus {
@@ -1072,6 +1267,7 @@ fn live_status(
         elapsed_seconds: status.elapsed_seconds,
         paused: status.paused,
         paused_seconds: status.paused_seconds,
+        handover: false,
         disk: None,
         files: plans
             .iter()
@@ -1088,11 +1284,19 @@ fn live_status(
                     let seen = newest.ticks_since(start, fps) + 1;
                     seen.max(overdue.ticks_since(start, fps)).max(0) as u64
                 };
+                let committed = plan.committed.load(Ordering::Relaxed);
                 LiveFile {
                     source: plan.source.clone(),
+                    codec: Some(plan.spec.video.encoder.codec),
+                    hardware_accelerated: match plan.hardware_accelerated.load(Ordering::Relaxed) {
+                        0 => Some(false),
+                        1 => Some(true),
+                        _ => None,
+                    },
                     frames,
                     dropped_frames: due.saturating_sub(frames),
                     audio_dropouts: plan.audio_dropouts.load(Ordering::Relaxed),
+                    committed_seconds: (committed >= 0).then(|| committed as f64 / 1e9),
                 }
             })
             .collect(),
@@ -1101,13 +1305,17 @@ fn live_status(
 
 /// A take's manifest as it stands: files that haven't finished have no
 /// duration or counts yet.
+#[allow(clippy::too_many_arguments)]
 fn take_manifest<P: Platform>(
     platform: &P,
     setup: &Setup,
     take: &Take,
     status: SessionStatus,
     errors: &[String],
+    stops: &[AudioStopped],
     control: Option<&SessionControl>,
+    canvas_controls: &[(CanvasId, &SessionControl)],
+    cameras: &BTreeMap<String, CameraMetadataReader>,
 ) -> SessionManifest {
     let finished = status != SessionStatus::Recording;
     let mapped = |at| control.map_or(at, |c| c.recording_time(at));
@@ -1115,6 +1323,23 @@ fn take_manifest<P: Platform>(
     // A file that failed has no report; its counters say what it holds and
     // what it lost up to the take's end.
     let failed = |plan: &FilePlan| {
+        if let Some(mut report) = plan.failed_report.lock().clone() {
+            // Keep the finalized media duration, but account for the frames
+            // missing through this take's actual end, including its tail.
+            let start = plan.start.load(Ordering::SeqCst);
+            if let Some(end) = take.end
+                && start != i64::MIN
+            {
+                let start = Time::from_nanos(start);
+                let fps = plan.spec.video.fps;
+                let end = file::file_end(start, mapped(end).max(start), fps);
+                let expected = end.ticks_since(start, fps).max(0) as u64;
+                report.dropped_frames = report.dropped_frames.max(
+                    expected.saturating_sub(report.frames.saturating_sub(report.repeated_frames)),
+                );
+            }
+            return Some(report);
+        }
         let start = plan.start.load(Ordering::SeqCst);
         let end = take.end?;
         // A failed writer may have closed long before the take ended. Read
@@ -1151,6 +1376,7 @@ fn take_manifest<P: Platform>(
                 repeated_frames: 0,
                 dropped_frames: (end.ticks_since(start, fps).max(0) as u64).saturating_sub(frames),
                 audio_dropouts: plan.audio_dropouts.load(Ordering::Relaxed),
+                audio_stops: Vec::new(),
             }
         })
     };
@@ -1186,20 +1412,46 @@ fn take_manifest<P: Platform>(
             .flatten(),
         markers,
         scenes,
+        vertical_scenes: canvas_controls
+            .iter()
+            .find(|(canvas, _)| canvas.is_vertical())
+            .map_or_else(Vec::new, |(_, control)| {
+                control
+                    .timeline(take.epoch, take.end.unwrap_or(Time::MAX))
+                    .1
+            }),
+        canvas_scenes: canvas_controls
+            .iter()
+            .filter(|(canvas, _)| !canvas.is_main() && !canvas.is_vertical())
+            .map(|(canvas, control)| {
+                (
+                    canvas.to_string(),
+                    control
+                        .timeline(take.epoch, take.end.unwrap_or(Time::MAX))
+                        .1,
+                )
+            })
+            .collect(),
         pauses: control.map_or_else(Vec::new, |c| {
-            let state = c.state.lock().unwrap();
+            let state = c.state.lock();
             state.clock.as_ref().map_or_else(Vec::new, |clock| {
                 clock
                     .state
                     .read()
-                    .unwrap()
                     .manifest(take.epoch, take.end.unwrap_or(Time::MAX))
             })
         }),
         files: plans
             .iter()
             .zip(results)
-            .map(|(plan, result)| {
+            .enumerate()
+            .filter(|(index, (plan, _))| {
+                // A failed handoff has no file. Keep its error in the take,
+                // not a phantom path in the file list returned to clients.
+                plan.start.load(Ordering::SeqCst) != i64::MIN
+                    || !matches!(&take.results[*index], Some(Err(_)))
+            })
+            .map(|(_, (plan, result))| {
                 let start = plan.start.load(Ordering::SeqCst);
                 ManifestFile {
                     path: plan
@@ -1232,32 +1484,207 @@ fn take_manifest<P: Platform>(
                     repeated_frames: result.as_ref().map(|r| r.repeated_frames),
                     dropped_frames: result.as_ref().map(|r| r.dropped_frames),
                     audio_dropouts: result.as_ref().map(|r| r.audio_dropouts),
+                    audio_stops: file_audio_stops(setup, take, plan, stops, mapped),
                 }
             })
             .collect(),
         errors: errors.to_vec(),
+        // Frozen once the take's final manifest is made, so restating it
+        // later never adds what the cameras saw after the take ended.
+        cameras: match &take.manifest {
+            Some(manifest) => manifest.cameras.clone(),
+            None => cameras
+                .iter()
+                .map(|(id, read)| (id.clone(), read()))
+                .collect(),
+        },
     }
+}
+
+/// An audio source that stopped while recording (a microphone unplugged, a
+/// picked input gone, an app's audio tap ended), and when the engine had it
+/// back, if it opened it again.
+#[derive(Debug, Clone)]
+pub(crate) struct AudioStopped {
+    pub source: String,
+    /// The end of the last audio it delivered, on the session clock (where
+    /// the files' tracks lose it).
+    pub at: Time,
+    pub reason: String,
+    /// The start of the first audio it delivered once reopened.
+    pub resumed: Option<Time>,
+}
+
+/// How an audio stop's reason starts in a take that began after it.
+const STOPPED_BEFORE: &str = "it stopped before this take began: ";
+
+/// The stops of `stops` that `plan`'s file (in `take`) carries: one per
+/// track holding the stopped source's audio, its own or the program mix
+/// it was mixed into, timed on the take's timeline. `mapped` takes a time
+/// on the session clock to the saved recording clock (pauses cut out).
+fn file_audio_stops(
+    setup: &Setup,
+    take: &Take,
+    plan: &FilePlan,
+    stops: &[AudioStopped],
+    mapped: impl Fn(Time) -> Time,
+) -> Vec<AudioStop> {
+    let end = take.end.unwrap_or(Time::MAX);
+    let mix = &setup.recording.program.audio;
+    let seconds = |at: Time| {
+        mapped(at)
+            .saturating_since(mapped(take.epoch))
+            .as_secs_f64()
+    };
+    let mut out = Vec::new();
+    for stop in stops.iter().filter(|stop| stop.at < end) {
+        for (track, id) in plan.audio.iter().enumerate() {
+            let program = id == PROGRAM && mix.contains(&stop.source);
+            if !program && *id != stop.source {
+                continue;
+            }
+            // Only the program mix takes a reopened source back: the ISO
+            // files' routes are fixed for the recording.
+            let resumed = stop.resumed.filter(|_| program);
+            if resumed.is_some_and(|at| at <= take.epoch) {
+                continue;
+            }
+            let before = stop.at <= take.epoch;
+            out.push(AudioStop {
+                source: stop.source.clone(),
+                track: track as u32,
+                time_seconds: if before { 0.0 } else { seconds(stop.at) },
+                resumed_seconds: resumed.filter(|at| *at < end).map(seconds),
+                reason: if before {
+                    format!("{STOPPED_BEFORE}{}", stop.reason)
+                } else {
+                    stop.reason.clone()
+                },
+            });
+        }
+    }
+    out
+}
+
+/// A take's errors for the audio sources that stopped in it (or before it
+/// and stayed stopped), naming the files that lost their audio.
+fn audio_stop_errors(
+    setup: &Setup,
+    take: &Take,
+    stops: &[AudioStopped],
+    control: Option<&SessionControl>,
+) -> Vec<String> {
+    let mapped = |at| control.map_or(at, |c| c.recording_time(at));
+    // One line per stop, with every file it is missing from.
+    let mut lines: Vec<(AudioStop, Vec<String>)> = Vec::new();
+    for plan in &take.plans {
+        let name = plan
+            .spec
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        for stop in file_audio_stops(setup, take, plan, stops, mapped) {
+            let same = |(line, _): &&mut (AudioStop, Vec<String>)| {
+                (&line.source, line.time_seconds, line.resumed_seconds)
+                    == (&stop.source, stop.time_seconds, stop.resumed_seconds)
+            };
+            match lines.iter_mut().find(same) {
+                Some((_, files)) => {
+                    if !files.contains(&name) {
+                        files.push(name.clone());
+                    }
+                }
+                None => lines.push((stop, vec![name.clone()])),
+            }
+        }
+    }
+    lines
+        .into_iter()
+        .map(|(stop, files)| {
+            let AudioStop {
+                source,
+                time_seconds: time,
+                resumed_seconds: resumed,
+                reason,
+                ..
+            } = stop;
+            let until = match resumed {
+                Some(r) => format!(" until {r:.3} s"),
+                None => String::new(),
+            };
+            let files_are = format!(
+                "{} {}",
+                files.join(", "),
+                if files.len() == 1 { "is" } else { "are" }
+            );
+            match reason.strip_prefix(STOPPED_BEFORE) {
+                Some(reason) => format!(
+                    "{source}: its audio stopped before this take began, so {files_are} \
+                     missing it from the start{until}: {reason}"
+                ),
+                None => format!(
+                    "{source}: its audio stopped at {time:.3} s, so {files_are} missing it \
+                     from there{until}: {reason}"
+                ),
+            }
+        })
+        .collect()
 }
 
 /// Write the manifest so that a reader (or a crash) never sees half of it.
 /// The `.partial` is made new (`O_EXCL | O_NOFOLLOW`), never written
 /// through whatever was at its name (a link a plugin put there, say).
+#[cfg(not(windows))]
 fn write_manifest(path: &Path, manifest: &SessionManifest) -> Result<()> {
+    write_manifest_with(path, manifest, false)
+}
+
+/// Write the manifest and flush it (and its folder entry) through to the
+/// disk: for the checkpoint a pause reply vouches for.
+#[cfg(not(windows))]
+fn write_manifest_durable(path: &Path, manifest: &SessionManifest) -> Result<()> {
+    write_manifest_with(path, manifest, true)
+}
+
+#[cfg(not(windows))]
+fn write_manifest_with(path: &Path, manifest: &SessionManifest, durable: bool) -> Result<()> {
     use std::io::Write;
+    #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
     let partial = path.with_extension("json.partial");
     let json = serde_json::to_string_pretty(manifest)?;
-    // A leftover (an earlier write that failed): remove the entry itself.
+    // Remove a leftover entry, never follow it into a plugin's target.
     if partial.symlink_metadata().is_ok() {
         let _ = std::fs::remove_file(&partial);
     }
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&partial)
-        .and_then(|mut file| file.write_all((json + "\n").as_bytes()))
-        .and_then(|()| std::fs::rename(&partial, path))
+    let write = || -> std::io::Result<()> {
+        #[cfg(unix)]
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&partial)?;
+        // create_new is atomic and refuses existing files, including links.
+        // On Windows std also sets FILE_FLAG_OPEN_REPARSE_POINT. Keep the
+        // Unix open flags and all durability/error handling unchanged.
+        #[cfg(not(unix))]
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&partial)?;
+        file.write_all((json + "\n").as_bytes())?;
+        if durable {
+            file.sync_all()?;
+        }
+        drop(file);
+        std::fs::rename(&partial, path)?;
+        if durable && let Some(folder) = path.parent() {
+            std::fs::File::open(folder)?.sync_all()?;
+        }
+        Ok(())
+    };
+    write()
         .inspect_err(|_| {
             let _ = std::fs::remove_file(&partial);
         })
@@ -1267,20 +1694,29 @@ fn write_manifest(path: &Path, manifest: &SessionManifest) -> Result<()> {
 /// The file recordings in a folder lock (shared) while they write there, so
 /// a manifest a killed or crashed recording left saying "recording" can be
 /// told from one still being written.
+#[cfg(not(windows))]
 const FOLDER_LOCK: &str = ".isocast.lock";
 
 /// What an interrupted session's manifest says about it.
+#[cfg(not(windows))]
 const INTERRUPTED: &str = "the recording ended without finishing: the process recording it \
                            (isocastd or `isocast record`) was stopped or crashed; only completed \
                            fragments may be playable, and a file with no completed fragment may \
                            not open. Recoverable durations and frame counts are unknown; inspect \
                            every file's video and audio tracks";
+/// The same, for files a crash-safe writer left and recovery finished.
+#[cfg(not(windows))]
+const INTERRUPTED_RECOVERED: &str = "the recording ended without finishing: the process recording it (isocastd or `isocast \
+     record`) was stopped or crashed. Its files were finished from the fragments that had \
+     reached the disk; the durations here are what was recovered, frame counts are unknown";
 
 /// A recording's hold on its folder's lock, released when dropped.
+#[cfg(not(windows))]
 pub(crate) struct FolderLock {
     _file: std::fs::File,
 }
 
+#[cfg(not(windows))]
 impl FolderLock {
     /// Hold `folder`'s lock alongside other recordings there; `None` if the
     /// folder can't be locked (some network shares).
@@ -1291,6 +1727,40 @@ impl FolderLock {
     }
 }
 
+#[cfg(windows)]
+pub(crate) struct FolderLock {
+    directory: isocast_mux::file::Directory,
+}
+
+#[cfg(windows)]
+impl FolderLock {
+    pub(crate) fn hold(folder: &Path) -> Result<Self> {
+        Ok(Self {
+            directory: isocast_mux::file::Directory::for_recording(folder).with_context(|| {
+                format!(
+                    "could not acquire recording ownership of {}",
+                    folder.display()
+                )
+            })?,
+        })
+    }
+
+    pub(crate) fn write(
+        &self,
+        path: &Path,
+        manifest: &SessionManifest,
+        durable: bool,
+    ) -> Result<()> {
+        isocast_mux::recovery::write_manifest_in(
+            &self.directory,
+            path.file_name().context("manifest has no file name")?,
+            manifest,
+            durable,
+        )
+    }
+}
+
+#[cfg(not(windows))]
 fn lock_file(folder: &Path) -> Option<std::fs::File> {
     std::fs::OpenOptions::new()
         .create(true)
@@ -1305,6 +1775,12 @@ fn lock_file(folder: &Path) -> Option<std::fs::File> {
 /// while a recording writes in the folder (it holds the lock), or if the
 /// folder can't be read or locked. With `mark`, each is rewritten as failed,
 /// saying so.
+#[cfg(windows)]
+pub fn interrupted_sessions(folder: &Path, mark: bool) -> Vec<PathBuf> {
+    isocast_mux::recovery::interrupted_sessions(folder, mark).unwrap_or_default()
+}
+
+#[cfg(not(windows))]
 pub fn interrupted_sessions(folder: &Path, mark: bool) -> Vec<PathBuf> {
     let Some(lock) = lock_file(folder) else {
         return Vec::new();
@@ -1344,6 +1820,27 @@ pub fn interrupted_sessions(folder: &Path, mark: bool) -> Vec<PathBuf> {
 
 /// What to tell the user about `interrupted` sessions (see
 /// [`interrupted_sessions`]), marked or not.
+#[cfg(windows)]
+pub fn interrupted_note(interrupted: &[PathBuf], marked: bool) -> Option<String> {
+    if interrupted.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "earlier recordings {}: {}; inspect each manifest for verified media, unknown counts and any persistence errors",
+        if marked {
+            "were inspected for recovery"
+        } else {
+            "may have been interrupted"
+        },
+        interrupted
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
+    ))
+}
+
+#[cfg(not(windows))]
 pub fn interrupted_note(interrupted: &[PathBuf], marked: bool) -> Option<String> {
     let list = interrupted
         .iter()
@@ -1383,18 +1880,31 @@ pub fn interrupted_note(interrupted: &[PathBuf], marked: bool) -> Option<String>
 
 /// Both launch-time and recording-start recovery use the pause policy. An
 /// open pause stays open: the crash time cannot be reconstructed from its cut.
+#[cfg(not(windows))]
 fn annotate_interrupted_pauses(manifest: &mut SessionManifest) {
     if manifest.pauses.is_empty() {
         return;
     }
-    if manifest
-        .pauses
-        .last()
-        .is_some_and(|p| p.end_seconds.is_none())
-    {
+    if let Some(open) = manifest.pauses.last().filter(|p| p.end_seconds.is_none()) {
         manifest
             .errors
-            .push("this take was interrupted while paused; recoverable duration unknown".into());
+            .push(match open.recoverable_seconds_at_pause {
+                Some(seconds) => format!(
+                    "this take was interrupted while paused; every file was on disk up to \
+                 {seconds:.3} s of its timeline when the pause was answered"
+                ),
+                None => {
+                    "this take was interrupted while paused; recoverable duration unknown".into()
+                }
+            });
+    }
+    // Crash-safe files' pause replies do state committed media.
+    if manifest
+        .pauses
+        .iter()
+        .all(|p| p.recoverable_seconds_at_pause.is_some())
+    {
+        return;
     }
     manifest.errors.push(
         "this take contains pauses: pause/resume replies checkpoint the cut \
@@ -1407,6 +1917,33 @@ fn annotate_interrupted_pauses(manifest: &mut SessionManifest) {
 
 /// Repair orphaned manifests only under the recording folder's exclusive
 /// lock. Probe durable media for duration; never infer frame/drop counts.
+#[cfg(windows)]
+pub fn recover_interrupted<P: Platform>(
+    _platform: &P,
+    folder: &Path,
+) -> Vec<isocast_protocol::manifest::InterruptedRecording> {
+    match isocast_mux::recovery::recover_directory(folder) {
+        Ok(recovery) => {
+            for warning in recovery.warnings {
+                isocast_diagnostics::diagnostic!("warn"; "recording recovery: {}: {warning}", folder.display());
+            }
+            recovery.sessions
+        }
+        Err(error) => {
+            // A live recording owns a shared lease; leave it alone. All other
+            // failures remain visible, rather than pretending repair succeeded.
+            if !error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock)
+            {
+                isocast_diagnostics::diagnostic!("warn"; "recording recovery: {}: {error:#}", folder.display());
+            }
+            Vec::new()
+        }
+    }
+}
+
+#[cfg(not(windows))]
 pub fn recover_interrupted<P: Platform>(
     platform: &P,
     folder: &Path,
@@ -1443,20 +1980,81 @@ pub fn recover_interrupted<P: Platform>(
         else {
             continue;
         };
+        // A manifest still saying "recording" is a crash; one saying
+        // "failed" or "interrupted" may still hold a file a crash-safe
+        // writer could not finish (a write error, or a repair that failed
+        // last time): every such file is finished from its fragments now.
+        // Files that are movies already are left alone.
         let newly_detected = manifest.status == SessionStatus::Recording;
+        if !matches!(
+            manifest.status,
+            SessionStatus::Recording | SessionStatus::Interrupted | SessionStatus::Failed
+        ) {
+            continue;
+        }
+        let mut changed = newly_detected;
+        let mut repaired = false;
         if newly_detected {
             manifest.status = SessionStatus::Interrupted;
             manifest.errors.push(INTERRUPTED.into());
             annotate_interrupted_pauses(&mut manifest);
-            for file in &mut manifest.files {
-                let relative = Path::new(&file.path);
-                if relative
-                    .components()
-                    .any(|c| !matches!(c, std::path::Component::Normal(_)))
-                {
-                    continue;
+        }
+        for file in &mut manifest.files {
+            // A file name in this folder, nothing else: recovery repairs
+            // only regular files here (the platform refuses links), under
+            // this folder's lock, which is held for the whole pass.
+            let relative = Path::new(&file.path);
+            let mut components = relative.components();
+            let Some(std::path::Component::Normal(name)) = components.next() else {
+                continue;
+            };
+            if components.next().is_some() {
+                continue;
+            }
+            let full = folder.join(name);
+            let recovered = platform.recover_file(folder, name);
+            let probe = match recovered {
+                Ok(Some(recovered)) => {
+                    repaired = true;
+                    if let Some(note) = manifest.errors.iter_mut().find(|e| *e == INTERRUPTED) {
+                        *note = INTERRUPTED_RECOVERED.into();
+                    }
+                    // The movie's own contents replace counters that only
+                    // described what the writer had accepted.
+                    if let Some(frames) = recovered.frames {
+                        file.frames = Some(frames);
+                        file.repeated_frames = None;
+                        file.dropped_frames = None;
+                    }
+                    manifest.errors.push(match recovered.frames {
+                        Some(_) => format!(
+                            "{}: finished at launch from the {} crash-safe fragments that \
+                             reached the disk before the interruption: {}",
+                            file.path, recovered.fragments, recovered.summary
+                        ),
+                        None => format!(
+                            "{}: its final header was completed at launch (the recording was \
+                             interrupted while finishing it)",
+                            file.path
+                        ),
+                    });
+                    true
                 }
-                match platform.media_info(&folder.join(relative)) {
+                Ok(None) => newly_detected,
+                Err(err) => {
+                    let note = format!(
+                        "{}: could not be finished from its fragments: {err:#}",
+                        file.path
+                    );
+                    if !manifest.errors.contains(&note) {
+                        manifest.errors.push(note);
+                        changed = true;
+                    }
+                    newly_detected
+                }
+            };
+            if probe {
+                match platform.media_info(&full) {
                     Ok(info) => file.duration_seconds = Some(info.duration.as_secs_f64()),
                     Err(err) => manifest.errors.push(format!(
                         "{}: durable media could not be probed: {err:#}",
@@ -1464,6 +2062,8 @@ pub fn recover_interrupted<P: Platform>(
                     )),
                 }
             }
+        }
+        if newly_detected || repaired {
             manifest.duration_seconds = manifest
                 .files
                 .iter()
@@ -1472,15 +2072,17 @@ pub fn recover_interrupted<P: Platform>(
                         .map(|d| d + f.start_offset_seconds.unwrap_or(0.0))
                 })
                 .reduce(f64::max);
-            if let Err(err) = write_manifest(&path, &manifest) {
-                manifest
-                    .errors
-                    .push(format!("could not persist interrupted marker: {err:#}"));
-            }
         }
-        if manifest.status == SessionStatus::Interrupted {
+        if (changed || repaired)
+            && let Err(err) = write_manifest(&path, &manifest)
+        {
+            manifest
+                .errors
+                .push(format!("could not persist interrupted marker: {err:#}"));
+        }
+        if manifest.status == SessionStatus::Interrupted || repaired {
             recovered.push(isocast_protocol::manifest::InterruptedRecording {
-                newly_detected,
+                newly_detected: newly_detected || repaired,
                 manifest: path,
                 recording: manifest,
             });
@@ -1491,6 +2093,16 @@ pub fn recover_interrupted<P: Platform>(
 
 /// A controlled emergency stop finished the media normally, but the take
 /// was interrupted by a critical-state failure, not ended by the operator.
+#[cfg(windows)]
+pub fn mark_interrupted(report: &Report, why: &str) {
+    for path in &report.takes {
+        if let Err(error) = isocast_mux::recovery::mark_interrupted(path, why) {
+            isocast_diagnostics::diagnostic!("warn"; "could not mark emergency recording {}: {error:#}", path.display());
+        }
+    }
+}
+
+#[cfg(not(windows))]
 pub fn mark_interrupted(report: &Report, why: &str) {
     for path in &report.takes {
         if let Some(mut manifest) = std::fs::read_to_string(path)
@@ -1546,10 +2158,18 @@ fn unique_paths(
 }
 
 pub fn expand_home(folder: &str) -> PathBuf {
+    #[cfg(windows)]
+    let home =
+        Some(isocast_protocol::api::home_folder()).filter(|home| !home.as_os_str().is_empty());
+    #[cfg(not(windows))]
     let home = std::env::var_os("HOME").map(PathBuf::from);
     match (folder.strip_prefix('~'), home) {
-        (Some(rest), Some(home)) if rest.is_empty() || rest.starts_with('/') => {
-            home.join(rest.trim_start_matches('/'))
+        (Some(rest), Some(home))
+            if rest.is_empty()
+                || rest.starts_with('/')
+                || (cfg!(windows) && rest.starts_with('\\')) =>
+        {
+            home.join(rest.trim_start_matches(|c| c == '/' || (cfg!(windows) && c == '\\')))
         }
         _ => PathBuf::from(folder),
     }

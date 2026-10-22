@@ -1081,6 +1081,10 @@ fn write(spec: &JoinSpec, path: &Path, progress: OnJoinProgress) -> Result<Joine
             duration_seconds: in_seconds(*length, out_tb),
             frames: frames[k],
             frames_left_out: left_out[k],
+            // Video packets are copied as they are; a part in another
+            // format isn't converted here (it fails the join instead).
+            reencoded: 0,
+            converted: false,
         })
         .collect();
     Ok(Joined {

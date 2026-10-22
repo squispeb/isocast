@@ -9,18 +9,24 @@ mod audio_filter;
 pub mod capacity;
 pub(crate) mod compiled;
 mod content;
+pub mod critical;
 pub mod data;
 pub mod doctor;
 pub(crate) mod draw_list;
+pub mod estimate;
 pub mod filter;
+pub mod governor;
 pub mod gpu;
 pub mod hotkeys;
 pub mod layout;
+pub mod machine_profile;
+mod mask;
 mod pacing;
 mod picture;
 pub mod project;
 pub mod record;
 pub mod render;
+pub mod replay;
 pub mod scene;
 pub mod snapshot;
 pub(crate) mod source;
@@ -51,6 +57,18 @@ pub const SAMPLE_RATE: u32 = 48_000;
 /// fragment; accepting those samples does not acknowledge an on-disk commit.
 /// Queued inputs and track timing mean this is not a maximum crash-loss bound.
 pub const MOVIE_FRAGMENT_SECONDS: i64 = 2;
+
+/// A frame's retention domain. Domains reserve independent capacity; clones
+/// and repeated deliveries of the same picture share that capacity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameUse {
+    Production = 0,
+    Recording = 1,
+    Auxiliary = 2,
+    /// Protected compositors must keep reading even when an ISO's file queue
+    /// has filled its separate recording reserve on the same source pool.
+    Composition = 3,
+}
 
 /// What the engine needs from the operating system.
 /// Platforms are cheap handles (macOS: a unit struct), cloned into the
@@ -88,6 +106,12 @@ pub trait Platform: Clone + Send + Sync + 'static {
     /// The current time on the host clock, the session's master clock.
     fn now(&self) -> Time;
 
+    /// This application's identity in the platform's credential store.
+    /// `None` for an unbundled executable.
+    fn app_identifier(&self) -> Option<String> {
+        None
+    }
+
     /// Critical media deadline used only after a clock detects stretched
     /// ordinary sleeps. Back ends should bound background timer coalescing.
     fn sleep_until(&self, at: Time) {
@@ -115,9 +139,12 @@ pub trait Platform: Clone + Send + Sync + 'static {
     }
 
     /// Ask the OS for screen recording, camera and microphone access where
-    /// it hasn't been decided, showing its prompts, and wait a while for
-    /// the answers. Returns the permissions afterwards.
-    fn request_permissions(&self) -> anyhow::Result<PermissionsReport>;
+    /// it hasn't been decided (only `only`, if given), showing its prompts,
+    /// and wait a while for the answers. Returns the permissions afterwards.
+    fn request_permissions(
+        &self,
+        only: Option<PermissionKind>,
+    ) -> anyhow::Result<PermissionsReport>;
 
     /// Open the settings where `permission` is turned on by hand. Returns
     /// what was opened.
@@ -158,6 +185,22 @@ pub trait Platform: Clone + Send + Sync + 'static {
     /// Free space and kind of the volume holding `path`.
     fn volume(&self, path: &Path) -> anyhow::Result<Volume>;
 
+    /// Whether two existing paths share the volume whose free space they use.
+    /// Exports must preserve the reserve of a recording on that volume.
+    fn same_volume(&self, left: &Path, right: &Path) -> anyhow::Result<bool>;
+
+    /// CPU seconds used by this process, user and kernel time together.
+    fn process_cpu_seconds(&self) -> Option<f64> {
+        None
+    }
+
+    /// Cumulative busy CPU core-seconds across the system. Calibration uses
+    /// deltas to include native encoder services, not only the helper process.
+    /// Outside activity is included and makes this observation conservative.
+    fn system_cpu_seconds(&self) -> Option<f64> {
+        None
+    }
+
     /// How long a small write to `probe` (a scratch file beside a
     /// recording) takes to reach the disk: written and synced, without
     /// flushing the drive's own cache. `None` where it can't be measured.
@@ -174,10 +217,43 @@ pub trait Platform: Clone + Send + Sync + 'static {
     /// what encoders take as is, at under half the size of BGRA.
     fn ycbcr_frame_pool(&self, width: u32, height: u32) -> anyhow::Result<Self::FramePool>;
 
+    /// What the program and ISO stages hand H.264 and HEVC encoders:
+    /// Y'CbCr from [`Platform::ycbcr_frame_pool`] (converted on the GPU),
+    /// or BGRA from [`Platform::frame_pool`] for backends that accept RGB
+    /// frames and own their conversion.
+    fn encoder_frame_format(&self) -> EncoderFrameFormat {
+        EncoderFrameFormat::Ycbcr
+    }
+
+    /// Move a retained reference to an output's domain before queueing it or
+    /// giving it to a GPU/native encoder. Refusal is local to that domain,
+    /// never charged to another output's reserve.
+    fn retain_frame(frame: &Self::Frame, _usage: FrameUse) -> Option<Self::Frame> {
+        Some(frame.clone())
+    }
+
+    /// The platform's distinct-buffer ledger, including GPU/native owners.
+    fn frame_budget(&self) -> Option<serde_json::Value> {
+        None
+    }
+
     /// Ask the OS to run the calling thread ahead of background work: it
     /// paces frames or audio in real time (the program, a file's frame
     /// clock, an audio reader, the mix, a file writer).
     fn real_time_thread(&self) {}
+
+    /// Lower a disposable calibration helper's process/thread priority.
+    /// Only [`machine_profile::measure`] in the helper may call this.
+    /// Returns what was set, for the profile's notes; `None` where the
+    /// platform doesn't lower it.
+    fn calibration_priority(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Read the existing sampler's latest non-consuming headroom observation.
+    fn governor_headroom(&self) -> Option<governor::Headroom> {
+        None
+    }
 
     /// The CPU time the calling thread has used so far, if the OS tells:
     /// what the compositor costs per frame is measured with it.
@@ -231,6 +307,32 @@ pub trait Platform: Clone + Send + Sync + 'static {
     /// Create a media file and get it ready to receive frames and audio.
     fn create_writer(&self, spec: &WriterSpec) -> anyhow::Result<Self::Writer>;
 
+    /// [`Platform::create_writer`] for a file that takes a source's frames
+    /// as captured, with `frame` one of them, for backends whose encoders
+    /// must know their input's pixel format up front. The frame is only
+    /// looked at, not kept or written. By default it is ignored.
+    fn create_writer_for_frame(
+        &self,
+        spec: &WriterSpec,
+        frame: &Self::Frame,
+    ) -> anyhow::Result<Self::Writer> {
+        let _ = frame;
+        self.create_writer(spec)
+    }
+
+    /// Finish the file `name` in `folder` that an interrupted recording
+    /// left behind, if it is one a crash-safe writer can complete from its
+    /// fragments. `None`: it isn't one, or it is already a finished movie.
+    /// The caller holds the folder's recording lock; the platform must
+    /// touch only a regular file inside that folder (no links).
+    fn recover_file(
+        &self,
+        _folder: &Path,
+        _name: &std::ffi::OsStr,
+    ) -> anyhow::Result<Option<RecoveredFile>> {
+        Ok(None)
+    }
+
     /// Start capturing `target` (a display, a window or an app's windows)
     /// at up to `fps`, at its native resolution, delivering frames to
     /// `sink`. `ten_bit` asks for 10-bit 4:2:0 frames instead of 8-bit;
@@ -255,19 +357,32 @@ pub trait Platform: Clone + Send + Sync + 'static {
         sink: VideoSink<Self::Frame>,
     ) -> anyhow::Result<(Self::Capture, CaptureFormat)>;
 
+    /// A reader of what a camera capture from [`Platform::capture_camera`]
+    /// has observed, for the session manifest. `None` (the default) when
+    /// the platform reports nothing. The reader must hold only the
+    /// device's identity and shared flags, never the capture or GPU
+    /// resources, so it stays readable after the capture stops.
+    fn camera_metadata(&self, _capture: &Self::Capture) -> Option<CameraMetadataReader> {
+        None
+    }
+
     /// Start capturing a microphone ("default", or an id, name or part of
-    /// a name from [`Platform::devices`]). Returns its channel count.
+    /// a name from [`Platform::devices`]): the input channels `channels`
+    /// picks (numbered from 1; one is delivered as mono, two as stereo),
+    /// or by default its first two. Returns the channel count delivered.
     fn capture_microphone(
         &self,
         device: &str,
+        channels: Option<&[u32]>,
         sink: AudioSink,
     ) -> anyhow::Result<(Self::Capture, u32)>;
 
-    /// Start capturing what the computer plays. Returns its channel count.
-    /// `exclude_own` leaves out what this process plays (monitoring), so it
-    /// isn't recorded twice.
+    /// Start capturing what the computer plays, leaving out the apps
+    /// `exclude` names. Returns its channel count. `exclude_own` leaves out
+    /// what this process plays (monitoring), so it isn't recorded twice.
     fn capture_system_audio(
         &self,
+        exclude: &[String],
         sink: AudioSink,
         exclude_own: bool,
     ) -> anyhow::Result<(Self::Capture, u32)>;
@@ -341,6 +456,16 @@ pub trait Platform: Clone + Send + Sync + 'static {
     }
 }
 
+/// The frames a platform's encoders want drawn for them (see
+/// [`Platform::encoder_frame_format`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncoderFrameFormat {
+    /// 8-bit BGRA, as drawn: conversion belongs to the encoder backend.
+    Bgra,
+    /// 8-bit 4:2:0 Y'CbCr, converted by the engine.
+    Ycbcr,
+}
+
 /// What a live H.264 encoder makes: constant-ish bitrate, High profile,
 /// no B-frames, Rec. 709 tags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -395,6 +520,15 @@ pub struct ParameterSets {
 pub trait VideoEncoder: Send {
     type Frame;
 
+    /// Cumulative intentional admission refusals included in `dropped()`.
+    /// They remain losses in public accounting, but aren't new overloads.
+    fn intentional_video_drops(&self) -> u64 {
+        0
+    }
+
+    /// Rank the canvas's live output ahead of ISO encodes; main comes first.
+    fn prioritize_video(&mut self, _canvas: isocast_protocol::CanvasId) {}
+
     /// Submit a frame shown at `pts`; `keyframe` makes it a keyframe.
     fn encode(&mut self, frame: &Self::Frame, pts: Time, keyframe: bool) -> anyhow::Result<()>;
 
@@ -409,6 +543,13 @@ pub trait VideoEncoder: Send {
 
     /// Frames the encoder dropped so far instead of encoding them.
     fn dropped(&self) -> u64;
+
+    /// A refused rate change could not be rolled back completely. The last
+    /// acknowledged rate is not proof of the current native properties;
+    /// requesting that rate again must still attempt restoration.
+    fn rate_uncertain(&self) -> bool {
+        false
+    }
 
     /// From the next frame, expect `fps` frames a second and aim for
     /// `bitrate_kbps` on average (a monitor changing its rate), keeping the
@@ -478,8 +619,11 @@ pub enum MediaPart {
 }
 
 /// Files to join end to end into one (a timeline's export): the video
-/// copied as it is, each audio track decoded and encoded again as one
-/// continuous track, so it lines up with the video at every join.
+/// copied as it is, except the frames from a cut that isn't on a keyframe
+/// to the next keyframe, and parts whose video is in another format than
+/// the joined file's, which are decoded and encoded again; each audio
+/// track decoded and encoded again as one continuous track, cross-faded
+/// at each join, so it lines up with the video at every join.
 #[derive(Debug, Clone)]
 pub struct JoinSpec {
     /// The files, in order. Each has one video track and the same number
@@ -488,6 +632,13 @@ pub struct JoinSpec {
     /// Where the joined file goes; it must not exist.
     pub output: PathBuf,
     pub container: Container,
+    /// The joined video takes this file's codec, size and frame rate (the
+    /// program's, for an edited file); the first part's if absent.
+    pub format: Option<PathBuf>,
+    /// The joined video's picture size, if not that file's (a vertical
+    /// edited file, #94): every part is encoded again, its picture (or
+    /// crop) fitted into it.
+    pub size: Option<(u32, u32)>,
 }
 
 #[derive(Debug, Clone)]
@@ -503,6 +654,22 @@ pub struct JoinPart {
     /// Where the file starts within its clip, in seconds (a file that
     /// started after the others): held before it, as at the end.
     pub offset_seconds: f64,
+    /// Where the part starts on its take's clock (its clip's in point), in
+    /// seconds: what the file holds from there on fills the part. The
+    /// picture at the start is the frame on screen at that moment.
+    pub in_seconds: f64,
+    /// Take the part's audio from this file of the same take instead (and
+    /// where it starts within the clip): an edited file shows an ISO
+    /// file's picture with the program's sound.
+    pub audio: Option<(PathBuf, f64)>,
+    /// The file's frame rate as recorded (its manifest's), which a file
+    /// with dropped frames can't tell; 0 if unknown (then the file's own
+    /// average, rounded).
+    pub fps: u32,
+    /// Show only this part of the file's picture (fractions of its width
+    /// and height), scaled to fit the joined file's size: the part is
+    /// decoded and encoded again whole (#87). The whole picture if absent.
+    pub crop: Option<isocast_protocol::timeline::Crop>,
 }
 
 /// What a join wrote.
@@ -522,6 +689,11 @@ pub struct JoinedPart {
     pub frames: u64,
     /// Frames starting past the part's length, left out.
     pub frames_left_out: u64,
+    /// Frames decoded and encoded again; the others were copied.
+    pub reencoded: u64,
+    /// Its file is in another format than the joined file's (codec, size
+    /// or frame rate), so it was encoded again whole.
+    pub converted: bool,
 }
 
 /// Called with how far a join has got, 0 to 1, a few times a second;
@@ -607,6 +779,11 @@ pub type SamplesCallback = Box<dyn Fn(&[f32], Time) + Send + Sync>;
 /// Fills a buffer of interleaved stereo samples for an output device.
 pub type AudioRender = Box<dyn FnMut(&mut [f32]) + Send>;
 
+/// Reads a camera capture's metadata as observed so far. Called only when
+/// a session manifest is written, never per frame.
+pub type CameraMetadataReader =
+    Arc<dyn Fn() -> isocast_protocol::CameraCaptureMetadata + Send + Sync>;
+
 /// Where a running audio capture delivers samples. Called on the capture's
 /// own threads.
 pub struct AudioSink {
@@ -674,9 +851,15 @@ pub trait FramePool: Send {
 pub trait FileWriter: Send {
     type Frame;
 
+    /// Cumulative deliberate admission refusals. Read around append_video
+    /// so a later policy restoration cannot reclassify a refused picture.
+    fn intentional_video_drops(&self) -> u64 {
+        0
+    }
+
     /// Protect this program output ahead of optional ISO encodes when the
     /// platform's shared encoder hardware is overloaded.
-    fn prioritize_video(&mut self) {}
+    fn prioritize_video(&mut self, _canvas: isocast_protocol::CanvasId) {}
 
     /// Start the file's timeline at `at`. Called once, before anything is
     /// appended.
@@ -686,24 +869,134 @@ pub trait FileWriter: Send {
     /// `false` if the encoder could not keep up and the frame was dropped.
     fn append_video(&mut self, frame: &Self::Frame, pts: Time) -> anyhow::Result<bool>;
 
+    /// Admission skipped a picture upstream. Make the same progress on
+    /// previously accepted work as a refused append, without new pixels.
+    fn skip_video(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Video frames waiting inside the writer for its encoder, for
     /// developer mode's traces.
     fn queue_depth(&self) -> usize {
         0
     }
 
+    /// Completed encoded video pictures observed so far, when the backend
+    /// exposes them. Calibration uses deltas, never queued submissions.
+    fn completed_video_frames(&self) -> Option<u64> {
+        None
+    }
+
+    /// Actual native session selection, not the machine's codec catalogue.
+    /// Unknown for backends that cannot inspect the running encoder.
+    fn hardware_accelerated(&self) -> Option<bool> {
+        None
+    }
+
     /// Append interleaved samples to audio track `track`. Returns `false` if
     /// they were dropped.
     fn append_audio(&mut self, track: usize, samples: &[f32], pts: Time) -> anyhow::Result<bool>;
 
-    /// End the timeline at `end` and finish the file. Returns the number of
-    /// repeated pictures added to cover missing tail frames. They are stored
-    /// frames, but must not reduce the count of dropped original pictures.
-    fn finish(self, end: Time) -> anyhow::Result<u64>;
+    /// End the timeline at `end` and finish the file: how many pictures
+    /// were repeated to cover missing tail frames (stored frames that must
+    /// not reduce the count of dropped original pictures), and what the
+    /// encoders discarded on their own while finishing. A writer that
+    /// repaired its file after failing attaches a [`RepairedFile`] to its
+    /// error.
+    fn finish(self, end: Time) -> anyhow::Result<Finished>;
 
     /// Abandon the file and delete what was written. Used when it never
     /// received a frame.
     fn cancel(self);
+
+    /// Whether this writer can commit what it holds to the disk on demand
+    /// and say how much of the file is recoverable after a crash.
+    fn crash_safe(&self) -> bool {
+        false
+    }
+
+    /// Write everything received so far to the disk and return how much of
+    /// the file's timeline (from its start) a crash can no longer lose.
+    /// `None`: the writer can't say (see [`FileWriter::crash_safe`]).
+    fn commit(&mut self) -> anyhow::Result<Option<std::time::Duration>> {
+        Ok(None)
+    }
+
+    /// How much of the file's timeline the fragments written so far make
+    /// recoverable, without committing anything.
+    fn committed(&self) -> Option<std::time::Duration> {
+        None
+    }
+
+    /// Frames the encoder accepted from `append_video` but discarded on
+    /// its own since the last call (a hardware encoder's dropped-frame
+    /// callback), so the file's frame count stays what is in the file.
+    fn lost_frames(&mut self) -> u64 {
+        0
+    }
+}
+
+/// What finishing a file established (see [`FileWriter::finish`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Finished {
+    /// Pictures repeated at the end to cover missing tail frames.
+    pub repeated: u64,
+    /// Pictures the encoder accepted and then discarded, discovered while
+    /// finishing (after the last `lost_frames` poll).
+    pub lost_frames: u64,
+    /// Audio tracks whose encoder delivered fewer packets than its input
+    /// covered (each counts as one dropout).
+    pub lost_audio_tracks: u64,
+}
+
+/// What a file holds after its writer failed and still finished it from
+/// what had reached the disk; attached as context to the writer's error.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RepairedFile {
+    /// Fragments the movie was rebuilt from.
+    pub fragments: u32,
+    /// Pictures in the movie, if it was rebuilt from fragments (a crash
+    /// between the final index and its header patch keeps every picture
+    /// the writer counted).
+    pub frames: Option<u64>,
+    /// The shortest kept track's duration.
+    pub seconds: Option<f64>,
+    /// What the movie holds, track by track ("video 16 pictures (0.533 s);
+    /// audio 0.319 s; left out: …"), empty when only the header patch was
+    /// missing.
+    pub summary: String,
+}
+
+impl std::fmt::Display for RepairedFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the file was still finished from its {} fragments",
+            self.fragments
+        )?;
+        if !self.summary.is_empty() {
+            write!(f, " ({})", self.summary)?;
+        }
+        Ok(())
+    }
+}
+
+/// An interrupted file a platform finished from what reached the disk
+/// (see [`Platform::recover_file`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecoveredFile {
+    /// Fragments the file was rebuilt from; 0 when only its final header
+    /// patch was missing.
+    pub fragments: u32,
+    /// Pictures in the rebuilt movie (unknown when only the header patch
+    /// was missing: the writer's own counts stand).
+    pub frames: Option<u64>,
+    /// The shortest kept track's recovered duration, if the file was rebuilt.
+    pub seconds: Option<f64>,
+    /// What the movie holds, track by track, including what was left out
+    /// (a track without any sample); empty when only the header patch was
+    /// missing.
+    pub summary: String,
 }
 
 /// A volume files are written to.
@@ -724,6 +1017,9 @@ pub struct WriterSpec {
     pub container: Container,
     pub video: VideoTrackSpec,
     pub audio: Vec<AudioTrackSpec>,
+    /// When the take began (wall clock): the file's creation time, the same
+    /// for every file of a take.
+    pub created: std::time::SystemTime,
 }
 
 #[derive(Debug, Clone)]

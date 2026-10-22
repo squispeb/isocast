@@ -6,7 +6,13 @@
 // the playhead, or the record head while a take is being recorded. A
 // 280px track-header column (200px in a narrow window) on the left, then
 // a 1px line, then the lanes, which scroll sideways. The rundown,
-// segments, ratings, the inspector and the ISO rows aren't in the MVP.
+// segments, ratings and the inspector aren't in the MVP.
+//
+// The Edit view (C.3) adds a 36px lane per ISO source under the Program
+// track (each clip's stretch of that file; the angle the edited video
+// shows lit, the others dimmed), the picture at the playhead beside the
+// tracks (CreateArea.layout: left or right), trim handles on a clip's
+// ends, the In/Out span, and Split, Delete, Undo and Redo in the header.
 //
 // Everything it shows comes from CreateArea (src/areas/create.rs), which
 // reads the engine's timeline methods and events; the playhead, zoom and
@@ -17,7 +23,7 @@ import { Icons, Icon, SvgPath } from "../../icons.slint";
 import { Ui } from "../../state.slint";
 import { FocusRing, Menus, Segment, Segmented, Slider, Tip } from "../../kit.slint";
 import { ControlsArea } from "../controls/state.slint";
-import { CreateArea, ClipRow } from "state.slint";
+import { CreateArea, ClipRow, SegmentRow, TrackRow } from "state.slint";
 
 // Paper's retake glyph (8EQ-0's cluster), not in Icons.
 global CreateIcons {
@@ -58,7 +64,7 @@ component TimeText inherits HorizontalLayout {
 
 // Paper's 24px header capsule (the "Retake / Next" cluster, "Marker"):
 // `control`, round ends, 2px in; PillItems split by a 1x12 line.
-component PillGroup inherits Rectangle {
+export component PillGroup inherits Rectangle {
     height: 24px;
     border-radius: 12px;
     background: Theme.control;
@@ -74,7 +80,7 @@ component PillGroup inherits Rectangle {
     }
 }
 
-component PillDivider inherits Rectangle {
+export component PillDivider inherits Rectangle {
     width: 1px;
     Rectangle {
         width: 1px;
@@ -85,7 +91,7 @@ component PillDivider inherits Rectangle {
 
 // One button of a PillGroup: a 12px icon and an 11px label, 8px in on
 // the left and 9px on the right, 5px between. Hover fills it.
-component PillItem inherits Rectangle {
+export component PillItem inherits Rectangle {
     in property <string> icon;
     in property <string> text;
     in property <bool> enabled: true;
@@ -210,8 +216,32 @@ component RecordButton inherits Rectangle {
 // `control` with 4px corners, a 20px line with its place, name and
 // length, and a strip of 39x22 frames 1px apart; a 2px yellow ring inside
 // when selected.
+// A file's waveform (#87) over the part of it a clip covers: its pictures
+// side by side, each `wave-frac` of the file, tinted.
+component WaveStrip inherits Rectangle {
+    in property <[image]> waves;
+    in property <float> wave-frac;
+    in property <float> in-frac;
+    in property <float> out-frac;
+    in property <brush> tint: Theme.text-3;
+    clip: true;
+    property <float> span: max(0.0001, root.out-frac - root.in-frac);
+    for wave[k] in root.waves: Image {
+        x: (k * root.wave-frac - root.in-frac) / root.span * root.width;
+        width: root.wave-frac / root.span * root.width;
+        height: root.height;
+        visible: self.x < root.width && self.x + self.width > 0;
+        source: wave;
+        image-fit: fill;
+        colorize: root.tint;
+    }
+}
+
 component ClipView inherits Rectangle {
     in property <ClipRow> data;
+    // In the editor window (C.3): trimmed clips show their own frames and
+    // a clip showing another angle says so. In the studio, as C.2 drew it.
+    in property <bool> editor;
     in property <bool> dragging;
     border-radius: 4px;
     background: Theme.control;
@@ -282,9 +312,61 @@ component ClipView inherits Rectangle {
                 if root.frames > 0: Image {
                     width: parent.width;
                     height: parent.height;
-                    source: root.data.thumbs[min(root.frames - 1, floor((t + 0.5) * root.frames / max(1, root.tiles)))];
+                    // The frame nearest the tile's place in the clip's
+                    // part of the take.
+                    // (The studio picks C.2's 8 evenly spaced frames: of
+                    // 24, every third from the second, at the same times.)
+                    source: root.editor
+                        ? root.data.thumbs[clamp(floor((root.data.in-frac + (t + 0.5) / max(1, root.tiles) * (root.data.out-frac - root.data.in-frac)) * root.frames), 0, root.frames - 1)]
+                        : root.data.thumbs[min(root.frames - 1, min(7, floor((t + 0.5) * 8 / max(1, root.tiles))) * floor(root.frames / 8) + floor(root.frames / 16))];
                     image-fit: cover;
+                    // Another angle shows in the edited video.
+                    opacity: root.editor && root.data.angle != "" ? 0.45 : 1;
                 }
+            }
+            if root.editor && root.data.angle != "" && root.width >= 40px: Rectangle {
+                x: 3px;
+                y: 3px;
+                width: min(parent.width - 6px, angle-text.preferred-width + 10px);
+                height: 16px;
+                border-radius: 3px;
+                background: Theme.accent-fill;
+                angle-text := Text {
+                    text: root.data.angle;
+                    color: Theme.on-accent;
+                    font-size: Theme.fs-micro;
+                    font-weight: Theme.weight-semibold;
+                    overflow: elide;
+                }
+            }
+            // A crop (#87): its mark at the frames' right.
+            if root.editor && root.data.cropped && root.width >= 40px: Rectangle {
+                x: parent.width - self.width - 3px;
+                y: 3px;
+                width: 16px;
+                height: 16px;
+                border-radius: 3px;
+                background: #000000b0;
+                // The crop mark, drawn (an SVG icon here cost a 30 ms
+                // frame the first time a clip was cropped): two corners.
+                Rectangle { x: 4px; y: 3px; width: 1.5px; height: 8px; background: Theme.accent; }
+                Rectangle { x: 4px; y: 9.5px; width: 8px; height: 1.5px; background: Theme.accent; }
+                Rectangle { x: 10.5px; y: 5px; width: 1.5px; height: 8px; background: Theme.accent; }
+                Rectangle { x: 4px; y: 5px; width: 8px; height: 1.5px; background: Theme.accent; }
+            }
+        }
+        // The sound under the frames (#87; tried over their lower half,
+        // which hid them: scratch/snaps/waves-compare.png).
+        if root.editor: Rectangle {
+            height: 12px;
+            WaveStrip {
+                y: 1px;
+                height: parent.height - 2px;
+                waves: root.data.waves;
+                wave-frac: root.data.wave-frac;
+                in-frac: root.data.in-frac;
+                out-frac: root.data.out-frac;
+                tint: Theme.text-3;
             }
         }
     }
@@ -296,13 +378,86 @@ component ClipView inherits Rectangle {
     }
 }
 
+// One clip's stretch of an ISO track: its frames, lit when the edited
+// video shows this angle for the clip, dimmed when not; an empty slot
+// when the clip's take didn't record the source.
+component SegmentView inherits Rectangle {
+    in property <SegmentRow> data;
+    // The waveform's strip under the frames.
+    in property <length> wave-h;
+    border-radius: 3px;
+    background: root.data.missing ? transparent : Theme.surface-inset;
+    border-width: root.data.missing ? 1px : 0px;
+    border-color: Theme.line;
+    clip: true;
+    property <length> thumbs-h: root.height - root.wave-h;
+    property <length> tile-w: root.thumbs-h * 16 / 9;
+    property <int> tiles: max(0, ceil(root.width / (root.tile-w + 1px)));
+    property <int> frames: root.data.thumbs.length;
+    if !root.data.missing: Rectangle {
+        opacity: root.data.active ? 1 : 0.4;
+        for t in root.tiles: Rectangle {
+            x: t * (root.tile-w + 1px);
+            y: 0;
+            width: root.tile-w;
+            height: root.thumbs-h;
+            if root.frames > 0: Image {
+                width: parent.width;
+                height: parent.height;
+                source: root.data.thumbs[clamp(floor((root.data.in-frac + (t + 0.5) / max(1, root.tiles) * (root.data.out-frac - root.data.in-frac)) * root.frames), 0, root.frames - 1)];
+                image-fit: cover;
+            }
+        }
+        if root.wave-h > 0: WaveStrip {
+            y: root.thumbs-h + 1px;
+            height: root.wave-h - 1px;
+            waves: root.data.waves;
+            wave-frac: root.data.wave-frac;
+            in-frac: root.data.in-frac;
+            out-frac: root.data.out-frac;
+            tint: Theme.text-3;
+        }
+    }
+    if root.data.active: Rectangle {
+        border-radius: 3px;
+        border-width: 2px;
+        border-color: Theme.accent;
+    }
+}
+
+// The playhead's place (its line is 20 points in): a type of its own so
+// the motion harness finds it (#87).
+component Playhead inherits Rectangle { }
+
 export component ClipBar inherits Rectangle {
+    // The editor window's timeline (C.3): ISO tracks, the preview, trims,
+    // splits and angles. Without it, the studio's clip bar exactly as C.2
+    // made it (record into a timeline, retake, reorder, export).
+    in property <bool> editor;
+    // The preview beside the tracks (the editor window shows it above
+    // them instead, as a viewer).
+    in property <bool> side-preview: true;
+    // The height that shows every track, with room under them.
+    out property <length> wanted-height: root.header-h + root.ruler-h + root.tracks-h + 52px;
     // The track-header column: Paper's 280px, 200px in a narrow window.
     property <length> head-w: root.width >= 1200px ? 280px : 200px;
     property <length> header-h: 34px;
     property <length> ruler-h: 20px;
-    property <length> lane-h: 56px;
-    property <length> lane-w: root.width - root.head-w - 1px;
+    // The editor's waveform strips (#87) make its tracks taller.
+    property <bool> wave-strip: root.editor;
+    property <length> lane-h: root.wave-strip ? 68px : 56px;
+    // The ISO tracks (C.3) under the Program track.
+    property <length> iso-h: root.wave-strip ? 48px : 36px;
+    property <length> tracks-h: root.lane-h + (root.editor ? CreateArea.tracks.length * root.iso-h : 0px);
+    // The preview beside the tracks: 16:9, as tall as there is room for
+    // (at most 200px), none in a narrow window or with no clips.
+    property <bool> editing: root.editor && CreateArea.has-timeline && CreateArea.clips.length > 0;
+    property <length> pv-h: min(200px, root.height - root.header-h - 16px);
+    property <length> pv-w: root.editing && root.side-preview && root.width >= 1000px && root.pv-h >= 80px ? root.pv-h * 16 / 9 + 16px : 0px;
+    property <length> pv-x: CreateArea.layout == 0 ? 0px : root.width - root.pv-w;
+    // Where the track headers start (after the preview at the left).
+    property <length> head-x: CreateArea.layout == 0 && root.pv-w > 0 ? root.pv-w + 1px : 0px;
+    property <length> lane-w: root.width - root.head-w - 1px - (root.pv-w > 0 ? root.pv-w + 1px : 0px);
 
     property <bool> recording: ControlsArea.record-state == "recording" || ControlsArea.record-state == "stopping";
     // A take is being recorded onto this timeline.
@@ -315,7 +470,9 @@ export component ClipBar inherits Rectangle {
     // 32 times closer at zoom 1. The first clip starts 8px in (Paper),
     // and room is left after the last for the next take's place.
     property <length> pad: 8px;
-    property <length> next-w: 120px;
+    // Room after the last clip for the next take's place (the editor has
+    // none: takes are recorded in the studio).
+    property <length> next-w: root.editor ? 16px : 120px;
     property <float> fit: max(0.2, (root.lane-w - 2 * root.pad - root.next-w) / 1px / max(10, root.span));
     property <float> pps: root.fit * pow(2, CreateArea.zoom * 5);
     property <length> content-w: max(root.lane-w, 2 * root.pad + root.next-w + root.span * root.pps * 1px);
@@ -333,6 +490,30 @@ export component ClipBar inherits Rectangle {
 
     // The playhead (at the end, where the next take lands, unless placed).
     property <float> playhead: CreateArea.playhead < 0 ? root.total : min(CreateArea.playhead, root.total);
+    // The playhead's time chip (or the record head's REC) on the ruler, in
+    // the lanes' coordinates; none when neither shows.
+    property <length> head-chip-x: root.rolling ? root.x-of(root.span) - root.sx - 19px : max(0px, root.x-of(root.playhead) - root.sx - 20px);
+    property <length> head-chip-w: root.rolling ? 38px : CreateArea.has-timeline ? 41px : 0px;
+    // A clip's end being dragged (C.3): its index, which end, how far.
+    property <int> trim-from: -1;
+    // A trim or roll let go is shown where it was dropped until the
+    // timeline read after it (#87: it sprang back for a frame).
+    property <bool> trim-held;
+    property <int> trim-version;
+    property <bool> trim-live: root.trim-from >= 0 && (!root.trim-held || CreateArea.timeline-version == root.trim-version);
+    property <bool> trim-out;
+    property <length> trim-dx;
+    property <length> trim-press-x;
+    // An ⌥-drag of an edge rolls the cut between two clips (#87): the clip
+    // before it (else -1).
+    property <int> roll-left: -1;
+    property <length> trim-snapped;
+    // An edge at `base` seconds dragged by `raw`: how far it goes, snapped.
+    function snapped-dx(base: float, raw: length) -> length {
+        return (CreateArea.snap(base + raw / 1px / root.pps, root.pps, false) - base) * root.pps * 1px;
+    }
+    // The marked span, if both marks are set.
+    property <bool> marked: CreateArea.mark-in >= 0 && CreateArea.mark-out > CreateArea.mark-in;
 
     // A clip being dragged: its index, how far, and where it would go.
     property <int> drag-from: -1;
@@ -346,8 +527,39 @@ export component ClipBar inherits Rectangle {
     function x-of(seconds: float) -> length {
         return root.pad + seconds * root.pps * 1px;
     }
+    function seconds-at(x: length) -> float {
+        return max(0, min(root.total, (x + root.sx - root.pad) / 1px / root.pps));
+    }
+    function scrub-to(seconds: float) {
+        CreateArea.playhead = seconds;
+        CreateArea.scrubbed();
+    }
     function scroll-by(dx: length) {
         CreateArea.scroll-x = clamp(root.sx + dx, 0px, root.max-scroll);
+    }
+    // Zoom to `z` (0 to 1) keeping the moment `anchor` at `anchor-x` in
+    // the lanes (#87).
+    function zoom-to(z: float, anchor: float, anchor-x: length) {
+        CreateArea.zoom = clamp(z, 0, 1);
+        CreateArea.scroll-x = clamp(root.pad + anchor * root.pps * 1px - anchor-x, 0px, root.max-scroll);
+    }
+    // ⌘+ ⌘− (= −): about √2 closer or further a step, around the
+    // playhead when it is in view, else the middle.
+    public function zoom-by(steps: float) {
+        if root.x-of(root.playhead) - root.sx >= 0 && root.x-of(root.playhead) - root.sx <= root.lane-w {
+            root.zoom-to(CreateArea.zoom + steps, root.playhead, root.x-of(root.playhead) - root.sx);
+        } else {
+            root.zoom-to(CreateArea.zoom + steps, root.seconds-at(root.lane-w / 2), root.lane-w / 2);
+        }
+    }
+    // ⇧Z: the whole timeline.
+    public function zoom-fit() {
+        CreateArea.zoom = 0;
+        CreateArea.scroll-x = 0;
+    }
+    // In the editor, the playhead snaps (N turns it off).
+    function scrub-at(x: length) {
+        root.scrub-to(CreateArea.snap(root.seconds-at(x), root.pps, false));
     }
 
     background: Theme.surface-stage;
@@ -374,8 +586,8 @@ export component ClipBar inherits Rectangle {
             y: 0;
             spacing: 0;
 
-            // Record, Retake and Remove (8EP-0).
-            HorizontalLayout {
+            // Record, Retake and Remove (8EP-0); in the editor, the edits.
+            if !root.editor: HorizontalLayout {
                 width: root.head-w;
                 padding-left: 10px;
                 spacing: 8px;
@@ -411,6 +623,71 @@ export component ClipBar inherits Rectangle {
                 }
             }
 
+            // The edits (wider than the track headers in a narrow
+            // window: they push the timeline's name along, #87).
+            if root.editor: HorizontalLayout {
+            width: max(root.head-w, edit-pills.preferred-width + 18px);
+            padding-left: 10px;
+            alignment: start;
+                edit-pills := VerticalLayout {
+                    alignment: center;
+                    PillGroup {
+                        PillItem {
+                            icon: Icons.scissors;
+                            text: root.width >= 1200px ? "Split" : "";
+                            accessible-label: "Split";
+                            enabled: !root.rolling;
+                            tooltip: "Split the clip at the playhead (S)";
+                            clicked => { CreateArea.split(); }
+                        }
+                        PillDivider { }
+                        PillItem {
+                            icon: Icons.trash;
+                            text: root.width >= 1200px ? "Delete" : "";
+                            accessible-label: "Delete Span";
+                            enabled: root.marked && !root.rolling;
+                            tooltip: "Take the marked span out and close the gap (I and O mark it; Delete)";
+                            clicked => { CreateArea.delete-range(); }
+                        }
+                        PillDivider { }
+                        PillItem {
+                            icon: Icons.undo;
+                            text: "";
+                            accessible-label: "Undo Edit";
+                            enabled: CreateArea.can-undo;
+                            tooltip: "Undo the last edit (⌘Z)";
+                            clicked => { CreateArea.undo(); }
+                        }
+                        PillItem {
+                            icon: Icons.rotate;
+                            text: "";
+                            accessible-label: "Redo Edit";
+                            enabled: CreateArea.can-redo;
+                            tooltip: "Redo (⇧⌘Z)";
+                            clicked => { CreateArea.redo(); }
+                        }
+                        PillDivider { }
+                        PillItem {
+                            icon: Icons.magnet;
+                            text: "";
+                            accessible-label: "Snapping";
+                            tint: CreateArea.snapping ? Theme.accent-text : Theme.text-3;
+                            tooltip: CreateArea.snapping ? "Snapping is on: the playhead and edges snap to edges, markers and marks (N)" : "Snapping is off (N)";
+                            clicked => { CreateArea.snapping = !CreateArea.snapping; }
+                        }
+                        PillItem {
+                            icon: Icons.crop;
+                            text: "";
+                            accessible-label: "Crop";
+                            enabled: root.editing;
+                            tint: CreateArea.crop-mode ? Theme.accent-text : Theme.text-2;
+                            tooltip: "Crop the clip at the playhead (C)";
+                            clicked => { CreateArea.crop-mode = !CreateArea.crop-mode; }
+                        }
+                    }
+                }
+            }
+
             // The take's line (8F2-0): "Next take: 04" · where it goes.
             HorizontalLayout {
                 horizontal-stretch: 1;
@@ -419,7 +696,7 @@ export component ClipBar inherits Rectangle {
                 padding-right: 8px;
                 spacing: 0;
                 Text {
-                    text: CreateArea.status-title;
+                    text: root.editor ? CreateArea.timeline-name : CreateArea.status-title;
                     color: CreateArea.retaking ? Theme.danger-text : Theme.text;
                     font-size: Theme.fs-sm;
                     font-weight: Theme.weight-semibold;
@@ -429,7 +706,7 @@ export component ClipBar inherits Rectangle {
                     min-width: 0px;
                 }
                 Text {
-                    text: CreateArea.status-detail;
+                    text: root.editor ? " · " + CreateArea.summary : CreateArea.status-detail;
                     color: Theme.text-3;
                     font-size: Theme.fs-xs;
                     vertical-alignment: center;
@@ -474,7 +751,7 @@ export component ClipBar inherits Rectangle {
                 padding-right: 8px;
                 spacing: 8px;
                 horizontal-stretch: 0;
-                VerticalLayout {
+                if !root.editor: VerticalLayout {
                     alignment: center;
                     timeline-pill := PillGroup {
                         PillItem {
@@ -487,15 +764,40 @@ export component ClipBar inherits Rectangle {
                         }
                     }
                 }
-                VerticalLayout {
+                // The editor's timeline as the next recording's place
+                // (#114): its next take, or back to new projects.
+                if root.editor && CreateArea.has-timeline: VerticalLayout {
                     alignment: center;
                     PillGroup {
+                        PillItem {
+                            icon: Icons.record;
+                            text: CreateArea.record-here ? "Next Take Here · Take " + CreateArea.record-take : "Record Next Take Here";
+                            tint: CreateArea.record-here ? Theme.accent-text : Theme.text-2;
+                            tooltip: CreateArea.record-here
+                                ? "The next recording is take " + CreateArea.record-take + " of " + CreateArea.timeline-name + ". Click to start new projects again."
+                                : "Add the next recording to " + CreateArea.timeline-name + " as take " + CreateArea.record-take + " (it starts a new project otherwise)";
+                            clicked => { CreateArea.record-here-chosen(!CreateArea.record-here); }
+                        }
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    export-pill := PillGroup {
                         PillItem {
                             icon: Icons.download;
                             text: CreateArea.exporting ? "Exporting…" : "Export";
                             enabled: CreateArea.can-export && !CreateArea.exporting;
-                            tooltip: "Join the clips into one file (and one per ISO source)";
-                            clicked => { CreateArea.export(); }
+                            // The editor's Export is a menu: as recorded, or
+                            // with a vertical (9:16) file too (#94).
+                            menu-open: root.editor && Menus.open && Menus.owner == "create:export";
+                            tooltip: root.editor ? "Join the clips into one file (and one per ISO source), or a vertical 9:16 file too" : "Join the clips into one file (and one per ISO source)";
+                            clicked => {
+                                if root.editor {
+                                    Menus.request("create:export", export-pill.absolute-position.x, export-pill.absolute-position.y, export-pill.width, export-pill.height);
+                                } else {
+                                    CreateArea.export();
+                                }
+                            }
                         }
                         if CreateArea.export-path != "": PillDivider { }
                         if CreateArea.export-path != "": PillItem {
@@ -540,7 +842,7 @@ export component ClipBar inherits Rectangle {
                         }
                     }
                 }
-                VerticalLayout {
+                if !root.editor: VerticalLayout {
                     alignment: center;
                     Segmented {
                         small: true;
@@ -558,9 +860,70 @@ export component ClipBar inherits Rectangle {
         }
     }
 
+    // ---- The preview (C.3): the angle the edited video shows at the
+    // playhead, and what it is.
+    if root.pv-w > 0: Rectangle {
+        x: root.pv-x;
+        y: root.header-h;
+        width: root.pv-w;
+        height: root.height - root.header-h;
+        background: Theme.surface-panel;
+        Rectangle {
+            x: 8px;
+            y: 8px;
+            width: parent.width - 16px;
+            height: self.width * 9 / 16;
+            border-radius: 4px;
+            background: #000000;
+            clip: true;
+            if CreateArea.has-preview: Image {
+                width: parent.width;
+                height: parent.height;
+                source: CreateArea.preview;
+                image-fit: contain;
+            }
+            Rectangle {
+                x: 6px;
+                y: parent.height - self.height - 6px;
+                width: min(parent.width - 12px, pv-label.preferred-width + 12px);
+                height: 18px;
+                border-radius: 4px;
+                background: #000000b0;
+                pv-label := Text {
+                    text: CreateArea.preview-label;
+                    color: Theme.bone;
+                    font-family: Theme.font-mono;
+                    font-size: Theme.fs-micro;
+                    overflow: elide;
+                }
+            }
+            if CreateArea.shuttle != 0: Rectangle {
+                x: parent.width - self.width - 6px;
+                y: 6px;
+                width: speed.preferred-width + 12px;
+                height: 18px;
+                border-radius: 4px;
+                background: #000000b0;
+                speed := Text {
+                    text: (CreateArea.shuttle < 0 ? "◀ " : "▶ ") + abs(CreateArea.shuttle) + "×";
+                    color: Theme.bone;
+                    font-family: Theme.font-mono;
+                    font-size: Theme.fs-micro;
+                }
+            }
+        }
+    }
+    if root.pv-w > 0: Rectangle {
+        x: CreateArea.layout == 0 ? root.pv-w : root.pv-x - 1px;
+        y: root.header-h;
+        width: 1px;
+        height: root.height - root.header-h;
+        background: Theme.line;
+    }
+
     // ---- The track-header column
     Rectangle {
-        x: 0;
+        x: root.head-x;
         y: root.header-h;
         width: root.head-w;
         height: root.height - root.header-h;
@@ -572,10 +935,14 @@ export component ClipBar inherits Rectangle {
             height: 1px;
             background: Theme.line;
         }
-        // Program (8H5-0): icon, name, PGM.
+        // Program (8H5-0): icon, name, PGM. A click shows the program over
+        // the marked span (or the clip): angle 1.
         Rectangle {
             y: root.ruler-h;
             height: root.lane-h;
+            if root.editing: TouchArea {
+                clicked => { CreateArea.set-angle("program"); }
+            }
             HorizontalLayout {
                 padding-left: 14px;
                 padding-right: 14px;
@@ -602,10 +969,10 @@ export component ClipBar inherits Rectangle {
                         height: 18px;
                         width: pgm.preferred-width + 14px;
                         border-radius: 9px;
-                        background: Theme.onair-soft;
+                        background: Theme.danger-soft;
                         pgm := Text {
                             text: "PGM";
-                            color: Theme.onair-text;
+                            color: Theme.danger-text;
                             font-size: Theme.fs-micro;
                             font-weight: Theme.weight-semibold;
                         }
@@ -618,9 +985,68 @@ export component ClipBar inherits Rectangle {
                 background: Theme.line;
             }
         }
+        // The ISO tracks' headers: icon, name, the angle's key. A click
+        // shows that angle over the marked span (or the clip).
+        for track[i] in CreateArea.tracks: Rectangle {
+            visible: root.editor;
+            y: root.ruler-h + root.lane-h + i * root.iso-h;
+            height: root.iso-h;
+            accessible-role: button;
+            accessible-label: "Show " + track.name;
+            accessible-action-default => { CreateArea.set-angle(track.source); }
+            ta := TouchArea {
+                clicked => { CreateArea.set-angle(track.source); }
+            }
+            Rectangle {
+                background: ta.has-hover ? Theme.control-hover : transparent;
+            }
+            HorizontalLayout {
+                padding-left: 14px;
+                padding-right: 14px;
+                spacing: 8px;
+                VerticalLayout {
+                    alignment: center;
+                    Icon {
+                        path: Icons.camera;
+                        size: Theme.icon-xs;
+                        color: Theme.text-3;
+                    }
+                }
+                Text {
+                    text: track.name;
+                    color: Theme.text-2;
+                    font-size: Theme.fs-xs;
+                    font-weight: Theme.weight-medium;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                    overflow: elide;
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Rectangle {
+                        width: 16px;
+                        height: 16px;
+                        border-radius: 3px;
+                        border-width: 1px;
+                        border-color: Theme.line-strong;
+                        Text {
+                            text: track.key;
+                            color: Theme.text-3;
+                            font-family: Theme.font-mono;
+                            font-size: Theme.fs-micro;
+                        }
+                    }
+                }
+            }
+            Rectangle {
+                y: parent.height - 1px;
+                height: 1px;
+                background: Theme.line;
+            }
+        }
         // The timeline's name and length.
         if CreateArea.has-timeline: VerticalLayout {
-            y: root.ruler-h + root.lane-h;
+            y: root.ruler-h + root.tracks-h;
             height: parent.height - self.y;
             padding-left: 14px;
             padding-right: 14px;
@@ -643,7 +1069,7 @@ export component ClipBar inherits Rectangle {
         }
     }
     Rectangle {
-        x: root.head-w;
+        x: root.head-x + root.head-w;
         y: root.header-h;
         width: 1px;
         height: root.height - root.header-h;
@@ -653,7 +1079,7 @@ export component ClipBar inherits Rectangle {
     // ---- The lanes: the ruler, the Program track and the air below,
     // scrolling sideways together.
     lanes := Rectangle {
-        x: root.head-w + 1px;
+        x: root.head-x + root.head-w + 1px;
         y: root.header-h;
         width: root.lane-w;
         height: root.height - root.header-h;
@@ -670,13 +1096,23 @@ export component ClipBar inherits Rectangle {
             height: 1px;
             background: Theme.line;
         }
+        for track[i] in CreateArea.tracks: Rectangle {
+            visible: root.editor;
+            y: root.ruler-h + root.lane-h + (i + 1) * root.iso-h - 1px;
+            height: 1px;
+            background: Theme.line;
+        }
 
         // A click on the ruler or the lanes puts the playhead there (and
         // lets go of the selected clip); scrolling moves sideways.
         TouchArea {
             pointer-event(event) => {
                 if event.kind == PointerEventKind.down && event.button == PointerEventButton.left && CreateArea.has-timeline {
-                    CreateArea.playhead = max(0, (self.mouse-x + root.sx - root.pad) / 1px / root.pps);
+                    if root.editor {
+                        root.scrub-at(self.mouse-x);
+                    } else {
+                        CreateArea.playhead = max(0, (self.mouse-x + root.sx - root.pad) / 1px / root.pps);
+                    }
                     if self.mouse-y >= root.ruler-h {
                         CreateArea.select("");
                     }
@@ -684,15 +1120,32 @@ export component ClipBar inherits Rectangle {
             }
             moved => {
                 if self.pressed && CreateArea.has-timeline {
-                    CreateArea.playhead = max(0, (self.mouse-x + root.sx - root.pad) / 1px / root.pps);
+                    if root.editor {
+                        root.scrub-at(self.mouse-x);
+                    } else {
+                        CreateArea.playhead = max(0, (self.mouse-x + root.sx - root.pad) / 1px / root.pps);
+                    }
                 }
             }
             scroll-event(event) => {
+                // ⌘-scroll zooms around the pointer (#87).
+                if root.editor && event.modifiers.control {
+                    root.zoom-to(CreateArea.zoom + event.delta-y / 1px / 400, root.seconds-at(self.mouse-x), self.mouse-x);
+                    return accept;
+                }
                 if root.max-scroll == 0 {
                     return reject;
                 }
                 root.scroll-by(-(abs(event.delta-x) >= abs(event.delta-y) ? event.delta-x : event.delta-y));
                 accept
+            }
+        }
+        // A trackpad pinch zooms around its middle (#87).
+        if root.editor: ScaleRotateGestureHandler {
+            property <float> start-zoom;
+            started => { self.start-zoom = CreateArea.zoom; }
+            updated => {
+                root.zoom-to(self.start-zoom + log(max(0.01, self.scale), 2) / 5, root.seconds-at(self.center.x), self.center.x);
             }
         }
 
@@ -711,22 +1164,48 @@ export component ClipBar inherits Rectangle {
                 height: tick.major ? 7px : 4px;
                 background: Theme.line-strong;
             }
+            // Not drawn where it would be cut at the lanes' right edge or
+            // under the playhead's (or record head's) time (#108).
             if tick.major: TimeText {
                 x: 4px;
                 y: 2px;
                 height: 12px;
                 seconds: tick.n / 4 * root.label-s;
+                visible: tick.x + self.x + self.preferred-width <= root.lane-w
+                    && (tick.x + self.x + self.preferred-width + 2px <= root.head-chip-x || tick.x + self.x >= root.head-chip-x + root.head-chip-w + 2px);
+            }
+        }
+
+        // The takes' markers (#87), on the ruler.
+        if root.editor: Rectangle {
+            for m in CreateArea.markers: Rectangle {
+                x: root.x-of(m) - root.sx - 4px;
+                y: root.ruler-h - 9px;
+                width: 8px;
+                height: 8px;
+                Rectangle {
+                    x: 1px;
+                    y: 1px;
+                    width: 6px;
+                    height: 6px;
+                    transform-rotation: 45deg;
+                    background: Theme.accent;
+                }
             }
         }
 
         // The clips, at their places (8HD-0).
         for clip[i] in CreateArea.clips: ClipView {
             property <bool> dragged: root.drag-from == i;
-            x: root.x-of(clip.start) - root.sx + (self.dragged ? root.drag-dx : 0px);
+            // An end being dragged: the clip grows or shrinks from it.
+            property <length> trim-in: root.trim-live && ((root.trim-from == i && !root.trim-out && root.roll-left < 0) || (root.roll-left >= 0 && root.roll-left + 1 == i)) ? root.trim-dx : 0px;
+            property <length> trim-out: root.trim-live && ((root.trim-from == i && root.trim-out && root.roll-left < 0) || root.roll-left == i) ? root.trim-dx : 0px;
+            x: root.x-of(clip.start) - root.sx + (self.dragged ? root.drag-dx : 0px) + self.trim-in;
             y: root.ruler-h + 10px;
-            width: max(3px, clip.duration * root.pps * 1px - 1px);
-            height: 44px;
+            width: max(3px, clip.duration * root.pps * 1px - 1px - self.trim-in + self.trim-out);
+            height: root.lane-h - 12px;
             data: clip;
+            editor: root.editor;
             dragging: self.dragged;
             opacity: self.dragged ? 0.8 : 1;
             z: self.dragged ? 2 : 0;
@@ -740,7 +1219,11 @@ export component ClipBar inherits Rectangle {
                     if event.kind == PointerEventKind.down && event.button == PointerEventButton.left {
                         root.press-x = self.absolute-position.x + self.mouse-x;
                         CreateArea.select(clip.id);
-                        CreateArea.playhead = clip.start;
+                        if root.editor {
+                            root.scrub-to(clip.start + self.mouse-x / 1px / root.pps);
+                        } else {
+                            CreateArea.playhead = clip.start;
+                        }
                     } else if event.kind == PointerEventKind.up && event.button == PointerEventButton.right {
                         CreateArea.select(clip.id);
                         Menus.request("create:clip:" + clip.id, self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y, 0, 0);
@@ -760,6 +1243,105 @@ export component ClipBar inherits Rectangle {
                         root.drag-dx = self.absolute-position.x + self.mouse-x - root.press-x;
                     }
                 }
+            }
+            // Trim handles (C.3): 6px at each end; drag to move the in or
+            // out point (the take's files never change).
+            for edge in [false, true]: TouchArea {
+                x: edge ? parent.width - 6px : 0px;
+                // Only in the editor window.
+                width: root.editor ? 6px : 0px;
+                enabled: root.editor && !root.rolling && root.drag-from < 0;
+                mouse-cursor: MouseCursor.ew-resize;
+                accessible-role: slider;
+                accessible-label: (edge ? "Out point of " : "In point of ") + clip.name;
+                pointer-event(event) => {
+                    if event.kind == PointerEventKind.down && event.button == PointerEventButton.left {
+                        root.trim-press-x = self.absolute-position.x + self.mouse-x;
+                        root.trim-from = i;
+                        root.trim-out = edge;
+                        root.trim-dx = 0;
+                        root.trim-held = false;
+                        // ⌥: roll the cut with the clip beside it, if any.
+                        root.roll-left = !event.modifiers.alt ? -1
+                            : edge ? (i + 1 < CreateArea.clips.length ? i : -1)
+                            : (i > 0 ? i - 1 : -1);
+                        CreateArea.select(clip.id);
+                    } else if (event.kind == PointerEventKind.up && event.button == PointerEventButton.left) || event.kind == PointerEventKind.cancel {
+                        if root.trim-from == i && !root.trim-held {
+                            if event.kind == PointerEventKind.up && abs(root.trim-dx) >= 1px {
+                                // Held until the timeline is read again.
+                                root.trim-version = CreateArea.timeline-version;
+                                root.trim-held = true;
+                                if root.roll-left >= 0 {
+                                    CreateArea.roll(CreateArea.clips[root.roll-left].id, root.trim-dx / 1px / root.pps);
+                                } else {
+                                    CreateArea.trim(clip.id, edge, root.trim-dx / 1px / root.pps);
+                                }
+                            } else {
+                                root.trim-from = -1;
+                                root.trim-dx = 0;
+                                root.roll-left = -1;
+                            }
+                        }
+                    }
+                }
+                moved => {
+                    if self.pressed && root.trim-from == i {
+                        // Where the pointer puts the edge, snapped to
+                        // edges, markers and the marks.
+                        root.trim-snapped = root.snapped-dx(clip.start + (edge ? clip.duration : 0), self.absolute-position.x + self.mouse-x - root.trim-press-x);
+                        if root.roll-left >= 0 {
+                            // Both clips keep 4 points.
+                            root.trim-dx = clamp(root.trim-snapped,
+                                -(CreateArea.clips[root.roll-left].duration * root.pps * 1px - 4px),
+                                CreateArea.clips[root.roll-left + 1].duration * root.pps * 1px - 4px);
+                            root.scrub-to(max(0, CreateArea.clips[root.roll-left + 1].start + root.trim-dx / 1px / root.pps));
+                        } else {
+                            // Never past the clip's other end.
+                            root.trim-dx = edge
+                                ? max(-(clip.duration * root.pps * 1px - 4px), root.trim-snapped)
+                                : min(clip.duration * root.pps * 1px - 4px, root.trim-snapped);
+                            root.scrub-to(max(0, clip.start + (edge ? clip.duration : 0) + root.trim-dx / 1px / root.pps));
+                        }
+                    }
+                }
+            }
+        }
+
+        // The ISO tracks' segments (C.3).
+        for track[t] in CreateArea.tracks: Rectangle {
+            visible: root.editor;
+            y: root.ruler-h + root.lane-h + t * root.iso-h;
+            height: root.iso-h;
+            for segment in track.segments: SegmentView {
+                x: root.x-of(segment.start) - root.sx;
+                y: 4px;
+                width: max(3px, segment.duration * root.pps * 1px - 1px);
+                height: root.iso-h - 9px;
+                wave-h: root.wave-strip ? 12px : 0px;
+                data: segment;
+            }
+        }
+
+        // The marked span (I to O), across the ruler and every track.
+        if root.editor && (CreateArea.mark-in >= 0 || CreateArea.mark-out >= 0): Rectangle {
+            property <float> from: CreateArea.mark-in >= 0 ? CreateArea.mark-in : 0;
+            property <float> to: CreateArea.mark-out >= 0 ? CreateArea.mark-out : root.total;
+            x: root.x-of(self.from) - root.sx;
+            y: 0;
+            width: max(1px, (self.to - self.from) * root.pps * 1px);
+            height: root.ruler-h + root.tracks-h;
+            background: Theme.accent-soft;
+            z: 3;
+            if CreateArea.mark-in >= 0: Rectangle {
+                x: 0;
+                width: 1px;
+                background: Theme.accent;
+            }
+            if CreateArea.mark-out >= 0: Rectangle {
+                x: parent.width - 1px;
+                width: 1px;
+                background: Theme.accent;
             }
         }
 
@@ -797,7 +1379,7 @@ export component ClipBar inherits Rectangle {
 
         // Where the next take lands (Paper's dashed "Placeholder / 04
         // Interview", drawn solid: Slint has no dashed edges).
-        if CreateArea.has-timeline && !root.rolling: Rectangle {
+        if !root.editor && CreateArea.has-timeline && !root.rolling: Rectangle {
             x: root.x-of(root.total) - root.sx + 1px;
             y: root.ruler-h + 10px;
             width: root.next-w - 2 * root.pad;
@@ -834,7 +1416,9 @@ export component ClipBar inherits Rectangle {
             x: 16px;
             y: root.ruler-h + root.lane-h + 14px;
             width: min(460px, parent.width - 32px);
-            text: "Every take you record lands here, in order: press Record, and when you stop (or split) the take is added to the end of " + CreateArea.timeline-name + ". Retake records the last one again; drag a clip to move it.";
+            text: CreateArea.record-here
+                ? "The next recording lands here: when you stop (or split), its take is added to the end of " + CreateArea.timeline-name + ". Retake records the last one again; drag a clip to move it."
+                : "No takes yet. Choose " + CreateArea.timeline-name + " next to Start Recording (or Record Next Take Here in the editor) to add the next recording here; otherwise each recording starts a new project.";
             color: Theme.text-3;
             font-size: Theme.fs-sm;
             wrap: word-wrap;
@@ -882,7 +1466,7 @@ export component ClipBar inherits Rectangle {
         }
 
         // The playhead (8NP-0): a bone line and its time.
-        if CreateArea.has-timeline && !root.rolling: Rectangle {
+        if CreateArea.has-timeline && !root.rolling: Playhead {
             x: root.x-of(root.playhead) - root.sx - 20px;
             y: 0;
             width: 41px;

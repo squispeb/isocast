@@ -16,20 +16,28 @@ pub mod devices;
 pub mod diagnostics;
 mod fields;
 mod filter;
+pub mod governor;
 pub mod hotkeys;
 pub mod init;
+pub mod isoprj;
 pub mod layout;
 pub mod library;
 pub mod located;
+pub mod machine;
 pub mod manifest;
+mod mask;
 pub mod obs;
+pub mod optimize;
 pub mod plugin;
 pub mod project;
+pub mod projector;
+pub mod replay;
 mod source;
 pub mod stream;
 pub mod timeline;
 mod transition;
 pub mod virtual_camera;
+pub mod websocket;
 
 pub use animation::*;
 pub use audio_filter::*;
@@ -37,10 +45,12 @@ pub use content::{Content, ContentKind};
 pub use fields::UnknownFields;
 pub use filter::*;
 pub use layout::Layout;
+pub use manifest::CameraCaptureMetadata;
+pub use mask::*;
 pub use source::*;
 pub use transition::*;
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -80,6 +90,16 @@ pub struct Setup {
     /// part of a setup: `isocast stream key set` keeps it in the Keychain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream: Option<stream::StreamSettings>,
+    /// A second, vertical canvas (for Shorts, Reels, TikTok) showing the
+    /// same scenes, with its own recording and stream. Absent: none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vertical: Option<VerticalCanvas>,
+    /// More canvases, each with its own id, size, frame rate, scene (or
+    /// the main one's, laid out its own way), recording and streams, for
+    /// streaming one show to several platforms in their own shapes (#84):
+    /// `[[canvases]]` with an `id`, otherwise as `[vertical]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub canvases: Vec<VerticalCanvas>,
     /// Profile hotkeys. Absent/empty keeps legacy profiles unchanged.
     #[serde(default, skip_serializing_if = "hotkeys::Config::is_absent")]
     pub hotkeys: hotkeys::Config,
@@ -94,6 +114,11 @@ pub struct Setup {
         skip_serializing_if = "developer::DeveloperSettings::is_default"
     )]
     pub developer: developer::DeveloperSettings,
+    #[serde(
+        default,
+        skip_serializing_if = "governor::GovernorSettings::is_default"
+    )]
+    pub governor: governor::GovernorSettings,
 }
 
 /// Audio settings for the whole setup.
@@ -174,6 +199,651 @@ pub struct Canvas {
     pub height: u32,
     /// Frames per second, from 1 to 240.
     pub fps: u32,
+}
+
+/// Which canvas, by id: `main` (the setup's `canvas`), `vertical` (its
+/// `[vertical]` canvas) or the id of one of its `[[canvases]]` (#84).
+///
+/// The id is stored inline (at most [`MAX_CANVAS_ID_LEN`] bytes), so a
+/// `CanvasId` is `Copy`, compares by value and needs no interning: an id
+/// a request names costs nothing until it is used, and one that names no
+/// canvas of the live setup is refused there, with the setup's canvases
+/// listed. `CanvasId::Main` and `CanvasId::Vertical` are constants, usable
+/// in patterns.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CanvasId {
+    len: u8,
+    bytes: [u8; MAX_CANVAS_ID_LEN],
+}
+
+/// A canvas id from text already known to be valid.
+const fn fixed_id(text: &str) -> CanvasId {
+    let from = text.as_bytes();
+    let mut bytes = [0u8; MAX_CANVAS_ID_LEN];
+    let mut i = 0;
+    while i < from.len() {
+        bytes[i] = from[i];
+        i += 1;
+    }
+    CanvasId {
+        len: from.len() as u8,
+        bytes,
+    }
+}
+
+#[allow(non_upper_case_globals)]
+impl CanvasId {
+    /// The setup's `canvas`.
+    pub const Main: CanvasId = fixed_id("main");
+    /// The setup's `[vertical]` canvas.
+    pub const Vertical: CanvasId = fixed_id("vertical");
+}
+
+impl Default for CanvasId {
+    fn default() -> Self {
+        Self::Main
+    }
+}
+
+impl std::fmt::Debug for CanvasId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::fmt::Display for CanvasId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The longest canvas id.
+pub const MAX_CANVAS_ID_LEN: usize = 32;
+
+/// The most canvases a setup may have besides the main one (the vertical
+/// one included).
+pub const MAX_EXTRA_CANVASES: usize = 8;
+
+impl CanvasId {
+    pub fn is_main(&self) -> bool {
+        *self == Self::Main
+    }
+
+    /// Whether this is the `[vertical]` canvas.
+    pub fn is_vertical(&self) -> bool {
+        *self == Self::Vertical
+    }
+
+    /// The id as written in setups and requests.
+    pub fn as_str(&self) -> &str {
+        // Only `parse` and `fixed_id` make one, from ASCII.
+        std::str::from_utf8(&self.bytes[..usize::from(self.len)]).unwrap_or_default()
+    }
+
+    /// The canvas `id`, or why it can't be one: lowercase letters, digits
+    /// and dashes, at most [`MAX_CANVAS_ID_LEN`].
+    pub fn parse(id: &str) -> Result<Self, String> {
+        let id = id.trim();
+        if !is_valid_id(id) || id.len() > MAX_CANVAS_ID_LEN {
+            return Err(format!(
+                "canvas {id:?}: a canvas id uses lowercase letters, digits and dashes, at \
+                 most {MAX_CANVAS_ID_LEN}"
+            ));
+        }
+        Ok(fixed_id(id))
+    }
+
+    /// The reserved source name of this canvas's program recording in
+    /// manifests and reports: [`PROGRAM`], [`VERTICAL_PROGRAM`] or
+    /// `<id>-program`. Never another canvas's.
+    pub fn program(self) -> String {
+        match self {
+            Self::Main => PROGRAM.into(),
+            Self::Vertical => VERTICAL_PROGRAM.into(),
+            other => format!("{other}-program"),
+        }
+    }
+
+    /// The monitor target of this canvas's program (`program`,
+    /// `vertical-program`, `<id>-program`): the same as [`program`](Self::program).
+    pub fn program_target(self) -> String {
+        self.program()
+    }
+
+    /// The monitor target of this canvas's Studio Mode preview
+    /// (`preview`, `vertical-preview`, `<id>-preview`).
+    pub fn preview_target(self) -> String {
+        match self {
+            Self::Main => "preview".into(),
+            other => format!("{other}-preview"),
+        }
+    }
+
+    /// The canvas a program or preview monitor target (as
+    /// [`program_target`](Self::program_target) and
+    /// [`preview_target`](Self::preview_target) make) shows, and whether it
+    /// is the preview.
+    pub fn from_target(target: &str) -> Option<(CanvasId, bool)> {
+        match target {
+            PROGRAM => return Some((Self::Main, false)),
+            "preview" => return Some((Self::Main, true)),
+            _ => {}
+        }
+        let (id, preview) = if let Some(id) = target.strip_suffix("-program") {
+            (id, false)
+        } else {
+            (target.strip_suffix("-preview")?, true)
+        };
+        if id == "main" {
+            return None;
+        }
+        Some((Self::parse(id).ok()?, preview))
+    }
+
+    /// The canvas and scene id of a scene monitor target (`scene:ID`,
+    /// `vertical-scene:ID`, `<canvas>-scene:ID`).
+    pub fn from_scene_target(target: &str) -> Option<(CanvasId, &str)> {
+        if let Some(id) = target.strip_prefix("scene:") {
+            return Some((Self::Main, id));
+        }
+        let (canvas, id) = target.split_once("-scene:")?;
+        if canvas == "main" {
+            return None;
+        }
+        Some((Self::parse(canvas).ok()?, id))
+    }
+
+    /// The prefix of this canvas's scene monitor targets (`scene:`,
+    /// `vertical-scene:`, `<id>-scene:`).
+    pub fn scene_prefix(self) -> String {
+        match self {
+            Self::Main => "scene:".into(),
+            other => format!("{other}-scene:"),
+        }
+    }
+}
+
+impl Serialize for CanvasId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for CanvasId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let id = std::borrow::Cow::<'de, str>::deserialize(deserializer)?;
+        CanvasId::parse(&id).map_err(serde::de::Error::custom)
+    }
+}
+
+impl JsonSchema for CanvasId {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "CanvasId".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "description": "A canvas id: `main`, `vertical` or one of the setup's `[[canvases]]`.",
+            "pattern": "^[a-z0-9-]{1,32}$",
+        })
+    }
+}
+
+/// Another canvas, upright by default, that shows the setup's scenes: the
+/// `[vertical]` canvas or one of `[[canvases]]`. A scene is laid out on it
+/// by its arrangement for it (`vertical`, or `canvases.<id>`) if it has
+/// one, else it shows the main picture fitted inside this canvas and
+/// centred (letterboxed; items placed by `layout` are laid out again on
+/// this canvas's size). Its program has the same audio mix as the main
+/// one (`recording.program.audio`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct VerticalCanvas {
+    /// Its id in `[[canvases]]` (lowercase letters, digits and dashes, at
+    /// most 32; not `main` or `vertical`), as requests' `canvas` names it.
+    /// Absent on `[vertical]`, whose id is `vertical`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Display label, like "YouTube Shorts". Defaults to the id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// An even number of pixels from 16 to 8192.
+    #[serde(default = "default_vertical_width")]
+    pub width: u32,
+    /// An even number of pixels from 16 to 8192.
+    #[serde(default = "default_vertical_height")]
+    pub height: u32,
+    /// Frames per second, from 1 to 240; the main canvas's if absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fps: Option<u32>,
+    /// Show the scene the main canvas has on air, switching with it. False
+    /// lets the vertical canvas put its own scene on air.
+    #[serde(default = "default_true", skip_serializing_if = "filter::is_true")]
+    pub follow_main: bool,
+    /// The vertical program recording. Absent: not recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording: Option<VerticalRecording>,
+    /// Live streaming of the vertical program, if set up (its own
+    /// service; the key stays in the Keychain).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<stream::StreamSettings>,
+}
+
+fn default_vertical_width() -> u32 {
+    1080
+}
+
+fn default_vertical_height() -> u32 {
+    1920
+}
+
+impl Default for VerticalCanvas {
+    fn default() -> Self {
+        Self {
+            id: None,
+            name: None,
+            width: default_vertical_width(),
+            height: default_vertical_height(),
+            fps: None,
+            follow_main: true,
+            recording: None,
+            stream: None,
+        }
+    }
+}
+
+/// A scene's main items as the vertical canvas shows them when the scene
+/// has no vertical arrangement (#109): the main picture fitted inside the
+/// `to`-sized canvas and centred (letterboxed, like OBS's Fit to Screen).
+/// Items placed by `rect` (in `from`-sized main canvas pixels) are scaled
+/// by the fitting factor about the canvas's top-left and moved by the
+/// centring offset, with their children, translations, radii, borders and
+/// shadows; items shown at their own size (`fit = "none"`) keep it and get
+/// the factor in their transform's scale instead. Items placed by `layout`
+/// are laid out again on the vertical canvas, as before. Nothing changes
+/// when both canvases have the same size.
+///
+/// Items showing a scene that `letterboxed` says is itself drawn
+/// letterboxed (see [`Scene::letterboxed`]) are cropped to the main picture
+/// inside it (#112): a nested scene is drawn at the vertical canvas's size,
+/// so without the crop its letterboxed picture would be fitted twice.
+pub fn fit_items(
+    items: &mut [SceneItem],
+    from: (u32, u32),
+    to: (u32, u32),
+    letterboxed: &dyn Fn(&str) -> bool,
+) {
+    let Some(canvas) = CanvasFit::new(from, to) else {
+        return;
+    };
+    let mut fitting = Fitting {
+        canvas,
+        letterboxed,
+        on_animation: &mut |_, _| {},
+    };
+    fit_level(items, canvas.offset, &mut fitting);
+}
+
+/// How the main canvas fits inside the vertical one.
+#[derive(Clone, Copy)]
+struct CanvasFit {
+    factor: f32,
+    offset: [f32; 2],
+    from: (u32, u32),
+    to: (u32, u32),
+}
+
+impl CanvasFit {
+    fn new(from: (u32, u32), to: (u32, u32)) -> Option<Self> {
+        if from == to || from.0 == 0 || from.1 == 0 {
+            return None;
+        }
+        let (fw, fh) = (from.0 as f32, from.1 as f32);
+        let (tw, th) = (to.0 as f32, to.1 as f32);
+        let factor = (tw / fw).min(th / fh);
+        let offset = [(tw - fw * factor) / 2.0, (th - fh * factor) / 2.0];
+        Some(Self {
+            factor,
+            offset,
+            from,
+            to,
+        })
+    }
+
+    /// `crop` of a main-canvas-sized picture of a letterboxed scene, as a
+    /// crop of its vertical-canvas-sized picture: the same part of the
+    /// main picture, which sits letterboxed in it. Its edges round as
+    /// [`fit_level`] rounds rect corners, so the cropped picture is what
+    /// the nested scene's full-canvas items cover.
+    fn crop(&self, crop: Crop) -> Crop {
+        let place = |offset: f32, at: u32| (offset + self.factor * at as f32).round().max(0.0);
+        let left = place(self.offset[0], crop.left);
+        let top = place(self.offset[1], crop.top);
+        let right = place(self.offset[0], self.from.0.saturating_sub(crop.right));
+        let bottom = place(self.offset[1], self.from.1.saturating_sub(crop.bottom));
+        Crop {
+            left: left as u32,
+            top: top as u32,
+            right: (self.to.0 as f32 - right).max(0.0) as u32,
+            bottom: (self.to.1 as f32 - bottom).max(0.0) as u32,
+        }
+    }
+}
+
+/// How a fitted item's keyframe values change with the fit (#112), so its
+/// animations look as on the main canvas, only smaller. Keyframe `scale`
+/// multiplies the item's own (fitted) transform, so it never changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KeyframeFit {
+    /// Translations in pixels, in its parent's (fitted) pixels.
+    translate_px: bool,
+    /// Translations in percent of its rect, which kept its main size.
+    translate_percent: bool,
+    /// Border width, radius and shadow: its own pixels were scaled.
+    style: bool,
+    /// Crop: it shows a letterboxed scene ([`CanvasFit::crop`]).
+    crop: bool,
+}
+
+impl KeyframeFit {
+    /// A suffix naming it in a keyframe set's id.
+    fn suffix(self) -> String {
+        let mut out = String::from("vertical-fit");
+        for (on, name) in [
+            (self.translate_px, "-px"),
+            (self.translate_percent, "-percent"),
+            (self.style, "-style"),
+            (self.crop, "-crop"),
+        ] {
+            if on {
+                out.push_str(name);
+            }
+        }
+        out
+    }
+
+    /// `set` with its values fitted.
+    fn apply(self, set: &Keyframes, canvas: &CanvasFit) -> Keyframes {
+        let factor = canvas.factor;
+        let mut set = set.clone();
+        for frame in &mut set.frames {
+            if let Some(translate) = frame.translate.as_mut() {
+                for length in translate {
+                    *length = match length.value() {
+                        Ok(layout::LengthValue::Px(px)) if self.translate_px => {
+                            layout::Length::Px(px * factor)
+                        }
+                        Ok(layout::LengthValue::Percent(percent)) if self.translate_percent => {
+                            layout::Length::Text(format!("{}%", percent * factor))
+                        }
+                        _ => length.clone(),
+                    };
+                }
+            }
+            if self.style {
+                frame.border_width = frame.border_width.map(|w| w * factor);
+                frame.radius = frame.radius.map(|radius| match radius {
+                    Radius::All(r) => Radius::All(r * factor),
+                    Radius::Each(r) => Radius::Each(r.map(|r| r * factor)),
+                });
+                if let Some(shadow) = frame.shadow.as_mut() {
+                    shadow.x *= factor;
+                    shadow.y *= factor;
+                    shadow.blur *= factor;
+                }
+            }
+            if self.crop {
+                frame.crop = frame.crop.map(|crop| canvas.crop(crop));
+            }
+        }
+        set
+    }
+}
+
+/// What fitting a scene's items needs as it walks them.
+struct Fitting<'a> {
+    canvas: CanvasFit,
+    letterboxed: &'a dyn Fn(&str) -> bool,
+    /// Called with each animation of a fitted item and how its keyframe
+    /// values fit.
+    on_animation: &'a mut dyn FnMut(&mut Animation, KeyframeFit),
+}
+
+impl Fitting<'_> {
+    fn animations(&mut self, item: &mut SceneItem, fit: KeyframeFit) {
+        for animation in &mut item.animations {
+            (self.on_animation)(animation, fit);
+        }
+    }
+
+    fn shows_letterboxed(&self, item: &SceneItem) -> bool {
+        item.scene
+            .as_deref()
+            .is_some_and(|id| (self.letterboxed)(id))
+    }
+}
+
+fn fit_level(items: &mut [SceneItem], offset: [f32; 2], fitting: &mut Fitting<'_>) {
+    let canvas = fitting.canvas;
+    let factor = canvas.factor;
+    for item in items {
+        if item.layout.is_some() {
+            // Laid out on the canvas it is drawn on; its children are
+            // relative to wherever layout puts it.
+            continue;
+        }
+        let nested = fitting.shows_letterboxed(item);
+        let Some(rect) = item.rect.as_mut() else {
+            continue;
+        };
+        let style = &mut item.style;
+        style.transform.translate = style.transform.translate.map(|t| t * factor);
+        if nested {
+            // A scene drawn at the vertical canvas's size with the main
+            // picture letterboxed in it: crop to that picture, which is the
+            // main one scaled by the factor, and place the item like a rect
+            // item. At its own size (`fit = "none"`) it is the main canvas
+            // less its crop there; the engine sizes it from the new crop.
+            if item.fit == Fit::None {
+                let crop = item.crop;
+                rect.width = canvas.from.0.saturating_sub(crop.left + crop.right).max(1);
+                rect.height = canvas.from.1.saturating_sub(crop.top + crop.bottom).max(1);
+            }
+            item.crop = canvas.crop(item.crop);
+        } else if item.fit == Fit::None {
+            // Drawn at its own size (the rect follows the picture), scaled
+            // by its transform about its centre: move the centre, scale the
+            // transform. Its children are in its own pixels, which the
+            // transform scales.
+            let (w, h) = (rect.width as f32, rect.height as f32);
+            let cx = offset[0] + factor * (rect.x as f32 + w / 2.0);
+            let cy = offset[1] + factor * (rect.y as f32 + h / 2.0);
+            rect.x = (cx - w / 2.0).round() as i32;
+            rect.y = (cy - h / 2.0).round() as i32;
+            style.transform.scale *= factor;
+            fitting.animations(
+                item,
+                KeyframeFit {
+                    translate_px: true,
+                    translate_percent: true,
+                    style: false,
+                    crop: false,
+                },
+            );
+            fit_scaled(&mut item.children, fitting);
+            continue;
+        }
+        let x0 = offset[0] + factor * rect.x as f32;
+        let y0 = offset[1] + factor * rect.y as f32;
+        let x1 = offset[0] + factor * (rect.x as f32 + rect.width as f32);
+        let y1 = offset[1] + factor * (rect.y as f32 + rect.height as f32);
+        rect.x = x0.round() as i32;
+        rect.y = y0.round() as i32;
+        rect.width = ((x1.round() - x0.round()) as u32).max(1);
+        rect.height = ((y1.round() - y0.round()) as u32).max(1);
+        style.radius = match style.radius {
+            Radius::All(r) => Radius::All(r * factor),
+            Radius::Each(r) => Radius::Each(r.map(|r| r * factor)),
+        };
+        if let Some(border) = style.border.as_mut() {
+            border.width *= factor;
+        }
+        if let Some(shadow) = style.shadow.as_mut() {
+            shadow.x *= factor;
+            shadow.y *= factor;
+            shadow.blur *= factor;
+        }
+        fitting.animations(
+            item,
+            KeyframeFit {
+                translate_px: true,
+                translate_percent: false,
+                style: true,
+                crop: nested,
+            },
+        );
+        fit_level(&mut item.children, [0.0, 0.0], fitting);
+    }
+}
+
+/// Items inside a fitted `fit = "none"` item, whose transform scales them:
+/// they keep their main values, except that a letterboxed scene's picture
+/// is cropped to the main picture in it and, at its own size, stretched
+/// to its main size, which its parent's transform scales.
+fn fit_scaled(items: &mut [SceneItem], fitting: &mut Fitting<'_>) {
+    let canvas = fitting.canvas;
+    for item in items {
+        if item.layout.is_some() {
+            continue;
+        }
+        if fitting.shows_letterboxed(item)
+            && let Some(rect) = item.rect.as_mut()
+        {
+            if item.fit == Fit::None {
+                let crop = item.crop;
+                rect.width = canvas.from.0.saturating_sub(crop.left + crop.right).max(1);
+                rect.height = canvas.from.1.saturating_sub(crop.top + crop.bottom).max(1);
+                item.fit = Fit::Stretch;
+            }
+            item.crop = canvas.crop(item.crop);
+            fitting.animations(
+                item,
+                KeyframeFit {
+                    translate_px: false,
+                    translate_percent: false,
+                    style: false,
+                    crop: true,
+                },
+            );
+        }
+        fit_scaled(&mut item.children, fitting);
+    }
+}
+
+impl VerticalCanvas {
+    /// The vertical canvas, with `main`'s frame rate unless it has its own.
+    pub fn canvas(&self, main: &Canvas) -> Canvas {
+        Canvas {
+            width: self.width,
+            height: self.height,
+            fps: self.fps.unwrap_or(main.fps),
+        }
+    }
+
+    /// A `[[canvases]]` entry `id` with default settings.
+    pub fn with_id(id: &str) -> Self {
+        Self {
+            id: Some(id.to_string()),
+            ..Self::default()
+        }
+    }
+
+    /// Its display label: `name`, else its id (`vertical` without one).
+    pub fn label(&self) -> &str {
+        self.name
+            .as_deref()
+            .or(self.id.as_deref())
+            .unwrap_or("vertical")
+    }
+}
+
+/// The default program file name of the extra canvas `canvas`.
+pub fn canvas_filename(canvas: CanvasId) -> String {
+    format!("{{date}} {{time}} {canvas}")
+}
+
+/// How the vertical program is recorded, in `recording.folder` alongside
+/// the main program. Its sound is the main program's mix
+/// (`recording.program.audio`): both canvases share one audio mix.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct VerticalRecording {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// File name without extension. Tokens: {date}, {time}. Must differ
+    /// from `recording.program.filename`.
+    #[serde(default = "default_vertical_filename")]
+    pub filename: String,
+    #[serde(default)]
+    pub encoder: Encoder,
+    /// Must be empty: the vertical program has the main program's audio
+    /// mix (`recording.program.audio`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audio: Vec<String>,
+    /// The file's size, if not the vertical canvas's (each side even, from
+    /// 16 up to the vertical canvas's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+}
+
+impl VerticalRecording {
+    /// The file name canvas `canvas` records with: `filename`, except that
+    /// a `[[canvases]]` entry left at the default (`recording = {}` in
+    /// TOML gives "{date} {time} vertical") uses its own id, so two
+    /// canvases never share a name (#84).
+    pub fn filename_for(&self, canvas: CanvasId) -> String {
+        if !canvas.is_vertical()
+            && !canvas.is_main()
+            && self.filename == default_vertical_filename()
+        {
+            canvas_filename(canvas)
+        } else {
+            self.filename.clone()
+        }
+    }
+}
+
+fn default_vertical_filename() -> String {
+    "{date} {time} vertical".into()
+}
+
+impl Default for VerticalRecording {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            filename: default_vertical_filename(),
+            encoder: Encoder::default(),
+            audio: Vec::new(),
+            width: None,
+            height: None,
+        }
+    }
+}
+
+/// How a scene is arranged on the vertical canvas, in place of its own
+/// `layout` and `items`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SceneLayout {
+    /// How its items with a `layout` are laid out, as the scene's `layout`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<Layout>,
+    /// Items drawn back to front, in vertical canvas pixels.
+    #[serde(default)]
+    pub items: Vec<SceneItem>,
 }
 
 /// One input. `id` is the stable machine identifier; `name` is a label.
@@ -307,9 +977,70 @@ pub struct Scene {
     /// override).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transition: Option<Transition>,
+    /// Its arrangement on the setup's vertical canvas, in place of `layout`
+    /// and `items`. Absent: the main picture fitted inside the vertical
+    /// canvas and centred (letterboxed): items placed by `rect` are scaled
+    /// and centred with it, items placed by `layout` are laid out again on
+    /// the vertical canvas's size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vertical: Option<SceneLayout>,
+    /// Its arrangements on the setup's `[[canvases]]`, by canvas id, as
+    /// `vertical` is on the vertical canvas.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub canvases: BTreeMap<String, SceneLayout>,
 }
 
 impl Scene {
+    /// Its arrangement for the extra canvas `canvas`, if it has one
+    /// (`vertical`, or `canvases.<id>`). None for the main canvas.
+    pub fn arrangement(&self, canvas: CanvasId) -> Option<&SceneLayout> {
+        match canvas {
+            CanvasId::Main => None,
+            CanvasId::Vertical => self.vertical.as_ref(),
+            other => self.canvases.get(other.as_str()),
+        }
+    }
+
+    /// Set (or with None, remove) its arrangement for the extra canvas
+    /// `canvas`. Does nothing for the main canvas.
+    pub fn set_arrangement(&mut self, canvas: CanvasId, layout: Option<SceneLayout>) {
+        match (canvas, layout) {
+            (CanvasId::Main, _) => {}
+            (CanvasId::Vertical, layout) => self.vertical = layout,
+            (other, Some(layout)) => {
+                self.canvases.insert(other.as_str().to_string(), layout);
+            }
+            (other, None) => {
+                self.canvases.remove(other.as_str());
+            }
+        }
+    }
+
+    /// Whether it has an arrangement for any extra canvas.
+    pub fn has_arrangements(&self) -> bool {
+        self.vertical.is_some() || !self.canvases.is_empty()
+    }
+
+    /// Whether the vertical canvas draws it as the main picture fitted and
+    /// centred (letterboxed, #109): it has no vertical arrangement and
+    /// nothing in it is placed by `layout`, which lays it out again on the
+    /// vertical canvas instead.
+    pub fn letterboxed(&self) -> bool {
+        self.letterboxed_on(CanvasId::Vertical)
+    }
+
+    /// Whether the extra canvas `canvas` draws it as the main picture
+    /// fitted and centred, as [`letterboxed`](Self::letterboxed) says for
+    /// the vertical one.
+    pub fn letterboxed_on(&self, canvas: CanvasId) -> bool {
+        fn any_layout(items: &[SceneItem]) -> bool {
+            items
+                .iter()
+                .any(|item| item.layout.is_some() || any_layout(&item.children))
+        }
+        self.arrangement(canvas).is_none() && self.layout.is_none() && !any_layout(&self.items)
+    }
+
     /// The video sources its visible items show, and those of the scenes
     /// they show, each once.
     pub fn video_sources<'a>(&'a self, scenes: &'a [Scene]) -> Vec<&'a str> {
@@ -791,6 +1522,20 @@ pub struct Rect {
 /// reserved, so no source can use it.
 pub const PROGRAM: &str = "program";
 
+/// The source name of the vertical canvas's program recording in manifests
+/// and reports; reserved, so no source can use it.
+pub const VERTICAL_PROGRAM: &str = "vertical-program";
+
+/// Source ids no source can have: the program recordings' names, and a
+/// timeline export's derived files' labels ([`timeline::EDITED`],
+/// [`timeline::VERTICAL`]).
+pub const RESERVED_SOURCE_IDS: [&str; 4] = [
+    PROGRAM,
+    VERTICAL_PROGRAM,
+    timeline::EDITED,
+    timeline::VERTICAL,
+];
+
 fn default_true() -> bool {
     true
 }
@@ -811,6 +1556,16 @@ pub struct Recording {
     /// its files, at least 64 MB, if that is more).
     #[serde(default = "default_keep_free_gb")]
     pub keep_free_gb: f64,
+    /// The replay buffer: how much of the program it keeps.
+    #[serde(default, skip_serializing_if = "replay::ReplaySettings::is_default")]
+    pub replay: replay::ReplaySettings,
+    /// The app opens the editor, in its own window, on the take's project
+    /// and timeline when a recording stops (a split doesn't). Off unless
+    /// set: a window after every stop gets in the way of a session of many
+    /// takes and of recordings driven from the CLI or MCP. While a stream
+    /// runs it opens behind the studio, never taking the keyboard.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub open_editor: bool,
 }
 
 fn default_keep_free_gb() -> f64 {
@@ -920,11 +1675,18 @@ pub struct IsoRecording {
     pub filename: String,
     #[serde(default)]
     pub encoder: Encoder,
-    /// Audio sources written into every ISO file. Omitted: each ISO uses
-    /// its own source's sound. An explicit list (including []) preserves
-    /// the chosen shared routing. A source's audio.iso can override its own sound.
+    /// Audio sources written into every ISO file without a list of its
+    /// own in `source_audio`. Omitted: each ISO uses its own source's
+    /// sound. An explicit list (including []) preserves the chosen shared
+    /// routing. A source's audio.iso can override its own sound.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio: Option<Vec<String>>,
+    /// Audio sources for one ISO file, by its video source's id, instead
+    /// of `audio`: `{ camera = ["mic"], screen = ["desktop"] }`. An empty
+    /// list records that file without audio. Sources not listed follow
+    /// `audio`; a source's audio.iso still adds or drops its own sound.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub source_audio: BTreeMap<String, Vec<String>>,
     /// Record sources with filters as filtered (as the program shows them)
     /// rather than as captured, and audio with its audio filters (all but
     /// sidechain ducking). Keyed-out areas come out black, since the files
@@ -941,6 +1703,7 @@ impl Default for IsoRecording {
             filename: default_iso_filename(),
             encoder: Encoder::default(),
             audio: None,
+            source_audio: BTreeMap::new(),
             filtered: false,
         }
     }
@@ -950,8 +1713,9 @@ impl IsoRecording {
     /// Effective tracks for one file. `has_audio` comes from the opened
     /// source, since a media file or browser can have no audio stream.
     pub fn audio_for(&self, source: &Source, has_audio: bool) -> Vec<String> {
-        let mut audio = self.audio.clone().unwrap_or_default();
-        let own = source.audio.iso.unwrap_or(self.audio.is_none());
+        let listed = self.source_audio.get(&source.id).or(self.audio.as_ref());
+        let mut audio = listed.cloned().unwrap_or_default();
+        let own = source.audio.iso.unwrap_or(listed.is_none());
         if !own && source.audio.iso == Some(false) {
             audio.retain(|id| id != &source.id);
         }
@@ -959,6 +1723,31 @@ impl IsoRecording {
             audio.push(source.id.clone());
         }
         audio
+    }
+
+    /// The audio sources the ISO files list (`audio`, and `source_audio`
+    /// for the ISO sources), with repeats; a file's own sound isn't listed.
+    pub fn listed_audio(&self) -> impl Iterator<Item = &String> {
+        self.audio.iter().flatten().chain(
+            self.sources
+                .iter()
+                .filter_map(|id| self.source_audio.get(id))
+                .flatten(),
+        )
+    }
+
+    /// The setup field listing audio source `id` for the ISO files, for
+    /// messages: `recording.iso.audio` or `recording.iso.source_audio.<iso>`.
+    pub fn audio_field(&self, id: &str) -> Option<String> {
+        if self.audio.iter().flatten().any(|a| a == id) {
+            return Some("recording.iso.audio".into());
+        }
+        self.sources.iter().find_map(|iso| {
+            self.source_audio
+                .get(iso)
+                .is_some_and(|list| list.iter().any(|a| a == id))
+                .then(|| format!("recording.iso.source_audio.{iso}"))
+        })
     }
 }
 
@@ -1251,6 +2040,54 @@ impl Setup {
         })
     }
 
+    /// Give sources whose ids became reserved (`edited`, `vertical`, #94)
+    /// the first free `<id>-2`, `<id>-3`, …, everywhere the setup names
+    /// them (scene items, recording lists, filters' side-chains, the
+    /// virtual camera, hotkeys). Returns each (old, new) id; a setup
+    /// without such a source is left as it was.
+    pub fn rename_reserved_sources(&mut self) -> Vec<(String, String)> {
+        let reserved = [timeline::EDITED, timeline::VERTICAL];
+        if !self
+            .sources
+            .iter()
+            .any(|s| reserved.contains(&s.id.as_str()))
+        {
+            return Vec::new();
+        }
+        let Ok(mut value) = serde_json::to_value(&*self) else {
+            return Vec::new();
+        };
+        let mut taken: HashSet<String> = self.sources.iter().map(|s| s.id.clone()).collect();
+        taken.extend(RESERVED_SOURCE_IDS.iter().map(|id| id.to_string()));
+        let mut renamed = Vec::new();
+        for old in reserved {
+            if !self.sources.iter().any(|s| s.id == old) {
+                continue;
+            }
+            let new = (2..)
+                .map(|n| format!("{old}-{n}"))
+                .find(|id| !taken.contains(id))
+                .expect("a free id");
+            taken.insert(new.clone());
+            if let Some(sources) = value.get_mut("sources").and_then(|v| v.as_array_mut()) {
+                for source in sources {
+                    if source.get("id").and_then(|v| v.as_str()) == Some(old) {
+                        source["id"] = serde_json::Value::String(new.clone());
+                    }
+                }
+            }
+            rename_refs(&mut value, old, &new);
+            renamed.push((old.to_string(), new));
+        }
+        match Self::from_value(value) {
+            Ok(setup) => {
+                *self = setup;
+                renamed
+            }
+            Err(_) => Vec::new(),
+        }
+    }
+
     /// The setup as TOML, as `isocast get` and setup files write it.
     pub fn to_toml(&self) -> Result<String, toml::ser::Error> {
         toml::to_string_pretty(self)
@@ -1353,10 +2190,20 @@ impl Setup {
                 ("app-audio", Some(app)) => SourceKind::ApplicationAudio(ApplicationAudioSource {
                     app: app.to_string(),
                 }),
-                ("mic", arg) => SourceKind::Microphone(MicrophoneSource {
-                    device: arg.unwrap_or("default").to_string(),
-                }),
-                ("system-audio", None) => SourceKind::SystemAudio(SystemAudioSource {}),
+                ("mic", arg) => SourceKind::Microphone(MicrophoneSource::new(arg.unwrap_or("default"))),
+                ("system-audio", None) => SourceKind::SystemAudio(SystemAudioSource::default()),
+                ("system-audio", Some(arg)) => match arg.strip_prefix("except=") {
+                    Some(apps) if !apps.trim().is_empty() => {
+                        SourceKind::SystemAudio(SystemAudioSource {
+                            exclude: apps.split(',').map(|a| a.trim().to_string()).collect(),
+                        })
+                    }
+                    _ => {
+                        return Err(format!(
+                            "{spec:?}: expected system-audio or system-audio:except=APP[,APP]"
+                        ));
+                    }
+                },
                 ("camera", Some(device)) => SourceKind::Camera(CameraSource {
                     device: device.to_string(),
                     width: None,
@@ -1438,18 +2285,255 @@ impl Setup {
                     ..IsoRecording::default()
                 },
                 keep_free_gb: default_keep_free_gb(),
+                replay: Default::default(),
+                open_editor: false,
             },
             stream: None,
+            vertical: None,
+            canvases: Default::default(),
             hotkeys: Default::default(),
             virtual_camera: Default::default(),
             developer: Default::default(),
+            governor: Default::default(),
         })
+    }
+
+    /// This setup as one canvas sees it, as a setup of its own: for `Main`
+    /// a copy; for `Vertical` (None without a vertical canvas) the vertical
+    /// canvas as `canvas`, each scene's vertical arrangement (if it has
+    /// one) as its `layout` and `items`, the vertical recording as
+    /// `recording.program` (with the main program's audio mix; disabled if
+    /// there is none) and the vertical stream as `stream`. ISO files, the
+    /// replay buffer and the virtual camera are the main canvas's, so ISO
+    /// recording is off in it and the other two have their defaults, and it
+    /// has no `vertical` of its own. Clones the
+    /// whole setup: call it off the frame thread.
+    pub fn for_canvas(&self, canvas: CanvasId) -> Option<Setup> {
+        if canvas.is_main() {
+            return Some(self.clone());
+        }
+        let vertical = self.extra_canvas(canvas)?;
+        let mut setup = self.clone();
+        setup.vertical = None;
+        setup.canvases.clear();
+        setup.canvas = vertical.canvas(&self.canvas);
+        let from = (self.canvas.width, self.canvas.height);
+        let to = (setup.canvas.width, setup.canvas.height);
+        let letterboxed: HashSet<&str> = self
+            .scenes
+            .iter()
+            .filter(|scene| scene.letterboxed_on(canvas))
+            .map(|scene| scene.id.as_str())
+            .collect();
+        let letterboxed = |id: &str| letterboxed.contains(id);
+        // Keyframe sets fitted items play, fitted with them (#112): each
+        // (set, how it fits) once, as a set of its own appended to the
+        // setup's, under an id no set has.
+        let mut fitted: Vec<(String, KeyframeFit, String)> = Vec::new();
+        let mut taken: HashSet<String> = self.keyframes.iter().map(|k| k.id.clone()).collect();
+        let fit = CanvasFit::new(from, to);
+        let mut on_animation = |animation: &mut Animation, how: KeyframeFit| {
+            let Some(canvas) = fit else {
+                return;
+            };
+            let Some(set) = self.keyframe_set(&animation.keyframes) else {
+                return;
+            };
+            if let Some((_, _, id)) = fitted
+                .iter()
+                .find(|(from, fit, _)| *from == set.id && *fit == how)
+            {
+                animation.keyframes = id.clone();
+                return;
+            }
+            if how.apply(set, &canvas).frames == set.frames {
+                return;
+            }
+            let base = format!("{}-{}", set.id, how.suffix());
+            let mut id = base.clone();
+            let mut n = 2;
+            while taken.contains(&id) {
+                id = format!("{base}-{n}");
+                n += 1;
+            }
+            taken.insert(id.clone());
+            fitted.push((set.id.clone(), how, id.clone()));
+            animation.keyframes = id;
+        };
+        for scene in &mut setup.scenes {
+            let arrangement = scene.arrangement(canvas).cloned();
+            scene.vertical = None;
+            scene.canvases.clear();
+            if let Some(SceneLayout { layout, items }) = arrangement {
+                scene.layout = layout;
+                scene.items = items;
+            } else if let Some(canvas) = fit {
+                let mut fitting = Fitting {
+                    canvas,
+                    letterboxed: &letterboxed,
+                    on_animation: &mut on_animation,
+                };
+                fit_level(&mut scene.items, canvas.offset, &mut fitting);
+            }
+        }
+        if let Some(canvas) = fit {
+            for (from, how, id) in fitted {
+                if let Some(set) = self.keyframe_set(&from) {
+                    let mut set = how.apply(set, &canvas);
+                    set.id = id;
+                    setup.keyframes.push(set);
+                }
+            }
+        }
+        let main = &self.recording.program;
+        setup.recording.program = match &vertical.recording {
+            Some(recording) => ProgramRecording {
+                enabled: recording.enabled,
+                filename: recording.filename_for(canvas),
+                encoder: recording.encoder.clone(),
+                audio: main.audio.clone(),
+                width: recording.width,
+                height: recording.height,
+            },
+            None => ProgramRecording {
+                enabled: false,
+                filename: canvas_filename(canvas),
+                encoder: main.encoder.clone(),
+                audio: main.audio.clone(),
+                width: None,
+                height: None,
+            },
+        };
+        setup.recording.iso.enabled = false;
+        setup.recording.replay = Default::default();
+        setup.stream = vertical.stream.clone();
+        setup.virtual_camera = Default::default();
+        Some(setup)
+    }
+
+    /// The extra canvas `canvas` (`vertical`, or one of `canvases`), if
+    /// the setup has it. None for the main canvas.
+    pub fn extra_canvas(&self, canvas: CanvasId) -> Option<&VerticalCanvas> {
+        match canvas {
+            CanvasId::Main => None,
+            CanvasId::Vertical => self.vertical.as_ref(),
+            other => self
+                .canvases
+                .iter()
+                .find(|c| c.id.as_deref() == Some(other.as_str())),
+        }
+    }
+
+    /// As [`extra_canvas`](Self::extra_canvas), to change it.
+    pub fn extra_canvas_mut(&mut self, canvas: CanvasId) -> Option<&mut VerticalCanvas> {
+        match canvas {
+            CanvasId::Main => None,
+            CanvasId::Vertical => self.vertical.as_mut(),
+            other => self
+                .canvases
+                .iter_mut()
+                .find(|c| c.id.as_deref() == Some(other.as_str())),
+        }
+    }
+
+    /// Every extra canvas's id, the vertical one first, then `canvases` in
+    /// order (those with a valid id).
+    pub fn extra_canvas_ids(&self) -> Vec<CanvasId> {
+        self.vertical
+            .iter()
+            .map(|_| CanvasId::Vertical)
+            .chain(
+                self.canvases
+                    .iter()
+                    .filter_map(|c| CanvasId::parse(c.id.as_deref()?).ok()),
+            )
+            .collect()
+    }
+
+    /// Every canvas's id, `main` first.
+    pub fn canvas_ids(&self) -> Vec<CanvasId> {
+        std::iter::once(CanvasId::Main)
+            .chain(self.extra_canvas_ids())
+            .collect()
+    }
+
+    /// Whether a recording writes any canvas's program file.
+    pub fn records_a_program(&self) -> bool {
+        self.recording.program.enabled
+            || self.extra_canvas_ids().into_iter().any(|canvas| {
+                self.extra_canvas(canvas)
+                    .and_then(|c| c.recording.as_ref())
+                    .is_some_and(|r| r.enabled)
+            })
+    }
+
+    /// Whether the setup has the canvas `canvas`.
+    pub fn has_canvas(&self, canvas: CanvasId) -> bool {
+        canvas.is_main() || self.extra_canvas(canvas).is_some()
+    }
+
+    /// The size and frame rate of canvas `canvas`, if the setup has it.
+    pub fn canvas_of(&self, canvas: CanvasId) -> Option<Canvas> {
+        match canvas {
+            CanvasId::Main => Some(self.canvas.clone()),
+            other => Some(self.extra_canvas(other)?.canvas(&self.canvas)),
+        }
+    }
+
+    /// The stream section of canvas `canvas` (`[stream]`, `[vertical.stream]`
+    /// or a `[[canvases]]` entry's `stream`), if it has one.
+    pub fn stream_of(&self, canvas: CanvasId) -> Option<&stream::StreamSettings> {
+        match canvas {
+            CanvasId::Main => self.stream.as_ref(),
+            other => self.extra_canvas(other)?.stream.as_ref(),
+        }
+    }
+
+    /// Why `canvas` can't be used here: the setup has no such canvas;
+    /// lists those it has. `field` is the request's field (`canvas`).
+    pub fn unknown_canvas(&self, field: &str, canvas: CanvasId) -> String {
+        let ids: Vec<String> = self.canvas_ids().iter().map(|c| c.to_string()).collect();
+        if canvas.is_vertical() {
+            return format!(
+                "{field}: the vertical canvas is not enabled; add [vertical] (canvases: {})",
+                ids.join(", ")
+            );
+        }
+        format!(
+            "{field}: the setup has no canvas {canvas:?}; canvases: {}",
+            ids.join(", ")
+        )
+    }
+
+    /// The setup field an extra canvas's settings are under: `vertical`, or
+    /// `canvases[i]`.
+    pub fn canvas_field(&self, canvas: CanvasId) -> String {
+        match canvas {
+            CanvasId::Main => "canvas".into(),
+            CanvasId::Vertical => "vertical".into(),
+            other => match self
+                .canvases
+                .iter()
+                .position(|c| c.id.as_deref() == Some(other.as_str()))
+            {
+                Some(i) => format!("canvases[{i}]"),
+                None => format!("canvases[id={other}]"),
+            },
+        }
     }
 
     /// Check references and values the type system cannot express. An empty
     /// list means the setup is valid.
     pub fn validate(&self) -> Vec<Issue> {
         let mut issues = Issues::default();
+        if self.governor.pins.len() > 128 {
+            issues.add("governor.pins", "at most 128 pins");
+        }
+        for (i, pin) in self.governor.pins.iter().enumerate() {
+            if !governor::GovernorSettings::valid_pin(pin) {
+                issues.add(format!("governor.pins[{i}]"), "valid pins: preview.fps, recording.iso.fps, recording.iso.sources.<source-id>.fps, vertical.fps, canvases.<canvas-id>.fps (secondary canvases only), stream.video_bitrate_kbps");
+            }
+        }
 
         if self.version != SETUP_VERSION {
             issues.add(
@@ -1524,6 +2608,23 @@ impl Setup {
                     "\"program\" is reserved for the program recording; pick another id",
                 );
             }
+            if source.id == VERTICAL_PROGRAM {
+                issues.add(
+                    format!("sources[{i}].id"),
+                    "\"vertical-program\" is reserved for the vertical program recording; pick \
+                     another id",
+                );
+            }
+            // An export's derived files are labelled like sources (#94).
+            if [timeline::EDITED, timeline::VERTICAL].contains(&source.id.as_str()) {
+                issues.add(
+                    format!("sources[{i}].id"),
+                    format!(
+                        "{:?} is reserved for a timeline export's {} file; pick another id",
+                        source.id, source.id
+                    ),
+                );
+            }
             source.kind.check(&format!("sources[{i}]"), &mut issues);
             fields::report(
                 &mut issues,
@@ -1580,13 +2681,44 @@ impl Setup {
             if let Some(layout) = &scene.layout {
                 layout::check(&format!("scenes[{i}].layout"), layout, true, &mut issues);
             }
+            if scene.vertical.is_some() && self.vertical.is_none() {
+                issues.add(
+                    format!("scenes[{i}].vertical"),
+                    "a vertical arrangement needs the setup's vertical canvas; add [vertical] \
+                     or remove this",
+                );
+            }
+            for id in scene.canvases.keys() {
+                let known = self.canvases.iter().any(|c| c.id.as_deref() == Some(id));
+                if !known {
+                    let ids: Vec<&str> = self
+                        .canvases
+                        .iter()
+                        .filter_map(|c| c.id.as_deref())
+                        .collect();
+                    issues.add(
+                        format!("scenes[{i}].canvases.{id}"),
+                        format!(
+                            "an arrangement for canvas {id:?}, which [[canvases]] doesn't have; \
+                             canvases: {}",
+                            if ids.is_empty() {
+                                "none".to_string()
+                            } else {
+                                ids.join(", ")
+                            }
+                        ),
+                    );
+                }
+            }
         }
+        self.check_canvases(&mut issues);
 
         let video = self.source_ids(SourceKind::has_video);
         let audio = self.source_ids(SourceKind::has_audio);
         for (i, source) in self.sources.iter().enumerate() {
             audio_filter::check_chain(&format!("sources[{i}]"), source, &audio, &mut issues);
         }
+        mask::check_mask_refs(self, &video, &mut issues);
 
         animation::check_keyframes(&self.keyframes, &mut issues);
         let keyframes: Vec<&str> = self.keyframes.iter().map(|k| k.id.as_str()).collect();
@@ -1672,6 +2804,17 @@ impl Setup {
         for (i, id) in rec.iso.audio.iter().flatten().enumerate() {
             issues.check_ref(format!("recording.iso.audio[{i}]"), id, &audio, "audio");
         }
+        for (iso, ids) in &rec.iso.source_audio {
+            let path = format!("recording.iso.source_audio.{iso}");
+            issues.check_ref(path.clone(), iso, &video, "video");
+            let mut seen = HashSet::new();
+            for (i, id) in ids.iter().enumerate() {
+                if !seen.insert(id) {
+                    issues.add(format!("{path}[{i}]"), format!("{id:?} is listed twice"));
+                }
+                issues.check_ref(format!("{path}[{i}]"), id, &audio, "audio");
+            }
+        }
         if rec.iso.enabled
             && rec.iso.sources.len() > 1
             && !rec.iso.filename.contains("{source}")
@@ -1723,6 +2866,7 @@ impl Setup {
                 "give width and height together, or neither to record the canvas's size",
             ),
         }
+        rec.replay.check(&mut issues);
         if !(rec.keep_free_gb >= 0.0 && rec.keep_free_gb <= 1e6) {
             issues.add(
                 "recording.keep_free_gb",
@@ -1764,7 +2908,238 @@ impl Setup {
         for issue in &mut issues.0 {
             self.identify_source_issue(issue);
         }
+        if let Some(vertical) = &self.vertical {
+            self.validate_vertical(CanvasId::Vertical, vertical, &mut issues);
+        }
+        let mut seen = HashSet::new();
+        for canvas in &self.canvases {
+            let Some(id) = canvas.id.as_deref().and_then(|id| CanvasId::parse(id).ok()) else {
+                continue;
+            };
+            if id.is_main() || id.is_vertical() || !seen.insert(id) {
+                continue;
+            }
+            self.validate_vertical(id, canvas, &mut issues);
+        }
         issues.0
+    }
+
+    /// `[[canvases]]`'s own problems: ids, how many, and names a program
+    /// file or source would share.
+    fn check_canvases(&self, issues: &mut Issues) {
+        if self.canvases.len() + usize::from(self.vertical.is_some()) > MAX_EXTRA_CANVASES {
+            issues.add(
+                "canvases",
+                format!(
+                    "{} canvases besides the main one; at most {MAX_EXTRA_CANVASES} (the vertical \
+                     one included)",
+                    self.canvases.len() + usize::from(self.vertical.is_some())
+                ),
+            );
+        }
+        let mut seen: HashSet<&str> = HashSet::new();
+        for (i, canvas) in self.canvases.iter().enumerate() {
+            let path = format!("canvases[{i}].id");
+            let Some(id) = canvas.id.as_deref() else {
+                issues.add(path, "each [[canvases]] entry needs an id, like \"shorts\"");
+                continue;
+            };
+            if let Err(err) = CanvasId::parse(id) {
+                issues.add(path, err);
+                continue;
+            }
+            if id == "main" || id == "vertical" {
+                issues.add(
+                    path,
+                    format!(
+                        "{id:?} is reserved: `main` is the setup's canvas and `vertical` its \
+                         [vertical] one; pick another id"
+                    ),
+                );
+                continue;
+            }
+            if !seen.insert(id) {
+                issues.add(path, format!("{id:?} is used by another canvas"));
+                continue;
+            }
+            // Its program recording's name, and its monitor targets.
+            for reserved in [format!("{id}-program"), format!("{id}-preview")] {
+                if let Some(j) = self.sources.iter().position(|s| s.id == reserved) {
+                    issues.add(
+                        format!("sources[{j}].id"),
+                        format!(
+                            "{reserved:?} is reserved for canvas {id:?}'s program and preview; \
+                             pick another id"
+                        ),
+                    );
+                }
+            }
+        }
+        if self
+            .vertical
+            .as_ref()
+            .is_some_and(|v| v.id.as_deref().is_some_and(|id| id != "vertical"))
+        {
+            issues.add(
+                "vertical.id",
+                "[vertical]'s id is always `vertical`; leave it out, or move this canvas to \
+                 [[canvases]]",
+            );
+        }
+        // Program files are all written to recording.folder.
+        let mut files: Vec<(String, String)> = Vec::new();
+        if self.recording.program.enabled {
+            files.push((
+                "recording.program.filename".into(),
+                self.recording.program.filename.clone(),
+            ));
+        }
+        for canvas in self.extra_canvas_ids() {
+            let field = self.canvas_field(canvas);
+            if let Some(recording) = self.extra_canvas(canvas).and_then(|c| c.recording.as_ref())
+                && recording.enabled
+            {
+                let path = format!("{field}.recording.filename");
+                let filename = recording.filename_for(canvas);
+                if let Some((other, _)) = files.iter().find(|(_, f)| *f == filename)
+                    && !(canvas.is_vertical() && other == "recording.program.filename")
+                {
+                    {
+                        issues.add(
+                            path.clone(),
+                            format!(
+                                "{:?} is {other} too, and every program is written to \
+                                 recording.folder; give this canvas's file its own name, like \
+                                 \"{}\"",
+                                filename,
+                                canvas_filename(canvas)
+                            ),
+                        );
+                    }
+                }
+                files.push((path, filename));
+            }
+        }
+    }
+
+    /// The vertical canvas's problems: its own fields, then everything the
+    /// setup it sees ([`Setup::for_canvas`]) adds to the main canvas's
+    /// problems, under the vertical fields they come from (`vertical.width`,
+    /// `vertical.recording.encoder`, `scenes[2].vertical.items[0].rect`…).
+    fn validate_vertical(&self, canvas: CanvasId, vertical: &VerticalCanvas, issues: &mut Issues) {
+        let field = self.canvas_field(canvas);
+        if let Some(recording) = &vertical.recording {
+            if !recording.audio.is_empty() {
+                issues.add(
+                    format!("{field}.recording.audio"),
+                    "this canvas's program has the main program's audio mix: both canvases \
+                     share one mix, so leave this empty and list the audio sources in \
+                     recording.program.audio",
+                );
+            }
+            if canvas.is_vertical()
+                && recording.enabled
+                && self.recording.program.enabled
+                && recording.filename == self.recording.program.filename
+            {
+                issues.add(
+                    "vertical.recording.filename",
+                    format!(
+                        "{:?} is recording.program.filename too, and both programs are written \
+                         to recording.folder; give the vertical file its own name, like \
+                         \"{{date}} {{time}} vertical\"",
+                        recording.filename
+                    ),
+                );
+            }
+        }
+        let Some(setup) = self.for_canvas(canvas) else {
+            return;
+        };
+        let main: HashSet<(String, String)> = issues
+            .0
+            .iter()
+            .map(|issue| (issue.path.clone(), issue.message.clone()))
+            .collect();
+        for mut issue in setup.validate() {
+            match self.vertical_path(canvas, vertical, &issue.path) {
+                VerticalPath::Own(path) => issue.path = path,
+                VerticalPath::Main => continue,
+                VerticalPath::Shared => {
+                    if main.contains(&(issue.path.clone(), issue.message.clone())) {
+                        continue;
+                    }
+                    issue.message = match canvas {
+                        CanvasId::Vertical => format!("on the vertical canvas: {}", issue.message),
+                        other => format!("on canvas {other:?}: {}", issue.message),
+                    };
+                }
+            }
+            issues.0.push(issue);
+        }
+    }
+
+    /// Where a problem of the vertical canvas's setup (`path` in it) is in
+    /// this setup.
+    fn vertical_path(
+        &self,
+        canvas: CanvasId,
+        vertical: &VerticalCanvas,
+        path: &str,
+    ) -> VerticalPath {
+        let field = self.canvas_field(canvas);
+        let under = |field: &str| {
+            path.strip_prefix(field)
+                .filter(|rest| rest.is_empty() || rest.starts_with(['.', '[']))
+        };
+        if let Some(rest) = under("canvas.width").or(under("canvas.height")) {
+            let field = &path["canvas.".len()..path.len() - rest.len()];
+            return VerticalPath::Own(format!("{}.{field}{rest}", self.canvas_field(canvas)));
+        }
+        if let Some(rest) = under("canvas.fps") {
+            return match vertical.fps {
+                Some(_) => VerticalPath::Own(format!("{field}.fps{rest}")),
+                // Inherited: the main canvas reports it.
+                None => VerticalPath::Main,
+            };
+        }
+        if under("recording.program.audio").is_some() {
+            // The main program's mix, checked there.
+            return VerticalPath::Main;
+        }
+        if let Some(rest) = under("recording.program") {
+            return match vertical.recording {
+                Some(_) => VerticalPath::Own(format!("{field}.recording{rest}")),
+                // Disabled stand-in with the main encoder: nothing of its own.
+                None => VerticalPath::Main,
+            };
+        }
+        if let Some(rest) = under("stream") {
+            return VerticalPath::Own(format!("{field}.stream{rest}"));
+        }
+        if let Some(rest) = path.strip_prefix("keyframes[")
+            && let Some((index, _)) = rest.split_once(']')
+            && index
+                .parse::<usize>()
+                .is_ok_and(|i| i >= self.keyframes.len())
+        {
+            // A fitted copy of one of the setup's sets (#112), whose own
+            // problems the main canvas reports.
+            return VerticalPath::Main;
+        }
+        if let Some(rest) = path.strip_prefix("scenes[")
+            && let Some((index, rest)) = rest.split_once(']')
+            && let Some(scene) = index.parse::<usize>().ok().and_then(|i| self.scenes.get(i))
+            && scene.arrangement(canvas).is_some()
+            && (rest.is_empty() || rest.starts_with(".layout") || rest.starts_with(".items"))
+        {
+            let arrangement = match canvas {
+                CanvasId::Vertical => "vertical".to_string(),
+                other => format!("canvases.{other}"),
+            };
+            return VerticalPath::Own(format!("scenes[{index}].{arrangement}{rest}"));
+        }
+        VerticalPath::Shared
     }
 
     /// Add a source's stable identity to a checker/plugin issue.
@@ -1852,6 +3227,17 @@ impl Setup {
 
 #[derive(Default)]
 pub(crate) struct Issues(Vec<Issue>);
+
+/// Where a problem the vertical canvas's setup has belongs.
+enum VerticalPath {
+    /// At this vertical field.
+    Own(String),
+    /// The main canvas's, which reports it itself.
+    Main,
+    /// Shared with the main canvas: reported unless the main canvas has
+    /// the same problem.
+    Shared,
+}
 
 /// The ids scene items may name: video sources, scenes and keyframe sets.
 struct Known<'a> {
@@ -2074,7 +3460,7 @@ pub const QUICK_SOURCES: &[&str] = &[
     "display[:NAME_OR_ID]",
     "camera:NAME_OR_ID",
     "mic[:NAME_OR_ID]",
-    "system-audio",
+    "system-audio[:except=APP[,APP]]",
     "window:APP",
     "app-audio:APP",
     "test-pattern[:WIDTHxHEIGHT[@FPS]]",
@@ -2095,6 +3481,53 @@ fn parse_pattern(arg: &str) -> Option<SourceKind> {
     }))
 }
 
+/// Rename source `old` to `new` wherever a setup's JSON names a source:
+/// `source`, `sidechain_source` (filters' and plugins' side-chains) and
+/// `mask_source` values, `sources` and `audio` lists, `source_audio`
+/// keys and every id in its lists, and `held_sources` keys. These are all
+/// the places `Setup::validate` checks a source id (#94).
+fn rename_refs(value: &mut serde_json::Value, old: &str, new: &str) {
+    use serde_json::Value;
+    let swap = |v: &mut Value| {
+        if v.as_str() == Some(old) {
+            *v = Value::String(new.to_string());
+        }
+    };
+    match value {
+        Value::Object(map) => {
+            for key in ["source_audio", "held_sources"] {
+                if let Some(Value::Object(inner)) = map.get_mut(key)
+                    && let Some(moved) = inner.remove(old)
+                {
+                    inner.insert(new.to_string(), moved);
+                }
+            }
+            // An ISO file's audio list names audio sources by id.
+            if let Some(Value::Object(inner)) = map.get_mut("source_audio") {
+                for list in inner.values_mut() {
+                    if let Value::Array(items) = list {
+                        items.iter_mut().for_each(swap);
+                    }
+                }
+            }
+            for (key, v) in map.iter_mut() {
+                match (key.as_str(), &mut *v) {
+                    ("source" | "sidechain_source" | "mask_source", Value::String(_)) => swap(v),
+                    ("sources" | "audio", Value::Array(items)) => items.iter_mut().for_each(swap),
+                    _ => {}
+                }
+                rename_refs(v, old, new);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                rename_refs(item, old, new);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn is_valid_id(id: &str) -> bool {
     !id.is_empty()
         && id
@@ -2105,6 +3538,80 @@ fn is_valid_id(id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reserved_source_ids_are_renamed_with_their_references() {
+        let mut setup = Setup::from_toml(
+            r##"
+version = 1
+name = "Old"
+[canvas]
+width = 1280
+height = 720
+fps = 30
+[recording]
+folder = "/tmp/rec"
+program = { encoder = { codec = "hevc" }, audio = ["edited"] }
+iso = { enabled = true, sources = ["vertical", "vertical-2"], audio = ["edited"], source_audio = { vertical = ["edited", "mic"], vertical-2 = ["edited"] } }
+[[sources]]
+id = "vertical"
+kind = "test_pattern"
+[[sources]]
+id = "vertical-2"
+kind = "color"
+color = "#000000"
+filters = [ { kind = "source_mask", mask_source = "vertical" } ]
+[[sources]]
+id = "edited"
+kind = "tone"
+[[sources]]
+id = "mic"
+kind = "tone"
+audio_filters = [ { kind = "compressor", sidechain_source = "edited" } ]
+[[scenes]]
+id = "main"
+name = "Main"
+[[scenes.items]]
+source = "vertical"
+rect = { x = 0, y = 0, width = 1280, height = 720 }
+"##,
+        )
+        .unwrap();
+        assert!(!setup.validate().is_empty());
+        let renamed = setup.rename_reserved_sources();
+        assert_eq!(
+            renamed,
+            [
+                ("edited".to_string(), "edited-2".to_string()),
+                ("vertical".to_string(), "vertical-3".to_string())
+            ]
+        );
+        assert!(setup.validate().is_empty(), "{:?}", setup.validate());
+        assert_eq!(setup.recording.iso.sources, ["vertical-3", "vertical-2"]);
+        let source_audio: Vec<(&str, Vec<&str>)> = setup
+            .recording
+            .iso
+            .source_audio
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.iter().map(String::as_str).collect()))
+            .collect();
+        assert_eq!(
+            source_audio,
+            [
+                ("vertical-2", vec!["edited-2"]),
+                ("vertical-3", vec!["edited-2", "mic"])
+            ]
+        );
+        let json = serde_json::to_string(&setup).unwrap();
+        assert!(json.contains(r#""mask_source":"vertical-3""#), "{json}");
+        assert!(json.contains(r#""sidechain_source":"edited-2""#), "{json}");
+        assert_eq!(setup.recording.program.audio, ["edited-2"]);
+        assert_eq!(
+            setup.scenes[0].items[0].source.as_deref(),
+            Some("vertical-3")
+        );
+        assert!(setup.rename_reserved_sources().is_empty());
+    }
 
     #[test]
     fn json_errors_name_their_path() {
@@ -2134,6 +3641,119 @@ mod tests {
             "sources.test-pattern.width"
         );
         assert!(Setup::from_json(&format!("{setup} x")).is_err());
+    }
+
+    #[test]
+    fn a_scene_without_a_vertical_arrangement_is_letterboxed() {
+        // #109: the main 16:9 picture sits in the middle of the 9:16
+        // canvas, scaled to its width, not at the top at main pixels.
+        let mut setup = Setup::from_toml(
+            r##"
+version = 1
+name = "t"
+canvas = { width = 1920, height = 1080, fps = 30 }
+
+[[sources]]
+id = "cam"
+kind = "test_pattern"
+
+[[scenes]]
+id = "main"
+items = [
+  { source = "cam", rect = { x = 0, y = 0, width = 1920, height = 1080 }, children = [
+    { id = "badge", style = { background = "#fff" }, rect = { x = 100, y = 200, width = 400, height = 80 } },
+  ] },
+  { id = "logo", source = "cam", fit = "none", rect = { x = 1600, y = 40, width = 200, height = 100 }, animations = [{ keyframes = "pop", duration_ms = 400 }] },
+  { id = "flow", source = "cam", layout = { width = 320, height = 180 } },
+  { id = "inner", scene = "card", rect = { x = 0, y = 0, width = 1920, height = 1080 }, animations = [{ keyframes = "pop", duration_ms = 400 }] },
+  { id = "inner-own", scene = "card", fit = "none", crop = { left = 960 }, rect = { x = 0, y = 0, width = 1, height = 1 } },
+  { id = "vertical-own", scene = "own", rect = { x = 0, y = 0, width = 960, height = 540 } },
+]
+
+[[scenes]]
+id = "card"
+items = [{ source = "cam", rect = { x = 0, y = 0, width = 1920, height = 1080 } }]
+
+[[keyframes]]
+id = "pop"
+frames = [{ at = 0.0, translate = [100, "50%"], border_width = 8, scale = 0.5, crop = { top = 108 } }, { at = 1.0, opacity = 1.0 }]
+
+[[scenes]]
+id = "own"
+items = [{ source = "cam", rect = { x = 0, y = 0, width = 1920, height = 1080 } }]
+vertical = { items = [{ source = "cam", rect = { x = 0, y = 0, width = 1080, height = 1920 } }] }
+
+[recording]
+folder = "."
+program = { encoder = { codec = "hevc", quality = 70 } }
+iso = { enabled = false, encoder = { codec = "hevc", quality = 70 } }
+
+[vertical]
+"##,
+        )
+        .unwrap();
+        let view = setup.for_canvas(CanvasId::Vertical).unwrap();
+        let main = &view.scenes[0].items;
+        let rect = |x, y, width, height| {
+            Some(Rect {
+                x,
+                y,
+                width,
+                height,
+            })
+        };
+        assert_eq!(main[0].rect, rect(0, 656, 1080, 608));
+        assert_eq!(main[0].children[0].rect, rect(56, 113, 225, 45));
+        // At its own size, scaled about its centre by its transform.
+        assert_eq!(main[1].rect, rect(856, 657, 200, 100));
+        assert_eq!(main[1].style.transform.scale, 0.5625);
+        assert_eq!(main[2].rect, None);
+        assert_eq!(view.scenes[2].items[0].rect, rect(0, 0, 1080, 1920));
+        // #112: a letterboxed nested scene is cropped to the main picture
+        // in it (drawn at the vertical canvas's size), not fitted twice.
+        let band = Crop {
+            left: 0,
+            top: 656,
+            right: 0,
+            bottom: 656,
+        };
+        assert_eq!(main[3].rect, rect(0, 656, 1080, 608));
+        assert_eq!(main[3].crop, band);
+        // At its own size: its main size (the canvas less its crop), fitted.
+        assert_eq!(main[4].rect, rect(0, 656, 540, 608));
+        assert_eq!(main[4].style.transform.scale, 1.0);
+        assert_eq!(main[4].crop.left, 540);
+        // A scene with its own vertical arrangement isn't letterboxed.
+        assert_eq!(main[5].crop, Crop::default());
+        // Keyframes play fitted copies: a rect item's pixels and style
+        // scale (and a nested scene's crop maps), a fit = "none" item's
+        // translations; scale multiplies the fitted transform, unchanged.
+        let set = |id: &str| view.keyframe_set(id).unwrap().frames[0].clone();
+        let rect_set = set(&main[3].animations[0].keyframes);
+        assert_eq!(
+            rect_set.translate.as_ref().unwrap()[0],
+            layout::Length::Px(56.25)
+        );
+        assert_eq!(
+            rect_set.translate.as_ref().unwrap()[1],
+            layout::Length::Text("50%".into())
+        );
+        assert_eq!(rect_set.border_width, Some(4.5));
+        assert_eq!(rect_set.scale, Some(0.5));
+        assert_eq!(rect_set.crop.unwrap().top, 717);
+        let none_set = set(&main[1].animations[0].keyframes);
+        assert_eq!(
+            none_set.translate.as_ref().unwrap()[1],
+            layout::Length::Text("28.125%".into())
+        );
+        assert_eq!(none_set.border_width, Some(8.0));
+        assert_ne!(main[1].animations[0].keyframes, "pop");
+        assert!(setup.validate().is_empty(), "{:?}", setup.validate());
+        // A same-sized canvas changes nothing.
+        setup.vertical.as_mut().unwrap().width = 1920;
+        setup.vertical.as_mut().unwrap().height = 1080;
+        let same = setup.for_canvas(CanvasId::Vertical).unwrap();
+        assert_eq!(same.scenes[0].items, setup.scenes[0].items);
     }
 
     #[test]

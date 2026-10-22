@@ -10,7 +10,7 @@ a client, for example:
 claude mcp add isocast -- isocast mcp
 ```
 
-70 tools. Arguments marked required must be given; ids, not names,
+108 tools. Arguments marked required must be given; ids, not names,
 address sources, scenes and clips. Errors name the field and list the
 valid options.
 
@@ -58,6 +58,44 @@ Generate a sanitized offline bug-report zip or preview every included file. Incl
 | `preview_id` | string (optional) | With `submit`: send exactly this preview (from an earlier `preview`) instead of collecting again. |
 | `submit` | boolean | Also send the report: the zip is written, then its ISSUE.md becomes a public GitHub issue and the zip is kept privately for maintainers. Never implied; if sending fails the zip is kept and `submit_error` says why. |
 
+## canvas_add
+
+Add a canvas (#84) to stream or record another shape of the show at once, like 9:16 for Shorts/TikTok beside a 16:9 main canvas: canvas "vertical" turns on the [vertical] canvas, any other id adds a [[canvases]] entry. Optional name, width/height (default 1080x1920), fps (else main's), follow_main (default true: shows the main scene, letterboxed unless a scene has an arrangement for it under scenes[].canvases.<id>; false: it switches its own scenes with switch_scene/preview/take and canvas), record. Then add its stream destinations with stream_destination_add and canvas set to its id (each destination its own key, bitrate, size, rate control, keyframes and audio bitrate; equal ones share one encoder). Returns every canvas.
+
+| Argument | Type | Description |
+|---|---|---|
+| `canvas` (required) | CanvasId | Which canvas: `vertical`, or a `[[canvases]]` id (lowercase letters, digits and dashes). |
+| `clear` | list of string | Fields to reset: `name`, `fps` (to the main canvas's) and `stream` (no stream of its own). |
+| `follow_main` | boolean (optional) | Show the main canvas's scene (true), or pick its own (false). |
+| `fps` | integer (optional) | Its own frame rate; the main canvas's if absent. |
+| `height` | integer (optional) |  |
+| `name` | string (optional) | Display label, like "YouTube Shorts". |
+| `record` | boolean (optional) | Record its program with each recording (true: a `recording` with default settings unless it has one; false: none). |
+| `width` | integer (optional) | Size: give both (each even, 16 to 8192). |
+
+## canvas_remove
+
+Remove a canvas with its scene arrangements, recording and stream destinations (not while it records or streams; its keys stay in the Keychain). Returns every canvas left.
+
+| Argument | Type | Description |
+|---|---|---|
+| `canvas` (required) | CanvasId | The canvas: "vertical" or a [[canvases]] id, from get_status's canvases. |
+
+## canvas_set
+
+Change a canvas ("vertical" or a [[canvases]] id): name, width/height, fps, follow_main, record, or `clear` some of name, fps, stream. Size and frame rate wait while it records or streams. Returns every canvas.
+
+| Argument | Type | Description |
+|---|---|---|
+| `canvas` (required) | CanvasId | Which canvas: `vertical`, or a `[[canvases]]` id (lowercase letters, digits and dashes). |
+| `clear` | list of string | Fields to reset: `name`, `fps` (to the main canvas's) and `stream` (no stream of its own). |
+| `follow_main` | boolean (optional) | Show the main canvas's scene (true), or pick its own (false). |
+| `fps` | integer (optional) | Its own frame rate; the main canvas's if absent. |
+| `height` | integer (optional) |  |
+| `name` | string (optional) | Display label, like "YouTube Shorts". |
+| `record` | boolean (optional) | Record its program with each recording (true: a `recording` with default settings unless it has one; false: none). |
+| `width` | integer (optional) | Size: give both (each even, 16 to 8192). |
+
 ## check_setup
 
 Check this Mac against a setup (the live setup if none is given): permissions, hardware encoders, whether each source's device is connected and what format it would record, and the recording disk's free space and speed. Each check has a status and, if needed, a fix.
@@ -71,18 +109,34 @@ Check this Mac against a setup (the live setup if none is given): permissions, h
 
 Leave Studio Mode by clearing its staged preview. Program stays on air.
 
+| Argument | Type | Description |
+|---|---|---|
+| `canvas` | CanvasId | "main" (the default) or "vertical". |
+
 ## clear_stream_key
 
 Remove the stored stream key for a streaming service (the live setup's by default).
 
 | Argument | Type | Description |
 |---|---|---|
+| `canvas` | CanvasId | "main" (the default, [stream]) or "vertical" ([vertical.stream]). |
+| `destination` | string (optional) | A destination ("main", or an id from get_status's streams). |
 | `server` | string (optional) | For "custom": the server the key belongs to. |
 | `service` | StreamService | The service; the live setup's [stream] service if absent. |
 
+## close_projector
+
+Close a projector by `id` (from list_projectors), or every one with `all`. Where each was is remembered for the next time its view opens. Returns the projectors still open.
+
+| Argument | Type | Description |
+|---|---|---|
+| `all` | boolean | Close every open projector. |
+| `id` | string (optional) | The projector's id (`projector_list`); absent with `all`. |
+| `reason` | string (optional) | Why, for the `projectors` event (the app says "the display was disconnected"). |
+
 ## close_timeline
 
-Make no timeline current: takes are only recorded, as without timelines. Returns the id of the timeline that was current.
+Make no timeline current; if it was chosen for the next recording, recordings start new projects again. Returns the id of the timeline that was current.
 
 ## create_collection_or_profile
 
@@ -90,11 +144,24 @@ Make a scene collection (one empty scene on the canvas in use) or a profile (60 
 
 | Argument | Type | Description |
 |---|---|---|
-| `copy_of` | string (optional) | Copy this one (by id) instead of starting blank (OBS's Duplicate). A blank collection has one empty scene on the current canvas; a blank profile records 60 fps HEVC with ISO files to ~/Movies/Isocast. |
+| `copy_of` | string (optional) | Copy this one (by id) instead of starting blank (OBS's Duplicate). A blank collection has one empty scene on the current canvas; a blank profile records HEVC with ISO files to ~/Movies/Isocast, at 30 fps on <=8-core or <=8-GB machines and 60 fps otherwise. |
 | `id` | string (optional) | Its id (lowercase letters, digits and dashes); made from the name if absent. |
 | `kind` (required) | LibraryKind |  |
 | `name` (required) | string | Its name. |
 | `switch` | boolean | Switch to it once made (refused while recording or streaming). |
+
+## crop_clip
+
+Crop the edited video from `start_seconds` to `end_seconds` on the timeline: `crop` is the part of each clip's picture to show ({x, y, width, height} as fractions of the picture, from the top-left), `preset` a shape (16:9, 9:16, 1:1, 4:5: the largest that fits inside `crop` or the picture, centred), or `clear` the whole picture again. Clips are split at the span's ends; the crop applies to the angle each clip shows. export_timeline encodes cropped clips again, scaled to the program's size, in the edited file (program and ISO files stay whole). One undoable edit. Returns the timeline.
+
+| Argument | Type | Description |
+|---|---|---|
+| `clear` | boolean | Show the whole picture again over the span (no `crop` or `preset`). |
+| `crop` | Crop | The part of each clip's picture to show (fractions of its width and height, from the top-left); the whole picture if absent and a `preset` is given. |
+| `end_seconds` (required) | number |  |
+| `preset` | CropPreset | Make it this shape: the largest rectangle of it inside `crop` (or the picture), centred: `16:9`, `9:16`, `1:1` or `4:5`. |
+| `start_seconds` (required) | number | Where the span starts and ends, in seconds on the timeline, each rounded to the frame grid of the clip there. |
+| `timeline` | string (optional) | The timeline's id; the current one if absent. |
 
 ## delete_collection_or_profile
 
@@ -105,6 +172,16 @@ Delete a scene collection or profile that isn't in use (switch away first); its 
 | `id` (required) | string |  |
 | `kind` (required) | LibraryKind |  |
 
+## delete_range
+
+Take `start_seconds` to `end_seconds` (on the timeline) out and close the gap (ripple delete): clips across its ends are trimmed, clips in it taken off. The takes' files are untouched; one undoable edit. Returns the timeline.
+
+| Argument | Type | Description |
+|---|---|---|
+| `end_seconds` (required) | number |  |
+| `start_seconds` (required) | number | Where the span starts and ends, in seconds on the timeline, each rounded to the frame grid of the clip there. |
+| `timeline` | string (optional) | The timeline's id; the current one if absent. |
+
 ## developer_mode
 
 Developer mode, for testing a build locally. With no arguments, read it: whether the current profile has it on, whether isocastd is writing its verbose records and traces, when it turns itself off, its logs folder and budget, and the latest per-second trace (each recording output's frames, drops, late frames, encode submit and capture-to-submit times, writer queue; compositor and pacing). With `enabled` (and/or `auto_off_hours`, 0 for never; 24 by default), change it: every API call and debug messages are logged and frame timing traced while recording, in their own log segments (read them with get_logs). Never disturbs a running recording.
@@ -114,13 +191,45 @@ Developer mode, for testing a build locally. With no arguments, read it: whether
 | `auto_off_hours` | integer (optional) | Hours until it turns itself off (0: never). |
 | `enabled` | boolean (optional) |  |
 
+## discover_obs
+
+Find OBS Studio's scene collections and profiles on this Mac (its settings folder, or `folder`) without importing anything: each collection with scene and source counts and the profile an import would use (`profile`, a basic.ini path), each profile's canvas, frame rate, recording encoder, format and folder, and stream service and bitrate (never the key; `key_in_file` says OBS keeps one in plain text), and files that couldn't be read. Offer the collections to the user, then import_obs_collection_or_profile with the collection's `file` and its `profile` (stream_key only if the user agreed to move the key).
+
+| Argument | Type | Description |
+|---|---|---|
+| `folder` | string (optional) | Look in this folder instead of OBS's (`~/Library/Application Support/obs-studio`, or the daemon's `$ISOCAST_OBS_FOLDER`). |
+
+## estimate_capacity
+
+Predict instantly, without benchmarking, whether a setup's files (the live setup's if none is given) fit this Mac's H.264/HEVC media engines, from measured per-chip data: `capacity` is fits, no_margin or cannot_keep_up, `load` the busiest engine's share, and `suggestions` the closest changes that fit (each a patch for plan_change, or a method like stream_stop; `after_take` ones wait for the recording to end). With add_iso, `admission` says how to turn that ISO file on so it fits (smaller, slower, or left off). tune_encoders measures instead.
+
+| Argument | Type | Description |
+|---|---|---|
+| `add_iso` | string (optional) | A video source id whose ISO file would be turned on: `admission` says how to add it so the setup still fits, and why. |
+| `setup` | object (optional) | The setup to judge; the live setup (at its sources' live formats) if absent (the shape get_setup returns). |
+| `stream` | boolean (optional) | Count the stream's encode. Default: the live setup's if it streams now; a given setup's if it has a stream. |
+
 ## export_timeline
 
-Join a timeline's clips (the current one unless `timeline` is given), in order, into one program file and one file per ISO source every clip has (video copied as recorded, audio re-encoded once so it stays in sync at every join), plus an .export.json manifest, next to the first take (or in `folder`). Sources some clips lack are skipped, saying why. It runs in the background: returns at once with the files it will write; get_events shows export_progress and export_finished.
+Join a timeline's clips (the current one unless `timeline` is given), in order, into one program file and one file per ISO source every clip has, each cut frame-accurately to the clips' in and out points (video copied as recorded except from a cut to the next keyframe; audio re-encoded once and cross-faded so it stays in sync at every join), an EDITED file when clips show other angles (set_angle) or crops (crop_clip), a VERTICAL (9:16) edited file with `vertical` (a 9:16 crop fills it), plus an .export.json manifest, next to the first take (or in `folder`). Sources some clips lack are skipped, saying why. It runs in the background: returns at once with the files it will write; get_events shows export_progress and export_finished.
 
 | Argument | Type | Description |
 |---|---|---|
 | `folder` | string (optional) | Where to write the joined files (made if missing); else the folder of the first clip's take. |
+| `timeline` | string (optional) | The timeline's id; the current one if absent. |
+| `vertical` | boolean | Also write a vertical (9:16) edited file, `<name> VERTICAL.<ext>`: each clip's angle (or its crop) fitted into the program's size turned on its side (1920x1080 → 1080x1920), so a 9:16 crop fills the frame; the program's sound. Every frame is encoded again. |
+
+## export_timeline_nle
+
+Write a timeline (the current one unless `timeline` is given) as a project another editor opens: `format` fcpxml (Final Cut Pro), xmeml (Premiere Pro; with `app` resolve, DaVinci Resolve) or otio (OpenTimelineIO). Every ISO source on its own video track with the program on top, each clip's angle the one track on at that clip, crops as crop and transform, markers, and each file's audio on its own tracks (the program's on, the ISO files' off), lined up from the take manifests. It points at the takes' own files: nothing is encoded, copied or changed. Written next to the first take (or in `folder`, numbered so nothing is overwritten), or exactly at `path` (replacing an earlier Isocast export there, or any file with `replace`). Returns the file, its tracks and notes on anything not as in Isocast's export.
+
+| Argument | Type | Description |
+|---|---|---|
+| `app` | NleApp | The editor it is for: `final_cut`, `premiere` or `resolve`. With xmeml, `resolve` writes the scale of a picture of another size than the sequence from Resolve's own fit, and each audio channel on its own track (Resolve reads xmeml audio a channel at a time). Absent: `final_cut` for fcpxml, `premiere` for xmeml, `resolve` for otio (the same file for any editor). Resolve's best format is xmeml: it ignores FCPXML's split of picture and sound. |
+| `folder` | string (optional) | Write it in this folder (made if missing), named after the timeline and numbered so nothing is overwritten; else the first clip's take's folder. Not with `path`. |
+| `format` (required) | NleFormat | `fcpxml` (Final Cut Pro), `xmeml` (Premiere Pro, or Resolve with app `resolve`) or `otio` (OpenTimelineIO). |
+| `path` | string (optional) | Write exactly this file (an absolute path ending in the format's extension: .fcpxml, .xml or .otio). A file already there is replaced only if it is an earlier Isocast timeline export, or with `replace`. Not with `folder`. |
+| `replace` | boolean | With `path`: replace whatever file is there. |
 | `timeline` | string (optional) | The timeline's id; the current one if absent. |
 
 ## get_collection_or_profile
@@ -173,6 +282,7 @@ The live setup document (sources, scenes, recording settings) and its revision, 
 
 | Argument | Type | Description |
 |---|---|---|
+| `canvas` | CanvasId | With resolved: whose layout, "main" (the default) or "vertical" (the vertical canvas's). The setup is the whole live setup. |
 | `resolved` | boolean | Also return where every item is drawn, as laid out (`resolved`). |
 
 ## get_setup_schema
@@ -224,7 +334,7 @@ Add a scene collection and/or profile from documents (as get_collection_or_profi
 
 | Argument | Type | Description |
 |---|---|---|
-| `collection` | object (optional) | Or a scene collection, as get_collection_or_profile returns one: the setup's version, name, canvas.width/height, sources, scenes, transition and recording.program.audio / recording.iso.sources / recording.iso.audio. |
+| `collection` | object (optional) | Or a scene collection, as get_collection_or_profile returns one: the setup's version, name, canvas.width/height, sources, scenes, transition and recording.program.audio / recording.iso.sources / recording.iso.audio / recording.iso.source_audio. |
 | `name` | string (optional) | The name to give them; their own if absent. |
 | `profile` | object (optional) | And/or a profile: version, name, canvas.fps, audio, stream and the rest of recording (folder, keep_free_gb, program and iso settings). |
 | `setup` | object (optional) | A whole setup (as get_setup returns one): its collection part and its profile part are both imported. |
@@ -252,6 +362,7 @@ Add an OBS Studio scene collection (its name in OBS's scenes folder, or an absol
 | `height` | integer (optional) |  |
 | `name` | string (optional) | The name to give them; OBS's if absent. |
 | `profile` | string (optional) | An OBS profile: its name, its folder or its basic.ini path. |
+| `stream_key` | boolean | Move the stream key OBS keeps in plain text in the profile's service.json into the Keychain, for the imported profile's service (only when the user agreed to it). Without it the key stays behind. |
 | `switch` | boolean | Switch to what was imported (refused while recording or streaming). |
 | `width` | integer (optional) | Import the collection onto a canvas this wide and high, scaling positions and sizes about the centre; its own canvas if absent. |
 
@@ -265,7 +376,7 @@ Make a good starting setup from this Mac's devices: the main display, the best r
 | `camera` | string (optional) | The camera: an id, a name or part of one from `isocast devices`, or "none". If absent, the best real camera: a USB or other external camera, else Continuity Camera, else the built-in one; virtual cameras (OBS, NDI) and Desk View only if there is nothing else. |
 | `display` | string (optional) | The display to capture: "main", or an id or name from `isocast devices`. The main display if absent. |
 | `folder` | string (optional) | Where recordings go; `~/Movies/Isocast` if absent. |
-| `fps` | integer (optional) | Canvas frame rate: 60 if absent (or the display's, if it refreshes more slowly). |
+| `fps` | integer (optional) | Canvas frame rate: the daemon defaults to 30 on <=8-core or <=8-GB machines, otherwise 60 (or the display's slower refresh rate). |
 | `height` | integer (optional) |  |
 | `layout` | Layout | Where the camera goes in the "Screen + Camera" scene. |
 | `microphone` | string (optional) | The microphone: "default" (the system's default input, if absent), an id, a name or part of one, or "none". |
@@ -289,6 +400,10 @@ List recording encoders with their display labels and supported containers. Use 
 
 The installed plugins: id, version, what they provide (a process, and kinds like twitch-chat/glow), state (ok, disabled, incompatible or failed, and why), their process (running or restarting, restarts, how it last ended, its log) and the permissions they were granted.
 
+## list_projectors
+
+The open projectors (what each shows, full screen on which display or where its window is, whether the app shows it) and the displays a projector can fill.
+
 ## list_projects
 
 The recording projects, newest first: each recording session writes into its own folder (`<date> <time> Untitled` in the recordings folder) with every take's program and ISO files, manifests and exports. Each has an id (stable across renames), name, folder, takes (manifests) and files. Optional `limit` (100 if absent).
@@ -299,7 +414,7 @@ The recording projects, newest first: each recording session writes into its own
 
 ## list_timelines
 
-Every timeline (id, name, clips, length) and which is current (the one finished takes are added to).
+Every timeline (id, name, clips, length) and which is current (the one the editor shows and timeline edits act on).
 
 ## live_engine
 
@@ -315,8 +430,21 @@ See the live engine's newest frame as a JPEG: the program (exactly what records 
 
 | Argument | Type | Description |
 |---|---|---|
-| `target` | string (optional) | "program" (the default), "preview" (studio mode's preview scene) or a video source id of the live setup. |
+| `canvas` | CanvasId | "main" (the default) or "vertical": the vertical canvas's program (with target "program" or none). |
+| `target` | string (optional) | "program" (the default), "preview" (studio mode's preview scene), "vertical-program" or a video source id of the live setup. |
 | `width` | integer (optional) | Scale the picture down to at most this many pixels wide (default 1280). |
+
+## machine_calibrate
+
+Start a silent synthetic self-test, at most 30 seconds, without capture, windows or network access. Refused while outputs are active; starting an output cancels it. Poll machine_profile for completion.
+
+## machine_cancel
+
+Cancel machine calibration and retain the previous valid profile.
+
+## machine_profile
+
+Show this machine's measured capabilities and calibration state; missing or stale measurements fall back to the per-chip table.
 
 ## move_clip
 
@@ -330,7 +458,7 @@ Move a clip (by id) to another place on a timeline: `index` counts from 0 (the f
 
 ## new_timeline
 
-Make a timeline (optional `name`) and make it current: from now on every take that finishes (stop_recording, or split_take) is added to its end as a clip. A timeline is takes in order, like a clip bar: retake records the last one again, remove_clip and move_clip edit the order, and export_timeline joins them into one file. Returns the timeline.
+Make a timeline (optional `name`), make it current and choose it for the next recording (record_target): from then on every take that finishes (stop_recording, or split_take) is added to its end as a clip, until record_target says `new`. A timeline is takes in order, like a clip bar: retake records the last one again, remove_clip and move_clip edit the order, and export_timeline joins them into one file. Returns the timeline.
 
 | Argument | Type | Description |
 |---|---|---|
@@ -338,19 +466,59 @@ Make a timeline (optional `name`) and make it current: from now on every take th
 
 ## open_permission_settings
 
-Open System Settings on the user's screen at the pane where a permission (screen_recording, camera or microphone) is turned on by hand, for one that was refused.
+Open System Settings on the user's screen at the pane where a permission (screen_recording, camera, microphone or system_audio) is turned on by hand, for one that was refused.
 
 | Argument | Type | Description |
 |---|---|---|
-| `permission` (required) | PermissionKind | screen_recording, camera or microphone. |
+| `permission` (required) | PermissionKind | screen_recording, camera, microphone or system_audio. |
+
+## open_project
+
+Open a project file (`<name>.isoprj`, in every project folder) or a project folder by full `path`: its timelines join the engine's (taken in if the folder was copied from elsewhere, paths resolved where it is now), one becomes the current timeline (`timeline`, else the current one if it is the project's, else its newest; a project with none gets one of its takes), and the app shows the editor on it unless `editor` is false. Missing takes are listed in `offline` (relink_clip), never an error. Allowed while recording. Whether the app opens the editor when a recording stops is the setup's `recording.open_editor` (apply_change with patch {"recording": {"open_editor": true}}). Returns the project, its timelines and the one opened.
+
+| Argument | Type | Description |
+|---|---|---|
+| `editor` | boolean (optional) | Ask the app to show the editor on it (true if absent). |
+| `path` (required) | string | A `.isoprj` file, or a project folder (its `.isoprj`, or its takes if it has none yet). |
+| `timeline` | string (optional) | Which of the project's timelines to open (an id); else the current timeline if it is one of them, else its newest. |
+
+## open_projector
+
+Open a projector: the program, studio mode's preview, a scene (`scene` id), a video source (`source` id) or a multiview grid (`layout`: top-8, 3x3 or 2x2; preview, program and scenes with labels and tally; `vertical` true puts the vertical program in its last tile, `canvases` [ids] puts those extra canvases' programs in its last tiles), with `canvas` "vertical" or a [[canvases]] id that canvas's program, preview or scene, full screen on a display (`fullscreen`, `display`: main, an id or a name from list_projectors) or in a window (`fullscreen` false, optional `frame` in points). The Isocast app shows it, and opens it when it next starts if it isn't running (`shown` says whether a window shows it). Opening a view that is already open moves it. Absent placement: where that view was last.
+
+| Argument | Type | Description |
+|---|---|---|
+| `canvas` | string (optional) | The canvas: `main` (the default), `vertical` (the live setup's vertical canvas) or one of its `[[canvases]]` ids (#120); views program, preview and scene. |
+| `canvases` | array (optional) | For `view = multiview`: extra canvases (`vertical` or `[[canvases]]` ids) whose programs fill the grid's last tiles in place of scenes, in order (#120); at most half the grid's scene tiles (one in `2x2`). Absent: as the open multiview has it, else none; empty: none. |
+| `display` | string (optional) | `main`, a display's id or its name (`isocast devices`). |
+| `frame` | Frame | The window's place (not full screen). Absent: where the same view was last, else the app picks. |
+| `fullscreen` | boolean (optional) | `true`: full screen on `display` (the main display if absent); `false`: in a window. Absent: where the same view was last (a window the first time), or full screen if `display` is given. |
+| `layout` | MultiviewLayout | The grid, for `view = multiview`: `top-8` (the default), `3x3` or `2x2`. |
+| `scene` | string (optional) | The scene's id, for `view = scene`. |
+| `source` | string (optional) | The video source's id, for `view = source`. |
+| `vertical` | boolean (optional) | For `view = multiview`: show the vertical canvas's program in the grid's last tile, in place of a scene (the live setup needs a vertical canvas). Absent: as the open multiview has it, else no. |
+| `view` (required) | ProjectorView |  |
 
 ## open_timeline
 
-Make a timeline current (by id), so finished takes are added to it.
+Make a timeline current (by id): the one the editor shows and timeline edits act on. Recordings go where record_target says.
 
 | Argument | Type | Description |
 |---|---|---|
 | `timeline` (required) | string | The id of the timeline to make current. |
+
+## optimize_setup
+
+Optimize the live setup for `goal` recording, streaming or both (OBS's Auto-Configuration Wizard). Recording favours quality and ISO files (HEVC High, an ISO file per captured source); streaming sets the service and a bitrate from the upload speed (upload_kbps, or measured like test_upload_speed; never for a custom server, test it first) and sizes the stream to it. Then it benchmarks this Mac like tune_encoders and steps down where it can't keep up. Returns a one-line `summary`, the optimized setup, its differences from the live setup, the benchmark and notes; with apply it becomes the live setup. Takes a minute or two; refused while recording or streaming.
+
+| Argument | Type | Description |
+|---|---|---|
+| `apply` | boolean | Make the result the live setup (refused while recording or streaming). |
+| `folder` | string (optional) | Benchmark writing to this folder instead of the setup's `recording.folder`. |
+| `goal` (required) | Goal |  |
+| `server` | string (optional) | Streaming: its ingest server, if not the service's default (needed for custom and Kick). |
+| `service` | StreamService | Streaming: the service; the live setup's stream service if absent. |
+| `upload_kbps` | integer (optional) | Streaming: the upload speed in kb/s (from `speed_test`, or known); measured with `speed_test` if absent. |
 
 ## pause_recording
 
@@ -382,6 +550,7 @@ Stage a scene in preview, by id, without changing what is on air; take_preview t
 
 | Argument | Type | Description |
 |---|---|---|
+| `canvas` | CanvasId | "main" (the default) or "vertical" (which must not follow the main canvas). |
 | `scene` (required) | string | The id of a scene in the setup. |
 
 ## read_bug_report_file
@@ -395,6 +564,30 @@ Read a UTF-8 page (default 4096 bytes, max 16384) from a redacted bug-report pre
 | `offset` | integer |  |
 | `preview_id` (required) | string |  |
 
+## recent_projects
+
+The project files opened lately (File › Open Recent), newest first, each with whether it is still there; `clear` forgets them.
+
+| Argument | Type | Description |
+|---|---|---|
+| `clear` | boolean | Forget them all (File › Open Recent › Clear Menu). |
+
+## record_target
+
+Where the next recording goes, and with `target`, choose it: `new` (the default: each recording starts a new project folder with its own timeline) or a timeline's id (list_timelines), whose next take it then is, written into the folder of its last take. Kept across restarts and shown in get_status (record_target); a recording running keeps its own. Returns the choice: the timeline, its name and the take it would be.
+
+| Argument | Type | Description |
+|---|---|---|
+| `target` | string (optional) | `new` (each recording starts a new project with its own timeline) or a timeline's id (`timeline_list` has them): its next take. Absent: the choice is only read. |
+
+## redo_edit
+
+Put back the last edit undo_edit took back. Returns the timeline.
+
+| Argument | Type | Description |
+|---|---|---|
+| `timeline` | string (optional) | A timeline's id (`timeline_list` has them); the current one if absent. |
+
 ## refresh_browser
 
 Reload a browser source's page in the running recording, bypassing the cache, for example after changing the page or when it stopped updating.
@@ -402,6 +595,16 @@ Reload a browser source's page in the running recording, bypassing the cache, fo
 | Argument | Type | Description |
 |---|---|---|
 | `source` (required) | string | The browser source's id. |
+
+## relink_clip
+
+Point an offline clip (its take isn't where the timeline says: the project folder was moved or copied) at where its take is now: `path` is the take's manifest (….session.json) or the folder holding it; given a folder, every take that was in the clip's old folder is looked for there too. The take's files are never touched. Returns the timeline.
+
+| Argument | Type | Description |
+|---|---|---|
+| `clip` (required) | string | The clip's id, like `c2`. |
+| `path` (required) | string | The take's manifest (`….session.json`), or the folder holding a manifest of the same name. Given a folder, every take of every timeline that was in the clip's old folder is looked for there too. |
+| `timeline` | string (optional) | The timeline's id; the current one if absent. |
 
 ## remove_clip
 
@@ -440,9 +643,21 @@ Rename a recording project (by id, from list_projects): its folder becomes `<dat
 | `name` (required) | string | Its new name: the folder becomes `<date> <time> <name>`. |
 | `project` (required) | string | The project's id (from `list_projects` or a `project_created` event). |
 
+## replay_status
+
+The replay buffer's state, seconds held, memory used and its limit, format, whether it shares the stream's encoder, missed frames and the last save; canvas "vertical" for the vertical canvas's buffer.
+
+| Argument | Type | Description |
+|---|---|---|
+| `canvas` | CanvasId | `main` (the default: the program) or `vertical` (the setup's vertical canvas's program, kept with the same `recording.replay` settings, as its own buffer). One canvas's buffer starts, stops and saves without touching the other's. |
+
 ## request_permissions
 
-Ask macOS for screen recording, camera and microphone access where it hasn't been decided yet. Its prompts appear on the user's screen; waits up to a minute for answers and returns the permissions with next steps.
+Ask macOS for screen recording, camera and microphone access where it hasn't been decided yet (or only `permission`). Its prompts appear on the user's screen; waits up to a minute for answers and returns the permissions with next steps.
+
+| Argument | Type | Description |
+|---|---|---|
+| `permission` | PermissionKind | Only this one: screen_recording, camera, microphone or system_audio (all not decided yet if left out). |
 
 ## restart_isocastd
 
@@ -460,6 +675,35 @@ Record the last take again, on the current timeline. Not recording: take the las
 |---|---|---|
 | `folder` | string (optional) | Write the new take here; else the folder of the take it replaces (else the setup's `recording.folder`). Not while recording, where the new take goes where the recording writes. |
 | `seconds` | number (optional) | Stop on its own after this many seconds (not while recording). |
+
+## roll_cut
+
+Move the cut between `clip` and the clip after it by `by_seconds` (negative: earlier), a roll edit: the clip's out point and the next clip's in point move together, so the timeline keeps its length. One undoable edit. Returns the timeline.
+
+| Argument | Type | Description |
+|---|---|---|
+| `by_seconds` (required) | number | How far to move the cut, in seconds (negative: earlier), rounded to the clips' frame grid. Both clips must keep a frame and stay within their takes. |
+| `clip` (required) | string | The clip before the cut, like `c2`. |
+| `timeline` | string (optional) | The timeline's id; the current one if absent. |
+
+## save_replay
+
+Save the replay buffer: write the last recording.replay.seconds of the program, up to this moment, to a new MOV/MP4 in the recordings folder (the running recording's project folder, if one records), without interrupting recording or streaming. Canvas "vertical" saves the vertical canvas's buffer (its file name ends in "vertical"). Returns the file's path, length, frames and any missed frames.
+
+| Argument | Type | Description |
+|---|---|---|
+| `canvas` | CanvasId | `main` (the default: the program) or `vertical` (the setup's vertical canvas's program, kept with the same `recording.replay` settings, as its own buffer). One canvas's buffer starts, stops and saves without touching the other's. |
+
+## set_angle
+
+Choose what the edited video shows from `start_seconds` to `end_seconds` on the timeline: `source` is `program` or an ISO source every clip there recorded (clips are split at the span's ends). export_timeline then writes an edited file with these angles and the program's sound. One undoable edit. Returns the timeline.
+
+| Argument | Type | Description |
+|---|---|---|
+| `end_seconds` (required) | number |  |
+| `source` (required) | string | What the edited video shows over the span: `program`, or an ISO source's id that every clip in the span recorded. |
+| `start_seconds` (required) | number | Where the span starts and ends, in seconds on the timeline, each rounded to the frame grid of the clip there. |
+| `timeline` | string (optional) | The timeline's id; the current one if absent. |
 
 ## set_audio
 
@@ -484,15 +728,35 @@ Set data keys to JSON values, several at once (all of them, or none if one is re
 | `persist` | boolean (optional) | Keep these keys with the scene collection, so they come back after a restart (`true`), or stop keeping them (`false`). If absent, a key keeps what it had; a new key isn't kept. |
 | `values` (required) | object | Keys and their new values (any JSON), set together: all of them or, if one is refused, none. |
 
+## set_iso_audio
+
+Choose the audio tracks of one source's ISO file in the live setup (recording.iso.source_audio): a camera's file with the mic only, a screen's with desktop audio only. Other ISO files keep recording.iso.audio, or their own sound. Applies from the next recording; the manifest lists each file's tracks.
+
+| Argument | Type | Description |
+|---|---|---|
+| `audio` | array (optional) | The audio sources' ids that file carries, in track order ([] for no audio). Null or absent puts it back to recording.iso.audio (or, without that list, the source's own sound). |
+| `source` (required) | string | The id of a video source in the live setup: its ISO file. |
+
 ## set_stream_key
 
 Keep a stream key in the macOS Keychain for a streaming service (the live setup's by default). It is never written to setups, logs or status. Returns where it is kept, not the key.
 
 | Argument | Type | Description |
 |---|---|---|
+| `canvas` | CanvasId | "main" (the default, [stream]) or "vertical" ([vertical.stream]): each canvas keeps its own keys. |
+| `destination` | string (optional) | A destination ("main", or an id from get_status's streams): its own key (with service and server only for one not applied yet). |
 | `key` (required) | string | The stream key from the service's dashboard. It goes into the Keychain and is never shown again; prefer `isocast stream key set` in a terminal, which keeps it out of this conversation. |
 | `server` | string (optional) | For "custom": the server it belongs to (rtmp://host/app). |
 | `service` | StreamService | The service it is for; the live setup's [stream] service if absent. |
+
+## split_clip
+
+Cut the clip at `at_seconds` (on the timeline, rounded to the frames there) in two; the second gets a new id. One undoable edit. Returns the timeline.
+
+| Argument | Type | Description |
+|---|---|---|
+| `at_seconds` (required) | number | Where to cut, in seconds on the timeline (0 is its start), rounded to the frame grid of the clip there. |
+| `timeline` | string (optional) | The timeline's id; the current one if absent. |
 
 ## split_take
 
@@ -500,25 +764,100 @@ Split the recording into a new take at the next whole second without stopping an
 
 ## start_recording
 
-Start recording the live setup (or the given setup, which then replaces the live setup): the program and every ISO source, each to its own file. Returns once every file is created.
+Start recording the live setup (or the given setup, which then replaces the live setup): the program and every ISO source, each to its own file. Its takes go where record_target says: a new project folder with its own timeline unless a timeline was chosen (`new_project` or `into` choose for this recording only). Returns once every file is created, with the timeline its takes go to.
 
 | Argument | Type | Description |
 |---|---|---|
 | `folder` | string (optional) | Absolute folder for the files instead of the setup's recording.folder. |
+| `into` | string (optional) | Add this recording's takes to this timeline (an id from list_timelines), in the folder of its last take. Not with `new_project`. Neither: record_target's choice (a new project unless a timeline was chosen). |
+| `new_project` | boolean | Start a new project with its own timeline, whatever record_target says. Not with `into`. |
 | `seconds` | number (optional) | Stop on its own after this many seconds. |
 | `setup` | object (optional) | The setup to record; the live setup if absent (the shape get_setup returns; get_setup_schema has its JSON Schema). |
 
+## start_replay
+
+Start the replay buffer: keep the last recording.replay.seconds (30 by default) of the encoded program, video and program mix, in memory, starting the live engine if needed; recording and streaming are independent of it. It shares the stream's encoder when the setup has a [stream]. Then save_replay writes the last seconds to a file. With canvas "vertical", the vertical canvas's program in a buffer of its own (same settings; sharing a [vertical.stream]'s encoder); each canvas's buffer starts, stops and saves independently. Returns its status.
+
+| Argument | Type | Description |
+|---|---|---|
+| `canvas` | CanvasId | `main` (the default: the program) or `vertical` (the setup's vertical canvas's program, kept with the same `recording.replay` settings, as its own buffer). One canvas's buffer starts, stops and saves without touching the other's. |
+
 ## start_stream
 
-Go live: stream the program (canvas and program mix) as H.264/AAC over RTMP or RTMPS to the live setup's [stream] service (twitch, youtube, kick, facebook or a custom server), starting the live engine if needed; recordings start and stop independently. Needs a stream key set. Returns the stream's status once live, or an error saying what to do. get_status shows the stream's health.
+Go live: stream the program (canvas and program mix) as H.264/AAC over RTMP or RTMPS to the live setup's [stream] destinations (twitch, youtube, kick, facebook or custom servers; every enabled one, or `only` those ids), starting the live engine if needed; destinations already live are left alone, and recordings start and stop independently. Destinations with the same bitrate and size share one encoder. Each needs its stream key set. Returns the first destination's status plus every destination's (`destinations`) once each is live or failed, or an error saying what to do. get_status shows each one's health (`streams`). With canvas "vertical", the vertical canvas's program to its own [vertical.stream] destinations and keys (`vertical_streams`).
+
+| Argument | Type | Description |
+|---|---|---|
+| `canvas` | CanvasId | Which canvas streams: `main` (the default: the program to `[stream]`) or `vertical` (the vertical program to `[vertical.stream]`). A stop leaves the other canvas's streams alone. |
+| `only` | list of string | Destination ids (`main` and the ids in `stream.destinations`); every enabled one (or for a stop, every one streaming) if empty. A destination named here starts even if it is turned off. |
 
 ## stop_recording
 
 Stop recording and finish every file. Returns the report: each file, its frames, dropped frames, audio dropouts and the manifest path.
 
+## stop_replay
+
+Stop the replay buffer, discarding what it holds (save_replay first to keep it); canvas "vertical" stops the vertical canvas's buffer only. Returns its final status.
+
+| Argument | Type | Description |
+|---|---|---|
+| `canvas` | CanvasId | `main` (the default: the program) or `vertical` (the setup's vertical canvas's program, kept with the same `recording.replay` settings, as its own buffer). One canvas's buffer starts, stops and saves without touching the other's. |
+
 ## stop_stream
 
-Stop streaming. Returns the stream's final status: frames sent and dropped, reconnects and the last error.
+Stop streaming (to every destination, or `only` those ids; the others keep going). Returns the final status of the first stopped, plus every destination's: frames sent and dropped, reconnects and the last error. Stops one canvas's streams: canvas "main" (the default) or "vertical".
+
+| Argument | Type | Description |
+|---|---|---|
+| `canvas` | CanvasId | Which canvas streams: `main` (the default: the program to `[stream]`) or `vertical` (the vertical program to `[vertical.stream]`). A stop leaves the other canvas's streams alone. |
+| `only` | list of string | Destination ids (`main` and the ids in `stream.destinations`); every enabled one (or for a stop, every one streaming) if empty. A destination named here starts even if it is turned off. |
+
+## stream_destination_add
+
+Add a stream destination to the live setup: a service (twitch, youtube, kick, facebook, custom), its server (custom and kick need one; never with the key in it), optional id (made from the service), enabled, and its own video_bitrate_kbps or width/height (else the main destination's; a different bitrate or size needs an encoder of its own, refused at start when this Mac's encoders lack room). The first one becomes the [stream] section itself (id main). Then set_stream_key with its destination id. Returns every destination's status.
+
+| Argument | Type | Description |
+|---|---|---|
+| `audio_bitrate_kbps` | integer (optional) | Its own AAC bitrate. |
+| `canvas` | CanvasId | Which canvas's destinations: `main` (the default, `[stream]`), `vertical` (`[vertical.stream]`) or a `[[canvases]]` id (its `stream`), a canvas the live setup must have. |
+| `clear` | list of string | Fields to reset: `server` (to the service's), `video_bitrate_kbps`, `size`, `rate_control`, `keyframe_interval_seconds` and `audio_bitrate_kbps` (to the main destination's; for `main`, the defaults). |
+| `enabled` | boolean (optional) |  |
+| `height` | integer (optional) |  |
+| `id` | string (optional) | The destination's id. For `add`, made from the service if absent (`youtube`, `youtube-2`); required for `set`. |
+| `keyframe_interval_seconds` | integer (optional) | Its own seconds between keyframes. |
+| `rate_control` | RateControl | Its own rate control (#84); the main destination's if absent. |
+| `server` | string (optional) |  |
+| `service` | StreamService | Required for `add`. |
+| `video_bitrate_kbps` | integer (optional) |  |
+| `width` | integer (optional) |  |
+
+## stream_destination_remove
+
+Remove a stream destination by id (not main: turn it off with stream_destination_set instead; not while it streams). Its stored key stays in the Keychain until clear_stream_key. Returns every destination's status.
+
+| Argument | Type | Description |
+|---|---|---|
+| `canvas` | CanvasId | "main" (the default, [stream]) or "vertical" ([vertical.stream]). |
+| `id` (required) | string | The destination's id, from get_status's streams (or vertical_streams, with canvas "vertical"). |
+
+## stream_destination_set
+
+Change a stream destination by id (main is the [stream] section): service, server, enabled, video_bitrate_kbps, width/height, rate_control, keyframe_interval_seconds, audio_bitrate_kbps, or `clear` some of those. With canvas, that canvas's destinations (vertical or a [[canvases]] id). Takes effect at its next start. Returns every destination's status.
+
+| Argument | Type | Description |
+|---|---|---|
+| `audio_bitrate_kbps` | integer (optional) | Its own AAC bitrate. |
+| `canvas` | CanvasId | Which canvas's destinations: `main` (the default, `[stream]`), `vertical` (`[vertical.stream]`) or a `[[canvases]]` id (its `stream`), a canvas the live setup must have. |
+| `clear` | list of string | Fields to reset: `server` (to the service's), `video_bitrate_kbps`, `size`, `rate_control`, `keyframe_interval_seconds` and `audio_bitrate_kbps` (to the main destination's; for `main`, the defaults). |
+| `enabled` | boolean (optional) |  |
+| `height` | integer (optional) |  |
+| `id` | string (optional) | The destination's id. For `add`, made from the service if absent (`youtube`, `youtube-2`); required for `set`. |
+| `keyframe_interval_seconds` | integer (optional) | Its own seconds between keyframes. |
+| `rate_control` | RateControl | Its own rate control (#84); the main destination's if absent. |
+| `server` | string (optional) |  |
+| `service` | StreamService | Required for `add`. |
+| `video_bitrate_kbps` | integer (optional) |  |
+| `width` | integer (optional) |  |
 
 ## switch_collection_or_profile
 
@@ -531,10 +870,11 @@ Start using another scene collection, profile or both (by id): the live setup be
 
 ## switch_scene
 
-Put a scene on air, by id, with a transition: cut, fade, swipe, slide, fade_to_color, luma_wipe, stinger or move (the scene's transition, else the setup's, by default). While recording, the switch is written to the manifest's scene timeline.
+Put a scene on air, by id, with a transition: cut, fade, swipe, slide, fade_to_color, luma_wipe, stinger or move (the scene's transition, else the setup's, by default). While recording, the switch is written to the manifest's scene timeline. canvas "vertical" switches the vertical canvas, once vertical.follow_main is false.
 
 | Argument | Type | Description |
 |---|---|---|
+| `canvas` | CanvasId | "main" (the default) or "vertical": the setup's [vertical] canvas, which must not follow the main one (vertical.follow_main false). |
 | `scene` (required) | string | The id of a scene in the setup. |
 | `transition` | Transition | How it comes on air, like {"kind":"fade","duration_ms":500}, {"kind":"swipe","direction":"up"} or {"kind":"cut"}; the scene's transition (else the setup's) if absent. |
 
@@ -544,7 +884,29 @@ Put the preview scene on air with a transition (the scene's, else the setup's, b
 
 | Argument | Type | Description |
 |---|---|---|
+| `canvas` | CanvasId | "main" (the default) or "vertical" (which must not follow the main canvas). |
 | `transition` | Transition | How the preview scene comes on air; its transition (else the setup's) if absent. |
+
+## test_upload_speed
+
+Measure the upload speed to a streaming service's ingest (the live setup's unless `service`/`server` say) with a few seconds of filler video: Twitch's bandwidth test mode (never on air) or a custom server (a relay would put the filler on air for a few seconds: ask the user first), using the stored stream key. YouTube, Facebook and Kick have no test mode, and without a key nothing can be tested: then `measured` is false, `reason` says why, and `recommended_kbps` is a safe default. Refused while streaming.
+
+| Argument | Type | Description |
+|---|---|---|
+| `seconds` | integer (optional) | How long to send for, 3 to 20 seconds; 8 if absent. |
+| `server` | string (optional) | Its ingest server (`rtmp://host/app`); the service's default, or the live setup's, if absent. Required for custom and Kick. |
+| `service` | StreamService | The service to test against; the live setup's stream service if absent. |
+
+## trim_clip
+
+Move a clip's in and/or out point (`in_seconds`, `out_seconds`, on the clip's take's own clock, rounded to its frames). Only the timeline changes, never the take's files; one undoable edit. Returns the timeline.
+
+| Argument | Type | Description |
+|---|---|---|
+| `clip` (required) | string | The clip's id, like `c2`. |
+| `in_seconds` | number (optional) | Where the clip starts, in seconds on its take's own clock (0 is the take's start); unchanged if absent. Rounded to the take's frame grid. |
+| `out_seconds` | number (optional) | Where the clip ends, on its take's clock, up to the take's length; unchanged if absent. Rounded to the take's frame grid. |
+| `timeline` | string (optional) | The timeline's id; the current one if absent. |
 
 ## tune_encoders
 
@@ -555,9 +917,21 @@ Benchmark the hardware encoders on a setup's video files (the live setup if none
 | `folder` | string (optional) | Check this folder instead of the setup's recording.folder. |
 | `setup` | object (optional) | The setup to check; the live setup if absent (the shape get_setup returns; get_setup_schema has its JSON Schema). |
 
+## undo_edit
+
+Take back the last edit of a timeline (trim, split, delete, angle, remove, move; not a recorded take). Returns the timeline, with how many edits can still be undone and redone.
+
+| Argument | Type | Description |
+|---|---|---|
+| `timeline` | string (optional) | A timeline's id (`timeline_list` has them); the current one if absent. |
+
+## virtual_camera_remove
+
+Remove Isocast Virtual Camera from macOS (the release app's camera extension), for deleting Isocast cleanly: stops the camera, then macOS asks the user for an administrator password; waits for it (up to about 4 minutes). Ask the user first. A later virtual_camera_start installs it again.
+
 ## virtual_camera_start
 
-Start Isocast Virtual Camera. Takes no arguments: configure virtual_camera.target/scene/source/width/height through plan_change and apply_change first. Requires its signed/approved extension; never installs it. Recording and streaming stay independent.
+Start Isocast Virtual Camera. Takes no arguments: configure virtual_camera.target/scene/source/width/height through plan_change and apply_change first (target "vertical" shows the vertical program, 1080x1920 by default; it needs the vertical canvas on). Requires its signed/approved extension; never installs it. Recording and streaming stay independent.
 
 ## virtual_camera_status
 
@@ -566,3 +940,22 @@ Read virtual camera state, output format, sent/dropped frame counts, enqueue lat
 ## virtual_camera_stop
 
 Stop feeding Isocast Virtual Camera. Other applications see the extension's Isocast waiting card.
+
+## websocket_disable
+
+Turn off the obs-websocket server, disconnecting its clients. Returns its status.
+
+## websocket_enable
+
+Turn on the obs-websocket v5 server (off by default; kept across restarts), optionally setting port (4455), bind (127.0.0.1, this Mac only; 0.0.0.0 for every network), password (kept in the Keychain) or no_password (loopback bind only; web pages are then refused and logged; kept until a password is given). Settings left out stay as they were. With a password required and none stored, one is generated and returned once as generated_password, for the user to enter in the OBS tool. Returns its status, with a warning if ISOCAST_WEBSOCKET_PASSWORD overrides the stored password.
+
+| Argument | Type | Description |
+|---|---|---|
+| `bind` | string (optional) | The address to listen on (an IPv4 or IPv6 address of this Mac; 0.0.0.0 for every network). |
+| `no_password` | boolean | Remove the password: any program on this Mac that reaches the port may connect, except web pages (connections with an Origin header are refused, and logged in isocastd's log). Only with a loopback bind (127.0.0.1 or ::1). Stays until a `password` is given. |
+| `password` | string (optional) | The password clients authenticate with, kept in the Keychain; it turns authentication back on after `no_password`. Left out, the stored one and the authentication stay as they were; with authentication on and no password stored, one is generated and returned once as `generated_password`. |
+| `port` | integer (optional) | The TCP port, 1–65535. |
+
+## websocket_status
+
+The obs-websocket v5 compatibility server (OBS tools such as Stream Deck, Touch Portal and Streamer.bot drive Isocast through it): whether it is on and listening, its ws:// address, whether it asks for a password, connected clients, and why it isn't listening if it should be.

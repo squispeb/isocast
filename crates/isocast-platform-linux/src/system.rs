@@ -57,6 +57,42 @@ pub(crate) fn thread_cpu_time() -> Option<Duration> {
     (status == 0).then(|| Duration::new(time.tv_sec.max(0) as u64, time.tv_nsec.max(0) as u32))
 }
 
+/// CPU seconds this process has used, user and kernel time together
+/// (`getrusage`): the daemon's own load, and the governor's.
+pub(crate) fn process_cpu_seconds() -> Option<f64> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    // SAFETY: getrusage fills only the correctly sized output structure.
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: filled in by getrusage above.
+    let usage = unsafe { usage.assume_init() };
+    let seconds = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+    Some(seconds(usage.ru_utime) + seconds(usage.ru_stime))
+}
+
+/// Busy core-seconds across the machine since boot, from `/proc/stat`'s
+/// `cpu` line: every column but idle and iowait, in clock ticks.
+pub(crate) fn system_cpu_seconds() -> Option<f64> {
+    let stat = std::fs::read_to_string("/proc/stat").ok()?;
+    let ticks: Vec<u64> = stat
+        .lines()
+        .find(|line| line.starts_with("cpu "))?
+        .split_whitespace()
+        .skip(1)
+        .filter_map(|value| value.parse().ok())
+        .collect();
+    // user nice system idle iowait irq softirq steal (guest time is
+    // already counted in user and nice).
+    if ticks.len() < 8 {
+        return None;
+    }
+    let busy: u64 = ticks[..8].iter().sum::<u64>() - ticks[3] - ticks[4];
+    // SAFETY: sysconf only reads a configuration value.
+    let per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    (per_second > 0).then(|| busy as f64 / per_second as f64)
+}
+
 // ---------------------------------------------------------------------------
 // What this machine is (doctor and tune read it).
 // ---------------------------------------------------------------------------
@@ -507,6 +543,9 @@ pub(crate) fn microphones() -> Result<Vec<Microphone>> {
             default: id == default,
             sample_rates: vec![sample_rate_of(spec)],
             channels: channels_of(spec),
+            // PipeWire names positions (front-left, aux0), not inputs;
+            // the protocol's names are the device's own, so none here.
+            channel_names: Vec::new(),
             id: id.to_string(),
         })
     }))
@@ -546,6 +585,40 @@ pub(crate) fn default_output() -> Result<String> {
 /// name, matched the way macOS matches its own devices (an exact id or
 /// name, then the same ignoring case, then the shortest name containing
 /// the query).
+/// The channel count to capture `microphone` in, and which of those
+/// channels go on (from 0), for a source's `channels` (from 1): a one- or
+/// two-channel device's own signal by default, a larger one's inputs
+/// 1 + 2 (as on macOS). The error names the channel and lists the valid.
+pub(crate) fn microphone_channels(
+    microphone: &Microphone,
+    channels: Option<&[u32]>,
+) -> Result<(u32, Option<Vec<usize>>)> {
+    let available = microphone.channels.max(1);
+    let Some(channels) = channels else {
+        return Ok(match available {
+            1 | 2 => (available, None),
+            _ => (available, Some(vec![0, 1])),
+        });
+    };
+    if channels.is_empty() || channels.len() > 2 {
+        bail!("channels: give one channel (mono) or two (stereo)");
+    }
+    if let Some((i, channel)) = channels
+        .iter()
+        .enumerate()
+        .find(|(_, c)| **c == 0 || **c > available)
+    {
+        bail!(
+            "channels[{i}]: {:?} has no input channel {channel}; valid: 1 to {available}",
+            microphone.name
+        );
+    }
+    Ok((
+        available,
+        Some(channels.iter().map(|c| *c as usize - 1).collect()),
+    ))
+}
+
 pub(crate) fn find_microphone(query: &str) -> Result<Microphone> {
     let sources = microphones().context("listing microphones")?;
     if query == "default" {
@@ -685,6 +758,10 @@ pub(crate) fn permissions_report() -> Result<PermissionsReport> {
                 settings_url: "isocast://linux/portal".to_string(),
                 next_step,
                 restart_after_granting: false,
+                // No settings list to find an app in: the portal asks.
+                app: String::new(),
+                app_path: None,
+                denied_without_prompt: false,
             }
         })
         .collect();
@@ -693,6 +770,8 @@ pub(crate) fn permissions_report() -> Result<PermissionsReport> {
             screen_recording: screen,
             camera: Permission::Granted,
             microphone: Permission::Granted,
+            // Linux has no separate permission for system audio.
+            system_audio: Permission::Granted,
         },
         app: "isocastd".to_string(),
         details,

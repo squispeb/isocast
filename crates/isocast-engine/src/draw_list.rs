@@ -28,6 +28,9 @@ const STAGING_CHUNK: u64 = 256 * 1024;
 
 pub(crate) struct DrawList {
     compiled: Arc<CompiledScenes>,
+    /// Optional smaller raster for monitor-only nested scenes. Records,
+    /// crop and layout still use the compiled canvas's coordinates.
+    raster_size: Option<(u32, u32)>,
     /// The records as drawn: the compiled ones, rewritten for the pictures
     /// drawn and the transitions running.
     records: Vec<Record>,
@@ -145,6 +148,7 @@ impl DrawList {
         let buffer = renderer.record_buffer(gpu, compiled.records.len(), compiled.clips.len());
         let mut list = Self {
             compiled: compiled.clone(),
+            raster_size: None,
             records: Vec::new(),
             bytes: Vec::new(),
             dirty: None,
@@ -749,6 +753,13 @@ impl DrawList {
         self.draws += self.encode_one(renderer, encoder, scene, target, clear);
     }
 
+    pub(crate) fn set_raster_size(&mut self, size: (u32, u32)) {
+        if self.raster_size != Some(size) {
+            self.canvases.iter_mut().for_each(|canvas| *canvas = None);
+            self.raster_size = Some(size);
+        }
+    }
+
     /// Encode drawing the scenes scene `scene` shows on their canvases,
     /// starting a new pass: only canvases drawn since show in it.
     pub(crate) fn encode_nested(
@@ -769,14 +780,42 @@ impl DrawList {
         }
     }
 
+    /// Encode drawing scene `scene` (an index), and the scenes it shows,
+    /// on its own canvas, as a source mask reads it (#115). Returns the
+    /// canvas as a picture.
+    pub(crate) fn encode_canvas(
+        &mut self,
+        gpu: &Gpu,
+        renderer: &Renderer,
+        encoder: &mut wgpu::CommandEncoder,
+        scene: usize,
+    ) -> GpuFrame {
+        self.encode_nested(gpu, renderer, encoder, scene);
+        self.make_canvas(gpu, renderer, scene);
+        let view = self.canvases[scene]
+            .as_ref()
+            .expect("made above")
+            .view
+            .clone();
+        self.draws += self.encode_one(renderer, encoder, scene, &view, wgpu::Color::TRANSPARENT);
+        self.drawn[scene] = self.pass;
+        let (width, height) = self.raster_size.unwrap_or(self.compiled.canvas);
+        GpuFrame {
+            width,
+            height,
+            pixels: crate::gpu::GpuPixels::Premultiplied(view.texture().clone()),
+        }
+    }
+
     /// The canvas scene `scene` (an index) was drawn on in this pass, as a
     /// picture for [`crate::scene::layers`].
     pub(crate) fn canvas_frame(&self, scene: usize) -> Option<GpuFrame> {
         (self.drawn[scene] == self.pass).then_some(())?;
         let texture = self.canvases[scene].as_ref()?.view.texture().clone();
+        let (width, height) = self.raster_size.unwrap_or(self.compiled.canvas);
         Some(GpuFrame {
-            width: self.compiled.canvas.0,
-            height: self.compiled.canvas.1,
+            width,
+            height,
             pixels: crate::gpu::GpuPixels::Premultiplied(texture),
         })
     }
@@ -785,7 +824,11 @@ impl DrawList {
         if self.canvases[scene].is_some() {
             return;
         }
-        let texture = canvas_texture(gpu, renderer.format(), self.compiled.canvas);
+        let texture = canvas_texture(
+            gpu,
+            renderer.format(),
+            self.raster_size.unwrap_or(self.compiled.canvas),
+        );
         let view = texture.create_view(&Default::default());
         let group = renderer.planes_group(gpu, &texture, &texture);
         self.canvases[scene] = Some(Canvas { view, group });

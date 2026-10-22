@@ -2,10 +2,11 @@
 //! and how long a small test write takes there now compared with when the
 //! take started. Drop warnings use it to say when the disk is the cause.
 
+use parking_lot::{Condvar, Mutex};
 use std::collections::VecDeque;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -34,6 +35,7 @@ pub(super) struct DiskProbe {
 struct ProbeState {
     at_start: Option<Duration>,
     latest: Option<Duration>,
+    latest_at: Option<u64>,
     wanted: bool,
     done: bool,
 }
@@ -47,17 +49,18 @@ impl DiskProbe {
         // Detached, so a write that never returns (a network share gone
         // away) can't hold up the end of the recording.
         let failed = state.clone();
+        #[cfg(not(windows))]
         let failed_path = path.clone();
         let _ = isocast_diagnostics::spawn(
             "disk probe",
             move || probe(&platform, &path, &shared),
             move |_| {
-                *failed.0.lock().unwrap_or_else(|p| p.into_inner()) = ProbeState {
+                *failed.0.lock() = ProbeState {
                     done: true,
                     ..Default::default()
                 };
-                failed.0.clear_poison();
                 failed.1.notify_all();
+                #[cfg(not(windows))]
                 let _ = std::fs::remove_file(failed_path);
             },
         );
@@ -67,27 +70,27 @@ impl DiskProbe {
     /// Measure again (at most every [`PROBE_INTERVAL`]).
     pub(super) fn want(&self) {
         let (state, wake) = &*self.state;
-        state.lock().unwrap().wanted = true;
+        state.lock().wanted = true;
         wake.notify_one();
     }
 
     /// The test write times at the start and lately, in ms.
-    fn latencies(&self) -> (Option<f64>, Option<f64>) {
-        let state = self.state.0.lock().unwrap();
+    fn latencies(&self) -> (Option<f64>, Option<f64>, Option<u64>) {
+        let state = self.state.0.lock();
         let ms = |d: Option<Duration>| d.map(|d| d.as_secs_f64() * 1000.0);
-        (ms(state.at_start), ms(state.latest))
+        (ms(state.at_start), ms(state.latest), state.latest_at)
     }
 }
 
 impl Drop for DiskProbe {
     fn drop(&mut self) {
         let (state, wake) = &*self.state;
-        state.lock().unwrap().done = true;
+        state.lock().done = true;
         wake.notify_one();
     }
 }
 
-fn probe<P: Platform>(platform: &P, path: &PathBuf, shared: &(Mutex<ProbeState>, Condvar)) {
+fn probe<P: Platform>(platform: &P, path: &Path, shared: &(Mutex<ProbeState>, Condvar)) {
     let measure = || {
         let mut times: Vec<Duration> = (0..PROBES)
             .filter_map(|_| platform.write_latency(path))
@@ -97,12 +100,12 @@ fn probe<P: Platform>(platform: &P, path: &PathBuf, shared: &(Mutex<ProbeState>,
     };
     let (state, wake) = shared;
     let initial = measure();
-    state.lock().unwrap().at_start = initial;
+    state.lock().at_start = initial;
     loop {
         {
-            let mut guard = state.lock().unwrap();
+            let mut guard = state.lock();
             while !guard.wanted && !guard.done {
-                guard = wake.wait(guard).unwrap();
+                wake.wait(&mut guard);
             }
             if guard.done {
                 break;
@@ -110,9 +113,17 @@ fn probe<P: Platform>(platform: &P, path: &PathBuf, shared: &(Mutex<ProbeState>,
             guard.wanted = false;
         }
         let latest = measure();
-        state.lock().unwrap().latest = latest;
+        {
+            let mut state = state.lock();
+            state.latest = latest;
+            state.latest_at = latest.map(|_| crate::governor::clock_ms());
+        }
         thread::sleep(PROBE_INTERVAL);
     }
+    // Windows has no latency-write implementation yet: it has never owned
+    // this pathname. A future native probe must clean up its owned HANDLE,
+    // not let a pathname-only unlink remove an existing or replaced file.
+    #[cfg(not(windows))]
     let _ = std::fs::remove_file(path);
 }
 
@@ -146,7 +157,7 @@ impl DiskMeter {
         }
         let (then, before) = self.samples[0];
         let seconds = now.saturating_since(then).as_secs_f64();
-        let (latency_at_start_ms, latency_ms) = probe.latencies();
+        let (latency_at_start_ms, latency_ms, measured_at_ms) = probe.latencies();
         LiveDisk {
             write_bytes_per_second: if seconds > 0.0 {
                 (bytes - before) as f64 / seconds
@@ -155,6 +166,7 @@ impl DiskMeter {
             },
             latency_at_start_ms,
             latency_ms,
+            measured_at_ms,
         }
     }
 }

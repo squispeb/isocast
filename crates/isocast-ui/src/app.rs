@@ -14,6 +14,7 @@ use std::rc::Rc;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
+use isocast_protocol::CanvasId;
 use isocast_protocol::api::{ApplyParams, EngineState, Event, Live, Method, Status};
 use isocast_protocol::change::{Change, merge_patch};
 use isocast_protocol::devices::Devices;
@@ -66,6 +67,12 @@ pub struct App {
     pub library: areas::library::Library,
     pub create: areas::create::Create,
     pub developer: areas::developer::Developer,
+    pub permissions: areas::permissions::PermissionsStep,
+    pub wizard: areas::wizard::Wizard,
+    /// Projectors and the multiview (G.4): windows of their own.
+    pub projectors: areas::projectors::Projectors,
+    /// Project files (#88): File › Open…, Open Recent, the Finder.
+    pub projects: areas::projects::Projects,
     /// `--drag-test`: how long each flush (the areas showing a change) and
     /// each update from the daemon took on the window's thread.
     pub work_log: RefCell<Option<WorkLog>>,
@@ -105,6 +112,10 @@ impl App {
             library: areas::library::Library::default(),
             create: areas::create::Create::default(),
             developer: areas::developer::Developer::default(),
+            permissions: areas::permissions::PermissionsStep::default(),
+            wizard: areas::wizard::Wizard::default(),
+            projectors: areas::projectors::Projectors::default(),
+            projects: areas::projects::Projects::default(),
         });
         window.set_version(env!("CARGO_PKG_VERSION").into());
         if !mode.offscreen {
@@ -112,6 +123,9 @@ impl App {
             crate::platform::apply_system_settings(window);
         }
         app.session.borrow_mut().studio = window.global::<Ui>().get_studio();
+        // The extra canvas the canvas monitor showed last (#120).
+        app.session.borrow_mut().extra_choice =
+            isocast_protocol::CanvasId::parse(&window.global::<Ui>().get_extra_choice()).ok();
         app.connect(window);
         for area in app.areas() {
             area.connect(&app, window);
@@ -139,9 +153,15 @@ impl App {
         app
     }
 
+    /// Calls made to the daemon and not answered yet (the motion
+    /// harness's lockstep waits for none).
+    pub fn calls_pending(&self) -> usize {
+        self.replies.borrow().len()
+    }
+
     /// The areas, in the order they update. Create comes first so that in
     /// its view Delete takes off the selected clip, not a scene item.
-    pub fn areas(&self) -> [&dyn Area; 8] {
+    pub fn areas(&self) -> [&dyn Area; 12] {
         [
             &self.create,
             &self.canvas,
@@ -151,6 +171,10 @@ impl App {
             &self.settings,
             &self.library,
             &self.developer,
+            &self.permissions,
+            &self.wizard,
+            &self.projectors,
+            &self.projects,
         ]
     }
 
@@ -210,21 +234,7 @@ impl App {
             }
         });
         let weak = Rc::downgrade(self);
-        menus.on_activated(move |owner, id| {
-            // On the next turn of the event loop, once the click that chose
-            // it is over and the menu's popup is gone: a dialog opened while
-            // the menu still held the pointer ignored later clicks.
-            let weak = weak.clone();
-            slint::Timer::single_shot(std::time::Duration::ZERO, move || {
-                if let Some(app) = weak.upgrade() {
-                    for area in app.areas() {
-                        if area.menu_chosen(&app, &owner, &id) {
-                            return;
-                        }
-                    }
-                }
-            });
-        });
+        menus.on_activated(move |owner, id| Self::menu_activated(&weak, owner, id));
         ToastList::connect(self, window);
         crate::form::connect(self, window);
     }
@@ -316,9 +326,10 @@ impl App {
         }
         self.changed(Changed::ALL);
         self.refresh_status(false);
+        self.projectors.load(self);
     }
 
-    fn event(self: &Rc<Self>, event: Event) {
+    pub(crate) fn event(self: &Rc<Self>, event: Event) {
         match &event {
             Event::SetupChanged { revision } => {
                 let stale = {
@@ -333,11 +344,33 @@ impl App {
                 self.session.borrow_mut().scene = Some(scene.clone());
                 self.changed(Changed::SCENES);
             }
+            Event::CanvasSceneChanged { canvas, scene, .. } => {
+                if !canvas.is_main() {
+                    self.session
+                        .borrow_mut()
+                        .canvas_scenes
+                        .insert(*canvas, scene.clone());
+                    self.changed(Changed::SCENES);
+                }
+            }
+            Event::CanvasPreviewChanged { canvas, scene } => {
+                if !canvas.is_main() {
+                    {
+                        let mut s = self.session.borrow_mut();
+                        match scene {
+                            Some(scene) => s.canvas_previews.insert(*canvas, scene.clone()),
+                            None => s.canvas_previews.remove(canvas),
+                        };
+                        s.studio = s.staged().is_some();
+                    }
+                    self.changed(Changed::SCENES);
+                }
+            }
             Event::PreviewChanged { scene } => {
                 {
                     let mut s = self.session.borrow_mut();
                     s.preview = Some(scene.clone());
-                    s.studio = true;
+                    s.studio = s.staged().is_some();
                 }
                 self.changed(Changed::SCENES);
             }
@@ -345,7 +378,7 @@ impl App {
                 {
                     let mut s = self.session.borrow_mut();
                     s.preview = None;
-                    s.studio = false;
+                    s.studio = s.staged().is_some();
                 }
                 self.changed(Changed::SCENES);
             }
@@ -381,13 +414,27 @@ impl App {
                 self.session.borrow_mut().vcam = Some(camera.clone());
                 self.changed(Changed::VCAM);
             }
+            // The Controls dock shows the main canvas's buffer; the canvas
+            // monitor's menu the others' (#120).
+            Event::Replay { replay } => {
+                self.session.borrow_mut().set_replay(replay.clone());
+                self.changed(Changed::REPLAY);
+            }
+            // The window that asked says so itself; a hotkey's or another
+            // client's save gets the same toast here.
+            Event::ReplaySaved { saved } => {
+                if !self.session.borrow().saving_replay {
+                    crate::areas::controls::replay_saved(self, saved);
+                }
+            }
             Event::Started { .. } => self.refresh_status(true),
             // Plugin-facing context; the app refreshes on `started` and
             // `stopped`.
             Event::TakeFinished { .. }
             | Event::ProjectCreated { .. }
             | Event::ProjectRenamed { .. }
-            | Event::DeviceChanged { .. } => {}
+            | Event::DeviceChanged { .. }
+            | Event::Projectors { .. } => {}
             Event::RecordingPaused { .. } => self.refresh_status(true),
             Event::Status { live } => {
                 {
@@ -420,14 +467,52 @@ impl App {
                 self.changed(Changed::RUNNING);
             }
             Event::Stream { stream } => {
-                let before = self.session.borrow().stream.as_ref().map(|s| s.state);
-                self.session.borrow_mut().stream = Some(stream.clone());
+                let (before, several) = {
+                    let s = self.session.borrow();
+                    let list: &[isocast_protocol::stream::StreamStatus] = if stream.canvas.is_main()
+                    {
+                        &s.streams
+                    } else if stream.canvas.is_vertical() {
+                        &s.vertical_streams
+                    } else {
+                        // A canvas the session doesn't know (yet): no
+                        // earlier state.
+                        s.canvases
+                            .iter()
+                            .find(|c| c.id == stream.canvas)
+                            .map_or(&[], |c| c.streams.as_slice())
+                    };
+                    let before = list.iter().find(|x| x.id == stream.id).map(|x| x.state);
+                    (before, list.len() > 1)
+                };
+                self.session.borrow_mut().set_stream(stream.clone());
+                // Each destination says so itself when there are several.
+                let canvas = if stream.canvas.is_main() {
+                    String::new()
+                } else {
+                    format!(
+                        "{} ",
+                        self.session
+                            .borrow()
+                            .canvas_label(stream.canvas)
+                            .to_lowercase()
+                    )
+                };
+                let what = if several {
+                    format!("the {canvas}stream to {}", stream.id)
+                } else {
+                    format!("the {canvas}stream")
+                };
                 if stream.state == StreamState::Failed && before != Some(StreamState::Failed) {
                     let why = stream
                         .last_error
                         .clone()
                         .unwrap_or_else(|| "It couldn’t stay connected.".into());
-                    self.toast(ToastKind::Error, "The stream stopped", why);
+                    self.toast(
+                        ToastKind::Error,
+                        &format!("{} stopped", capital(&what)),
+                        why,
+                    );
                 } else if stream.state == StreamState::Reconnecting
                     && before == Some(StreamState::Live)
                 {
@@ -435,7 +520,7 @@ impl App {
                         .last_error
                         .clone()
                         .unwrap_or_else(|| "The connection dropped.".into());
-                    self.toast(ToastKind::Warning, "Reconnecting the stream", why);
+                    self.toast(ToastKind::Warning, &format!("Reconnecting {what}"), why);
                 }
                 self.changed(Changed::STREAM);
             }
@@ -447,8 +532,11 @@ impl App {
                     self.changed(Changed::RUNNING);
                 }
             }
-            Event::Stopped { error, .. } => {
+            Event::Stopped { error, report, .. } => {
                 self.refresh_status(true);
+                if let Some(report) = report {
+                    self.audio_stops(report);
+                }
                 // A refused start also says so in its own words: one toast
                 // for the two (the same key), titled by the start.
                 if let Some(error) = error {
@@ -469,6 +557,19 @@ impl App {
                 }
             }
             Event::Marker { .. } => {}
+            // The Controls area shows its notice.
+            Event::EncoderOverload { .. } => {}
+            // The Create area opens the editor on it.
+            Event::ProjectOpened { .. } => {}
+            // Automatic quality (T.2): the status bar and Settings show it.
+            Event::GovernorChanged { governor } => {
+                if let Some(status) = self.session.borrow_mut().status.as_mut() {
+                    status.governor = Some(governor.clone());
+                }
+                self.changed(Changed::STATUS);
+            }
+            // The Controls area shows where the next recording goes.
+            Event::RecordTarget { .. } => {}
         }
         for area in self.areas() {
             area.event(self, &event);
@@ -532,15 +633,40 @@ impl App {
                 format!("Isocast — {name}").into()
             });
             ui.set_setup_name(name.into());
-            if let Some(setup) = &s.setup {
+            // The canvas being edited: an extra one's while editing it.
+            if let Some(setup) = s.edited_setup() {
                 ui.set_canvas_width(setup.canvas.width as i32);
                 ui.set_canvas_height(setup.canvas.height as i32);
                 ui.set_canvas_fps(setup.canvas.fps as i32);
             }
+            // The extra canvases (#120): the chosen one's monitor and the
+            // monitor's canvas switcher.
+            ui.set_has_extra(s.extra.is_some());
+            ui.set_editing_extra(s.editing_extra());
+            if let (Some(extra), Some(canvas)) = (&s.extra, s.extra_canvas()) {
+                ui.set_extra_width(extra.canvas.width as i32);
+                ui.set_extra_height(extra.canvas.height as i32);
+                ui.set_extra_id(canvas.as_str().into());
+                ui.set_extra_label(s.canvas_label(canvas).into());
+            }
+            let canvases: Vec<crate::ExtraCanvas> = s
+                .extra_canvases()
+                .into_iter()
+                .filter_map(|canvas| {
+                    let size = s.setup.as_ref()?.extra_canvas(canvas)?;
+                    Some(crate::ExtraCanvas {
+                        id: canvas.as_str().into(),
+                        label: s.canvas_label(canvas).into(),
+                        width: size.width as i32,
+                        height: size.height as i32,
+                    })
+                })
+                .collect();
+            ui.set_extra_canvases(slint::ModelRc::new(slint::VecModel::from(canvases)));
         }
         if changed.any(Changed::SCENES | Changed::SETUP) {
-            ui.set_on_air_scene(s.scene.clone().unwrap_or_default().into());
-            ui.set_preview_scene(s.preview.clone().unwrap_or_default().into());
+            ui.set_on_air_scene(s.on_air().cloned().unwrap_or_default().into());
+            ui.set_preview_scene(s.staged().cloned().unwrap_or_default().into());
             ui.set_editing_scene(s.editing_scene().unwrap_or_default().into());
             ui.set_studio(s.studio);
         }
@@ -596,7 +722,7 @@ impl App {
                     .into(),
             );
             let scene = s.editing_scene().and_then(|id| {
-                let scene = model::find_scene(s.setup.as_ref()?, &id)?;
+                let scene = model::find_scene(s.edited_setup()?, &id)?;
                 let n = scene.items.len();
                 Some(format!(
                     "{} · {n} source{}",
@@ -670,15 +796,40 @@ impl App {
         self.edit_then(patch, options, |_, _| {});
     }
 
-    /// `edit`, then `done` with whether the daemon applied it.
+    /// `edit`, then `done` with whether the daemon applied it. While the
+    /// canvas editor edits an extra canvas, what the patch changes in
+    /// scenes' items goes to their arrangement for it (#86, #120).
     pub fn edit_then(
         self: &Rc<Self>,
         patch: Value,
         options: EditOptions,
         done: impl FnOnce(&Rc<App>, bool) + 'static,
     ) {
+        let canvas = self.session.borrow().edit_canvas();
+        self.edit_on_then(patch, options, canvas, done);
+    }
+
+    /// `edit` of canvas `canvas`'s items whichever canvas is being edited
+    /// now (an Undo made while editing the other one).
+    pub fn edit_on(self: &Rc<Self>, patch: Value, options: EditOptions, canvas: CanvasId) {
+        self.edit_on_then(patch, options, canvas, |_, _| {});
+    }
+
+    fn edit_on_then(
+        self: &Rc<Self>,
+        patch: Value,
+        options: EditOptions,
+        canvas: CanvasId,
+        done: impl FnOnce(&Rc<App>, bool) + 'static,
+    ) {
         {
             let mut s = self.session.borrow_mut();
+            let patch = match s.setup_json() {
+                Some(shown) if model::canvas_json(shown, canvas).is_object() => {
+                    model::route_canvas(shown, canvas, patch)
+                }
+                _ => patch,
+            };
             if !options.not_undoable {
                 s.remember(options.key.as_deref());
             }
@@ -800,7 +951,7 @@ impl App {
                     return;
                 }
                 let interval = next.interval;
-                let since = s.last_sent.map_or(Duration::MAX, |t| t.elapsed());
+                let since = s.last_sent.map_or(Duration::MAX, crate::clock::since);
                 if since < interval {
                     s.waiting = true;
                     let weak = Rc::downgrade(self);
@@ -841,7 +992,7 @@ impl App {
                 s.inflight.push_back((edit, revision));
                 s.applies_sent += 1;
                 s.most_in_flight = s.most_in_flight.max(s.inflight.len());
-                s.last_sent = Some(Instant::now());
+                s.last_sent = Some(crate::clock::now());
                 ApplyParams {
                     revision,
                     change,
@@ -1004,7 +1155,7 @@ impl App {
 
     /// Read the engine's status (`quiet`: no toast if it fails).
     pub fn refresh_status(self: &Rc<Self>, quiet: bool) {
-        let asked = Instant::now();
+        let asked = crate::clock::now();
         self.call_as::<Status>(Method::Status, move |app, result| match result {
             Ok(status) => {
                 {
@@ -1027,13 +1178,23 @@ impl App {
                     if fresh {
                         s.scene = status.scene.clone();
                         s.preview = status.preview.clone();
-                        s.studio = status.preview.is_some();
                     }
                     if !s.busy_stream {
-                        s.stream = status.stream.clone();
+                        s.set_streams(status.stream.clone(), status.streams.clone());
+                    }
+                    if !s.busy_canvas_stream {
+                        s.vertical_streams = status.vertical_streams.clone();
+                        s.canvases = status.canvases.clone();
+                    }
+                    if fresh {
+                        s.set_canvas_scenes(&status.canvases);
+                        s.studio = s.staged().is_some();
                     }
                     if !s.busy_vcam {
                         s.vcam = status.virtual_camera.clone();
+                    }
+                    if !s.busy_replay {
+                        s.replay = status.replay.clone();
                     }
                     s.status = Some(status);
                 }
@@ -1042,13 +1203,19 @@ impl App {
                         | Changed::SCENES
                         | Changed::RUNNING
                         | Changed::STREAM
-                        | Changed::VCAM,
+                        | Changed::VCAM
+                        | Changed::REPLAY,
                 );
             }
             Err(error) => {
                 let connected = app.session.borrow().link == Some(Link::Connected);
-                // Not while an update stops the engine on purpose.
-                if !quiet && connected && !crate::update::stopping_engine() {
+                // Not while an update, or the permissions step's Relaunch,
+                // stops the engine on purpose.
+                if !quiet
+                    && connected
+                    && !crate::update::stopping_engine()
+                    && !app.permissions.relaunching()
+                {
                     app.failed("Couldn’t read the engine’s status", &error);
                 }
             }
@@ -1069,23 +1236,32 @@ impl App {
         });
     }
 
-    /// Click on a scene: on air, or into preview in Studio Mode.
+    /// Click on a scene: on air, or into preview in Studio Mode. While
+    /// editing an extra canvas with scenes of its own, its scene (#86);
+    /// one that follows the main canvas switches with it.
     pub fn choose_scene(self: &Rc<Self>, id: &str) {
-        let studio = {
+        let (studio, canvas) = {
             let mut s = self.session.borrow_mut();
-            s.switched_at = Some(Instant::now());
+            s.switched_at = Some(crate::clock::now());
             s.selection = None;
-            if s.studio {
-                s.preview = Some(id.to_string());
-            } else {
-                s.scene = Some(id.to_string());
+            let canvas = s.scene_canvas();
+            let studio = s.studio;
+            match (studio, canvas) {
+                (true, CanvasId::Main) => s.preview = Some(id.to_string()),
+                (false, CanvasId::Main) => s.scene = Some(id.to_string()),
+                (true, other) => {
+                    s.canvas_previews.insert(other, id.to_string());
+                }
+                (false, other) => {
+                    s.canvas_scenes.insert(other, id.to_string());
+                }
             }
-            s.studio
+            (studio, canvas)
         };
         self.changed(Changed::SCENES | Changed::SELECTION);
         let scene = id.to_string();
         if studio {
-            self.call(Method::Preview { scene }, |app, result| {
+            self.call(Method::Preview { scene, canvas }, |app, result| {
                 if let Err(error) = result {
                     app.failed("Couldn’t put the scene in preview", &error);
                     app.refresh_status(true);
@@ -1096,6 +1272,7 @@ impl App {
                 Method::SwitchScene {
                     scene,
                     transition: None,
+                    canvas,
                 },
                 |app, result| {
                     if let Err(error) = result {
@@ -1108,19 +1285,32 @@ impl App {
     }
 
     /// Studio Mode: put the preview on air with `transition` (a quick
-    /// transition) or the setup's.
+    /// transition) or the setup's; an extra canvas's own preview while
+    /// editing it, if it has scenes of its own (#86).
     pub fn take(self: &Rc<Self>, transition: Option<isocast_protocol::Transition>) {
-        {
+        let canvas = {
             let mut s = self.session.borrow_mut();
-            let Some(preview) = s.preview.clone() else {
+            let canvas = s.scene_canvas();
+            let Some(preview) = s.staged().cloned() else {
                 return;
             };
-            s.switched_at = Some(Instant::now());
-            let on_air = s.scene.replace(preview);
-            s.preview = on_air;
-        }
+            s.switched_at = Some(crate::clock::now());
+            match canvas {
+                CanvasId::Main => {
+                    let on_air = s.scene.replace(preview);
+                    s.preview = on_air;
+                }
+                other => {
+                    match s.canvas_scenes.insert(other, preview) {
+                        Some(on_air) => s.canvas_previews.insert(other, on_air),
+                        None => s.canvas_previews.remove(&other),
+                    };
+                }
+            }
+            canvas
+        };
         self.changed(Changed::SCENES);
-        self.call(Method::Take { transition }, |app, result| {
+        self.call(Method::Take { transition, canvas }, |app, result| {
             if let Err(error) = result {
                 app.failed("Couldn’t take the preview to air", &error);
                 app.refresh_status(true);
@@ -1132,7 +1322,7 @@ impl App {
         let stage = {
             let mut s = self.session.borrow_mut();
             s.studio = on;
-            s.switched_at = Some(Instant::now());
+            s.switched_at = Some(crate::clock::now());
             if !on {
                 s.preview = None;
             }
@@ -1150,17 +1340,76 @@ impl App {
         self.changed(Changed::SCENES | Changed::SELECTION);
         if let Some(scene) = stage {
             self.session.borrow_mut().preview = Some(scene.clone());
-            self.call(Method::Preview { scene }, |app, result| {
-                if let Err(error) = result {
-                    app.failed("Couldn’t start studio mode", &error);
-                }
-            });
+            self.call(
+                Method::Preview {
+                    scene,
+                    canvas: CanvasId::Main,
+                },
+                |app, result| {
+                    if let Err(error) = result {
+                        app.failed("Couldn’t start studio mode", &error);
+                    }
+                },
+            );
         } else if !on {
             self.call(Method::ClearPreview, |app, result| {
                 if let Err(error) = result {
                     app.failed("Couldn’t leave studio mode", &error);
                 }
             });
+        }
+        self.stage_extra_preview();
+    }
+
+    /// Studio Mode while editing an extra canvas with scenes of its own
+    /// (#86, #120): its own preview starts with the scene on air on it,
+    /// and is cleared when Studio Mode ends.
+    pub fn stage_extra_preview(self: &Rc<Self>) {
+        let (canvas, action) = {
+            let mut s = self.session.borrow_mut();
+            let canvas = s.scene_canvas();
+            if canvas.is_main() {
+                return;
+            }
+            let action = match (s.studio, s.canvas_previews.contains_key(&canvas)) {
+                (true, false) => {
+                    let scene = s
+                        .canvas_scenes
+                        .get(&canvas)
+                        .cloned()
+                        .or_else(|| s.editing_scene());
+                    if let Some(scene) = &scene {
+                        s.canvas_previews.insert(canvas, scene.clone());
+                    }
+                    scene.map(Some)
+                }
+                (false, true) => {
+                    s.canvas_previews.remove(&canvas);
+                    Some(None)
+                }
+                _ => None,
+            };
+            (canvas, action)
+        };
+        match action {
+            Some(Some(scene)) => {
+                self.changed(Changed::SCENES);
+                self.call(Method::Preview { scene, canvas }, |app, result| {
+                    if let Err(error) = result {
+                        app.failed("Couldn’t put the canvas’s scene in preview", &error);
+                        app.refresh_status(true);
+                    }
+                });
+            }
+            Some(None) => {
+                self.changed(Changed::SCENES);
+                self.call(Method::ClearCanvasPreview { canvas }, |app, result| {
+                    if let Err(error) = result {
+                        app.failed("Couldn’t clear the canvas’s preview", &error);
+                    }
+                });
+            }
+            None => {}
         }
     }
 
@@ -1202,15 +1451,63 @@ impl App {
         }
     }
 
+    /// An item of a menu was chosen.
+    fn menu_activated(weak: &std::rc::Weak<App>, owner: SharedString, id: SharedString) {
+        // On the next turn of the event loop, once the click that chose
+        // it is over and the menu's popup is gone: a dialog opened while
+        // the menu still held the pointer ignored later clicks.
+        let weak = weak.clone();
+        slint::Timer::single_shot(std::time::Duration::ZERO, move || {
+            if let Some(app) = weak.upgrade() {
+                // Open Projector items come first: they're added to
+                // other areas' menus.
+                if app.projectors.chosen(&app, &id) {
+                    return;
+                }
+                for area in app.areas() {
+                    if area.menu_chosen(&app, &owner, &id) {
+                        return;
+                    }
+                }
+            }
+        });
+    }
+
+    /// The editor window's menus (#94: its Export menu, a clip's menu),
+    /// shown in its own window, chosen as the studio's are.
+    pub fn connect_editor_menus(self: &Rc<Self>, editor: &crate::EditorWindow) {
+        let menus = editor.global::<Menus>();
+        menus.on_step(kit::step);
+        let weak = Rc::downgrade(self);
+        let window = editor.as_weak();
+        menus.on_request(move |owner, x, y, w, h| {
+            if let (Some(app), Some(editor)) = (weak.upgrade(), window.upgrade())
+                && let Some(menu) = app.menu_for(&owner)
+            {
+                let (list, submenus) = menu.build();
+                editor
+                    .global::<Menus>()
+                    .invoke_show(owner, list, submenus, x, y, w, h);
+            }
+        });
+        let weak = Rc::downgrade(self);
+        menus.on_activated(move |owner, id| Self::menu_activated(&weak, owner, id));
+    }
+
+    /// `owner`'s menu, built by the area that knows the owner.
+    fn menu_for(self: &Rc<Self>, owner: &str) -> Option<MenuBuilder> {
+        self.areas()
+            .iter()
+            .find_map(|area| area.context_menu(self, owner))
+            // Open Projector, on the preview's, a scene's and a source's.
+            .map(|menu| self.projectors.extend_menu(self, owner, menu))
+    }
+
     /// A menu asked for by `owner` at `anchor` (window points: x, y,
     /// width, height; a point for a context menu): the area that knows
     /// the owner builds it.
     fn request_menu(self: &Rc<Self>, owner: &str, anchor: [f32; 4]) {
-        let menu = self
-            .areas()
-            .iter()
-            .find_map(|area| area.context_menu(self, owner));
-        if let Some(menu) = menu {
+        if let Some(menu) = self.menu_for(owner) {
             self.show_menu(owner, menu, anchor);
         }
     }
@@ -1277,6 +1574,18 @@ impl App {
             }
             "reset_ui" => {
                 prefs::reset(&window, false);
+                // The canvas monitor back to the first extra canvas (#120),
+                // after editing the main canvas again (the edited canvas
+                // never changes under the editor).
+                if self.session.borrow().editing_extra() {
+                    self.menu("edit_canvas_main");
+                }
+                {
+                    let mut s = self.session.borrow_mut();
+                    s.extra_choice = None;
+                    s.refresh_extra();
+                }
+                self.changed(Changed::SETUP);
                 saved(self);
             }
             "reset_docks" => {
@@ -1398,6 +1707,61 @@ pub fn named_paths(message: &str, setup: &isocast_protocol::Setup) -> String {
     out
 }
 
+impl App {
+    /// The take's audio sources that stopped while it recorded (the
+    /// files say so too): which, when, and why.
+    pub fn audio_stops(self: &Rc<Self>, report: &isocast_protocol::api::Report) {
+        let mut seen: Vec<(u32, &str, f64)> = Vec::new();
+        let mut rows = Vec::new();
+        let mut reasons: Vec<String> = Vec::new();
+        let takes = report.takes.len() > 1;
+        for file in &report.files {
+            for stop in &file.audio_stops {
+                // A later take only repeats it ("stopped before this take").
+                if stop.reason.starts_with("it stopped before this take began") {
+                    continue;
+                }
+                let key = (file.take, stop.source.as_str(), stop.time_seconds);
+                if seen.contains(&key) {
+                    continue;
+                }
+                seen.push(key);
+                let name = self
+                    .session
+                    .borrow()
+                    .setup
+                    .as_ref()
+                    .and_then(|s| {
+                        s.source(&stop.source)
+                            .map(|s| model::source_name(s).to_string())
+                    })
+                    .unwrap_or_else(|| stop.source.clone());
+                let mut when = format!("from {:.1} s", stop.time_seconds);
+                if takes {
+                    when = format!("take {}, {when}", file.take);
+                }
+                if let Some(back) = stop.resumed_seconds {
+                    when.push_str(&format!(" to {back:.1} s"));
+                }
+                rows.push((name.clone(), when, "warn"));
+                reasons.push(format!("{name}: {}", stop.reason));
+            }
+        }
+        if rows.is_empty() {
+            return;
+        }
+        let message = format!(
+            "Each source's audio is missing from the take's files from the time shown. {}.",
+            reasons.join("; ")
+        );
+        self.show_toast(
+            Toast::new(ToastKind::Warning, "Audio stopped while recording", message)
+                .key("audio-stops")
+                .rows(rows),
+        );
+    }
+}
+
 /// "the stream dropped" → "The stream dropped".
 pub fn sentence(text: &str) -> String {
     let mut chars = text.chars();
@@ -1405,4 +1769,13 @@ pub fn sentence(text: &str) -> String {
         .next()
         .map(|c| c.to_uppercase().chain(chars).collect())
         .unwrap_or_default()
+}
+
+/// `text` with its first letter capitalized ("the stream" → "The stream").
+fn capital(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
 }

@@ -5,6 +5,7 @@ use isocast_protocol::api::{Event, Response, RpcError};
 use isocast_protocol::diagnostics::{BugReport, BugReportParams};
 use serde_json::{Value, json};
 use std::sync::{Arc, Weak};
+
 use std::time::{Duration, Instant};
 pub(crate) static CONNECTION_PANIC: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -166,6 +167,9 @@ pub fn start(daemon: &Arc<Daemon>) {
                 d.contain("diagnostics sampler", || timeline(Arc::downgrade(&d)));
             }
         });
+    // One owner consumes native peak counters and immediately evaluates the
+    // quality policy; never create a second LoadMonitor for the governor.
+    crate::governor::start(daemon);
     // Explicit isolated, debug-only fault injection, never a public method.
     if (cfg!(debug_assertions) || std::env::var_os("ISOCAST_SOCKET").is_some())
         && let Ok(seconds) = std::env::var("ISOCAST_DEBUG_PANIC_AFTER")
@@ -190,9 +194,17 @@ pub fn start(daemon: &Arc<Daemon>) {
                     Ok("connection") => {
                         CONNECTION_PANIC.store(true, std::sync::atomic::Ordering::SeqCst)
                     }
-                    Ok("state") => daemon.contain("debug poisoned control state", || {
-                        let _state = daemon.state.lock().unwrap();
-                        panic!("requested shared-state poison");
+                    // A panic mid-change to the control state: it may be
+                    // half-updated, so recordings end by emergency stop.
+                    Ok("state") => daemon.contain("debug broken control state", || {
+                        let _change = daemon.state.lock();
+                        panic!("requested shared-state break");
+                    }),
+                    // A panic while only looking at it (housekeeping, like
+                    // the sampler): recordings and the stream keep running.
+                    Ok("state_read") => daemon.contain("debug control-state reader", || {
+                        let _look = daemon.state.read();
+                        panic!("requested panic while reading shared state");
                     }),
                     _ => daemon.contain("debug worker", || {
                         panic!("ISOCAST_DEBUG_PANIC_AFTER: requested diagnostic worker panic")
@@ -207,46 +219,28 @@ fn timeline(weak: Weak<Daemon>) {
     let mut sampler = isocast_platform_macos::diagnostics::Sampler::default();
     #[cfg(target_os = "macos")]
     let mut device_changes = isocast_platform_macos::diagnostics::DeviceChanges::default();
-    // The sampler, permission and inventory watches all run the macOS
-    // system's own state readers; on Linux these locals stay null until
-    // the Linux samplers land (docs/port-omarchy.md's doctor work).
-    #[cfg_attr(
-        not(target_os = "macos"),
-        allow(dead_code, unused_variables, unused_mut, unused_assignments)
-    )]
+    #[cfg(target_os = "macos")]
     let mut inventory = Value::Null;
-    #[cfg_attr(
-        not(target_os = "macos"),
-        allow(dead_code, unused_variables, unused_mut, unused_assignments)
-    )]
+    #[cfg(target_os = "macos")]
     let mut permissions = Value::Null;
-    #[cfg_attr(
-        not(target_os = "macos"),
-        allow(dead_code, unused_variables, unused_mut, unused_assignments)
-    )]
+    #[cfg(target_os = "macos")]
     let mut sampler_cpu_us = 0.0;
-    #[cfg_attr(
-        not(target_os = "macos"),
-        allow(dead_code, unused_variables, unused_mut, unused_assignments)
-    )]
+    #[cfg(target_os = "macos")]
     let mut count = 0u64;
     let mut next = Instant::now() + Duration::from_secs(1);
     loop {
         std::thread::sleep(next.saturating_duration_since(Instant::now()));
         next += Duration::from_secs(1);
         let Some(daemon) = weak.upgrade() else { return };
-        // The sampler wall time, thread CPU and folder are sampler
-        // inputs only; Linux reports through status alone until its
-        // samplers land.
-        #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+        #[cfg(target_os = "macos")]
         let started = Instant::now();
-        #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+        #[cfg(target_os = "macos")]
         let cpu = thread_cpu();
         let status = daemon.status();
         crate::debug::tick(&daemon, &status);
-        #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+        #[cfg(target_os = "macos")]
         let folder = {
-            let state = daemon.state.lock().unwrap();
+            let state = daemon.state.read();
             status
                 .files
                 .first()
@@ -309,8 +303,6 @@ fn timeline(weak: Weak<Daemon>) {
                 }
             }
         }
-        // macOS only until the Linux samplers land: counting the
-        // sampler's own CPU and the tick index feeds nothing else yet.
         #[cfg(target_os = "macos")]
         {
             sampler_cpu_us = (thread_cpu() - cpu) * 1e6;
@@ -359,6 +351,7 @@ fn devices_came_or_went(before: &Value, after: &Value) -> Vec<isocast_protocol::
     events
 }
 
+#[cfg(target_os = "macos")]
 fn thread_cpu() -> f64 {
     let mut time = std::mem::MaybeUninit::<libc::timespec>::zeroed();
     if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, time.as_mut_ptr()) } != 0 {
@@ -373,7 +366,7 @@ pub fn bug_report(daemon: &Daemon, params: &BugReportParams) -> Result<BugReport
         return isocast_diagnostics::bundle::from_preview(params).map_err(error);
     }
     let status = daemon.status();
-    let live = daemon.get(Default::default());
+    let live = daemon.get(Default::default()).ok();
     let library = daemon.library();
     let mut credentials = std::env::var("ISOCAST_STREAM_KEY")
         .ok()
@@ -386,11 +379,38 @@ pub fn bug_report(daemon: &Daemon, params: &BugReportParams) -> Result<BugReport
         if let Ok(document) = daemon.library_get(isocast_protocol::library::LibraryTarget {
             kind: isocast_protocol::library::LibraryKind::Profile,
             id: entry.id.clone(),
-        }) && let Some(stream) = document.profile.and_then(|p| p.stream)
-            && let Ok(Some(key)) =
-                crate::secret(isocast_engine::stream::KEY_SERVICE, &stream.key_account())
+        }) && let Some(profile) = document.profile
         {
-            credentials.push(key);
+            let accounts = profile
+                .stream
+                .as_ref()
+                .map(|stream| stream.key_account())
+                .into_iter()
+                .chain(
+                    profile
+                        .vertical
+                        .iter()
+                        .map(|vertical| (isocast_protocol::CanvasId::Vertical, vertical))
+                        .chain(profile.canvases.iter().filter_map(|canvas| {
+                            let id =
+                                isocast_protocol::CanvasId::parse(canvas.id.as_deref()?).ok()?;
+                            Some((id, canvas))
+                        }))
+                        .filter_map(|(id, canvas)| Some((id, canvas.stream.as_ref()?)))
+                        .flat_map(|(id, stream)| stream.resolve_canvas(id))
+                        .map(|destination| destination.key_account),
+                );
+            // This build's key and an old one it may still read (#63).
+            for account in accounts {
+                for service in [
+                    crate::key_service(),
+                    isocast_engine::stream::LEGACY_KEY_SERVICE,
+                ] {
+                    if let Ok(Some(key)) = crate::secret(service, &account) {
+                        credentials.push(key);
+                    }
+                }
+            }
         }
     }
     let profile = library.profile.as_ref().and_then(|id| {
@@ -402,7 +422,7 @@ pub fn bug_report(daemon: &Daemon, params: &BugReportParams) -> Result<BugReport
             .ok()
     });
     let mut folders = Vec::new();
-    if let Some(setup) = &live.setup {
+    if let Some(setup) = live.as_ref().and_then(|live| live.setup.as_ref()) {
         // The recordings folder and its newest project folders.
         folders.extend(isocast_protocol::project::recording_folders(
             &crate::expand_home(&setup.recording.folder),
@@ -419,10 +439,7 @@ pub fn bug_report(daemon: &Daemon, params: &BugReportParams) -> Result<BugReport
     }
     folders.sort();
     folders.dedup();
-    // Only the macOS environment reader uses a single folder today;
-    // Linux's snapshot keeps null platform fields until its reader
-    // lands with the doctor work.
-    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+    #[cfg(target_os = "macos")]
     let folder = folders
         .first()
         .cloned()

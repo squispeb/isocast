@@ -63,6 +63,39 @@ frames in a 24 s take); 30 fps 1.75× (`fits`, recommended, 720/720). A lower
 quality preset barely changes VideoToolbox HEVC's speed (1.02× vs 1.04×), so
 it helps the disk, not the encoders.
 
+## A quick answer without benchmarking (`isocast capacity`)
+
+`isocast capacity [SETUP] [--stream|--no-stream] [--add-iso SOURCE] [--json]`
+(MCP `estimate_capacity`, method `estimate_capacity`) predicts instantly
+from per-chip data (`crates/isocast-engine/src/media_engines.json`): each
+H.264/HEVC encoder (program, stream, every ISO file) runs on one of the
+chip's encode engines for its whole life, the largest first on the least
+busy engine, and `load` is the busiest engine's pixel rate over what one
+engine encodes in real time. Up to 0.85 `fits`, up to 1 `no_margin`, over 1
+`cannot_keep_up` (ISO files drop first; `iso_drop_percent` is a floor).
+ProRes runs on engines of its own and isn't counted. A tune measurement
+that couldn't keep up overrules it.
+
+`suggestions` lists the closest changes that fit (a camera or test pattern
+captured smaller or slower, the program or stream smaller, half the frame
+rate, the stream stopped, an ISO file off), each a patch for `plan` or a
+method; `after_take` ones wait for the recording to end. `--add-iso`
+answers "how do I turn this ISO file on so it still fits": as is, at a
+smaller size or rate, or not at all, with the reason. `setup check` and
+`doctor` print it as the "encoder capacity" check (a warning, never a
+failure), `start` notes it when nothing was measured and it can't keep
+up, and while recording the engine sends `encoder_overload` once per take
+when files drop because the encoders fell behind.
+
+On a base M2 (isocast-m2-b, 25 s synthetic takes, 2026-10-15): a 4K60 ISO
+plus a 1080p60 program, 0.78 `fits`, dropped nothing; adding a 1080p60
+ISO, 0.93 `no_margin`, dropped nothing; adding a 1080p60 stream, 1.23
+`cannot_keep_up`, dropped half the ISO frames (and `encoder_overload`
+came); the first suggestion (the 4K ISO at 1920×1080, 0.76) dropped
+nothing. H.264 counts 1.9× HEVC per picture: `tune` on the same Mac ran
+the same ISO files about 1.8× slower as H.264, so H.264 files are offered
+HEVC, never the reverse.
+
 ## Quality
 
 `quality` accepts exactly these five names, or an integer from **1–100**.
@@ -168,7 +201,11 @@ the separately reproduced, intermittent raw-ISO video stalls under contention.
   ProRes uses substantially more disk bandwidth.
 
 `container` is `mov` (default) or `mp4`. Video is tagged SDR Rec.709.
-Files use 2-second movie fragments so completed fragments survive a crash.
+Files use 2-second movie fragments so completed fragments survive a crash
+or kill of the recording process (the last seconds are lost; see
+[Getting started](getting-started.md) for the limits). Power loss is not
+covered: the writer doesn't force data to the disk, so it can lose more
+than the last fragment.
 H.264 and HEVC require the hardware encoder instead of falling back to a
 CPU-heavy software encoder under contention. All recording outputs use
 AVAssetWriter's asynchronous encoding path. The earlier direct HEVC ISO path
@@ -188,3 +225,126 @@ The recording disk check is a capacity/speed budget, not a prediction of
 typical file size. Constant-quality rates depend strongly on motion, noise,
 fine detail, codec, depth and the Mac's encoder. Measure a representative
 take before budgeting a long recording.
+
+## Audio interface inputs
+
+A microphone source records its device's inputs 1 and 2 as left and
+right (a 1-input device's one input as one channel). On an interface
+with more than two inputs that is its first pair too, not macOS's mix of
+every input (since 0.0.6); if such an interface later drops to one input
+while recording, the source records input 1 in both channels instead of
+stopping, and says so in the diagnostics. `channels` picks inputs instead, numbered
+from 1 as `isocast devices` lists them (with the names the device gives
+them):
+
+```toml
+[[sources]]
+id = "vocal"
+kind = "microphone"
+device = "Scarlett 4i4"
+channels = [1]        # the mic on input 1: centred mono at full level
+
+[[sources]]
+id = "keys"
+kind = "microphone"
+device = "Scarlett 4i4"
+channels = [3, 4]     # inputs 3 and 4 as left and right
+```
+
+One channel is a mono source: the program and monitoring hear it in both
+sides at its own level (no −6 dB, unlike downmixing a stereo pair), and
+its ISO track is mono. Two channels are a stereo source and a stereo ISO
+track. The device is read whole (AVFoundation mixes when asked for fewer
+channels than a device has) and only the picked channels go on: the ISO
+track holds exactly those, before gain, mute,
+balance and Mono (which apply to the program and monitoring). `isocast
+doctor` and opening the source check that the device has the channels in
+the format it runs now (an ADAT interface at 88.2 or 96 kHz has fewer
+inputs) and list the valid ones. If the device loses a picked input while
+recording (its sample rate or format changes), that source stops with the
+reason, like a disconnected microphone, and the rest of the take records
+on; a change that keeps the picked inputs records on. (Without `channels`
+nothing stops: see above.) In the app: the
+source's Properties (Channels).
+
+## An audio source that stops while recording
+
+A microphone unplugged, a picked input gone or an app's audio tap ending
+stops that source; the take records on, and the tracks that carried it
+lose it from then on. The take's manifest says so in each such file's
+entry, the stop reply (and `status.last`) in the same entry of `files`,
+and both in `errors` (the take's status is then `failed`, like a file
+that stopped early):
+
+```json
+"audio_stops": [
+  {
+    "source": "mic",
+    "track": 0,
+    "time_seconds": 4.9385,
+    "reason": "the device was disconnected"
+  }
+]
+```
+
+`track` is the file's audio track (from 0, in `audio` order): the
+source's own track in an ISO file, or the program mix it was mixed into
+(the program and vertical program files). `time_seconds` is on the take's
+timeline, like markers: the end of the last audio it delivered. A take
+split off after it began holds it from 0, its reason starting "it stopped
+before this take began". The engine opens a failed source again only if
+the recording didn't list it for an ISO file; the program mix then plays
+it again from `resumed_seconds`. The field is absent when nothing
+stopped, so other manifests are unchanged. The app shows a notice when
+the recording stops.
+
+`audio.mono` (the app's Mono, in Advanced Audio Properties and each mixer
+strip's menu) downmixes a stereo source to (left + right) / 2 in the
+program and monitoring; ISO files keep it as captured.
+
+## Replay buffer
+
+Like OBS's: while it runs, the buffer keeps the last
+`recording.replay.seconds` (30 by default, 5–300) of the program, its
+picture and the program mix, in memory as compressed H.264 and AAC, apart
+from any recording or stream. A save writes them, up to the moment it was
+asked for, to a new file without encoding again.
+
+```sh
+isocast replay start          # Controls dock: Replay Buffer
+isocast replay save --json    # Save Replay, or the replay.save hotkey
+isocast replay status
+isocast replay stop
+```
+
+MCP has `start_replay`, `save_replay`, `replay_status` and `stop_replay`;
+hotkey actions are `replay.start`, `replay.stop`, `replay.toggle` and
+`replay.save` (suggested: ctrl+alt+cmd+Y saves).
+
+- **The file** is `Replay <date> <time>.mov` (or `.mp4`, as
+  `recording.program.encoder.container`) in the running recording's project
+  folder, or else the recordings folder. It starts on a keyframe at or
+  before `seconds` ago, so it is up to a keyframe interval longer, and ends
+  at the save. It is written under a hidden temporary name and named when
+  complete, and needs room for itself plus `recording.keep_free_gb`.
+  Saving never touches a recording or a stream; saves can follow each
+  other at once.
+- **The encoder.** While the setup has a `[stream]`, the buffer encodes as
+  the stream does (its size, bitrate and 2 s keyframes), so a running
+  stream and the buffer share one hardware encoder session. Otherwise it
+  encodes on its own: the program file's size, 1 s keyframes, about 0.1
+  bit per pixel (12 Mb/s at 1080p60, at most 40 Mb/s) unless
+  `recording.replay.video_bitrate_kbps` says. Recordings encode inside
+  their file writers, so the buffer can't share theirs yet.
+- **Memory** is the bitrate times `seconds`, plus up to 3 s and a
+  keyframe interval; `recording.replay.max_memory_mb` (1024 by default)
+  caps it, and `replay_status` reports `memory_bytes` and says
+  `memory_limited` when the cap keeps it short. Frames the buffer missed
+  are counted in `dropped_frames` (warned about like the stream's), and a
+  saved file reports its own.
+
+```toml
+[recording.replay]
+seconds = 60
+max_memory_mb = 512
+```

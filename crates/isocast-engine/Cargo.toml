@@ -16,6 +16,9 @@ serde_json = "1.0.154"
 # O_NOFOLLOW for files made in project folders (already in the lock file).
 libc = "0.2"
 png = "0.18.1"
+# Locks that don't poison (already in the lock file through wgpu): one
+# contained panic must not fail every thread that shares its state (#30).
+parking_lot = "0.12"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tga"] }
 cosmic-text = "0.19.0"
 # CSS flexbox, grid and block layout for scene items (MIT; already in the
@@ -32,8 +35,14 @@ native-tls = "0.2.18"
 # LLVM-exception), compiled with Cranelift; no WASI, async, GC or cache.
 wasmtime = { version = "=49.0.2", default-features = false, features = ["cranelift", "component-model", "runtime", "std"] }
 # Pinned: the frame import uses wgpu-hal APIs, which change between releases.
-wgpu = { version = "=30.0.1", default-features = false, features = ["std", "parking_lot", "metal", "wgsl"] }
-# On Linux the same pinned wgpu carries the Vulkan back end instead of
-# Metal; resolver 3 keeps the two feature sets per target.
+wgpu = { version = "=30.0.1", default-features = false, features = ["std", "parking_lot", "wgsl"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { version = "=30.0.1", default-features = false, features = ["metal"] }
+
 [target.'cfg(target_os = "linux")'.dependencies]
-wgpu = { version = "=30.0.1", default-features = false, features = ["std", "parking_lot", "vulkan", "wgsl"] }
+wgpu = { version = "=30.0.1", default-features = false, features = ["vulkan"] }
+
+[target.'cfg(windows)'.dependencies]
+isocast-mux = { path = "../isocast-mux" }
+wgpu = { version = "=30.0.1", default-features = false, features = ["dx12"] }

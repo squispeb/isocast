@@ -1,24 +1,25 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use isocast_client::DaemonError;
-use isocast_engine::record::{LiveStatus, RecordOptions, Report};
 use isocast_protocol::api::{
-    Applied, ApplyParams, Capacity, CheckStatus, DoctorParams, EngineInfo, EngineState, Event,
-    EventKind, Frame, FrameParams, FramesParams, ImportObsParams, Live, Marked, Method, Plan,
-    Refreshed, RpcError, Snapshot, SnapshotParams, SourceRun, StartParams, Started, Status,
-    StreamKey, StreamKeyParams, StreamKeyTarget, Switched, TuneParams, Tuning, WatchParams,
+    Applied, ApplyParams, Capacity, CapacityEstimate, CapacityParams, CheckStatus, DoctorParams,
+    EngineInfo, EngineState, Event, EventKind, Frame, FrameParams, FramesParams, ImportObsParams,
+    Live, Marked, Method, Plan, Refreshed, Report, RpcError, Snapshot, SnapshotParams, SourceRun,
+    StartParams, Started, Status, StreamDestinationParams, StreamDestinations, StreamKey,
+    StreamKeyParams, StreamKeyTarget, StreamStartParams, Streaming, Switched, TuneParams, Tuning,
+    WatchParams,
 };
 use isocast_protocol::change::{Change, Difference, DifferenceOp};
 use isocast_protocol::devices::Devices;
 use isocast_protocol::obs::Imported;
-use isocast_protocol::stream::{StreamService, StreamState, StreamStatus};
-use isocast_protocol::{QUICK_SOURCES, Setup, Transition};
+use isocast_protocol::stream::{MAIN_DESTINATION, StreamService, StreamState, StreamStatus};
+use isocast_protocol::{CanvasId, QUICK_SOURCES, Setup, Transition};
 
 use crate::client::Client;
 
@@ -28,12 +29,17 @@ mod debug;
 mod hotkeys;
 mod library;
 mod mcp;
+mod optimize;
 mod plugin;
 mod project;
+mod projector;
+mod record;
+mod replay;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod shared_frames;
 mod timeline;
 mod virtual_camera;
+mod websocket;
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn shared_frames(options: shared_frames::Options) -> Result<ExitCode> {
@@ -41,8 +47,11 @@ fn shared_frames(options: shared_frames::Options) -> Result<ExitCode> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 mod shared_frames {
+    #[expect(
+        dead_code,
+        reason = "parsed options retained while shared surfaces are unsupported"
+    )]
     pub struct Options {
         pub target: String,
         pub max_width: Option<u32>,
@@ -77,6 +86,25 @@ fn shared_frames(_options: shared_frames::Options) -> Result<ExitCode> {
 struct Cli {
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Subcommand)]
+enum MachineCommand {
+    /// Show the profile and calibration state without starting a measurement.
+    Show {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Start an idle-only self-test (at most 30 seconds); poll show for results.
+    Calibrate {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Cancel a self-test, retaining the previous profile.
+    Cancel {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -170,9 +198,10 @@ enum Command {
         #[command(subcommand)]
         command: data::DataCommand,
     },
-    /// Timelines: takes in order, joined into one file by `export`. While
-    /// one is current, every take that finishes (`stop`, or a `split`) is
-    /// added to its end; `retake` records the last one again.
+    /// Timelines: takes in order, joined into one file by `export`. Each
+    /// recording starts a new project with its own timeline unless
+    /// `isocast record-target` (or `timeline new`) chose one to add its
+    /// takes to; `retake` records the last one again.
     Timeline {
         #[command(subcommand)]
         command: timeline::TimelineCommand,
@@ -214,7 +243,8 @@ enum Command {
         /// Setup file (.toml or .json).
         setup: Option<PathBuf>,
         /// Record without a setup file: screen, display[:NAME_OR_ID],
-        /// camera:NAME_OR_ID, mic[:NAME_OR_ID], system-audio,
+        /// camera:NAME_OR_ID, mic[:NAME_OR_ID],
+        /// system-audio[:except=APP[,APP]], window:APP, app-audio:APP,
         /// test-pattern[:WIDTHxHEIGHT[@FPS]] or tone[:HZ]. Repeat for more
         /// sources; every audio source goes into every file.
         #[arg(long = "source", value_name = "SPEC")]
@@ -235,6 +265,10 @@ enum Command {
     /// and return once every file is created. Same options as `record`;
     /// with neither a setup nor --source, records the live setup. A setup
     /// or --source given here becomes the live setup.
+    ///
+    /// Its takes go where `isocast record-target` says (a new project with
+    /// its own timeline, unless a timeline was chosen); --new-project or
+    /// --into choose for this recording only.
     Start {
         setup: Option<PathBuf>,
         #[arg(long = "source", value_name = "SPEC")]
@@ -244,6 +278,23 @@ enum Command {
         seconds: Option<f64>,
         #[arg(long)]
         folder: Option<PathBuf>,
+        /// Start a new project with its own timeline.
+        #[arg(long, conflicts_with = "into")]
+        new_project: bool,
+        /// Add a take to this timeline (an id from `isocast timeline
+        /// list`), in the folder of its last take.
+        #[arg(long, value_name = "TIMELINE")]
+        into: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Where the next recording goes, or choose it: `new` (each recording
+    /// starts a new project with its own timeline; the default) or a
+    /// timeline's id (its next take). Kept across restarts; a recording
+    /// running keeps its own.
+    RecordTarget {
+        /// `new`, or a timeline's id; absent: show the choice.
+        target: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -294,6 +345,10 @@ enum Command {
         scene: String,
         #[command(flatten)]
         transition: TransitionArgs,
+        /// Which canvas: main, or vertical (the setup's [vertical] canvas,
+        /// once it stops following the main one).
+        #[arg(long, value_parser = parse_canvas, default_value = "main")]
+        canvas: CanvasId,
         #[arg(long)]
         json: bool,
     },
@@ -304,6 +359,10 @@ enum Command {
         /// Leave Studio Mode (clear its staged preview).
         #[arg(long)]
         clear: bool,
+        /// Which canvas: main, or vertical (once it stops following the
+        /// main one).
+        #[arg(long, value_parser = parse_canvas, default_value = "main")]
+        canvas: CanvasId,
         #[arg(long)]
         json: bool,
     },
@@ -313,6 +372,10 @@ enum Command {
     Take {
         #[command(flatten)]
         transition: TransitionArgs,
+        /// Which canvas: main, or vertical (once it stops following the
+        /// main one).
+        #[arg(long, value_parser = parse_canvas, default_value = "main")]
+        canvas: CanvasId,
         #[arg(long)]
         json: bool,
     },
@@ -327,6 +390,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Measure this machine quietly, inspect its profile, or cancel calibration.
+    Machine {
+        #[command(subcommand)]
+        command: MachineCommand,
+    },
     /// Benchmark the encoders on a setup's files (the live setup if none is
     /// given), all at once as in a recording, and say whether this Mac keeps
     /// up (fits, keeps up with no margin, or can't keep up). If it doesn't
@@ -340,6 +408,56 @@ enum Command {
         /// Benchmark writing to this folder instead of recording.folder.
         #[arg(long)]
         folder: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Predict, instantly and without benchmarking, whether a setup's files
+    /// (the live setup's, at its sources' live formats, if none is given)
+    /// fit this Mac's video encoders, from measured per-chip data, and list
+    /// the closest changes that fit as patches for `plan` and `apply`.
+    /// `tune` measures instead. Runs in isocastd.
+    Capacity {
+        setup: Option<PathBuf>,
+        /// Count the stream's encode (default: the live setup's if it
+        /// streams now; a given setup's if it has a stream).
+        #[arg(long, conflicts_with = "no_stream")]
+        stream: bool,
+        /// Leave the stream's encode out.
+        #[arg(long)]
+        no_stream: bool,
+        /// How to turn on this source's ISO file so the setup still fits.
+        #[arg(long, value_name = "SOURCE")]
+        add_iso: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Optimize the live setup for recording, streaming or both, like
+    /// OBS's Auto-Configuration Wizard: recording favours quality and ISO
+    /// files; streaming sets the service and a bitrate from the upload
+    /// speed (tested unless --upload-kbps is given; a custom server only
+    /// with `isocast stream speed-test`). Then `tune` benchmarks
+    /// this Mac and steps down where it can't keep up. Prints a one-line
+    /// summary and the changes; --apply makes them. Runs in isocastd.
+    Optimize {
+        /// recording, streaming or both.
+        #[arg(value_parser = optimize::parse_goal)]
+        goal: isocast_protocol::optimize::Goal,
+        /// Streaming: custom, twitch, youtube, kick or facebook; the live
+        /// setup's if absent.
+        #[arg(long, value_parser = parse_service)]
+        service: Option<StreamService>,
+        /// Streaming: the ingest server, rtmp://host/app or rtmps://…
+        #[arg(long)]
+        server: Option<String>,
+        /// Streaming: the upload speed in kb/s, instead of testing it.
+        #[arg(long)]
+        upload_kbps: Option<u32>,
+        /// Benchmark writing to this folder instead of recording.folder.
+        #[arg(long)]
+        folder: Option<PathBuf>,
+        /// Make the changes.
+        #[arg(long)]
+        apply: bool,
         #[arg(long)]
         json: bool,
     },
@@ -392,19 +510,45 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Choose the audio sources an ISO file carries, in the live setup:
+    /// `isocast iso-audio camera mic` gives the camera's ISO file the mic
+    /// only, --none no audio, --default back to recording.iso.audio (or,
+    /// without it, the source's own sound). Without a source, list each
+    /// video source's ISO tracks.
+    IsoAudio {
+        /// A video source's id.
+        source: Option<String>,
+        /// Audio source ids, in track order.
+        #[arg(requires = "source")]
+        audio: Vec<String>,
+        #[arg(long, requires = "source", conflicts_with_all = ["audio", "none"])]
+        default: bool,
+        #[arg(long, requires = "source", conflicts_with = "audio")]
+        none: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Restart isocastd, for example after granting it screen recording
     /// permission. Refused, atomically by isocastd, while it records,
     /// streams, exports or feeds the virtual camera.
     Restart,
-    /// Show the screen recording, camera and microphone permissions and
-    /// what to do about each that isn't granted; with --request, ask macOS
-    /// for the ones not decided yet (its prompts appear) and wait up to a
-    /// minute for the answers; with --open, open the System Settings pane
-    /// where one is turned on.
+    /// Show the screen recording, camera, microphone and system audio
+    /// recording permissions and what to do about each that isn't granted; with --request, ask macOS
+    /// for the ones not decided yet (its prompts appear; --request camera
+    /// asks for that one only) and wait up to a minute for the answers;
+    /// with --open, open the System Settings pane where one is turned on.
     Permissions {
-        #[arg(long, conflicts_with = "open")]
-        request: bool,
-        /// screen_recording, camera or microphone.
+        /// screen_recording, camera, microphone or system_audio; all if
+        /// left out.
+        #[arg(
+            long,
+            conflicts_with = "open",
+            value_name = "PERMISSION",
+            num_args = 0..=1,
+            value_parser = parse_permission
+        )]
+        request: Option<Option<isocast_protocol::devices::PermissionKind>>,
+        /// screen_recording, camera, microphone or system_audio.
         #[arg(long, value_name = "PERMISSION", value_parser = parse_permission)]
         open: Option<isocast_protocol::devices::PermissionKind>,
         #[arg(long)]
@@ -416,6 +560,10 @@ enum Command {
     Get {
         #[arg(long)]
         resolved: bool,
+        /// With --resolved: whose layout, main or vertical (the setup is
+        /// the whole live setup either way).
+        #[arg(long, value_parser = parse_canvas, default_value = "main")]
+        canvas: CanvasId,
         #[arg(long)]
         json: bool,
     },
@@ -449,6 +597,32 @@ enum Command {
     Stream {
         #[command(subcommand)]
         command: StreamCommand,
+    },
+    /// Canvases besides the main one (#84): the vertical canvas and
+    /// `[[canvases]]`, each with its own size, frame rate, scene (or the
+    /// main one's), recording and stream destinations.
+    Canvas {
+        #[command(subcommand)]
+        command: CanvasCommand,
+    },
+    /// The replay buffer: keep the last seconds of the program in memory,
+    /// and save them to a file on demand.
+    Replay {
+        #[command(subcommand)]
+        command: replay::Command,
+    },
+    /// The obs-websocket v5 server, so OBS tools (Stream Deck, Touch
+    /// Portal, Streamer.bot, scripts) drive Isocast. Off until enabled.
+    Websocket {
+        #[command(subcommand)]
+        command: websocket::Command,
+    },
+    /// Projectors: the program, the preview, a scene, a source or a
+    /// multiview grid, full screen on a display or in a window (the app
+    /// shows them).
+    Projector {
+        #[command(subcommand)]
+        command: projector::Command,
     },
     /// Feed a picture to Isocast Virtual Camera (extension approval required once).
     Vcam {
@@ -485,7 +659,7 @@ enum Command {
     /// studio mode's preview, or a video source as a JPEG. Starts the engine
     /// if it isn't running.
     Frame {
-        /// `program`, `preview` or a source id.
+        /// `program`, `preview`, `scene:ID` or a source id.
         #[arg(default_value = "program")]
         target: String,
         /// Where to save it; `<target>.jpg` if absent.
@@ -494,6 +668,10 @@ enum Command {
         /// Scale it down to at most this many pixels wide.
         #[arg(long)]
         width: Option<u32>,
+        /// Which canvas: main, or vertical (its program; vertical takes
+        /// `program` only).
+        #[arg(long, value_parser = parse_canvas, default_value = "main")]
+        canvas: CanvasId,
         #[arg(long)]
         json: bool,
     },
@@ -502,7 +680,7 @@ enum Command {
     /// video source, saved as an H.264 elementary stream (Annex B, which
     /// ffprobe and ffplay read). Starts the engine if it isn't running.
     Frames {
-        /// `program`, `preview` or a source id.
+        /// `program`, `preview`, `scene:ID` or a source id.
         #[arg(default_value = "program")]
         target: String,
         /// Where to save it; `<target>.h264` if absent.
@@ -545,6 +723,10 @@ enum Command {
         /// marker, briefly) and check frames show its new revision.
         #[arg(long, requires = "check")]
         touch: bool,
+        /// Which canvas: main, or vertical (its program; vertical takes
+        /// `program` only).
+        #[arg(long, value_parser = parse_canvas, default_value = "main")]
+        canvas: CanvasId,
         #[arg(long)]
         json: bool,
     },
@@ -565,29 +747,271 @@ enum Command {
 #[derive(Subcommand)]
 enum StreamCommand {
     /// Go live: stream the program (the canvas and the program mix) to the
-    /// live setup's [stream] service, starting the live engine if needed.
-    /// Recordings start and stop without touching it. Returns once live,
-    /// or says why not.
+    /// live setup's [stream] destinations (every enabled one), starting the
+    /// live engine if needed. Recordings start and stop without touching
+    /// it. Returns once each is live or failed, or says why not.
     Start {
+        /// Only this destination (main, or an id from `stream status`);
+        /// repeat for several. A turned-off destination starts too.
+        #[arg(long = "only", value_name = "ID")]
+        only: Vec<String>,
+        /// Which canvas: main ([stream]), or vertical ([vertical.stream],
+        /// with its own destinations and keys).
+        #[arg(long, value_parser = parse_canvas, default_value = "main")]
+        canvas: CanvasId,
         #[arg(long)]
         json: bool,
     },
-    /// Stop streaming.
+    /// Stop streaming (to every destination of the canvas, or --only
+    /// those); the other canvas's streams keep going.
     Stop {
+        /// Only this destination; repeat for several. The others keep going.
+        #[arg(long = "only", value_name = "ID")]
+        only: Vec<String>,
+        /// Which canvas: main ([stream]), or vertical ([vertical.stream],
+        /// with its own destinations and keys).
+        #[arg(long, value_parser = parse_canvas, default_value = "main")]
+        canvas: CanvasId,
         #[arg(long)]
         json: bool,
     },
-    /// Show the stream's state, bitrates, dropped frames, congestion and
-    /// reconnects, and whether a stream key is set.
+    /// Show each destination's state, bitrates, dropped frames, congestion
+    /// and reconnects, and whether its stream key is set.
     Status {
+        /// Which canvas: main ([stream]), or vertical ([vertical.stream],
+        /// with its own destinations and keys).
+        #[arg(long, value_parser = parse_canvas, default_value = "main")]
+        canvas: CanvasId,
         #[arg(long)]
         json: bool,
+    },
+    /// Add, remove or change the places the program streams to.
+    Destination {
+        #[command(subcommand)]
+        command: DestinationCommand,
     },
     /// Keep or remove the stream key (in the Keychain, never in a setup).
     Key {
         #[command(subcommand)]
         command: StreamKeyCommand,
     },
+    /// Measure the upload speed to the service's ingest (a short publish
+    /// of filler: Twitch's bandwidth test mode, or a custom server, which
+    /// shows it for a few seconds if it relays to a live service) and
+    /// recommend a stream bitrate. YouTube, Facebook and Kick have no test
+    /// mode, so they get a safe bitrate instead, with the reason.
+    SpeedTest {
+        #[command(flatten)]
+        target: KeyTargetArgs,
+        /// Seconds to send for, 3 to 20 (8 by default).
+        #[arg(long)]
+        seconds: Option<u32>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum CanvasCommand {
+    /// Every canvas: size, frame rate, scene, recording and streams.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Add a canvas: `vertical` (the [vertical] canvas) or a new id
+    /// (lowercase letters, digits and dashes), 1080×1920 following the main
+    /// scene unless said otherwise. Add its streams next: `isocast stream
+    /// destination add SERVICE --canvas ID`.
+    Add {
+        canvas: String,
+        #[command(flatten)]
+        fields: CanvasFields,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Change a canvas.
+    Set {
+        canvas: String,
+        #[command(flatten)]
+        fields: CanvasFields,
+        /// Reset a field: name, fps (to the main canvas's) or stream (no
+        /// stream of its own). Repeat for several.
+        #[arg(long, value_name = "FIELD")]
+        clear: Vec<String>,
+        /// Shorthand for --clear stream.
+        #[arg(long)]
+        no_stream: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a canvas with its arrangements, recording and streams (not
+    /// while it records or streams).
+    Remove {
+        canvas: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(clap::Args)]
+struct CanvasFields {
+    /// Display label, like "YouTube Shorts".
+    #[arg(long)]
+    name: Option<String>,
+    /// Size as WIDTHxHEIGHT, optionally @FPS (1080x1920, 1080x1080@30).
+    #[arg(long)]
+    size: Option<String>,
+    /// Its own frame rate (else the main canvas's).
+    #[arg(long)]
+    fps: Option<u32>,
+    /// Show the main canvas's scene (true) or pick its own (false).
+    #[arg(long)]
+    follow_main: Option<bool>,
+    /// Record its program with each recording (true or false).
+    #[arg(long)]
+    record: Option<bool>,
+}
+
+impl CanvasFields {
+    fn params(self, canvas: &str) -> Result<isocast_protocol::api::CanvasParams> {
+        let canvas = CanvasId::parse(canvas).map_err(anyhow::Error::msg)?;
+        let (width, height, fps) = parse_canvas_size(self.size.as_deref())?;
+        Ok(isocast_protocol::api::CanvasParams {
+            canvas,
+            name: self.name,
+            width,
+            height,
+            fps: self.fps.or(fps),
+            follow_main: self.follow_main,
+            record: self.record,
+            clear: Vec::new(),
+        })
+    }
+}
+
+/// What `canvas list` and the changes print.
+fn print_canvases(
+    canvases: &[isocast_protocol::api::CanvasStatus],
+    main: Option<&isocast_protocol::Canvas>,
+) {
+    if let Some(main) = main {
+        println!(
+            "main      {}×{} at {} fps",
+            main.width, main.height, main.fps
+        );
+    }
+    if canvases.is_empty() {
+        println!("no other canvases; add one with `isocast canvas add ID --size 1080x1920`");
+    }
+    for canvas in canvases {
+        let live = canvas.streams.iter().filter(|s| s.is_active()).count();
+        println!(
+            "{:<9} {}×{} at {} fps, {}{}{}{}",
+            canvas.id.as_str(),
+            canvas.canvas.width,
+            canvas.canvas.height,
+            canvas.canvas.fps,
+            if canvas.follow_main {
+                "follows main".to_string()
+            } else {
+                format!("own scene {}", canvas.scene.as_deref().unwrap_or("-"))
+            },
+            if canvas.recorded { ", recorded" } else { "" },
+            match canvas.streams.len() {
+                0 => String::new(),
+                n => format!(", {n} destination(s), {live} live"),
+            },
+            if canvas.name != canvas.id.as_str() {
+                format!(" ({})", canvas.name)
+            } else {
+                String::new()
+            }
+        );
+    }
+}
+
+#[derive(Subcommand)]
+enum DestinationCommand {
+    /// Add a destination (the first makes the setup's [stream] section,
+    /// id main). Set its key next: `isocast stream key set --destination ID`.
+    Add {
+        /// custom, twitch, youtube, kick or facebook.
+        #[arg(value_parser = parse_service)]
+        service: StreamService,
+        /// Its id; made from the service if absent (youtube, youtube-2).
+        #[arg(long)]
+        id: Option<String>,
+        #[command(flatten)]
+        fields: DestinationFields,
+        /// Add it turned off (`stream start` skips it unless --only names it).
+        #[arg(long)]
+        disabled: bool,
+        /// Which canvas: main ([stream]), or vertical ([vertical.stream],
+        /// with its own destinations and keys).
+        #[arg(long, value_parser = parse_canvas, default_value = "main")]
+        canvas: CanvasId,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a destination (not main; not while it streams).
+    Remove {
+        id: String,
+        /// Which canvas: main ([stream]), or vertical ([vertical.stream],
+        /// with its own destinations and keys).
+        #[arg(long, value_parser = parse_canvas, default_value = "main")]
+        canvas: CanvasId,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Change a destination (main is the [stream] section itself).
+    Set {
+        id: String,
+        #[arg(long, value_parser = parse_service)]
+        service: Option<StreamService>,
+        #[command(flatten)]
+        fields: DestinationFields,
+        /// Turn it on or off for `stream start`.
+        #[arg(long)]
+        enabled: Option<bool>,
+        /// Reset a field: server, video_bitrate_kbps, size, rate_control,
+        /// keyframe_interval_seconds or audio_bitrate_kbps (a destination
+        /// then uses main's; main the defaults). Repeat for several.
+        #[arg(long, value_name = "FIELD")]
+        clear: Vec<String>,
+        /// Which canvas: main ([stream]), or vertical ([vertical.stream],
+        /// with its own destinations and keys).
+        #[arg(long, value_parser = parse_canvas, default_value = "main")]
+        canvas: CanvasId,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(clap::Args)]
+struct DestinationFields {
+    /// The ingest server without the key (rtmp://host/app or rtmps://…);
+    /// required for custom and kick.
+    #[arg(long)]
+    server: Option<String>,
+    /// Its own video bitrate in kb/s (else main's). A bitrate or size of
+    /// its own needs an encoder of its own.
+    #[arg(long)]
+    video_bitrate_kbps: Option<u32>,
+    /// Its own size sent (with --height; else main's).
+    #[arg(long, requires = "height")]
+    width: Option<u32>,
+    /// Its own height sent (with --width).
+    #[arg(long, requires = "width")]
+    height: Option<u32>,
+    /// Its own rate control: constant or average (else main's).
+    #[arg(long, value_parser = parse_rate_control)]
+    rate_control: Option<isocast_protocol::stream::RateControl>,
+    /// Its own seconds between keyframes (else main's).
+    #[arg(long)]
+    keyframe_interval_seconds: Option<u32>,
+    /// Its own AAC bitrate in kb/s (else main's).
+    #[arg(long)]
+    audio_bitrate_kbps: Option<u32>,
 }
 
 #[derive(Subcommand)]
@@ -598,6 +1022,10 @@ enum StreamKeyCommand {
     Set {
         #[command(flatten)]
         target: KeyTargetArgs,
+        /// Which canvas: main ([stream]), or vertical ([vertical.stream],
+        /// with its own destinations and keys).
+        #[arg(long, value_parser = parse_canvas, default_value = "main")]
+        canvas: CanvasId,
         #[arg(long)]
         json: bool,
     },
@@ -606,6 +1034,10 @@ enum StreamKeyCommand {
     Clear {
         #[command(flatten)]
         target: KeyTargetArgs,
+        /// Which canvas: main ([stream]), or vertical ([vertical.stream],
+        /// with its own destinations and keys).
+        #[arg(long, value_parser = parse_canvas, default_value = "main")]
+        canvas: CanvasId,
         #[arg(long)]
         json: bool,
     },
@@ -614,6 +1046,10 @@ enum StreamKeyCommand {
 /// Which service's key; the live setup's [stream] if absent.
 #[derive(clap::Args)]
 struct KeyTargetArgs {
+    /// A destination of the live setup (main, or an id from `stream
+    /// status`): its own key.
+    #[arg(long)]
+    destination: Option<String>,
     /// custom, twitch, youtube, kick or facebook.
     #[arg(long, value_parser = parse_service)]
     service: Option<StreamService>,
@@ -623,16 +1059,46 @@ struct KeyTargetArgs {
 }
 
 impl KeyTargetArgs {
-    fn target(self) -> StreamKeyTarget {
+    fn target(self, canvas: CanvasId) -> StreamKeyTarget {
         StreamKeyTarget {
+            destination: self.destination,
             service: self.service,
             server: self.server,
+            canvas,
         }
     }
 }
 
 fn parse_service(text: &str) -> Result<StreamService, String> {
     StreamService::from_id(text)
+}
+
+/// A canvas, as `--canvas` names it: main, vertical or a `[[canvases]]`
+/// id (whether the live setup has it, the engine says).
+fn parse_canvas(text: &str) -> Result<CanvasId, String> {
+    CanvasId::parse(text)
+}
+
+fn parse_rate_control(text: &str) -> Result<isocast_protocol::stream::RateControl, String> {
+    serde_json::from_value(serde_json::Value::String(text.to_string()))
+        .map_err(|_| format!("{text:?} is not a rate control; use constant or average"))
+}
+
+/// The monitor target `--canvas` means: the target itself on the main
+/// canvas; on the vertical one, its program or preview. Sources are shared.
+fn canvas_target(canvas: CanvasId, target: String) -> Result<String> {
+    if canvas.is_main() || target == canvas.program_target() || target == canvas.preview_target() {
+        return Ok(target);
+    }
+    if target == isocast_protocol::PROGRAM {
+        return Ok(canvas.program_target().to_string());
+    }
+    if target == "preview" {
+        return Ok(canvas.preview_target());
+    }
+    bail!(
+        "--canvas {canvas}: give `program` (the default) or `preview`, or watch source {target:?} without --canvas"
+    )
 }
 
 #[derive(Subcommand)]
@@ -694,6 +1160,17 @@ enum SetupCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Find OBS Studio's scene collections and profiles on this Mac (in
+    /// ~/Library/Application Support/obs-studio, or --folder), without
+    /// importing anything: each collection with the profile an import
+    /// would use, and each profile's video, recording and stream settings.
+    DiscoverObs {
+        /// Look in this folder instead.
+        #[arg(long)]
+        folder: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Import an OBS Studio scene collection as a setup: its sources,
     /// scenes and items, filters and transition, matched against this
     /// Mac's devices (in isocastd). Prints the setup as TOML, or writes it
@@ -730,8 +1207,9 @@ fn main() -> ExitCode {
         }
     };
     // `isocast get | head` should end quietly when the reader goes away, as
-    // other tools do, not panic on the closed pipe. Not for an in-process
-    // recording (its files must finish) or the MCP server.
+    // other tools do, not panic on the closed pipe. Not for foreground
+    // recording (wait for its files to finish) or the MCP server.
+    #[cfg(unix)]
     if !matches!(cli.command, Command::Record { .. } | Command::Mcp) {
         // SAFETY: setting a signal's disposition before any threads start.
         unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
@@ -887,6 +1365,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
         }
         Command::Setup { command } => match command {
             SetupCommand::Check { path, json } => check(&path, json),
+            SetupCommand::DiscoverObs { folder, json } => optimize::discover(folder, json),
             SetupCommand::Schema => {
                 println!("{}", serde_json::to_string_pretty(&Setup::json_schema())?);
                 Ok(ExitCode::SUCCESS)
@@ -911,11 +1390,11 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 name,
                 json,
             } => {
-                let (width, height, fps) = parse_canvas(canvas.as_deref())?;
+                let (width, height, fps) = parse_canvas_size(canvas.as_deref())?;
                 // The daemon may run in another folder: make a relative
                 // folder absolute here.
                 let folder = match folder {
-                    Some(f) if !f.starts_with('~') && !f.starts_with('/') => {
+                    Some(f) if !f.starts_with('~') && !Path::new(&f).is_absolute() => {
                         Some(std::path::absolute(&f)?.display().to_string())
                     }
                     other => other,
@@ -988,13 +1467,27 @@ fn run(cli: Cli) -> Result<ExitCode> {
             sources,
             seconds,
             folder,
+            new_project,
+            into,
             json,
-        } => start(setup.as_deref(), &sources, seconds, folder, json),
+        } => start(
+            setup.as_deref(),
+            &sources,
+            seconds,
+            folder,
+            (new_project, into),
+            json,
+        ),
+        Command::RecordTarget { target, json } => timeline::record_target(target, json),
         Command::Stop { json } => stop(json),
         Command::Pause { json } => pause(true, json),
         Command::Resume { json } => pause(false, json),
         Command::Status { json } => status(json),
-        Command::Get { resolved, json } => get(resolved, json),
+        Command::Get {
+            resolved,
+            canvas,
+            json,
+        } => get(resolved, canvas, json),
         Command::Permissions {
             request,
             open,
@@ -1033,6 +1526,57 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Command::IsoAudio {
+            source,
+            audio,
+            default,
+            none,
+            json,
+        } => {
+            let mut client = Client::connect_or_launch()?;
+            let Some(source) = source else {
+                let live: Live = client.call(Method::Get(None))?;
+                let Some(setup) = live.setup else {
+                    bail!("there is no live setup; apply one first");
+                };
+                let rows = client::iso_audio(&setup);
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&rows)?);
+                } else {
+                    for row in &rows {
+                        let tracks = match row.audio.is_empty() {
+                            true => "no audio".to_string(),
+                            false => row.audio.join(", "),
+                        };
+                        let from = match row.from {
+                            client::IsoAudioFrom::SourceAudio => "its own list",
+                            client::IsoAudioFrom::Shared => "recording.iso.audio",
+                            client::IsoAudioFrom::Own => "own sound",
+                        };
+                        let off = if row.recorded { "" } else { " (no ISO file)" };
+                        println!("  {:<14} {tracks} — {from}{off}", row.source);
+                    }
+                }
+                return Ok(ExitCode::SUCCESS);
+            };
+            if !(default || none) && audio.is_empty() {
+                bail!(
+                    "give the audio sources for {source}'s ISO file, --none for no audio, or \
+                     --default for recording.iso.audio's choice"
+                );
+            }
+            let list = (!default).then_some(audio.as_slice());
+            let applied = client::set_iso_audio(&mut client, &source, list)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&applied)?);
+            } else {
+                println!("Live setup is now at revision {}.", applied.revision);
+                for note in &applied.notes {
+                    println!("note: {note}");
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Snapshot {
             source,
             scene,
@@ -1055,35 +1599,99 @@ fn run(cli: Cli) -> Result<ExitCode> {
             folder,
             json,
         } => doctor(setup.as_deref(), folder, json),
+        Command::Machine { command } => {
+            let (method, json) = match command {
+                MachineCommand::Show { json } => (Method::MachineProfile, json),
+                MachineCommand::Calibrate { json } => (Method::MachineCalibrate, json),
+                MachineCommand::Cancel { json } => (Method::MachineCancel, json),
+            };
+            let result: isocast_protocol::machine::MachineStatus =
+                Client::connect_or_launch()?.call(method)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!("{}", result.summary);
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Tune {
             setup,
             folder,
             json,
         } => tune(setup.as_deref(), folder, json),
+        Command::Capacity {
+            setup,
+            stream,
+            no_stream,
+            add_iso,
+            json,
+        } => capacity(
+            setup.as_deref(),
+            (stream || no_stream).then_some(stream),
+            add_iso,
+            json,
+        ),
+        Command::Optimize {
+            goal,
+            service,
+            server,
+            upload_kbps,
+            folder,
+            apply,
+            json,
+        } => optimize::optimize(
+            isocast_protocol::optimize::OptimizeParams {
+                goal,
+                service,
+                server,
+                upload_kbps,
+                folder: folder.map(std::path::absolute).transpose()?,
+                apply,
+            },
+            json,
+        ),
         Command::Split { json } => split(json),
         Command::Marker { label, json } => marker(label, json),
         Command::Refresh { source, json } => refresh(source, json),
         Command::Scene {
             scene,
             transition,
+            canvas,
             json,
         } => {
             let transition = transition.get()?;
-            switched(Method::SwitchScene { scene, transition }, json)
+            switched(
+                Method::SwitchScene {
+                    scene,
+                    transition,
+                    canvas,
+                },
+                json,
+            )
         }
-        Command::Preview { scene, clear, json } => switched(
-            if clear {
-                Method::ClearPreview
-            } else {
-                Method::Preview {
+        Command::Preview {
+            scene,
+            clear,
+            canvas,
+            json,
+        } => switched(
+            match (clear, canvas.is_main()) {
+                (true, true) => Method::ClearPreview,
+                (true, false) => Method::ClearCanvasPreview { canvas },
+                (false, _) => Method::Preview {
                     scene: scene.expect("required by clap"),
-                }
+                    canvas,
+                },
             },
             json,
         ),
-        Command::Take { transition, json } => {
+        Command::Take {
+            transition,
+            canvas,
+            json,
+        } => {
             let transition = transition.get()?;
-            switched(Method::Take { transition }, json)
+            switched(Method::Take { transition, canvas }, json)
         }
         Command::Plan { file, patch, json } => plan(file.as_deref(), patch.as_deref(), json),
         Command::Apply {
@@ -1103,8 +1711,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
             target,
             output,
             width,
+            canvas,
             json,
-        } => frame(target, output, width, json),
+        } => frame(canvas_target(canvas, target)?, output, width, json),
         Command::Frames {
             target,
             output,
@@ -1118,9 +1727,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
             check,
             expect,
             touch,
+            canvas,
             json,
-        } => match shared {
-            true => shared_frames(shared_frames::Options {
+        } => match (shared, canvas_target(canvas, target)?) {
+            (true, target) => shared_frames(shared_frames::Options {
                 target,
                 max_width: width,
                 max_height: height,
@@ -1133,25 +1743,89 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 touch,
                 json,
             }),
-            false => frames(target, output, width, fps, seconds, json),
+            (false, target) => frames(target, output, width, fps, seconds, json),
         },
         Command::Engine { command, json } => engine(command, json),
         Command::Vcam { command } => virtual_camera::run(command),
+        Command::Projector { command } => projector::run(command),
+        Command::Replay { command } => replay::run(command),
+        Command::Websocket { command } => websocket::run(command),
         Command::Debug { command } => debug::run(command),
-        Command::Stream { command } => match command {
-            StreamCommand::Start { json } => {
-                let status: StreamStatus =
-                    Client::connect_or_launch()?.call(Method::StreamStart)?;
-                print_stream(&status, json)
+        Command::Canvas { command } => {
+            use isocast_protocol::api::Canvases;
+            let mut client = Client::connect_or_launch()?;
+            let (method, json) = match command {
+                CanvasCommand::List { json } => {
+                    let status: Status = client.call(Method::Status)?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&status.canvases)?);
+                    } else {
+                        let main = status.engine.as_ref().map(|engine| &engine.canvas);
+                        print_canvases(&status.canvases, main);
+                    }
+                    return Ok(ExitCode::SUCCESS);
+                }
+                CanvasCommand::Add {
+                    canvas,
+                    fields,
+                    json,
+                } => (Method::CanvasAdd(Box::new(fields.params(&canvas)?)), json),
+                CanvasCommand::Set {
+                    canvas,
+                    fields,
+                    mut clear,
+                    no_stream,
+                    json,
+                } => {
+                    if no_stream {
+                        clear.push("stream".into());
+                    }
+                    let params = isocast_protocol::api::CanvasParams {
+                        clear,
+                        ..fields.params(&canvas)?
+                    };
+                    (Method::CanvasSet(Box::new(params)), json)
+                }
+                CanvasCommand::Remove { canvas, json } => (
+                    Method::CanvasRemove {
+                        canvas: CanvasId::parse(&canvas).map_err(anyhow::Error::msg)?,
+                    },
+                    json,
+                ),
+            };
+            let changed: Canvases = client.call(method)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&changed)?);
+            } else {
+                print_canvases(&changed.canvases, None);
             }
-            StreamCommand::Stop { json } => {
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Stream { command } => match command {
+            StreamCommand::SpeedTest {
+                target,
+                seconds,
+                json,
+            } => optimize::speed_test(target.service, target.server, seconds, json),
+            StreamCommand::Start { only, canvas, json } => {
+                let mut client = Client::connect_or_launch()?;
+                client::check_engine(&mut client);
+                let started: Streaming =
+                    client.call(Method::StreamStart(Some(StreamStartParams {
+                        only,
+                        canvas,
+                    })))?;
+                print_streaming(&started, json)
+            }
+            StreamCommand::Stop { only, canvas, json } => {
                 let Some(mut client) = Client::connect()? else {
                     bail!("not streaming: isocastd isn't running");
                 };
-                let status: StreamStatus = client.call(Method::StreamStop)?;
-                print_stream(&status, json)
+                let stopped: Streaming =
+                    client.call(Method::StreamStop(Some(StreamStartParams { only, canvas })))?;
+                print_streaming(&stopped, json)
             }
-            StreamCommand::Status { json } => {
+            StreamCommand::Status { canvas, json } => {
                 let Some(mut client) = Client::connect()? else {
                     if json {
                         println!("null");
@@ -1160,35 +1834,121 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     }
                     return Ok(ExitCode::SUCCESS);
                 };
-                let status: Option<StreamStatus> = client.call::<Status>(Method::Status)?.stream;
-                match status {
-                    Some(status) => print_stream(&status, json),
+                let status = client.call::<Status>(Method::Status)?;
+                // The vertical canvas's: its main destination's (else its
+                // first) as the stream.
+                let (stream, destinations) = if canvas.is_main() {
+                    (status.stream, status.streams)
+                } else {
+                    let first = status
+                        .vertical_streams
+                        .iter()
+                        .find(|s| s.id == MAIN_DESTINATION)
+                        .or(status.vertical_streams.first())
+                        .cloned();
+                    (first, status.vertical_streams)
+                };
+                match stream {
+                    Some(stream) => print_streaming(
+                        &Streaming {
+                            stream,
+                            destinations,
+                        },
+                        json,
+                    ),
                     None if json => {
                         println!("null");
                         Ok(ExitCode::SUCCESS)
                     }
+                    None if canvas.is_main() => {
+                        println!(
+                            "Not set up for streaming: the live setup has no [stream] section \
+                             (add one: `isocast stream destination add SERVICE`)"
+                        );
+                        Ok(ExitCode::SUCCESS)
+                    }
                     None => {
                         println!(
-                            "Not set up for streaming: the live setup has no [stream] section"
+                            "The vertical canvas isn't set up for streaming: the live setup has \
+                             no [vertical.stream] section (add one: `isocast stream destination \
+                             add SERVICE --canvas vertical`)"
                         );
                         Ok(ExitCode::SUCCESS)
                     }
                 }
             }
+            StreamCommand::Destination { command } => {
+                let (method, json) = match command {
+                    DestinationCommand::Add {
+                        service,
+                        id,
+                        fields,
+                        disabled,
+                        canvas,
+                        json,
+                    } => (
+                        Method::StreamDestinationAdd(Box::new(StreamDestinationParams {
+                            id,
+                            service: Some(service),
+                            enabled: disabled.then_some(false),
+                            canvas,
+                            ..fields.params()
+                        })),
+                        json,
+                    ),
+                    DestinationCommand::Remove { id, canvas, json } => {
+                        (Method::StreamDestinationRemove { id, canvas }, json)
+                    }
+                    DestinationCommand::Set {
+                        id,
+                        service,
+                        fields,
+                        enabled,
+                        clear,
+                        canvas,
+                        json,
+                    } => (
+                        Method::StreamDestinationSet(Box::new(StreamDestinationParams {
+                            id: Some(id),
+                            service,
+                            enabled,
+                            clear,
+                            canvas,
+                            ..fields.params()
+                        })),
+                        json,
+                    ),
+                };
+                let changed: StreamDestinations = Client::connect_or_launch()?.call(method)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&changed)?);
+                } else {
+                    print_destinations(&changed.destinations);
+                }
+                Ok(ExitCode::SUCCESS)
+            }
             StreamCommand::Key { command } => match command {
-                StreamKeyCommand::Set { target, json } => {
+                StreamKeyCommand::Set {
+                    target,
+                    canvas,
+                    json,
+                } => {
                     let mut client = Client::connect_or_launch()?;
                     let key = read_stream_key()?;
                     let stored: StreamKey =
                         client.call(Method::StreamKeySet(Box::new(StreamKeyParams {
                             key,
-                            target: target.target(),
+                            target: target.target(canvas),
                         })))?;
                     print_stream_key(&stored, json)
                 }
-                StreamKeyCommand::Clear { target, json } => {
+                StreamKeyCommand::Clear {
+                    target,
+                    canvas,
+                    json,
+                } => {
                     let stored: StreamKey = Client::connect_or_launch()?
-                        .call(Method::StreamKeyClear(Box::new(target.target())))?;
+                        .call(Method::StreamKeyClear(Box::new(target.target(canvas))))?;
                     print_stream_key(&stored, json)
                 }
             },
@@ -1217,7 +1977,7 @@ fn load(path: &Path) -> Result<Setup> {
 /// `record` uses it): isocastd runs in another folder, and refuses one.
 fn absolute_recording_folder(setup: &mut Setup) -> Result<()> {
     let folder = &setup.recording.folder;
-    if !folder.is_empty() && !folder.starts_with('/') && !folder.starts_with('~') {
+    if !folder.is_empty() && !Path::new(folder).is_absolute() && !folder.starts_with('~') {
         setup.recording.folder = std::path::absolute(folder)?.display().to_string();
     }
     Ok(())
@@ -1263,11 +2023,15 @@ fn check(path: &Path, json: bool) -> Result<ExitCode> {
         ExitCode::FAILURE
     };
 
+    // Whether its files fit this Mac's encoders (#66): a warning, never a
+    // failure.
+    let capacity = issues.is_empty().then(|| capacity_check(&setup)).flatten();
     if json {
         let report = serde_json::json!({
             "valid": issues.is_empty(),
             "issues": issues,
             "setup": setup,
+            "capacity": capacity,
         });
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(code);
@@ -1296,7 +2060,49 @@ fn check(path: &Path, json: bool) -> Result<ExitCode> {
     if iso.enabled {
         println!("iso: {} → {:?}", iso.sources.join(", "), iso.encoder.codec);
     }
+    if let Some(check) = &capacity {
+        if check.status == CheckStatus::Ok {
+            println!("encoders: {}", check.detail);
+        } else {
+            isocast_diagnostics::diagnostic!("warn"; "encoders: {}", check.detail);
+            if let Some(fix) = &check.fix {
+                isocast_diagnostics::diagnostic!("warn"; "  fix: {fix}");
+            }
+        }
+    }
     Ok(code)
+}
+
+/// Use the daemon's estimate, including its profile and exact tune results;
+/// setup validation remains local if the daemon cannot answer.
+fn capacity_check(setup: &Setup) -> Option<isocast_protocol::api::Check> {
+    let not_checked = |reason: String| {
+        Some(isocast_protocol::api::Check {
+            name: "encoder capacity".into(),
+            status: CheckStatus::Warning,
+            detail: format!("not checked: {reason}"),
+            fix: Some(
+                "start Isocast, then check the file again; file validation did not start an engine"
+                    .into(),
+            ),
+        })
+    };
+    let mut client = match Client::connect() {
+        Ok(Some(client)) => client,
+        Ok(None) => return not_checked("isocastd is not running".into()),
+        Err(error) => return not_checked(format!("could not reach isocastd: {error}")),
+    };
+    let estimate: CapacityEstimate =
+        match client.call(Method::EstimateCapacity(Box::new(CapacityParams {
+            setup: Some(setup.clone()),
+            ..Default::default()
+        }))) {
+            Ok(estimate) => estimate,
+            Err(error) => {
+                return not_checked(format!("isocastd could not estimate capacity: {error}"));
+            }
+        };
+    isocast_engine::estimate::check(&estimate)
 }
 
 fn import_obs(
@@ -1306,7 +2112,7 @@ fn import_obs(
     profile: Option<String>,
     json: bool,
 ) -> Result<ExitCode> {
-    let (width, height, fps) = parse_canvas(canvas)?;
+    let (width, height, fps) = parse_canvas_size(canvas)?;
     if let Some(path) = &output
         && path.exists()
     {
@@ -1395,7 +2201,7 @@ fn import_obs(
 }
 
 /// `--canvas WIDTHxHEIGHT[@FPS]`.
-fn parse_canvas(canvas: Option<&str>) -> Result<(Option<u32>, Option<u32>, Option<u32>)> {
+fn parse_canvas_size(canvas: Option<&str>) -> Result<(Option<u32>, Option<u32>, Option<u32>)> {
     let Some(canvas) = canvas else {
         return Ok((None, None, None));
     };
@@ -1603,55 +2409,31 @@ fn record(
     json: bool,
 ) -> Result<ExitCode> {
     let setup = resolve_setup(setup, sources)?;
-    let duration = duration(seconds)?;
-
-    let stop = Arc::new(AtomicBool::new(false));
-    let flag = stop.clone();
-    ctrlc::set_handler(move || flag.store(true, Ordering::SeqCst))
-        .context("could not install the Ctrl-C handler")?;
-    let announce = |paths: &[PathBuf], _manifest: &Path| {
-        if json {
-            return;
-        }
-        match duration {
-            Some(d) => isocast_diagnostics::diagnostic!("Recording for {} s:", d.as_secs_f64()),
-            None => isocast_diagnostics::diagnostic!("Recording, press Ctrl-C to stop:"),
-        }
-        for path in paths {
-            isocast_diagnostics::diagnostic!("  {}", path.display());
-        }
+    duration(seconds)?;
+    let root = std::path::absolute(
+        folder.unwrap_or_else(|| isocast_engine::record::expand_home(&setup.recording.folder)),
+    )?;
+    // Keep the parent's recordings registry, not just the isolated daemon's
+    // temporary one. Project creation and all media I/O now belong to isocastd.
+    let remembered = if isocast_protocol::project::read(&root).is_some() {
+        root.parent().unwrap_or(&root)
+    } else {
+        &root
     };
-    // Warn as soon as a file starts losing frames or audio.
-    let reported = Mutex::new(Vec::<(u64, u64)>::new());
-    let warn = |status: &LiveStatus| {
-        if json {
-            return;
-        }
-        for message in status.new_drops(&mut reported.lock().unwrap()) {
-            isocast_diagnostics::diagnostic!("warn"; "warning: {message}");
-        }
-    };
-    // Into a project folder in the recordings folder, as isocastd records.
-    let root = match folder {
-        Some(folder) => folder,
-        None => isocast_engine::record::expand_home(&setup.recording.folder),
-    };
-    let (project, _, created) = isocast_engine::project::begin(&root)
-        .with_context(|| format!("could not make a project folder in {}", root.display()))?;
-    let options = RecordOptions {
-        folder: Some(project.clone()),
-        duration,
-        stop,
-        on_start: Some(&announce),
-        on_status: Some(&warn),
-        on_take: None,
-        control: None,
-    };
-    let report = record_with_platform(&setup, &options);
-    if report.is_err() && created {
-        isocast_protocol::project::discard_if_empty(&project);
+    if let Err(err) = isocast_protocol::project::remember_root(remembered) {
+        isocast_diagnostics::diagnostic!("warn";
+            "warning: could not add {} to the recordings folders isocastd lists ({err}); \
+             its projects show in list_projects while it is the setup's recording.folder",
+            remembered.display()
+        );
     }
-    print_report(&report?, json)
+    let (report, cleanup) = record::run(setup, root, seconds, json)?;
+    let code = print_report(&report, json)?;
+    if let Some(error) = cleanup {
+        isocast_diagnostics::diagnostic!("error"; "recording finished, but isolated daemon cleanup failed: {error:#}");
+        return Ok(ExitCode::FAILURE);
+    }
+    Ok(code)
 }
 
 /// Print a session report; failing if the session had errors.
@@ -1717,6 +2499,7 @@ fn start(
     sources: &[String],
     seconds: Option<f64>,
     folder: Option<PathBuf>,
+    (new_project, into): (bool, Option<String>),
     json: bool,
 ) -> Result<ExitCode> {
     // Neither a setup nor sources: record the live setup.
@@ -1728,10 +2511,13 @@ fn start(
     // The daemon may run in another folder; give it an absolute one.
     let folder = folder.map(std::path::absolute).transpose()?;
     let mut client = Client::connect_or_launch()?;
+    client::check_engine(&mut client);
     let started: Started = client.call(Method::Start(Box::new(StartParams {
         setup,
         folder,
         seconds,
+        new_project,
+        into,
     })))?;
     if json {
         println!("{}", serde_json::to_string_pretty(&started)?);
@@ -1806,9 +2592,16 @@ fn last_summary(report: &Report) -> String {
 
 fn status(json: bool) -> Result<ExitCode> {
     let status = match Client::connect()? {
-        Some(mut client) => client.call(Method::Status)?,
+        Some(mut client) => {
+            let status: Status = client.call(Method::Status)?;
+            client::warn_if_stale(status.daemon.as_ref());
+            status
+        }
         None => Status {
             state: EngineState::Idle,
+            governor: None,
+            machine_profile: None,
+            load_warning: None,
             scene: None,
             preview: None,
             live: None,
@@ -1820,22 +2613,45 @@ fn status(json: bool) -> Result<ExitCode> {
             collection: None,
             profile: None,
             stream: None,
+            streams: Vec::new(),
             cpu_percent: None,
             data: None,
             diagnostics: None,
             interrupted: Vec::new(),
             timeline: None,
             timeline_problem: None,
+            record_target: None,
+            recording_into: None,
             export: None,
             virtual_camera: None,
+            replay: None,
             recording_free_bytes: None,
             program_bytes_per_second: None,
             daemon: None,
+            vertical_replay: None,
+            canvases: Vec::new(),
+            vertical_scene: None,
+            vertical_preview: None,
+            vertical_streams: Vec::new(),
         },
     };
     if json {
         println!("{}", serde_json::to_string_pretty(&status)?);
         return Ok(ExitCode::SUCCESS);
+    }
+    if let Some(warning) = &status.load_warning {
+        eprintln!("warning: {}", warning.message);
+    }
+    if let Some(machine) = &status.machine_profile {
+        println!("Machine: {}", machine.summary);
+    }
+    if let Some(governor) = &status.governor
+        && (governor.steps > 0 || governor.bottleneck.is_some() || !governor.enabled)
+    {
+        println!("{}", governor.reason);
+        if let Some(error) = &governor.error {
+            eprintln!("warning: automatic quality: {error}");
+        }
     }
     if let (Some(collection), Some(profile)) = (&status.collection, &status.profile) {
         println!(
@@ -1877,13 +2693,39 @@ fn status(json: bool) -> Result<ExitCode> {
     }
     if let Some(timeline) = &status.timeline {
         println!(
-            "Timeline: {:?} ({}), {} clip{}, {:.2} s; finished takes are added to it",
+            "Timeline: {:?} ({}), {} clip{}, {:.2} s (current)",
             timeline.name,
             timeline.id,
             timeline.clips,
             if timeline.clips == 1 { "" } else { "s" },
             timeline.duration_seconds
         );
+    }
+    if let Some(into) = &status.recording_into {
+        println!(
+            "Recording into: {}",
+            match into.new_project {
+                true => format!(
+                    "a new project, timeline {:?} ({})",
+                    into.name, into.timeline
+                ),
+                false => format!(
+                    "take {} of {:?} ({})",
+                    into.clips + 1,
+                    into.name,
+                    into.timeline
+                ),
+            }
+        );
+    }
+    if let Some(target) = &status.record_target {
+        println!(
+            "Next recording: {} (`isocast record-target` changes it)",
+            timeline::target_words(target)
+        );
+        for note in &target.notes {
+            println!("note: {note}");
+        }
     }
     if let Some(problem) = &status.timeline_problem {
         println!("warning: {problem}");
@@ -1959,6 +2801,9 @@ fn status(json: bool) -> Result<ExitCode> {
                 live.elapsed_seconds,
                 live.paused_seconds
             );
+            if live.handover {
+                println!("  Starting a new take: split, pause and resume wait until it has");
+            }
             for file in &live.files {
                 println!(
                     "  {}  {} frames, {} dropped, {} audio dropouts",
@@ -1976,8 +2821,12 @@ fn status(json: bool) -> Result<ExitCode> {
             }
         }
     }
-    if let Some(stream) = &status.stream {
-        print_stream_lines(stream);
+    if status.streams.is_empty() {
+        if let Some(stream) = &status.stream {
+            print_stream_lines(stream);
+        }
+    } else {
+        print_destinations(&status.streams);
     }
     if status.state != EngineState::Idle {
         for file in &status.files {
@@ -2009,8 +2858,18 @@ fn pause(paused: bool, json: bool) -> Result<ExitCode> {
             recording.elapsed_seconds,
             recording.paused_seconds
         );
+        if let Some(seconds) = recording.recoverable_seconds {
+            println!("  on disk up to {seconds:.3} s of every file");
+        }
+        for error in &recording.errors {
+            eprintln!("  error: {error}");
+        }
     }
-    Ok(ExitCode::SUCCESS)
+    if recording.errors.is_empty() {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Ok(ExitCode::FAILURE)
+    }
 }
 
 fn split(json: bool) -> Result<ExitCode> {
@@ -2027,6 +2886,9 @@ fn split(json: bool) -> Result<ExitCode> {
         }
         for file in &started.files {
             println!("  {}", file.display());
+        }
+        for note in &started.notes {
+            println!("note: {note}");
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -2102,14 +2964,14 @@ impl TransitionArgs {
         // A stinger's video, given here, is relative to this folder.
         if let Some(file) = value.get_mut("file")
             && let Some(path) = file.as_str()
-            && !path.starts_with('/')
+            && !Path::new(path).is_absolute()
             && !path.starts_with('~')
         {
             *file = std::env::current_dir()?.join(path).to_string_lossy().into();
         }
         if let Some(image) = value.get_mut("image")
             && let Some(path) = image.as_str()
-            && !path.starts_with('/')
+            && !Path::new(path).is_absolute()
             && !path.starts_with('~')
         {
             *image = std::env::current_dir()?.join(path).to_string_lossy().into();
@@ -2135,7 +2997,10 @@ fn switched(method: Method, json: bool) -> Result<ExitCode> {
         println!("{}", serde_json::to_string_pretty(&switched)?);
         return Ok(ExitCode::SUCCESS);
     }
-    let how = how(switched.transition.as_ref());
+    let mut how = how(switched.transition.as_ref());
+    if !switched.canvas.is_main() {
+        how = format!(" on the vertical canvas{how}");
+    }
     match switched.take.zip(switched.time_seconds) {
         Some((take, t)) => println!(
             "Scene {:?} on air{how} at {t:.2} s in take {take}",
@@ -2280,6 +3145,136 @@ fn tune(setup: Option<&Path>, folder: Option<PathBuf>, json: bool) -> Result<Exi
     Ok(ExitCode::SUCCESS)
 }
 
+fn capacity(
+    setup: Option<&Path>,
+    stream: Option<bool>,
+    add_iso: Option<String>,
+    json: bool,
+) -> Result<ExitCode> {
+    let setup = setup
+        .map(|path| load(path).with_context(|| format!("{} is not a valid setup", path.display())))
+        .transpose()?;
+    let estimate: CapacityEstimate =
+        Client::connect_or_launch()?.call(Method::EstimateCapacity(Box::new(CapacityParams {
+            setup,
+            stream,
+            add_iso,
+        })))?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&estimate)?);
+        return Ok(ExitCode::SUCCESS);
+    }
+    println!(
+        "{}: {} H.264/HEVC engine(s), {:.0} Mpx/s each",
+        estimate.chip,
+        estimate.encode_engines,
+        estimate.engine_pixels_per_second / 1e6
+    );
+    println!("  ({})", estimate.basis);
+    for o in &estimate.outputs {
+        println!(
+            "  {:<14} {}×{}@{} {:?}{}  {:>5.0} Mpx/s{}",
+            o.output,
+            o.width,
+            o.height,
+            o.fps,
+            o.codec,
+            if o.protected { ", protected" } else { "" },
+            o.pixels_per_second / 1e6,
+            if o.assumed { " (size assumed)" } else { "" }
+        );
+    }
+    for resource in &estimate.resources {
+        let (scale, unit) = if resource.unit == "bytes/second" {
+            (1e6, "MB/s")
+        } else {
+            (1.0, resource.unit.as_str())
+        };
+        println!(
+            "  {}: {:.2} {}; capacity {}{}",
+            resource.resource,
+            resource.demand / scale,
+            unit,
+            resource
+                .capacity
+                .map_or_else(|| "unqualified".into(), |v| format!("{:.2}", v / scale)),
+            resource
+                .load
+                .map_or_else(String::new, |v| format!(", {:.0}% load", v * 100.0))
+        );
+        println!("    {}", resource.basis);
+    }
+    let verdict = match estimate.capacity {
+        Capacity::Fits => "fits",
+        Capacity::NoMargin
+            if estimate.resources.iter().any(|r| {
+                matches!(
+                    r.resource.as_str(),
+                    "prores" | "recording_disk" | "startup_recovery"
+                ) && r.capacity.is_none()
+            }) =>
+        {
+            "not qualified"
+        }
+        Capacity::NoMargin => "keeps up, no margin",
+        Capacity::CannotKeepUp => "can't keep up",
+    };
+    println!(
+        "Verdict: {verdict}, {} at {:.0}%{}",
+        if estimate.resources.is_empty() {
+            "busiest engine"
+        } else {
+            "largest modelled resource"
+        },
+        estimate.load * 100.0,
+        if estimate.streaming {
+            ", stream counted"
+        } else {
+            ""
+        }
+    );
+    let mut summary = estimate.summary.clone();
+    if let Some(first) = summary.get(..1) {
+        summary.replace_range(..1, &first.to_uppercase());
+    }
+    println!("{summary}.");
+    if let Some(measured) = &estimate.measured {
+        println!("note: {measured}");
+    }
+    for s in &estimate.suggestions {
+        let how = match (&s.change, &s.method) {
+            (Some(change), _) => {
+                format!("isocast plan --patch '{}'", serde_json::to_string(change)?)
+            }
+            (None, Some(method)) => format!("method {method}"),
+            _ => String::new(),
+        };
+        println!(
+            "Fix: {} ({:.0}%{}): {how}",
+            s.description,
+            s.load * 100.0,
+            if s.after_take {
+                ", after this take"
+            } else {
+                ""
+            }
+        );
+    }
+    if let Some(a) = &estimate.admission {
+        println!("Add ISO: {}", a.description);
+        if let Some(reason) = &a.reason {
+            println!("  because {reason}");
+        }
+        if let Some(change) = &a.change {
+            println!(
+                "  isocast plan --patch '{}'",
+                serde_json::to_string(change)?
+            );
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 fn human(bytes: f64) -> String {
     isocast_engine::space::human(bytes)
 }
@@ -2336,10 +3331,12 @@ fn restart() -> Result<ExitCode> {
 }
 
 fn permissions(
-    request: bool,
+    request: Option<Option<isocast_protocol::devices::PermissionKind>>,
     open: Option<isocast_protocol::devices::PermissionKind>,
     json: bool,
 ) -> Result<ExitCode> {
+    let only = request.flatten();
+    let request = request.is_some();
     // Ask the daemon: it records, so its permissions are the ones that count.
     let mut client = Client::connect_or_launch()?;
     if let Some(permission) = open {
@@ -2349,7 +3346,7 @@ fn permissions(
             println!("{}", serde_json::to_string_pretty(&opened)?);
         } else {
             println!(
-                "Opened System Settings at {}; turn isocastd's app on there.",
+                "Opened System Settings at {}; turn the Isocast engine's app on there.",
                 permission.label()
             );
         }
@@ -2358,10 +3355,10 @@ fn permissions(
     if request && !json {
         // Only when macOS has something to ask.
         let now: isocast_protocol::devices::PermissionsReport = client.call(Method::Permissions)?;
-        let undecided = now
-            .details
-            .iter()
-            .any(|d| d.state == isocast_protocol::devices::Permission::NotDetermined);
+        let undecided = now.details.iter().any(|d| {
+            d.state == isocast_protocol::devices::Permission::NotDetermined
+                && only.is_none_or(|only| only == d.permission)
+        });
         if undecided {
             isocast_diagnostics::diagnostic!(
                 "Asking macOS; answer its prompts (waiting up to a minute)…"
@@ -2369,7 +3366,11 @@ fn permissions(
         }
     }
     let report: isocast_protocol::devices::PermissionsReport = if request {
-        client.call(Method::RequestPermissions)?
+        client.call(Method::RequestPermissions(only.map(|permission| {
+            isocast_protocol::api::RequestPermissionsParams {
+                permission: Some(permission),
+            }
+        })))?
     } else {
         client.call(Method::Permissions)?
     };
@@ -2401,8 +3402,11 @@ fn parse_permission(value: &str) -> Result<isocast_protocol::devices::Permission
     })
 }
 
-fn get(resolved: bool, json: bool) -> Result<ExitCode> {
-    let params = resolved.then_some(isocast_protocol::api::GetParams { resolved });
+fn get(resolved: bool, canvas: CanvasId, json: bool) -> Result<ExitCode> {
+    if !resolved && !canvas.is_main() {
+        bail!("--canvas says whose layout --resolved shows; give --resolved too");
+    }
+    let params = resolved.then_some(isocast_protocol::api::GetParams { resolved, canvas });
     let live: Live = Client::connect_or_launch()?.call(Method::Get(params))?;
     if json {
         println!("{}", serde_json::to_string_pretty(&live)?);
@@ -3043,6 +4047,16 @@ fn watch(levels: bool, kinds: &[String], except: &[String], json: bool) -> Resul
                 print_stream_lines(&stream);
             }
             Event::VirtualCamera { camera } => virtual_camera::print(&camera),
+            Event::Replay { replay } => replay::print(&replay),
+            Event::ReplaySaved { saved } => println!(
+                "{}replay saved: {}",
+                if saved.canvas.is_main() {
+                    ""
+                } else {
+                    "vertical "
+                },
+                saved.path
+            ),
             Event::SceneChanged {
                 scene,
                 take,
@@ -3057,6 +4071,32 @@ fn watch(levels: bool, kinds: &[String], except: &[String], json: bool) -> Resul
                     None => println!("scene {scene:?} on air{how}"),
                 }
             }
+            Event::CanvasSceneChanged {
+                canvas,
+                scene,
+                take,
+                time_seconds,
+                transition,
+            } => {
+                let how = how(transition.as_ref());
+                let canvas = serde_json::to_value(canvas)?;
+                let canvas = canvas.as_str().unwrap_or("other");
+                match take.zip(time_seconds) {
+                    Some((take, t)) => println!(
+                        "scene {scene:?} on air on the {canvas} canvas{how} at {t:.2} s in take \
+                         {take}"
+                    ),
+                    None => println!("scene {scene:?} on air on the {canvas} canvas{how}"),
+                }
+            }
+            Event::CanvasPreviewChanged { canvas, scene } => {
+                let canvas = serde_json::to_value(canvas)?;
+                let canvas = canvas.as_str().unwrap_or("other");
+                match scene {
+                    Some(scene) => println!("scene {scene:?} in the {canvas} canvas's preview"),
+                    None => println!("the {canvas} canvas's preview cleared"),
+                }
+            }
             Event::PreviewChanged { scene } => println!("scene {scene:?} in preview"),
             Event::PreviewCleared => println!("preview cleared"),
             Event::Marker {
@@ -3065,11 +4105,25 @@ fn watch(levels: bool, kinds: &[String], except: &[String], json: bool) -> Resul
                 time_seconds,
                 ..
             } => println!("marker {label:?} at {time_seconds:.2} s in take {take}"),
-            Event::Stopped { report, error, .. } => match (report, error) {
+            Event::Stopped {
+                report,
+                error,
+                timeline,
+                ..
+            } => match (report, error) {
                 (Some(report), _) => println!(
-                    "recording stopped after {:.2} s; manifest {}",
+                    "recording stopped after {:.2} s; manifest {}{}",
                     report.duration_seconds,
-                    report.manifest.display()
+                    report.manifest.display(),
+                    timeline
+                        .map(|into| format!(
+                            "; {} take{} on timeline {} ({} clips)",
+                            into.takes,
+                            if into.takes == 1 { "" } else { "s" },
+                            into.timeline,
+                            into.clips
+                        ))
+                        .unwrap_or_default()
                 ),
                 (None, Some(error)) => println!("recording failed: {error}"),
                 (None, None) => println!("recording stopped"),
@@ -3207,6 +4261,46 @@ fn watch(levels: bool, kinds: &[String], except: &[String], json: bool) -> Resul
                 serde_json::to_value(kind)?.as_str().unwrap_or_default(),
                 serde_json::to_value(action)?.as_str().unwrap_or_default()
             ),
+            Event::Projectors { projectors, reason } => {
+                if let Some(reason) = reason {
+                    println!("projector closed: {reason}");
+                }
+                println!("projectors: {} open", projectors.len());
+                for projector in &projectors {
+                    print!("  ");
+                    projector::print_one(projector);
+                }
+            }
+            Event::EncoderOverload { overload } => {
+                println!(
+                    "encoder overload in take {}: {}",
+                    overload.take, overload.reason
+                );
+                for fix in overload.estimate.iter().flat_map(|e| &e.suggestions) {
+                    match &fix.change {
+                        Some(change) => println!(
+                            "  fix: {}: isocast plan --patch '{}'",
+                            fix.description,
+                            serde_json::to_string(change)?
+                        ),
+                        None => println!("  fix: {}", fix.description),
+                    }
+                }
+            }
+            Event::GovernorChanged { governor } => println!("{}", governor.reason),
+            Event::ProjectOpened {
+                path,
+                timeline,
+                editor,
+                ..
+            } => println!(
+                "project {} opened on timeline {timeline}{}",
+                path.display(),
+                if editor { " (in the editor)" } else { "" }
+            ),
+            Event::RecordTarget { target } => {
+                println!("next recording: {}", timeline::target_words(&target))
+            }
         }
     }
     // Events end only when isocastd hangs up; a watcher must not mistake
@@ -3219,6 +4313,12 @@ fn watch(levels: bool, kinds: &[String], except: &[String], json: bool) -> Resul
 
 /// Read a stream key: from stdin, or asked for without echo in a terminal.
 fn read_stream_key() -> Result<String> {
+    read_secret("stream key", "Stream key")
+}
+
+/// Read a secret (`what`): from stdin, or asked for (`label`) without echo
+/// in a terminal.
+fn read_secret(what: &str, label: &str) -> Result<String> {
     use std::io::{BufRead, IsTerminal, Read, Write};
     let stdin = std::io::stdin();
     if !stdin.is_terminal() {
@@ -3226,17 +4326,17 @@ fn read_stream_key() -> Result<String> {
         stdin
             .lock()
             .read_to_string(&mut key)
-            .context("could not read the stream key from stdin")?;
+            .with_context(|| format!("could not read the {what} from stdin"))?;
         return Ok(key.trim().to_string());
     }
-    eprint!("Stream key (not shown): ");
+    eprint!("{label} (not shown): ");
     std::io::stderr().flush()?;
     let _echo = EchoOff::new();
     let mut key = String::new();
     stdin
         .lock()
         .read_line(&mut key)
-        .context("could not read the stream key")?;
+        .with_context(|| format!("could not read the {what}"))?;
     isocast_diagnostics::diagnostic!();
     Ok(key.trim().to_string())
 }
@@ -3290,16 +4390,48 @@ fn print_stream_key(stored: &StreamKey, json: bool) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn print_stream(status: &StreamStatus, json: bool) -> Result<ExitCode> {
-    if json {
-        println!("{}", serde_json::to_string_pretty(status)?);
-    } else {
-        print_stream_lines(status);
+impl DestinationFields {
+    fn params(self) -> StreamDestinationParams {
+        StreamDestinationParams {
+            server: self.server,
+            video_bitrate_kbps: self.video_bitrate_kbps,
+            width: self.width,
+            height: self.height,
+            rate_control: self.rate_control,
+            keyframe_interval_seconds: self.keyframe_interval_seconds,
+            audio_bitrate_kbps: self.audio_bitrate_kbps,
+            ..Default::default()
+        }
     }
-    Ok(match status.state {
-        StreamState::Failed => ExitCode::FAILURE,
-        _ => ExitCode::SUCCESS,
+}
+
+/// What `stream start`, `stop` and `status` print: every destination (or
+/// the one there is). Fails when the destination they touched failed.
+fn print_streaming(streaming: &Streaming, json: bool) -> Result<ExitCode> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(streaming)?);
+    } else if streaming.destinations.is_empty() {
+        print_stream_lines(&streaming.stream);
+    } else {
+        print_destinations(&streaming.destinations);
+    }
+    // Any destination failed (a start or stop names each one's state).
+    let failed = streaming.stream.state == StreamState::Failed
+        || streaming
+            .destinations
+            .iter()
+            .any(|d| d.state == StreamState::Failed);
+    Ok(if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
     })
+}
+
+fn print_destinations(destinations: &[StreamStatus]) {
+    for stream in destinations {
+        print_stream_lines(stream);
+    }
 }
 
 fn print_stream_lines(stream: &StreamStatus) {
@@ -3315,13 +4447,32 @@ fn print_stream_lines(stream: &StreamStatus) {
     } else {
         stream.server.clone()
     };
+    let main = stream.id == MAIN_DESTINATION;
     println!(
-        "Stream {state}: {} ({server}){}",
+        "{}{} {state}: {} ({server}){}{}",
+        if stream.canvas.is_main() {
+            "Stream"
+        } else {
+            "Vertical stream"
+        },
+        if main {
+            String::new()
+        } else {
+            format!(" to {}", stream.id)
+        },
         stream.service.id(),
-        if stream.key_set {
+        if stream.enabled || stream.is_active() {
             ""
         } else {
-            "; no stream key set (`isocast stream key set`)"
+            "; turned off"
+        },
+        match (stream.key_set, main) {
+            (true, _) => String::new(),
+            (false, true) => "; no stream key set (`isocast stream key set`)".into(),
+            (false, false) => format!(
+                "; no stream key set (`isocast stream key set --destination {}`)",
+                stream.id
+            ),
         }
     );
     let ended = matches!(stream.state, StreamState::Offline | StreamState::Failed);
@@ -3450,6 +4601,23 @@ fn devices(json: bool) -> Result<ExitCode> {
             m.channels,
             m.id
         );
+        // The channels a source's `channels` picks from, when named.
+        if !m.channel_names.is_empty() {
+            let names: Vec<String> = m
+                .channel_names
+                .iter()
+                .enumerate()
+                .map(|(i, name)| match name.as_str() {
+                    "" => format!("{}", i + 1),
+                    name => format!("{} {name}", i + 1),
+                })
+                .collect();
+            println!("    channels: {}", names.join(", "));
+        }
+        // What a source without `channels` records.
+        if m.channels > 2 {
+            println!("    default: inputs 1 + 2 (stereo); `channels` picks others");
+        }
     }
     println!("Audio outputs (for monitoring)");
     if devices.audio_outputs.is_empty() {
@@ -3462,12 +4630,21 @@ fn devices(json: bool) -> Result<ExitCode> {
             o.name, o.sample_rate, o.channels, o.id
         );
     }
+    if !devices.audio_apps.is_empty() {
+        println!("Apps with audio (for app-audio and system-audio's exclude)");
+        for a in &devices.audio_apps {
+            let playing = if a.playing { " (playing)" } else { "" };
+            let bundle = a.bundle_id.as_deref().unwrap_or("-");
+            println!("  {}{playing}  {bundle}  pid {}", a.name, a.pid);
+        }
+    }
     let p = &devices.permissions;
     println!(
-        "Permissions: screen recording {}, camera {}, microphone {}",
+        "Permissions: screen recording {}, camera {}, microphone {}, system audio recording {}",
         p.screen_recording.label(),
         p.camera.label(),
-        p.microphone.label()
+        p.microphone.label(),
+        p.system_audio.label()
     );
     for note in &devices.notes {
         println!("note: {note}");
@@ -3505,19 +4682,4 @@ fn parse_monitoring(value: &str) -> Result<isocast_protocol::Monitoring, String>
 /// permissions are the ones that count.
 fn list_devices() -> Result<Devices> {
     Client::connect_or_launch()?.call(Method::Devices)
-}
-
-#[cfg(target_os = "macos")]
-fn record_with_platform(setup: &Setup, options: &RecordOptions) -> Result<Report> {
-    isocast_engine::record::record(&isocast_platform_macos::MacPlatform, setup, options)
-}
-
-#[cfg(target_os = "linux")]
-fn record_with_platform(setup: &Setup, options: &RecordOptions) -> Result<Report> {
-    isocast_engine::record::record(&isocast_platform_linux::LinuxPlatform, setup, options)
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn record_with_platform(_setup: &Setup, _options: &RecordOptions) -> Result<Report> {
-    bail!("recording is only supported on macOS and Linux so far")
 }

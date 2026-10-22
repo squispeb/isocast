@@ -4,8 +4,12 @@ The **Release** workflow builds an existing `vX.Y.Z` tag on GitHub-hosted
 `macos-15` (arm64), signs with Developer ID, notarizes/staples the app and
 DMG, runs the mounted CLI/engine recording checks, and creates **one draft**
 with the DMG, its checksum and Sparkle's `appcast.xml` (the self-update
-feed, EdDSA-signed). Rerunning a version replaces that draft's assets and
-generated notes. Published releases are refused. Only Ryan publishes a
+feed, EdDSA-signed). The release notes are `docs/releases/X.Y.Z.md`,
+committed before tagging: Sparkle's update window shows them (embedded in
+the appcast as markdown) and they are the GitHub release body, followed by
+a **Full Changelog** compare link. Rerunning a version replaces that
+draft's assets and notes. Published releases are refused; a published
+release's update notes are fixed with **Refresh appcast notes** (below). Only Ryan publishes a
 draft, and publishing is what ships the update: installed copies read
 `releases/latest/download/appcast.xml`, which only a published, non-
 prerelease release serves.
@@ -14,13 +18,22 @@ No pull requests or self-hosted machines run this job. Actions are pinned
 to commit SHAs. The job has `contents: write`; workflow defaults are read-only.
 It waits at the **release** environment before receiving its secrets. A
 workflow-wide concurrency group serializes tag pushes and manual reruns.
-The camera extension remains a separate, one-time installation.
+The DMG's app carries the virtual camera's CMIO extension
+(`dev.isocast.isocastd.camera`) inside its engine helper, which activates it
+on the first Start Virtual Camera; that needs two Developer ID provisioning
+profiles (step 4a), and no build is made without them. The engine helper is
+`Isocast.app/Contents/Helpers/Isocast Engine.app` (bundle id
+`dev.isocast.isocastd`), and its executable is `Contents/MacOS/Isocast Engine`
+(Cargo's `isocastd`, renamed when packaged; #83): macOS names that file in the
+camera extension's approval alert. Releases before #83 called it `isocastd`;
+the clients and the extension accept both.
 
 A small **preflight** job runs first, without secrets or approval: it
 checks the version, that the tag exists, that Cargo.toml at the tag matches,
-and whether that version is already published. A published version ends
-the run green with "nothing to build or draft" and never asks for an
-approval; a missing tag or a mismatch fails there with the reason.
+whether that version is already published, and that `docs/releases/X.Y.Z.md`
+exists at the tag and isn't empty. A published version ends the run green
+with "nothing to build or draft" and never asks for an approval; a missing
+tag, a mismatch or missing notes fail there with the reason.
 
 ## One-time setup (Ryan)
 
@@ -119,6 +132,56 @@ Credentials are not placed in Cargo/Homebrew caches or passed to the
 recording daemon. Rotate/revoke the certificate and API key in Apple's
 portals and replace the environment secrets when necessary.
 
+### 4a. The virtual camera's two provisioning profiles
+
+Make them as the guide in `~/dev/isocast-status/guides/virtual-camera-profiles.html`
+says (Developer ID profiles, Distribution → Developer ID), choosing **the
+Developer ID Application certificate releases are signed with**, not the
+newest one in the account. Identify it by serial number from a signed
+release (the portal lists certificates by expiry date and serial):
+
+```sh
+d="$(mktemp -d)" && codesign -d --extract-certificates="$d/c" /Applications/Isocast.app &&
+  openssl x509 -inform DER -in "$d/c0" -noout -subject -serial -enddate && rm -r "$d"
+```
+
+Today that is serial `05D0C582E2F1E2D8`, expiring 1 Feb 2027 (the
+login keychain's "Developer ID Application: Ryan Vogel (9G68SMNHEU)").
+A profile's own expiry (2044) is not the limit: the portal only lets you
+download it until its certificate expires, so **renewing or replacing the
+signing certificate means regenerating both profiles for the new one and
+replacing both secrets** (`release-profiles --identity` refuses profiles
+without the signing certificate). The profiles: **Isocast Engine Developer ID** for
+`dev.isocast.isocastd` with the **System Extension** capability, and
+**Isocast Virtual Camera Developer ID** for `dev.isocast.isocastd.camera`
+(no capabilities; the Team-ID-prefixed app group
+`9G68SMNHEU.dev.isocast.isocastd` needs no registration). Then keep them
+where local builds look and add them as two more environment secrets:
+
+```sh
+secrets="$HOME/.config/isocast-release-secrets"
+( umask 077 &&
+  mv "$HOME/Downloads/Isocast_Engine_Developer_ID.provisionprofile" "$secrets/isocast-engine.provisionprofile" &&
+  mv "$HOME/Downloads/Isocast_Virtual_Camera_Developer_ID.provisionprofile" "$secrets/isocast-camera.provisionprofile" &&
+  chmod 600 "$secrets"/isocast-*.provisionprofile )
+python3 scripts/vcam-package.py release-profiles "$secrets/isocast-engine.provisionprofile" "$secrets/isocast-camera.provisionprofile" --identity "Developer ID Application: Ryan Vogel (9G68SMNHEU)"
+base64 < "$secrets/isocast-engine.provisionprofile" | tr -d '\n' | gh secret set ENGINE_PROVISIONING_PROFILE_B64 --repo R44VC0RP/isocast --env release
+base64 < "$secrets/isocast-camera.provisionprofile" | tr -d '\n' | gh secret set CAMERA_PROVISIONING_PROFILE_B64 --repo R44VC0RP/isocast --env release
+```
+
+(Use the downloaded files' actual names in the two `mv` lines.) The check
+line must print two "Provisioning profile checked" lines: Developer ID
+(no device list), team 9G68SMNHEU, the exact app id, the System Extension
+capability on the engine's, at least 30 days left, and your signing
+certificate. Local builds read the two files from that folder (or
+`ISOCAST_ENGINE_PROFILE` / `ISOCAST_CAMERA_PROFILE`); the workflow decodes
+the secrets into its temporary signing folder and stops before building
+while either is missing. `release.sh` checks them before the build and
+again after signing (each bundle's embedded profile against its signature
+and signed entitlements), and refuses the build otherwise. Profiles aren't
+secret, but keep them only there and in 1Password. Done on 2026-10-15
+(both secrets set, profiles tied to the 2027 certificate).
+
 ### 5. Sparkle update key
 
 Updates are signed with an EdDSA key that only you hold: its public half is
@@ -155,7 +218,8 @@ cd "$HOME/dev/isocast" &&
 The printed line is the public key (fine to share). Save the keychain item
 "Private key for signing Sparkle updates" to 1Password. Until the public
 key is committed, Developer ID builds stop at once with "no Sparkle public
-key"; `gh secret list` must now show seven names.
+key"; `gh secret list` must now show nine names (step 4's six, 4a's two
+and this one).
 
 ### 6. First hosted run
 
@@ -257,6 +321,17 @@ an Apple ID app-specific password. Rotate it once the hosted run works:
 
 1. Set `[workspace.package].version` in Cargo.toml (and refresh Cargo.lock)
    in the source repository, verify/commit it, and publish a clean snapshot.
+   **Write the release notes in the same commit or before it:**
+   `docs/releases/X.Y.Z.md`, markdown, for testers (see `docs/releases/0.0.6.md`).
+   Start with one line on who it's for and how to update, then `**Bold**`
+   group headings with `- ` bullets. Sparkle's update window (macOS 12+)
+   renders headings, bold/italic, lists, `code`, block quotes and http(s)
+   links. Don't use tables (their text disappears there), `---` rules
+   (blank space) or images (only the alt text). No **Full Changelog** line
+   (the GitHub release adds it). They are
+   read from the tag, so they can't be added after tagging without
+   re-tagging: `python3 scripts/release-finalize.py --check-notes X.Y.Z`
+   checks them, and preflight refuses a tag without them.
 2. In the **public snapshot checkout**, tag the matching version and push
    only that tag. For example, after updating Cargo.toml to `0.0.2`:
 
@@ -274,6 +349,20 @@ an Apple ID app-specific password. Rotate it once the hosted run works:
    approval and before any secret is read.
 4. Inspect the job summary's draft link, checksum and results. Download the
    DMG for the final human check. Publication is manual, outside the workflow.
+5. **README once-over, before publishing (every release).** The README is
+   the landing page for people looking for an OBS alternative, so when the
+   release goes live it must describe exactly what this version ships:
+   - every feature it lists as available is in this version's DMG; this
+     version's new features are added, and anything still unreleased sits
+     under "coming";
+   - the screenshots show this version's app: retake any that changed (new
+     buttons, dialogs, layout) from the release build, always through
+     `scripts/snapshot.sh` or `scripts/screenshots/take.sh`, never against
+     Ryan's own engine;
+   - the Isocast vs OBS table, FAQ, requirements and benchmark numbers are
+     still true; every image link resolves and has alt text.
+   Commit it as `README: <version>` (or "README checked for <version>, no
+   changes"), publish the snapshot, and only then publish the release.
 
 Manual retry of an **existing tag** (also requires environment approval):
 
@@ -288,6 +377,35 @@ workflow is still updating assets. Once a version is published, a tag push
 or manual run for it stops in preflight (green, "nothing to build or
 draft"); if it is published while the job waits for approval, the job stops
 before importing secrets, and the finalizer refuses as a last resort.
+
+## Fix a published release's update notes
+
+The appcast is signed (`SURequireSignedFeed`), so its notes can't be edited
+by hand. The **Refresh appcast notes** workflow
+(`.github/workflows/refresh-appcast.yml`) replaces only `appcast.xml` on a
+published release with one that embeds `docs/releases/X.Y.Z.md` from main:
+
+1. Commit and publish the corrected `docs/releases/X.Y.Z.md` on main.
+2. Run it and approve the **release** environment when it waits:
+
+   ```sh
+   gh workflow run refresh-appcast.yml --repo R44VC0RP/isocast --ref main -f version=0.0.6
+   ```
+
+Preflight (no secrets) refuses drafts, unpublished or missing versions,
+missing notes and a release whose assets aren't exactly the DMG, its
+`.sha256` and `appcast.xml`. After approval the job downloads the three,
+checks their GitHub digests and the DMG's `.sha256`, reads the version, build
+and `SUPublicEDKey` from the DMG's app (mounted read-only), verifies the
+published appcast (one item, the DMG's EdDSA signature against that key,
+feed signature), then runs `generate_appcast` on the same DMG with the notes.
+The new feed must have the same item and enclosure (URL, length, EdDSA
+signature; Ed25519 is deterministic, so the same key gives the same
+signature) and pubDate, the notes as markdown and a valid feed signature.
+Only then is `appcast.xml` uploaded with `--clobber`, and every asset digest
+is checked again. The DMG is never rebuilt or re-signed. The job summary
+keeps the old and new feeds; installed apps see the new notes on their next
+check (GitHub may cache the download for a few minutes).
 
 ## Verification and local use
 
@@ -330,12 +448,13 @@ unusable recording/graphics backends or other runtime errors block drafting
 rather than quietly passing a skipped check. All runs use private state,
 bounded waits and the common recording lock; owned daemons are shut down.
 
-Local defaults remain the login-keychain identity/profile and short alpha
-notes. CI opts into the extra modes:
+Local defaults remain the login-keychain identity/profile; notes always
+come from `docs/releases/X.Y.Z.md` (a Developer ID build and `--draft-release`
+stop without them). CI opts into the extra modes:
 
 ```sh
 scripts/release.sh --notarize --verify-runtime --hosted \
-  --draft-release --verify-tag --generate-notes --replace-draft \
+  --draft-release --verify-tag --replace-draft \
   --output /path/to/prepared/release
 ```
 

@@ -13,18 +13,24 @@
 //
 // Start/Stop Virtual Camera sits under recording, as OBS has it, with a
 // gear beside it that opens its output choice (program, preview, a scene
-// or a video source) and size in a popover. Six buttons need 208px under
+// or a video source) and size in a popover. Seven buttons need 240px under
 // the header, so they are 4px apart with 10px above and below (Paper's
 // board has five, 6px apart, 12px down); in a shorter dock Exit becomes a
 // square button beside Settings (Quit Isocast in the app menu does the
-// same).
+// same), and in the shortest (a window under 900px tall) the six rows
+// left are 2px apart with 6px above and below.
+//
+// The replay buffer (G.2) sits between recording and the virtual camera,
+// as OBS has it: a toggle named as Virtual Camera is (lit while it keeps
+// the program), with Save Replay beside it, a square button with OBS's
+// words in its tooltip, usable while the buffer runs.
 
 import { Theme } from "../../theme.slint";
-import { Icons } from "../../icons.slint";
+import { Icon, Icons } from "../../icons.slint";
 import { Ui } from "../../state.slint";
 import {
     Button, ButtonVariant, ControlSize, Dock, Dropdown, GroupHeading, GroupHint, GroupRow, IconButton, Popover,
-    PopoverPlacement, RowGroup, RowPlace, Viewport,
+    PopoverPlacement, RowGroup, RowPlace, Viewport, Menus,
 } from "../../kit.slint";
 import { ControlsArea } from "state.slint";
 
@@ -40,11 +46,42 @@ component Centred inherits VerticalLayout {
 }
 
 // The virtual camera's output: what it sends and at what size, how it is
-// doing, and, when its extension isn't installed, how to install it.
+// doing, and, when its extension isn't installed or allowed yet, what to do.
 component VirtualCameraDetails inherits VerticalLayout {
     property <bool> off: ControlsArea.vcam-state == "stopped" || ControlsArea.vcam-state == "failed";
     padding: Theme.space-2;
     spacing: 0;
+
+    if ControlsArea.vcam-approval: VerticalLayout {
+        spacing: 0;
+        GroupHeading { title: "Allow in System Settings"; }
+        Rectangle {
+            preferred-height: allow.preferred-height;
+            min-height: allow.preferred-height;
+            allow := Text {
+                x: 0;
+                y: 0;
+                width: parent.width;
+                text: "macOS asks you once to allow Isocast Virtual Camera. In System Settings › General › Login Items & Extensions › Camera Extensions, turn on Isocast Virtual Camera. It starts as soon as you do.";
+                color: Theme.text-2;
+                font-size: Theme.fs-sm;
+                letter-spacing: Theme.tracking-sm;
+                line-height-factor: Theme.leading-sm;
+                wrap: word-wrap;
+            }
+        }
+        HorizontalLayout {
+            padding-top: Theme.space-2;
+            padding-bottom: Theme.space-2;
+            alignment: start;
+            Button {
+                size: ControlSize.small;
+                text: "Open System Settings";
+                icon: Icons.settings;
+                clicked => { ControlsArea.open-vcam-settings(); }
+            }
+        }
+    }
 
     if ControlsArea.vcam-missing: VerticalLayout {
         spacing: 0;
@@ -173,6 +210,39 @@ component VirtualCameraDetails inherits VerticalLayout {
             + (root.off ? "" : ". Stop the camera to change its output.")
             + (ControlsArea.vcam-error != "" ? "\n" + ControlsArea.vcam-error : "");
     }
+
+    // Deleting Isocast leaves its camera in macOS: take it out first (#69).
+    if ControlsArea.vcam-removable: VerticalLayout {
+        spacing: 0;
+        GroupHeading { title: "Remove"; }
+        Rectangle {
+            preferred-height: remove.preferred-height;
+            min-height: remove.preferred-height;
+            remove := Text {
+                x: 0;
+                y: 0;
+                width: parent.width;
+                text: "Before you delete Isocast, remove its camera from macOS. macOS asks for an administrator password. Starting the camera again installs it again.";
+                color: Theme.text-2;
+                font-size: Theme.fs-sm;
+                letter-spacing: Theme.tracking-sm;
+                line-height-factor: Theme.leading-sm;
+                wrap: word-wrap;
+            }
+        }
+        HorizontalLayout {
+            padding-top: Theme.space-2;
+            padding-bottom: Theme.space-2;
+            alignment: start;
+            Button {
+                size: ControlSize.small;
+                text: ControlsArea.vcam-removing ? "Removing…" : "Remove Virtual Camera…";
+                enabled: !ControlsArea.busy-vcam;
+                accessible-name: "Remove Virtual Camera from macOS";
+                clicked => { ControlsArea.remove-vcam(); }
+            }
+        }
+    }
 }
 
 export component ControlsDock inherits Dock {
@@ -180,21 +250,44 @@ export component ControlsDock inherits Dock {
     property <bool> recording: ControlsArea.record-state == "recording";
     property <bool> room-for-words: Ui.controls-width >= 224px && Viewport.width >= Ui.scenes-width + Ui.sources-width + Ui.transitions-width + Ui.controls-width + 232px;
     property <bool> vcam-on: ControlsArea.vcam-state == "running" || ControlsArea.vcam-state == "starting";
+    property <bool> replay-on: ControlsArea.replay-state == "running" || ControlsArea.replay-state == "starting";
     property <int> vcam-serial: ControlsArea.vcam-details-serial;
     // The dock row's height as app.slint's Workspace sets it (read from
     // the window, not this dock's layout, so it can't loop).
     property <length> row-height: Ui.docks-height > 0 ? Ui.docks-height : round(min(320px, max(224px, Viewport.height * 4 / 15)) / 1px) * 1px;
+    // Exit beside Settings below this; the rows closer together below 240px.
+    property <bool> exit-beside: root.target-row ? root.row-height < 300px : root.row-height < 272px;
+    property <bool> tight: root.row-height < 240px;
+    // A dock squeezed below the width "Replay Buffer" and "Virtual Camera"
+    // need beside their square buttons (a window about 1000px wide or
+    // less): they say "Replay" and "Virtual Cam" instead of eliding, with
+    // the whole words as their tooltip and for screen readers (#108). Read
+    // from the layout settings and the window, as `room-for-words` is (this
+    // dock's own width would loop through its buttons' labels).
+    property <bool> short-words: Ui.controls-width < 200px || Viewport.width < Ui.scenes-width + Ui.sources-width + Ui.transitions-width + Ui.controls-width + 232px;
     changed vcam-serial => { vcam-details.show(); }
+    // The record target's row under Start Recording (#114).
+    // A row of its own under it when the dock has room for one more
+    // (a window about 1000px tall or more), else a square button beside
+    // Start Recording (#114, docs/notes.md).
+    property <bool> target-row: root.row-height >= 268px;
+    // Beside that square button, a squeezed dock says "Record" (the
+    // whole words in its tooltip), as Replay and Virtual Cam do (#108).
+    property <bool> record-short: !root.target-row && root.short-words;
+    property <int> target-serial: ControlsArea.target-menu-serial;
+    changed target-serial => {
+        Menus.request("controls:record-target", record-row.absolute-position.x, record-row.absolute-position.y, record-row.width, record-row.height + (root.target-row ? Theme.space-1 + Theme.control-h-sm : 0px));
+    }
 
     title: "Controls";
 
     VerticalLayout {
         vertical-stretch: 1;
-        padding-top: 10px;
-        padding-bottom: 10px;
+        padding-top: root.tight ? 6px : 10px;
+        padding-bottom: root.tight ? 6px : 10px;
         padding-left: Theme.pane-x;
         padding-right: Theme.pane-x;
-        spacing: Theme.space-1;
+        spacing: root.tight ? 2px : Theme.space-1;
         alignment: start;
 
         DockButton {
@@ -204,29 +297,40 @@ export component ControlsDock inherits Dock {
             enabled: Ui.has-setup && !ControlsArea.busy-stream;
             clicked => { ControlsArea.toggle-stream(); }
         }
-        HorizontalLayout {
+        record-row := HorizontalLayout {
             spacing: Theme.space-1;
             DockButton {
                 horizontal-stretch: 1;
                 shrinks: true;
                 // Its whole words for screen readers and as a tooltip
                 // when they are shortened.
-                tooltip: root.recording ? "Stop Recording" : "";
-                accessible-name: root.recording ? "Stop Recording" : "";
+                tooltip: root.recording ? "Stop Recording" : root.record-short ? "Start Recording" : "";
+                accessible-name: root.recording ? "Stop Recording" : root.record-short ? "Start Recording" : "";
                 // Beside Pause and Marker the whole words need the dock
                 // 224px wide (its width as set, when the window has room for
                 // every dock at theirs: read from the layout settings, not
                 // this dock, which would loop); else it says "Stop", red
                 // with its light, rather than "Stop R…".
-                text: ControlsArea.record-state == "starting" ? "Starting…" : ControlsArea.record-state == "stopping" ? "Stopping…" : root.recording ? (root.room-for-words ? "Stop Recording" : "Stop") : "Start Recording";
+                text: ControlsArea.record-state == "starting" ? "Starting…" : ControlsArea.record-state == "stopping" ? "Stopping…" : root.recording ? (root.room-for-words ? "Stop Recording" : "Stop") : root.record-short ? "Record" : "Start Recording";
                 // Recording: the button is red, so its light goes bone.
                 dot: root.recording || ControlsArea.record-state == "starting" ? Theme.bone : Theme.danger;
                 variant: root.recording || ControlsArea.record-state == "starting" ? ButtonVariant.live : ButtonVariant.secondary;
                 enabled: Ui.has-setup && !ControlsArea.busy-record;
                 clicked => { ControlsArea.toggle-record(); }
             }
+            if !root.target-row && !root.recording: Button {
+                width: Theme.control-h;
+                inset: 0px;
+                icon: ControlsArea.target-notice ? Icons.warning : ControlsArea.target-new ? Icons.folder : Icons.stack;
+                checked: !ControlsArea.target-new;
+                accessible-name: "Next recording: " + ControlsArea.target-label;
+                tooltip: ControlsArea.target-tooltip;
+                menu-open: Menus.open && Menus.owner == "controls:record-target";
+                clicked => { Menus.request("controls:record-target", self.absolute-position.x, self.absolute-position.y, self.width, self.height); }
+            }
             if root.recording: Button {
                 width: Theme.control-h;
+                inset: 0px;
                 icon: ControlsArea.paused ? Icons.play : Icons.pause;
                 checked: ControlsArea.paused;
                 toggle: true;
@@ -237,10 +341,63 @@ export component ControlsDock inherits Dock {
             }
             if root.recording: Button {
                 width: Theme.control-h;
+                inset: 0px;
                 icon: Icons.flag;
                 accessible-name: "Marker";
                 tooltip: "Add a marker at this moment";
                 clicked => { ControlsArea.marker(""); }
+            }
+        }
+        // Where the next recording goes (#114): a new project, or a take
+        // on a chosen timeline; its menu chooses.
+        if root.target-row: Rectangle {
+            height: Theme.control-h-sm;
+            DockButton {
+                width: parent.width;
+                height: parent.height;
+                size: ControlSize.small;
+                variant: ButtonVariant.quiet;
+                shrinks: true;
+                inset-end: 24px;
+                icon: ControlsArea.target-notice ? Icons.warning : ControlsArea.target-new ? Icons.folder : Icons.stack;
+                text: ControlsArea.target-label;
+                tooltip: ControlsArea.target-tooltip;
+                accessible-name: "Next recording: " + ControlsArea.target-label;
+                menu-open: Menus.open && Menus.owner == "controls:record-target";
+                clicked => { Menus.request("controls:record-target", self.absolute-position.x, self.absolute-position.y, self.width, self.height); }
+            }
+            Icon {
+                x: parent.width - 8px - self.width;
+                y: (parent.height - self.height) / 2;
+                size: 12px;
+                path: Icons.chevron-down;
+                color: Theme.text-3;
+            }
+        }
+        HorizontalLayout {
+            spacing: Theme.space-1;
+            DockButton {
+                horizontal-stretch: 1;
+                shrinks: true;
+                tooltip: root.replay-on ? "Stop Replay Buffer" : "Start Replay Buffer: keep " + ControlsArea.replay-length + " of the program in memory";
+                accessible-name: root.replay-on ? "Stop Replay Buffer" : "Start Replay Buffer";
+                text: ControlsArea.replay-state == "starting" ? "Starting…" : ControlsArea.replay-state == "stopping" ? "Stopping…" : root.short-words ? "Replay" : "Replay Buffer";
+                icon: Icons.history;
+                checked: root.replay-on;
+                toggle: true;
+                enabled: Ui.has-setup && !ControlsArea.busy-replay;
+                clicked => { ControlsArea.toggle-replay(); }
+            }
+            Button {
+                width: Theme.control-h;
+                inset: 0px;
+                icon: Icons.download;
+                accessible-name: "Save Replay";
+                tooltip: ControlsArea.replay-state == "running"
+                    ? "Save Replay: " + ControlsArea.replay-length + " to the recordings folder" + (ControlsArea.replay-counts != "" ? " (" + ControlsArea.replay-counts + ")" : "")
+                    : "Save Replay: start the replay buffer first";
+                enabled: ControlsArea.replay-state == "running" && !ControlsArea.saving-replay;
+                clicked => { ControlsArea.save-replay(); }
             }
         }
         HorizontalLayout {
@@ -251,9 +408,11 @@ export component ControlsDock inherits Dock {
                 // OBS's words don't fit beside the gear in a 172px dock, so
                 // it is a toggle named as Studio Mode is (lit while on);
                 // screen readers and the tooltip get OBS's words.
-                tooltip: ControlsArea.vcam-missing ? "Isocast Virtual Camera isn’t installed: see how to install it" : root.vcam-on ? "Stop Virtual Camera" : "Start Virtual Camera";
-                accessible-name: ControlsArea.vcam-missing ? "Virtual Camera (not installed)" : root.vcam-on ? "Stop Virtual Camera" : "Start Virtual Camera";
-                text: ControlsArea.vcam-state == "starting" ? "Starting…" : ControlsArea.vcam-state == "stopping" ? "Stopping…" : "Virtual Camera";
+                tooltip: ControlsArea.vcam-missing ? "Isocast Virtual Camera isn’t installed: see how to install it" : ControlsArea.vcam-approval ? "Allow Isocast Virtual Camera in System Settings, then it starts" : root.vcam-on ? "Stop Virtual Camera" : "Start Virtual Camera";
+                accessible-name: ControlsArea.vcam-missing ? "Virtual Camera (not installed)" : ControlsArea.vcam-approval ? "Virtual Camera (waiting for approval)" : root.vcam-on ? "Stop Virtual Camera" : "Start Virtual Camera";
+                text: ControlsArea.vcam-state == "starting" ? "Starting…" : ControlsArea.vcam-state == "stopping" ? "Stopping…" : root.short-words ? "Virtual Cam" : "Virtual Camera";
+                // The short words take the end padding too (172px dock).
+                inset-end: root.short-words ? 4px : 10px;
                 icon: Icons.camera;
                 checked: root.vcam-on;
                 toggle: true;
@@ -268,9 +427,10 @@ export component ControlsDock inherits Dock {
             }
             vcam-gear := Button {
                 width: Theme.control-h;
-                icon: ControlsArea.vcam-missing ? Icons.warning : Icons.settings;
+                inset: 0px;
+                icon: ControlsArea.vcam-missing || ControlsArea.vcam-approval ? Icons.warning : Icons.settings;
                 accessible-name: "Virtual Camera Settings";
-                tooltip: ControlsArea.vcam-missing ? "Isocast Virtual Camera isn’t installed" : "What the virtual camera shows, and its size";
+                tooltip: ControlsArea.vcam-missing ? "Isocast Virtual Camera isn’t installed" : ControlsArea.vcam-approval ? "Allow Isocast Virtual Camera in System Settings" : "What the virtual camera shows, and its size";
                 menu-open: vcam-details.open;
                 enabled: Ui.has-setup;
                 clicked => { vcam-details.show(); }
@@ -300,8 +460,9 @@ export component ControlsDock inherits Dock {
                 icon: Icons.settings;
                 clicked => { Ui.open-dialog("settings", ""); }
             }
-            if root.row-height < 240px: Button {
+            if root.exit-beside: Button {
                 width: Theme.control-h;
+                inset: 0px;
                 icon: Icons.log-out;
                 variant: ButtonVariant.quiet;
                 accessible-name: "Exit";
@@ -309,7 +470,7 @@ export component ControlsDock inherits Dock {
                 clicked => { Ui.quit(); }
             }
         }
-        if root.row-height >= 240px: DockButton {
+        if !root.exit-beside: DockButton {
             text: "Exit";
             icon: Icons.log-out;
             variant: ButtonVariant.quiet;

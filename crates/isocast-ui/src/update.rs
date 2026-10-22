@@ -16,9 +16,12 @@
 //! - an update chosen to install waits for the same, then isocastd is
 //!   stopped as `isocast restart` stops it (refused while busy), so the
 //!   relaunched app starts the new engine;
-//! - an engine still running from before an update (Quit › Keep Recording
-//!   lets Sparkle replace the app while isocastd records) is restarted
-//!   once it is idle, so the app and its engine are the same build;
+//! - an engine older than the bundled one (left running from before an
+//!   update: Quit › Keep Recording lets Sparkle replace the app while
+//!   isocastd records; or an older copy's engine on the same socket) is
+//!   restarted with a notice once it is idle, and while it records or
+//!   streams a notice says it restarts afterwards, so the app and its
+//!   engine are the same build (with or without Sparkle);
 //! - the feed is always the Info.plist's: one set in user defaults (which
 //!   Sparkle would otherwise prefer) is cleared and ignored.
 
@@ -59,13 +62,15 @@ pub use other::{
 };
 
 /// What keeps an update from installing now, from the engine's status:
-/// a recording (paused or not), a stream, a timeline export or the
-/// virtual camera (a call may be showing it). The engine's
+/// a recording (paused or not), a stream, a timeline export, the virtual
+/// camera (a call may be showing it) or the replay buffer. The engine's
 /// `shutdown_if_idle` decides the same atomically before it stops.
+#[cfg(target_os = "macos")]
 fn busy_with(
     status: Option<&isocast_protocol::api::Status>,
     stream_active: bool,
     camera_active: bool,
+    replay_active: bool,
 ) -> Option<&'static str> {
     use isocast_protocol::api::EngineState;
     use isocast_protocol::virtual_camera::VirtualCameraState;
@@ -92,6 +97,12 @@ fn busy_with(
             })
     {
         Some("the virtual camera")
+    } else if replay_active
+        || status
+            .and_then(|s| s.replay.as_ref())
+            .is_some_and(|r| r.state == isocast_protocol::replay::ReplayState::Running)
+    {
+        Some("the replay buffer")
     } else {
         None
     }
@@ -114,7 +125,11 @@ mod mac {
 
     use crate::app::App;
     use crate::platform::{ns_string, rust_string};
+    use crate::toasts::Toast;
     use crate::{ToastKind, daemon};
+
+    /// The stale-engine notices' toast key: the restart replaces the notice.
+    const STALE_KEY: &str = "stale-engine";
 
     /// The menu item's tag, to find it again after the menu bar is rebuilt.
     const MENU_TAG: isize = 0x150CA57;
@@ -124,12 +139,14 @@ mod mac {
         updater: Retained<AnyObject>,
         _delegate: Retained<AnyObject>,
         _observer: Option<Retained<AnyObject>>,
-        _timer: slint::Timer,
     }
 
     thread_local! {
         static APP: RefCell<Weak<App>> = const { RefCell::new(Weak::new()) };
         static SPARKLE: RefCell<Option<Sparkle>> = const { RefCell::new(None) };
+        /// `tick`'s timer, with or without Sparkle: an older engine is
+        /// restarted either way.
+        static TICKER: RefCell<Option<slint::Timer>> = const { RefCell::new(None) };
         /// The installation Sparkle let us postpone, until isocastd is idle.
         static INSTALL: RefCell<Option<RcBlock<dyn Fn()>>> = const { RefCell::new(None) };
         /// A scheduled check waited for isocastd.
@@ -140,7 +157,13 @@ mod mac {
         static TOLD: Cell<bool> = const { Cell::new(false) };
         static RETRY_AT: Cell<Option<Instant>> = const { Cell::new(None) };
         /// The out-of-date isocastd (its pid) that was asked to stop.
-        static RESTARTED: Cell<Option<u32>> = const { Cell::new(None) };
+        static RESTARTED: Cell<Option<Option<u32>>> = const { Cell::new(None) };
+        /// The out-of-date isocastd (its pid) whose restart was announced
+        /// as waiting for a recording, stream or other work to stop.
+        static STALE_TOLD: Cell<Option<Option<u32>>> = const { Cell::new(None) };
+        /// No stale-engine check until then: just after a restart, the
+        /// status shown is still the old engine's.
+        static RESTART_PAUSE: Cell<Option<Instant>> = const { Cell::new(None) };
         /// An update is downloaded and extracted: Sparkle installs it when
         /// the app quits, whatever isocastd is doing then.
         static STAGED: Cell<bool> = const { Cell::new(false) };
@@ -325,7 +348,11 @@ mod mac {
             use isocast_protocol::virtual_camera::VirtualCameraState as V;
             matches!(c.state, V::Starting | V::Running | V::Stopping)
         });
-        super::busy_with(s.status.as_ref(), stream, camera)
+        let replay = s.busy_replay
+            || s.replay
+                .as_ref()
+                .is_some_and(|r| r.state == isocast_protocol::replay::ReplayState::Running);
+        super::busy_with(s.status.as_ref(), stream, camera, replay)
     }
 
     /// Start Sparkle if this bundle carries it (released builds do).
@@ -343,6 +370,9 @@ mod mac {
             }
             Err(why) => isocast_diagnostics::diagnostic!("info"; "updates: off ({why})"),
         }
+        let timer = slint::Timer::default();
+        timer.start(slint::TimerMode::Repeated, Duration::from_secs(1), tick);
+        TICKER.with(|t| *t.borrow_mut() = Some(timer));
     }
 
     unsafe fn load() -> Result<Sparkle, String> {
@@ -384,8 +414,6 @@ mod mac {
             let _: Option<Retained<AnyObject>> = msg_send![&*updater, clearFeedURLFromUserDefaults];
             let _: () = msg_send![&*controller, startUpdater];
             let observer = observe_menu_bar();
-            let timer = slint::Timer::default();
-            timer.start(slint::TimerMode::Repeated, Duration::from_secs(1), tick);
             isocast_diagnostics::diagnostic!("info"; "updates: on, feed {}",
                 info(&bundle, "SUFeedURL").map(|f| rust_string(&f)).unwrap_or_default());
             Ok(Sparkle {
@@ -393,7 +421,6 @@ mod mac {
                 updater,
                 _delegate: delegate,
                 _observer: observer,
-                _timer: timer,
             })
         }
     }
@@ -471,9 +498,7 @@ mod mac {
             return;
         }
         if !waiting {
-            if busy.is_none() {
-                restart_stale_engine(&app);
-            }
+            restart_stale_engine(&app, busy);
             return;
         }
         if let Some(what) = busy {
@@ -492,38 +517,59 @@ mod mac {
         finish();
     }
 
-    /// This app's own engine, left running from before an update (its build
-    /// differs from the bundle's), is stopped while idle; the link then
-    /// starts the bundled one. Once per engine process.
-    fn restart_stale_engine(app: &Rc<App>) {
-        let bundle = main_bundle();
-        // SAFETY: Info.plist and bundle path reads on the main thread.
-        let (own, path) = unsafe {
-            let own = info(&bundle, "CFBundleVersion").map(|v| rust_string(&v));
-            let path: Option<Retained<AnyObject>> = msg_send![&*bundle, bundlePath];
-            (own, path.map(|p| rust_string(&p)))
-        };
-        let (Some(own), Some(path)) = (own, path) else {
-            return;
-        };
-        let helper = std::path::Path::new(&path)
-            .join("Contents/Helpers/Isocast Engine.app/Contents/MacOS/isocastd");
-        let stale = app.session.try_borrow().ok().and_then(|s| {
-            s.status
-                .as_ref()
-                .and_then(|status| status.daemon.clone())
-                .filter(|d| d.build != own && std::path::Path::new(&d.executable) == helper)
-        });
-        let Some(daemon) = stale else { return };
-        if RESTARTED.get() == Some(daemon.pid) {
+    /// An engine older than the one this app bundles (left running from
+    /// before an update, or another copy's older engine on the same
+    /// socket; `isocast_client::stale_engine`) is stopped once it is idle,
+    /// and the link then starts the bundled one. While it records, streams
+    /// or does other work (`busy`), a notice says it restarts afterwards.
+    /// Once per engine process.
+    fn restart_stale_engine(app: &Rc<App>, busy: Option<&'static str>) {
+        if RESTART_PAUSE
+            .get()
+            .is_some_and(|until| Instant::now() < until)
+        {
             return;
         }
-        RESTARTED.set(Some(daemon.pid));
+        let stale = app.session.try_borrow().ok().and_then(|s| {
+            let status = s
+                .status
+                .as_ref()
+                .filter(|_| s.link == Some(daemon::Link::Connected))?;
+            isocast_client::stale_engine(status.daemon.as_ref())
+        });
+        let Some(stale) = stale else { return };
+        if let Some(what) = busy {
+            if STALE_TOLD.replace(Some(stale.pid)) != Some(stale.pid) {
+                isocast_diagnostics::diagnostic!("info";
+                    "updates: isocastd {} is older than this app (build {}); restarting it after {what} stops",
+                    stale.running, stale.expected);
+                // Stays until dismissed, or replaced (same key) once the
+                // engine restarts.
+                app.show_toast(
+                    Toast::new(
+                        ToastKind::Info,
+                        "Older engine running",
+                        format!(
+                            "isocastd {} is older than this Isocast. It keeps running {what} \
+                             and restarts as this version’s engine once {what} stops.",
+                            stale.running
+                        ),
+                    )
+                    .key(STALE_KEY)
+                    .action2("OK", |_| {}),
+                );
+            }
+            return;
+        }
+        if RESTARTED.get() == Some(stale.pid) {
+            return;
+        }
+        RESTARTED.set(Some(stale.pid));
         FINISHING.set(true);
         quiet_for(40);
         isocast_diagnostics::diagnostic!("info";
-            "updates: isocastd {} (build {}) is older than this app (build {own}); restarting it",
-            daemon.version, daemon.build);
+            "updates: isocastd {} is older than this app (build {}); restarting it",
+            stale.running, stale.expected);
         std::thread::spawn(move || {
             let result = stop_engine();
             let _ = slint::invoke_from_event_loop(move || {
@@ -531,27 +577,57 @@ mod mac {
                 match result {
                     Stopped::Done => {
                         quiet_for(5);
+                        // The status shown is the old engine's until the
+                        // new one answers.
+                        RESTART_PAUSE.set(Some(Instant::now() + Duration::from_secs(15)));
                         if let Some(app) = self::app() {
-                            app.toast(
-                                ToastKind::Info,
-                                "Engine updated",
-                                format!(
-                                    "isocastd {} was still running from before the update; \
-                                     Isocast restarted it.",
-                                    daemon.version
-                                ),
+                            app.show_toast(
+                                Toast::new(
+                                    ToastKind::Info,
+                                    "Engine restarted",
+                                    format!(
+                                        "Isocast Engine {} was still running from an older Isocast; \
+                                         Isocast restarted it with this version’s engine.",
+                                        stale.running
+                                    ),
+                                )
+                                .key(STALE_KEY),
                             );
+                            app.refresh_status(true);
                         }
                     }
-                    // Busy again: try once it is idle.
+                    // Busy again (or with what the status doesn't show,
+                    // as a `tune` benchmark): try again in a while.
                     Stopped::Busy(_) => {
                         QUIET_UNTIL.set(None);
                         RESTARTED.set(None);
+                        RESTART_PAUSE.set(Some(Instant::now() + Duration::from_secs(15)));
                     }
                     Stopped::Failed(why) => {
                         QUIET_UNTIL.set(None);
                         isocast_diagnostics::diagnostic!("warn";
                             "updates: couldn't restart the older isocastd: {why}");
+                        if let Some(app) = self::app() {
+                            let pid = stale.pid.map_or_else(
+                                || "`pgrep -f 'Isocast Engine'`".to_string(),
+                                |pid| pid.to_string(),
+                            );
+                            app.show_toast(
+                                Toast::new(
+                                    ToastKind::Warning,
+                                    "Older engine running",
+                                    format!(
+                                        "Isocast Engine {} is older than this Isocast and couldn’t be \
+                                         restarted ({why}). Quit Isocast, end it with `kill {pid}` \
+                                         (it finishes its files first), then open Isocast again.",
+                                        stale.running
+                                    ),
+                                )
+                                .key(STALE_KEY)
+                                // Stays until dismissed: it says what to do.
+                                .action2("OK", |_| {}),
+                            );
+                        }
                     }
                 }
             });
@@ -619,6 +695,9 @@ mod mac {
             Stopped::Busy(what) => {
                 QUIET_UNTIL.set(None);
                 daemon::NO_LAUNCH.store(false, Ordering::SeqCst);
+                // The status may not show what refused (a `tune`
+                // benchmark): ask again in a while, not every second.
+                RETRY_AT.set(Some(Instant::now() + Duration::from_secs(15)));
                 isocast_diagnostics::diagnostic!("info"; "updates: not installing yet: {what}");
             }
             Stopped::Failed(why) => {

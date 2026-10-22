@@ -7,7 +7,7 @@
 // `set-number` or `set-flag` with the field's name (settings.rs maps the
 // names to the setup). Apply (or OK) sends what changed as one patch.
 
-import { DropdownOption, NavTab } from "../../kit.slint";
+import { DropdownOption, NavTab, Segment } from "../../kit.slint";
 
 // A streaming service to choose (Stream, before streaming is set up).
 export struct ServiceChoice {
@@ -16,11 +16,32 @@ export struct ServiceChoice {
     hint: string,
 }
 
+// A stream destination (Stream → Destinations, #73): its id, what to call
+// it ("YouTube", "backup"), a few words on its state ("Live", "Key saved",
+// "No key yet", "Own encoder") and whether `stream start` streams to it.
+export struct DestinationRow {
+    id: string,
+    label: string,
+    status: string,
+    enabled: bool,
+}
+
 // A video source the ISO files can record (Output → ISO Recording).
+// An audio source an ISO file can carry, and whether it does.
+export struct IsoTrack {
+    id: string,
+    name: string,
+    on: bool,
+}
+
 export struct IsoChoice {
     id: string,
     name: string,
     on: bool,
+    // Its file's audio: the other ISO files' choice (no list of its own),
+    // and each audio source, checked when the file carries it.
+    shared-audio: bool,
+    tracks: [IsoTrack],
 }
 
 // An Audio Input Capture source and its device (Audio → Audio Devices).
@@ -65,23 +86,6 @@ export struct BindingGroup {
 export struct ReportFileRow {
     name: string,
     size: string,
-}
-
-// First run: a permission and where it stands.
-export struct PermissionRow {
-    id: string,
-    icon: string,
-    title: string,
-    hint: string,
-    // What to do, if it isn't allowed ("" when nothing).
-    todo: string,
-    // The engine restarts to pick it up (a link after `todo`).
-    restart: bool,
-    state: string,
-    granted: bool,
-    denied: bool,
-    // "Open Settings" is the way to allow it.
-    open-settings: bool,
 }
 
 // First run: one choice of a device column.
@@ -150,11 +154,21 @@ export global SettingsArea {
     in-out property <bool> snapping;
     in-out property <float> snap-distance;
     in-out property <string> preview-rate;
+    in-out property <string> machine-summary;
+    in-out property <bool> machine-calibrating;
     // App updates (Sparkle, src/update.rs): only a released app has them.
     in-out property <bool> updates-available;
     in-out property <bool> auto-updates;
 
     // ---- Stream
+    // Which canvas's streams the page shows (#96): "main" ([stream]) or
+    // "vertical" ([vertical.stream], its own destinations and keys);
+    // the choice shows only with a vertical canvas.
+    in-out property <string> stream-canvas: "main";
+    in-out property <bool> stream-canvas-choice;
+    // Every canvas whose streams the Stream page can show (#84): main,
+    // vertical and the setup's [[canvases]].
+    in-out property <[Segment]> stream-canvas-options: [{ value: "main", label: "Main Canvas" }, { value: "vertical", label: "Vertical Canvas" }];
     in-out property <bool> has-stream;
     in-out property <[ServiceChoice]> services;
     // Custom and Kick need a server first: which one is asking ("" for
@@ -187,6 +201,24 @@ export global SettingsArea {
     callback server-back();
     callback save-key(string);
     callback clear-key();
+    // The destinations, the main one ([stream] itself) first; the one
+    // `destination` names is open below its row, and the Service, Server
+    // and Stream Key rows above are its. Adding one shows the services.
+    in-out property <[DestinationRow]> destinations;
+    in-out property <string> destination: "main";
+    in-out property <bool> adding-destination;
+    // The open destination streams now (it can't be removed).
+    in-out property <bool> destination-live;
+    // An added destination's own bitrate and size (else the main one's).
+    in-out property <bool> destination-own-bitrate;
+    in-out property <float> destination-bitrate;
+    in-out property <bool> destination-own-size;
+    in-out property <float> destination-width;
+    in-out property <float> destination-height;
+    callback select-destination(string);
+    callback add-destination();
+    callback remove-destination();
+    callback set-destination-enabled(string, bool);
 
     // ---- Output
     in-out property <string> folder;
@@ -207,6 +239,11 @@ export global SettingsArea {
     in-out property <float> program-quality;
     in-out property <float> iso-quality;
     in-out property <float> keep-free;
+    // recording.open_editor (#88): the editor opens when a recording stops.
+    in-out property <bool> open-editor;
+    // The replay buffer's length (s) and memory limit (MB).
+    in-out property <float> replay-seconds: 30;
+    in-out property <float> replay-memory: 1024;
     in-out property <bool> program-on;
     in-out property <string> program-codec;
     in-out property <string> program-container;
@@ -223,6 +260,8 @@ export global SettingsArea {
     callback browse-folder();
     callback choose-quality(int);
     callback set-iso-source(string, bool);
+    // An ISO file's audio (source, audio source or "default").
+    callback set-iso-audio(string, string);
 
     // ---- Audio
     in-out property <[MicRow]> mics;
@@ -242,6 +281,25 @@ export global SettingsArea {
     in-out property <float> canvas-height;
     in-out property <string> fps;
     in-out property <[DropdownOption]> fps-options;
+    // The vertical canvas (#86): on, its size, whether it follows the
+    // main canvas's scenes, and whether recordings write it too.
+    in-out property <bool> vertical-on;
+    in-out property <float> vertical-width: 1080;
+    in-out property <float> vertical-height: 1920;
+    in-out property <bool> vertical-follow: true;
+    in-out property <bool> vertical-record;
+    // Canvases besides the main one (#84): the vertical canvas and the
+    // setup's [[canvases]], as rows (id, label, summary). `edit-canvas` is
+    // the open one (its id; "" for none); the vertical-* fields above are
+    // its.
+    in-out property <[DropdownOption]> canvas-rows;
+    in-out property <string> edit-canvas;
+    in-out property <string> canvas-fps: "main";
+    in-out property <[DropdownOption]> canvas-fps-options;
+    in-out property <[DropdownOption]> canvas-presets;
+
+    // Recording now: scene linking keeps until it stops (#96).
+    in-out property <bool> recording;
 
     // ---- Hotkeys: the profile's bindings by action group (they apply at
     // once, through hotkeys_set), then Isocast's fixed keys.
@@ -291,6 +349,27 @@ export global SettingsArea {
     // Developer mode (the profile's `developer`).
     in-out property <bool> developer-on;
     in-out property <bool> developer-auto-off;
+    // "Turn Off After 24 Hours", or the profile's own hours.
+    in-out property <string> developer-auto-off-label: "Turn Off After 24 Hours";
+    // Automatic quality (the setup's `governor`, T.2): on unless turned
+    // off, and what it may never lower (its pins, by field path, changed
+    // through `set-flag("pin:PATH", on)`): the preview's refresh, every
+    // ISO file's frame rate or one source's, the vertical canvas's frame
+    // rate and the stream's bitrate.
+    in-out property <bool> governor-on: true;
+    // The user's explicit choice to let it skip ISO pictures under
+    // pressure (`governor.allow_iso_thinning`, off by default). Off, ISO
+    // files are never thinned by it, so the ISO pins only matter when on.
+    in-out property <bool> iso-thinning;
+    in-out property <bool> pin-preview;
+    in-out property <bool> pin-iso;
+    in-out property <bool> pin-vertical;
+    in-out property <bool> pin-stream;
+    // The ISO files recorded now, each kept at its frame rate when `on`
+    // (`id` is the source's).
+    in-out property <[IsoTrack]> pin-iso-sources;
+    // What it is doing now, in plain words ("" while nothing is lowered).
+    in-out property <string> governor-now;
 
     // ---- Welcome (no setup yet) and the failed state
     // Which choice is working ("obs", "file"; "" for none).
@@ -305,11 +384,6 @@ export global SettingsArea {
     // A live setup exists: the first run can be closed.
     in-out property <bool> can-close;
     in-out property <bool> creating;
-    // Permissions: read at least once, and asking now.
-    in-out property <bool> checked;
-    in-out property <bool> asking;
-    in-out property <bool> any-to-ask;
-    in-out property <[PermissionRow]> permissions;
     // Devices: listed at least once.
     in-out property <bool> devices-listed;
     in-out property <[DeviceChoice]> displays;
@@ -330,10 +404,6 @@ export global SettingsArea {
     callback ob-back();
     callback ob-next();
     callback ob-create();
-    callback ob-ask();
-    callback ob-check();
-    callback ob-restart-engine();
-    callback ob-open-settings(string);
     // A choice: the field ("display", "camera", "microphone",
     // "system_audio", "layout", "canvas", "fps", "folder", "name") and
     // its value.

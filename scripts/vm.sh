@@ -9,6 +9,12 @@
 #                               and grant permissions
 #   scripts/vm.sh sh CMD...     run a command in it (isocast on PATH,
 #                               ISOCAST_MONITOR_SILENT=1)
+#   scripts/vm.sh e2e [ARGS]    scripts/e2e.py in it on this checkout's
+#                               release isocastd ($ISOCAST_BIN_DIR, default
+#                               $CARGO_TARGET_DIR/release), synthetic sources;
+#                               ARGS go to e2e.py (--only NAME, --hosted…);
+#                               the report comes back to $ISOCAST_VM_OUT
+#                               (default /Volumes/IsocastBuild/vm/e2e-<time>)
 #   scripts/vm.sh status        state, address and permissions
 #   scripts/vm.sh down          shut it down
 #   scripts/vm.sh save          make the current VM the clean copy (stops it)
@@ -37,14 +43,31 @@ VM_USER=lume
 VM_PASSWORD=lume
 
 ip() {
+  # lume's own state goes stale when the VM was started by an earlier
+  # `lume run` process (it then reports "stopped" with no address), so fall
+  # back to the host's DHCP lease for the VM's MAC address.
   lume get "$VM" --format json 2>/dev/null | python3 -c '
-import json, sys
+import json, os, re, sys
 d = json.load(sys.stdin)
 d = d[0] if isinstance(d, list) else d
-print(d.get("ipAddress") or "")'
+ip = d.get("ipAddress") or ""
+if not ip:
+    try:
+        mac = json.load(open(os.path.expanduser("~/.lume/" + sys.argv[1] + "/config.json")))["macAddress"]
+        want = ":".join(p.lstrip("0") or "0" for p in mac.lower().split(":"))
+        for block in open("/var/db/dhcpd_leases").read().split("}"):
+            m = re.search(r"ip_address=(\S+)", block)
+            if m and "hw_address=1," + want + "\n" in block:
+                ip = m.group(1)
+                break
+    except (OSError, KeyError, ValueError):
+        pass
+print(ip)' "$VM"
 }
 
-running() { lume get "$VM" --format json 2>/dev/null | grep -q '"running"'; }
+running() {
+  lume get "$VM" --format json 2>/dev/null | grep -q '"running"' || pgrep -f "lume run $VM( |$)" >/dev/null
+}
 
 ssh_vm() {
   ssh -i "$KEY" -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
@@ -121,6 +144,44 @@ sh)
   shift
   ssh_vm "export PATH=/usr/local/bin:\$PATH ISOCAST_MONITOR_SILENT=1; $*"
   ;;
+e2e)
+  shift
+  bin="${ISOCAST_BIN_DIR:-${CARGO_TARGET_DIR:-target}/release}"
+  out="${ISOCAST_VM_OUT:-$HOME_DIR/e2e-$(date +%Y%m%d-%H%M%S)}"
+  [ -f "$bin/isocastd" ] || { echo "vm: no $bin/isocastd (cargo build --release -p isocast-daemon)" >&2; exit 2; }
+  running || { echo "vm: $VM isn't running; scripts/vm.sh up" >&2; exit 1; }
+  mkdir -p "$out"
+  # Each invocation its own folder in the VM: two runs at once (of two lanes
+  # or one) must not replace each other's sources, binaries or CLI, or
+  # delete each other's work (e2e.py's lock then runs them one after the
+  # other). Removed after its report and kept work come back.
+  lane="$(basename "$(pwd)")"; [ "$lane" = isocast ] && lane=main
+  dir="isocast-e2e/$lane/run-$(date +%Y%m%d-%H%M%S)-$$"
+  ssh_vm "export PATH=/opt/homebrew/bin:\$PATH; command -v ffprobe >/dev/null ||
+    HOMEBREW_NO_AUTO_UPDATE=1 brew install ffmpeg >/dev/null; mkdir -p ~/$dir/src/target/release"
+  # Tracked files (e2e.py reads the daemon's Info.plist and the example
+  # plugin) and the binary under test.
+  git ls-files -z | perl -0 -ne 'chomp; print "$_\0" if -f $_' |
+    rsync -a --from0 --files-from=- -e "ssh -i $KEY -o BatchMode=yes -o UserKnownHostsFile=$HOME_DIR/known_hosts" \
+      ./ "$VM_USER@$(ip):$dir/src/"
+  # The CLI too when it was built: the frame oracle reads scene feeds with it.
+  cli=; [ -f "$bin/isocast" ] && cli="$bin/isocast"
+  rsync -a -e "ssh -i $KEY -o BatchMode=yes -o UserKnownHostsFile=$HOME_DIR/known_hosts" \
+    "$bin/isocastd" $cli "$VM_USER@$(ip):$dir/src/target/release/"
+  set +e
+  ssh_vm "export PATH=/opt/homebrew/bin:/usr/local/bin:\$PATH; cd ~/$dir/src && mkdir -p ~/$dir/work && python3 scripts/e2e.py --daemon target/release/isocastd \
+      --work ~/$dir/work --report ~/$dir/e2e-report.json $*"
+  status=$?
+  set -e
+  rsync -a -e "ssh -i $KEY -o BatchMode=yes -o UserKnownHostsFile=$HOME_DIR/known_hosts" \
+    "$VM_USER@$(ip):$dir/e2e-report.json" "$out/" || true
+  # Kept evidence (--keep, --keep-failures: the oracle's contact sheets).
+  rsync -a -e "ssh -i $KEY -o BatchMode=yes -o UserKnownHostsFile=$HOME_DIR/known_hosts" \
+    "$VM_USER@$(ip):$dir/work/" "$out/work/" 2>/dev/null || true
+  ssh_vm "rm -rf ~/$dir" || true
+  echo "vm: e2e exit $status; report $out/e2e-report.json"
+  exit "$status"
+  ;;
 status)
   if running; then
     echo "vm: $VM running at $(ip)"
@@ -148,7 +209,7 @@ reset)
   echo "vm: $VM is a fresh copy of $CLEAN; \`scripts/vm.sh up\` to boot it"
   ;;
 *)
-  sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
   exit 2
   ;;
 esac

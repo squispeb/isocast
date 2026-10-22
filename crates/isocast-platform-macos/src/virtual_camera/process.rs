@@ -44,7 +44,7 @@ fn response(socket: &mut UnixStream, operation: &str) -> Result<bool> {
         (0, _) => Ok(true),
         (1, 7) => Ok(false),
         (-1, 1) => bail!(
-            "virtual_camera: Isocast Virtual Camera is not installed/approved; run scripts/vcam-install.sh (Start never installs it)"
+            "virtual_camera: {NOT_INSTALLED}; run scripts/vcam-install.sh (a development engine never installs it)"
         ),
         (_, 2) => bail!(
             "virtual_camera: installed device has no unique Isocast Camera Sink output stream (CoreMediaIO {status})"
@@ -303,6 +303,7 @@ pub fn run_child(args: &[String]) -> Result<()> {
         return Ok(());
     }
     let mut camera = (!handle.is_null()).then(|| Camera(handle));
+    let mut native_pool = None;
     reply(&mut socket, 0, 0)?;
     loop {
         deadline.store(
@@ -353,8 +354,14 @@ pub fn run_child(args: &[String]) -> Result<()> {
         let pixels = NonNull::new(pixels)
             .filter(|_| code == 0)
             .context("could not wrap camera IOSurface")?;
-        let frame = PixelBuffer(unsafe { CFRetained::<CVPixelBuffer>::from_raw(pixels) });
+        let frame = unsafe { CFRetained::<CVPixelBuffer>::from_raw(pixels) };
         stall("send");
+        // CMIO acknowledges enqueue, not release. Its private bounded pool
+        // must own the pixels before the parent is allowed to recycle them.
+        let Some(frame) = crate::FramePool::copy_native(&mut native_pool, &frame)? else {
+            reply(&mut socket, 1, 7)?;
+            continue;
+        };
         let code = if let Some(camera) = &camera {
             unsafe {
                 isocast_camera_send(

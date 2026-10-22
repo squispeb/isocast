@@ -13,9 +13,10 @@
 //! its filters (Filters' preview in the app), read live so each change
 //! shows at once.
 
+use parking_lot::{Condvar, Mutex};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use isocast_protocol::Filter;
@@ -23,14 +24,12 @@ use isocast_protocol::ScaleFilter;
 
 use super::frame_stream::{MAX_FPS, Pace, Source, stamp_at};
 use crate::filter::Filters;
-use crate::gpu::{FrameImporter, Gpu};
+use crate::gpu::{FrameImporter, Gpu, InFlight};
 use crate::render::{Layer, Renderer};
 use crate::{Platform, Time};
 
 /// How long to wait for a slot to come back before looking again.
 const WAIT: Duration = Duration::from_millis(50);
-/// How long the GPU may take to draw one frame.
-const DRAW_TIMEOUT: Duration = Duration::from_secs(1);
 /// Surfaces in a ring.
 pub const DEFAULT_SLOTS: u32 = 4;
 pub const MAX_SLOTS: u32 = 8;
@@ -103,12 +102,7 @@ struct Pending {
 impl SharedControl {
     /// The viewer is done with `slot` of ring `generation`.
     pub fn release(&self, generation: u64, slot: u32) {
-        self.0
-            .pending
-            .lock()
-            .unwrap()
-            .released
-            .push((generation, slot));
+        self.0.pending.lock().released.push((generation, slot));
         self.0.changed.notify_all();
     }
 
@@ -120,26 +114,27 @@ impl SharedControl {
     /// Fit the picture in a new size from the next frame (a new ring if
     /// its size changes).
     pub fn set_size(&self, max_width: Option<u32>, max_height: Option<u32>) {
-        self.0.pending.lock().unwrap().size = Some((max_width, max_height));
+        self.0.pending.lock().size = Some((max_width, max_height));
         self.0.changed.notify_all();
     }
 
     /// Slots released and a new size, since last asked.
     fn take(&self) -> Pending {
-        std::mem::take(&mut self.0.pending.lock().unwrap())
+        std::mem::take(&mut self.0.pending.lock())
     }
 
     /// Wait up to `timeout` for a slot to come back.
     fn wait(&self, timeout: Duration) {
-        let pending = self.0.pending.lock().unwrap();
-        let _ = self
-            .0
-            .changed
-            .wait_timeout_while(pending, timeout, |pending| {
+        let mut pending = self.0.pending.lock();
+        let _ = self.0.changed.wait_while_for(
+            &mut pending,
+            |pending| {
                 pending.released.is_empty()
                     && pending.size.is_none()
                     && !self.0.closed.load(Ordering::SeqCst)
-            });
+            },
+            timeout,
+        );
     }
 }
 
@@ -151,8 +146,9 @@ pub(crate) struct Request {
     pub(crate) slots: u32,
 }
 
-/// A source's filters as they are now (the live setup's).
-pub(crate) type LiveFilters = Box<dyn Fn() -> Vec<Filter> + Send>;
+/// A source's filters as they are now (the live setup's), and when the
+/// engine's clock started (mask animations on `clock` run from it).
+pub(crate) type LiveFilters = Box<dyn Fn() -> (Vec<Filter>, Option<Time>) + Send>;
 
 /// Start a viewer's stream of `request`. `source` finds where the target's
 /// frames arrive (looked up again all the time, since a source can reopen,
@@ -161,7 +157,9 @@ pub(crate) type LiveFilters = Box<dyn Fn() -> Vec<Filter> + Send>;
 pub(crate) fn watch<P: Platform>(
     platform: &P,
     request: Request,
-    source: impl Fn(u32) -> Result<Source<P::Frame>, String> + Send + 'static,
+    source: impl Fn(u32, (Option<u32>, Option<u32>)) -> Result<Source<P::Frame>, String>
+    + Send
+    + 'static,
     filters: Option<LiveFilters>,
 ) -> SharedFeed<P::SharedSurface> {
     let (tx, events) = channel();
@@ -210,11 +208,11 @@ fn run<P: Platform>(
     control: &SharedControl,
     tx: &Sender<SharedEvent<P::SharedSurface>>,
     request: &Request,
-    source: impl Fn(u32) -> Result<Source<P::Frame>, String>,
+    source: impl Fn(u32, (Option<u32>, Option<u32>)) -> Result<Source<P::Frame>, String>,
     filters: Option<LiveFilters>,
 ) -> Result<(), String> {
     let failed = |err: anyhow::Error| format!("{err:#}");
-    let gpu = Gpu::new().map_err(failed)?;
+    let gpu = Gpu::for_platform(platform).map_err(failed)?;
     let renderer = Renderer::new(&gpu, wgpu::TextureFormat::Rgba8Unorm);
     let mut importer = platform.frame_importer(&gpu).map_err(failed)?;
     let slots = request.slots.clamp(2, MAX_SLOTS) as usize;
@@ -225,9 +223,14 @@ fn run<P: Platform>(
     // The filters drawn last, and what draws them (made on first use).
     let mut drawn_filters: Vec<Filter> = Vec::new();
     let mut filtering: Option<Filters> = None;
+    let mut in_flight = InFlight::default();
     loop {
         if control.0.closed.load(Ordering::SeqCst) {
             return Ok(());
+        }
+        if !in_flight.available().map_err(failed)? {
+            control.wait(Duration::from_millis(1));
+            continue;
         }
         let pending = control.take();
         if let Some(ring) = &mut ring {
@@ -258,8 +261,10 @@ fn run<P: Platform>(
             continue;
         }
         // Changed filters show at once, even on a still picture.
+        let mut epoch = None;
         if let Some(filters) = &filters {
-            let now = filters();
+            let (now, started) = filters();
+            epoch = started;
             if now != drawn_filters {
                 drawn_filters = now;
                 if let Some(ring) = &mut ring {
@@ -267,16 +272,24 @@ fn run<P: Platform>(
                 }
             }
         }
-        let fps = control.0.fps.load(Ordering::Relaxed);
-        let Source { slot, grid, drawn } = source(fps)?;
+        let fps = crate::governor::monitor_fps(control.0.fps.load(Ordering::Relaxed));
+        let Source { slot, grid, drawn } = source(fps, max_size)?;
         let again = || ring.as_ref().is_none_or(|ring| ring.fresh);
         let Some((frame, at)) = pace.next(platform, &slot, grid, fps, again) else {
             continue;
         };
-        let mut picture = importer.import(&frame).map_err(failed)?;
+        // The completion below retains `frame` through the GPU read, so
+        // pooled surfaces can reuse their texture wrappers between ticks.
+        let mut picture = match importer.import_cached(&frame).map_err(failed)? {
+            Some(picture) => picture,
+            None => importer.import(&frame).map_err(failed)?,
+        };
         if drawn_filters.iter().any(|filter| filter.enabled) {
             let filtering =
                 filtering.get_or_insert_with(|| Filters::new(&gpu, renderer.format(), true));
+            if let Some(epoch) = epoch {
+                filtering.set_epoch(epoch);
+            }
             picture = filtering.apply(
                 &gpu,
                 &renderer,
@@ -331,22 +344,23 @@ fn run<P: Platform>(
             ScaleFilter::Bicubic
         };
         let target = &ring.surfaces[index].1;
-        let submission = renderer.render(&gpu, target, &[layer], size);
-        // The viewer's GPU must read a finished picture.
-        gpu.device
-            .poll(wgpu::PollType::Wait {
-                submission_index: Some(submission),
-                timeout: Some(DRAW_TIMEOUT),
-            })
-            .map_err(|err| format!("the GPU did not finish drawing a frame: {err}"))?;
-        // A surface that is not the texture itself is filled now, while
-        // the GPU's picture is the newest one there is: the viewer is told
-        // the frame is ready only afterwards, so what it reads is a
-        // finished picture, never a half-written one.
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        renderer.encode(
+            &gpu,
+            &mut encoder,
+            target,
+            &[layer],
+            size,
+            wgpu::Color::BLACK,
+        );
+        let done = in_flight.submit(&gpu, encoder.finish());
+        // A surface that is not the texture itself (Linux's shared
+        // memory) is filled now, before the viewer is told below that the
+        // frame is ready, so it never reads a half-written picture. The
+        // copy waits for the draw (same queue); macOS has nothing to do.
         platform
             .publish_shared_surface(&gpu, target, &ring.surfaces[index].0)
             .map_err(failed)?;
-        drop(picture);
         ring.held[index] = true;
         ring.fresh = false;
         let stamp = drawn.and_then(|drawn| stamp_at(&drawn, at));
@@ -357,15 +371,26 @@ fn run<P: Platform>(
             revision: stamp.map(|stamp| stamp.revision),
             layout_generation: stamp.map(|stamp| stamp.generation),
         };
-        if tx.send(event).is_err() {
-            return Ok(());
-        }
+        let tx = tx.clone();
+        let control = control.clone();
+        let surface = ring.surfaces[index].0.clone();
+        done.then(move |_| {
+            // A resize/close can drop the ring while drawing. Keep its
+            // native surface alive, and never announce unfinished pixels.
+            let _held = (surface, frame, picture);
+            if !control.0.closed.load(Ordering::SeqCst) {
+                let _ = tx.send(event);
+            }
+        });
     }
 }
 
 /// `input` scaled down to fit in `max_size` (either side unbounded if
 /// absent), keeping its shape; never larger than it is.
-fn fitted((width, height): (u32, u32), max_size: (Option<u32>, Option<u32>)) -> (u32, u32) {
+pub(super) fn fitted(
+    (width, height): (u32, u32),
+    max_size: (Option<u32>, Option<u32>),
+) -> (u32, u32) {
     let (width, height) = (width.max(1), height.max(1));
     let across = max_size
         .0

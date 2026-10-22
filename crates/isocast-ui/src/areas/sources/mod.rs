@@ -13,7 +13,7 @@
 
 mod colors;
 mod dialogs;
-mod items;
+pub(super) mod items;
 mod preview;
 
 use std::cell::RefCell;
@@ -269,7 +269,8 @@ impl Area for Sources {
                 let s = app.session.borrow();
                 s.editing_scene().and_then(|scene| {
                     let setup = s.setup.clone()?;
-                    let sc = setup_model::find_scene(&setup, &scene)?;
+                    let edited = s.edited_setup()?;
+                    let sc = setup_model::find_scene(edited, &scene)?;
                     let chain = setup_model::item_chain(sc, &path)?;
                     let source = chain[chain.len() - 1].source.clone()?;
                     Some((items::is_iso(&setup, &source), source))
@@ -368,6 +369,16 @@ impl Area for Sources {
             .sources
             .dialogs
             .filter_defaults(&app));
+        wire!(
+            area,
+            app,
+            on_mask_moved,
+            |app, w, x, y, width, height, rotation, done| {
+                app.sources
+                    .dialogs
+                    .mask_moved(&app, &w, [x, y, width, height, rotation], done)
+            }
+        );
         wire!(area, app, on_transform_number, |app, w, field, v, live| {
             app.sources
                 .dialogs
@@ -561,6 +572,28 @@ impl Area for Sources {
             app.select(path);
             return Some(self.item_menu(app, false, true));
         }
+        // The ISO badge's: recording the file, and its audio tracks.
+        if let Some(path) = owner.strip_prefix("sources:iso:") {
+            app.select(path);
+            let s = app.session.borrow();
+            let setup = s.setup.clone()?;
+            let source = s
+                .selected(|_, chain| chain[chain.len() - 1].source.clone())
+                .flatten()?;
+            drop(s);
+            let on = items::is_iso(&setup, &source);
+            let menu = MenuBuilder::new()
+                .item("iso", "Record ISO File")
+                .checked(on);
+            if !on {
+                return Some(menu);
+            }
+            return Some(items::iso_audio_menu(
+                menu.separator().heading("ISO Audio"),
+                &setup,
+                &source,
+            ));
+        }
         if owner == "sources:list" {
             return Some(self.list_menu(app, false));
         }
@@ -613,6 +646,7 @@ impl Area for Sources {
         }
         let path = owner
             .strip_prefix("sources:item:")
+            .or_else(|| owner.strip_prefix("sources:iso:"))
             .or_else(|| owner.strip_prefix("canvas:item:"))
             .map(str::to_string);
         let selected_path = || {
@@ -624,7 +658,15 @@ impl Area for Sources {
                     .map(|s| s.path.clone())
             })
         };
-        if let Some(group) = id.strip_prefix("into:") {
+        if let Some(audio) = id.strip_prefix("iso_audio:") {
+            let found = app
+                .session
+                .borrow()
+                .selected(|_, chain| chain[chain.len() - 1].source.clone());
+            if let Some(Some(source)) = found {
+                items::choose_iso_audio(app, &source, audio);
+            }
+        } else if let Some(group) = id.strip_prefix("into:") {
             if let Some(path) = selected_path() {
                 items::move_to_group(app, &path, group);
             }
@@ -1077,6 +1119,14 @@ impl Sources {
             .separator();
         if let Some((true, on)) = iso {
             menu = menu.item("iso", "Record ISO File").checked(on);
+            if let (true, Some(src), Some(setup)) =
+                (on, &source, app.session.borrow().setup.as_ref())
+            {
+                menu = menu.submenu(
+                    "ISO Audio",
+                    items::iso_audio_menu(MenuBuilder::new(), setup, &src.id),
+                );
+            }
         }
         menu = menu.item("lock", "Lock").checked(item.locked).separator();
         if source.is_some() {
@@ -1206,8 +1256,10 @@ fn show_lists(app: &Rc<App>) {
         SceneRow {
             id: scene.id.as_str().into(),
             name: name.into(),
-            on_air: s.scene.as_deref() == Some(&scene.id),
-            in_preview: s.preview.as_deref() == Some(&scene.id),
+            // On the canvas whose scenes are switched (the vertical one's
+            // own, #86).
+            on_air: s.on_air() == Some(&scene.id),
+            in_preview: s.staged() == Some(&scene.id),
             tooltip: if i < 9 {
                 format!("{name} ({})", i + 1)
             } else {
@@ -1219,9 +1271,12 @@ fn show_lists(app: &Rc<App>) {
     kit::update_rows(&app.sources.scene_rows, scenes.collect());
     let collapsed = app.sources.collapsed.borrow();
     let mut rows = Vec::new();
+    // The items of the canvas being edited (the vertical ones while editing
+    // it); sources and ISO files are the setup's own.
+    let edited = s.edited_setup().cloned().unwrap_or_else(|| setup.clone());
     if let Some(scene) = s
         .editing_scene()
-        .and_then(|id| setup_model::find_scene(&setup, &id))
+        .and_then(|id| setup_model::find_scene(&edited, &id))
     {
         // Top first, as OBS lists them; children under their group.
         struct Walk<'a> {
@@ -1434,14 +1489,18 @@ fn show_quick_setting(app: &Rc<App>, window: &AppWindow) {
             "device",
             devices::microphone_options(devices.as_ref(), &text("device")),
         ),
-        SourceKind::Window(_) | SourceKind::Application(_) | SourceKind::ApplicationAudio(_) => {
-            choice(
-                &area,
-                "Application",
-                "app",
-                devices::app_options(devices.as_ref(), &text("app")),
-            )
-        }
+        SourceKind::Window(_) | SourceKind::Application(_) => choice(
+            &area,
+            "Application",
+            "app",
+            devices::app_options(devices.as_ref(), &text("app")),
+        ),
+        SourceKind::ApplicationAudio(_) => choice(
+            &area,
+            "Application",
+            "app",
+            devices::audio_app_options(devices.as_ref(), &text("app")),
+        ),
         SourceKind::Text(_) => {
             let file = text("file");
             if file.is_empty() {
@@ -1621,16 +1680,20 @@ fn nudge(app: &Rc<App>, by: &str) {
     let locked = app
         .window()
         .is_some_and(|w| w.global::<Ui>().get_preview_locked());
-    let patch = app.session.borrow().selected(|scene, chain| {
+    // On the canvas being edited (the vertical one's items while editing
+    // it, #86).
+    let s = app.session.borrow();
+    let patch = s.selected(|scene, chain| {
         let item = chain[chain.len() - 1];
         // Items placed by their layout (no rect) aren't moved here.
         let rect = item.rect.filter(|_| !item.locked)?;
-        Some(setup_model::item_patch(
+        Some(s.canvas_item_patch(
             &scene.id,
             chain,
             json!({ "rect": { "x": rect.x as i64 + dx, "y": rect.y as i64 + dy } }),
         ))
     });
+    drop(s);
     if let Some(Some(patch)) = patch
         && !locked
     {

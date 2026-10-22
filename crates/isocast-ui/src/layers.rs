@@ -51,6 +51,9 @@ pub struct Geometry {
     /// Studio Mode's program picture, relative to the area (zero size
     /// when not in Studio Mode).
     pub program: [f64; 4],
+    /// The chosen extra canvas's program picture, relative to the area (zero
+    /// size when it isn't shown, #86).
+    pub extra: [f64; 4],
     /// Points per canvas pixel.
     pub scale: f64,
     /// The control bar's master level's inside (window points).
@@ -145,6 +148,7 @@ pub struct Layers {
     stage: Retained<CALayer>,
     picture: Retained<CALayer>,
     program: Retained<CALayer>,
+    extra: Retained<CALayer>,
     /// The box: a dark ring outside a yellow one, the handles over them.
     ring: Retained<CALayer>,
     outline: Retained<CALayer>,
@@ -237,6 +241,9 @@ impl Layers {
         let program = picture_layer(colours.monitor);
         program.setHidden(true);
         stage.addSublayer(&program);
+        let extra = picture_layer(colours.monitor);
+        extra.setHidden(true);
+        stage.addSublayer(&extra);
 
         // The dark ring keeps the yellow edge visible on bright pictures.
         let ring = layer();
@@ -299,6 +306,7 @@ impl Layers {
             stage,
             picture,
             program,
+            extra,
             ring,
             outline,
             handles,
@@ -382,20 +390,27 @@ impl Layers {
         CATransaction::commit();
     }
 
+    /// Show `frame` in the chosen extra canvas's program picture (#86).
+    pub fn show_extra(&mut self, frame: &SharedFrame) {
+        CATransaction::begin();
+        CATransaction::setDisableActions(true);
+        self.set_contents(&self.extra.clone(), frame);
+        CATransaction::commit();
+    }
+
     /// Where the layers are now.
     pub fn geometry(&self) -> Geometry {
         self.geometry
     }
 
-    /// No picture to show (the daemon is away): the edited one, or the
-    /// program's.
-    pub fn clear(&mut self, program: bool) {
+    /// No picture to show (the daemon is away) in `role`'s monitor.
+    pub fn clear(&mut self, role: crate::preview::Role) {
         CATransaction::begin();
         CATransaction::setDisableActions(true);
-        let layer = if program {
-            &self.program
-        } else {
-            &self.picture
+        let layer = match role {
+            crate::preview::Role::Editor => &self.picture,
+            crate::preview::Role::Program => &self.program,
+            crate::preview::Role::Extra => &self.extra,
         };
         unsafe { layer.setContents(None) };
         CATransaction::commit();
@@ -462,6 +477,9 @@ impl Layers {
         let [qx, qy, qw, qh] = geometry.program;
         self.program.setFrame(rect(qx, qy, qw, qh));
         self.program.setHidden(qw <= 0.0 || qh <= 0.0);
+        let [vx, vy, vw, vh] = geometry.extra;
+        self.extra.setFrame(rect(vx, vy, vw, vh));
+        self.extra.setHidden(vw <= 0.0 || vh <= 0.0);
     }
 
     fn place_box(&self, shape: Option<BoxShape>, style: BoxStyle, geometry: Geometry) {

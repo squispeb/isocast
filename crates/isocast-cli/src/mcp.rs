@@ -5,9 +5,11 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use isocast_protocol::api::{
-    Applied, ApplyParams, Doctor, DoctorParams, EngineInfo, Frame, FrameParams, ImportObsParams,
-    Live, Marked, Method, Plan, Refreshed, Report, Snapshot, SnapshotParams, StartParams, Started,
-    Status, StreamKey, StreamKeyParams, StreamKeyTarget, Switched, TuneParams, Tuning,
+    Applied, ApplyParams, CapacityEstimate, CapacityParams, Doctor, DoctorParams, EngineInfo,
+    Frame, FrameParams, ImportObsParams, Live, Marked, Method, Plan, Refreshed, Report, Snapshot,
+    SnapshotParams, StartParams, Started, Status, StreamDestinationParams, StreamDestinations,
+    StreamKey, StreamKeyParams, StreamKeyTarget, StreamStartParams, Streaming, Switched,
+    TuneParams, Tuning,
 };
 use isocast_protocol::change::Change;
 use isocast_protocol::data::{DataGetParams, DataRevision, DataSetParams, DataValues};
@@ -15,22 +17,30 @@ use isocast_protocol::devices::{Devices, PermissionsReport};
 use isocast_protocol::hotkeys::{
     Catalogue, Hotkeys, InputParams as HotkeyInput, SetParams as HotkeysSet,
 };
+use isocast_protocol::isoprj::{
+    ProjectOpenParams, ProjectOpened, RecentProjects, RecentProjectsParams,
+};
 use isocast_protocol::library::{
     Library, LibraryChange, LibraryCreateParams, LibraryDocument, LibraryImportObsParams,
     LibraryImportParams, LibraryRenameParams, LibrarySwitchParams, LibraryTarget,
 };
-use isocast_protocol::obs::Imported;
+use isocast_protocol::obs::{Discovery, Imported};
+use isocast_protocol::optimize::{
+    ObsDiscoverParams, OptimizeParams, Optimized, SpeedTest, SpeedTestParams,
+};
 use isocast_protocol::plugin::{PluginAddParams, PluginChange, PluginTarget, Plugins};
 use isocast_protocol::project::{
     ListProjectsParams, ProjectRenamed, Projects, RenameProjectParams,
 };
-use isocast_protocol::stream::{StreamService, StreamStatus};
+use isocast_protocol::stream::StreamService;
 use isocast_protocol::timeline::{
-    ExportStarted, RetakeParams, Retaken, TimelineClosed, TimelineExportParams, TimelineInfo,
-    TimelineList, TimelineMoveParams, TimelineNewParams, TimelineOpenParams, TimelineRemoveParams,
-    TimelineTarget,
+    ExportStarted, NleExported, RecordTarget, RecordTargetParams, RetakeParams, Retaken,
+    TimelineAngleParams, TimelineClosed, TimelineCropParams, TimelineExportNleParams,
+    TimelineExportParams, TimelineInfo, TimelineList, TimelineMoveParams, TimelineNewParams,
+    TimelineOpenParams, TimelineRangeParams, TimelineRelinkParams, TimelineRemoveParams,
+    TimelineRollParams, TimelineSplitParams, TimelineTarget, TimelineTrimParams,
 };
-use isocast_protocol::{Setup, Transition};
+use isocast_protocol::{CanvasId, Setup, Transition};
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router};
@@ -41,6 +51,9 @@ use serde::{Deserialize, Serialize};
 use crate::client::Client;
 
 mod events;
+
+use isocast_protocol::replay::{ReplayParams, ReplaySaved, ReplayStatus};
+use isocast_protocol::websocket::{WebsocketEnableParams, WebsocketStatus};
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -88,6 +101,10 @@ struct GetSetupParams {
     /// Also return where every item is drawn, as laid out (`resolved`).
     #[serde(default)]
     resolved: bool,
+    /// With resolved: whose layout, "main" (the default) or "vertical"
+    /// (the vertical canvas's). The setup is the whole live setup.
+    #[serde(default)]
+    canvas: CanvasId,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -116,6 +133,15 @@ struct StartRecordingParams {
     folder: Option<String>,
     /// Stop on its own after this many seconds.
     seconds: Option<f64>,
+    /// Start a new project with its own timeline, whatever
+    /// record_target says. Not with `into`.
+    #[serde(default)]
+    new_project: bool,
+    /// Add this recording's takes to this timeline (an id from
+    /// list_timelines), in the folder of its last take. Not with
+    /// `new_project`. Neither: record_target's choice (a new project
+    /// unless a timeline was chosen).
+    into: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -127,6 +153,21 @@ struct CheckSetupParams {
     setup: Option<serde_json::Value>,
     /// Check this folder instead of the setup's recording.folder.
     folder: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct EstimateCapacityParams {
+    /// The setup to judge; the live setup (at its sources' live formats)
+    /// if absent (the shape get_setup returns).
+    #[serde(default)]
+    #[schemars(schema_with = "setup_schema")]
+    setup: Option<serde_json::Value>,
+    /// Count the stream's encode. Default: the live setup's if it streams
+    /// now; a given setup's if it has a stream.
+    stream: Option<bool>,
+    /// A video source id whose ISO file would be turned on: `admission`
+    /// says how to add it so the setup still fits, and why.
+    add_iso: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -147,9 +188,13 @@ struct PreviewFrameParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct LiveFrameParams {
-    /// "program" (the default), "preview" (studio mode's preview scene) or
-    /// a video source id of the live setup.
+    /// "program" (the default), "preview" (studio mode's preview scene),
+    /// "vertical-program" or a video source id of the live setup.
     target: Option<String>,
+    /// "main" (the default) or "vertical": the vertical canvas's program
+    /// (with target "program" or none).
+    #[serde(default)]
+    canvas: CanvasId,
     /// Scale the picture down to at most this many pixels wide (default
     /// 1280).
     width: Option<u32>,
@@ -195,6 +240,17 @@ struct SetAudioParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct SetIsoAudioParams {
+    /// The id of a video source in the live setup: its ISO file.
+    source: String,
+    /// The audio sources' ids that file carries, in track order ([] for
+    /// no audio). Null or absent puts it back to recording.iso.audio (or,
+    /// without that list, the source's own sound).
+    #[serde(default)]
+    audio: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct SwitchSceneParams {
     /// The id of a scene in the setup.
     scene: String,
@@ -202,12 +258,27 @@ struct SwitchSceneParams {
     /// {"kind":"swipe","direction":"up"} or {"kind":"cut"}; the scene's
     /// transition (else the setup's) if absent.
     transition: Option<Transition>,
+    /// "main" (the default) or "vertical": the setup's [vertical] canvas,
+    /// which must not follow the main one (vertical.follow_main false).
+    #[serde(default)]
+    canvas: CanvasId,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct PreviewSceneParams {
     /// The id of a scene in the setup.
     scene: String,
+    /// "main" (the default) or "vertical" (which must not follow the main
+    /// canvas).
+    #[serde(default)]
+    canvas: CanvasId,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct ClearPreviewParams {
+    /// "main" (the default) or "vertical".
+    #[serde(default)]
+    canvas: CanvasId,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -215,6 +286,10 @@ struct TakeParams {
     /// How the preview scene comes on air; its transition (else the
     /// setup's) if absent.
     transition: Option<Transition>,
+    /// "main" (the default) or "vertical" (which must not follow the main
+    /// canvas).
+    #[serde(default)]
+    canvas: CanvasId,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -270,7 +345,7 @@ struct ImportDocumentsParams {
     /// Or a scene collection, as get_collection_or_profile returns one: the
     /// setup's version, name, canvas.width/height, sources, scenes,
     /// transition and recording.program.audio / recording.iso.sources /
-    /// recording.iso.audio.
+    /// recording.iso.audio / recording.iso.source_audio.
     #[serde(default)]
     #[schemars(schema_with = "setup_schema")]
     collection: Option<serde_json::Value>,
@@ -286,9 +361,17 @@ struct ImportDocumentsParams {
     switch: bool,
 }
 
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct RequestPermissionsToolParams {
+    /// Only this one: screen_recording, camera, microphone or system_audio
+    /// (all not decided yet if left out).
+    #[serde(default)]
+    permission: Option<isocast_protocol::devices::PermissionKind>,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 struct OpenPermissionSettingsParams {
-    /// screen_recording, camera or microphone.
+    /// screen_recording, camera, microphone or system_audio.
     permission: isocast_protocol::devices::PermissionKind,
 }
 
@@ -304,18 +387,49 @@ struct StreamKeyToolParams {
     /// Keychain and is never shown again; prefer `isocast stream key set`
     /// in a terminal, which keeps it out of this conversation.
     key: String,
+    /// A destination ("main", or an id from get_status's streams): its
+    /// own key (with service and server only for one not applied yet).
+    destination: Option<String>,
     /// The service it is for; the live setup's [stream] service if absent.
     service: Option<StreamService>,
     /// For "custom": the server it belongs to (rtmp://host/app).
     server: Option<String>,
+    /// "main" (the default, [stream]) or "vertical" ([vertical.stream]):
+    /// each canvas keeps its own keys.
+    #[serde(default)]
+    canvas: CanvasId,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct CanvasIdParams {
+    /// The canvas: "vertical" or a [[canvases]] id, from get_status's
+    /// canvases.
+    canvas: CanvasId,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct DestinationIdParams {
+    /// The destination's id, from get_status's streams (or
+    /// vertical_streams, with canvas "vertical").
+    id: String,
+    /// "main" (the default, [stream]) or "vertical" ([vertical.stream]).
+    #[serde(default)]
+    canvas: CanvasId,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct StreamKeyTargetParams {
+    /// A destination ("main", or an id from get_status's streams).
+    destination: Option<String>,
     /// The service; the live setup's [stream] service if absent.
     service: Option<StreamService>,
     /// For "custom": the server the key belongs to.
     server: Option<String>,
+    /// "main" (the default, [stream]) or "vertical" ([vertical.stream]).
+    #[serde(default)]
+    canvas: CanvasId,
 }
 
 #[tool_router]
@@ -646,9 +760,10 @@ impl Isocast {
     }
 
     #[tool(
-        description = "Make a timeline (optional `name`) and make it current: from now on every \
-                       take that finishes (stop_recording, or split_take) is added to its end as \
-                       a clip. A timeline is takes in order, like a clip bar: retake records the \
+        description = "Make a timeline (optional `name`), make it current and choose it for the \
+                       next recording (record_target): from then on every take that finishes \
+                       (stop_recording, or split_take) is added to its end as a clip, until \
+                       record_target says `new`. A timeline is takes in order, like a clip bar: retake records the \
                        last one again, remove_clip and move_clip edit the order, and \
                        export_timeline joins them into one file. Returns the timeline.",
         annotations(
@@ -680,7 +795,7 @@ impl Isocast {
 
     #[tool(
         description = "Every timeline (id, name, clips, length) and which is current (the one \
-                       finished takes are added to).",
+                       the editor shows and timeline edits act on).",
         annotations(read_only_hint = true)
     )]
     async fn list_timelines(&self) -> Result<Json<TimelineList>, String> {
@@ -688,7 +803,8 @@ impl Isocast {
     }
 
     #[tool(
-        description = "Make a timeline current (by id), so finished takes are added to it.",
+        description = "Make a timeline current (by id): the one the editor shows and timeline \
+                       edits act on. Recordings go where record_target says.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -703,8 +819,9 @@ impl Isocast {
     }
 
     #[tool(
-        description = "Make no timeline current: takes are only recorded, as without \
-                       timelines. Returns the id of the timeline that was current.",
+        description = "Make no timeline current; if it was chosen for the next recording, \
+                       recordings start new projects again. Returns the id of the timeline that \
+                       was current.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -713,6 +830,26 @@ impl Isocast {
     )]
     async fn close_timeline(&self) -> Result<Json<TimelineClosed>, String> {
         self.call(Method::TimelineClose).await
+    }
+
+    #[tool(
+        description = "Where the next recording goes, and with `target`, choose it: `new` (the \
+                       default: each recording starts a new project folder with its own \
+                       timeline) or a timeline's id (list_timelines), whose next take it then \
+                       is, written into the folder of its last take. Kept across restarts and \
+                       shown in get_status (record_target); a recording running keeps its own. \
+                       Returns the choice: the timeline, its name and the take it would be.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn record_target(
+        &self,
+        Parameters(Strict(params)): Parameters<Strict<RecordTargetParams>>,
+    ) -> Result<Json<RecordTarget>, String> {
+        self.call(Method::RecordTarget(Some(params))).await
     }
 
     #[tool(
@@ -750,6 +887,210 @@ impl Isocast {
     }
 
     #[tool(
+        description = "Move a clip's in and/or out point (`in_seconds`, `out_seconds`, on the \
+                       clip's take's own clock, rounded to its frames). Only the timeline \
+                       changes, never the take's files; one undoable edit. Returns the timeline.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn trim_clip(
+        &self,
+        Parameters(Strict(params)): Parameters<Strict<TimelineTrimParams>>,
+    ) -> Result<Json<TimelineInfo>, String> {
+        self.call(Method::TimelineTrim(params)).await
+    }
+
+    #[tool(
+        description = "Cut the clip at `at_seconds` (on the timeline, rounded to the frames \
+                       there) in two; the second gets a new id. One undoable edit. Returns the \
+                       timeline.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    async fn split_clip(
+        &self,
+        Parameters(Strict(params)): Parameters<Strict<TimelineSplitParams>>,
+    ) -> Result<Json<TimelineInfo>, String> {
+        self.call(Method::TimelineSplit(params)).await
+    }
+
+    #[tool(
+        description = "Take `start_seconds` to `end_seconds` (on the timeline) out and close \
+                       the gap (ripple delete): clips across its ends are trimmed, clips in it \
+                       taken off. The takes' files are untouched; one undoable edit. Returns \
+                       the timeline.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    async fn delete_range(
+        &self,
+        Parameters(Strict(params)): Parameters<Strict<TimelineRangeParams>>,
+    ) -> Result<Json<TimelineInfo>, String> {
+        self.call(Method::TimelineDeleteRange(params)).await
+    }
+
+    #[tool(
+        description = "Choose what the edited video shows from `start_seconds` to \
+                       `end_seconds` on the timeline: `source` is `program` or an ISO source \
+                       every clip there recorded (clips are split at the span's ends). \
+                       export_timeline then writes an edited file with these angles and the \
+                       program's sound. One undoable edit. Returns the timeline.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn set_angle(
+        &self,
+        Parameters(Strict(params)): Parameters<Strict<TimelineAngleParams>>,
+    ) -> Result<Json<TimelineInfo>, String> {
+        self.call(Method::TimelineAngle(params)).await
+    }
+
+    #[tool(
+        description = "Crop the edited video from `start_seconds` to `end_seconds` on the \
+                       timeline: `crop` is the part of each clip's picture to show ({x, y, \
+                       width, height} as fractions of the picture, from the top-left), \
+                       `preset` a shape (16:9, 9:16, 1:1, 4:5: the largest that fits inside \
+                       `crop` or the picture, centred), or `clear` the whole picture again. \
+                       Clips are split at the span's ends; the crop applies to the angle each \
+                       clip shows. export_timeline encodes cropped clips again, scaled to the \
+                       program's size, in the edited file (program and ISO files stay whole). \
+                       One undoable edit. Returns the timeline.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn crop_clip(
+        &self,
+        Parameters(Strict(params)): Parameters<Strict<TimelineCropParams>>,
+    ) -> Result<Json<TimelineInfo>, String> {
+        self.call(Method::TimelineCrop(params)).await
+    }
+
+    #[tool(
+        description = "Move the cut between `clip` and the clip after it by `by_seconds` \
+                       (negative: earlier), a roll edit: the clip's out point and the next \
+                       clip's in point move together, so the timeline keeps its length. One \
+                       undoable edit. Returns the timeline.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    async fn roll_cut(
+        &self,
+        Parameters(Strict(params)): Parameters<Strict<TimelineRollParams>>,
+    ) -> Result<Json<TimelineInfo>, String> {
+        self.call(Method::TimelineRoll(params)).await
+    }
+
+    #[tool(
+        description = "Take back the last edit of a timeline (trim, split, delete, angle, \
+                       remove, move; not a recorded take). Returns the timeline, with how many \
+                       edits can still be undone and redone.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    async fn undo_edit(
+        &self,
+        Parameters(Strict(params)): Parameters<Strict<TimelineTarget>>,
+    ) -> Result<Json<TimelineInfo>, String> {
+        self.call(Method::TimelineUndo(Some(params))).await
+    }
+
+    #[tool(
+        description = "Put back the last edit undo_edit took back. Returns the timeline.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    async fn redo_edit(
+        &self,
+        Parameters(Strict(params)): Parameters<Strict<TimelineTarget>>,
+    ) -> Result<Json<TimelineInfo>, String> {
+        self.call(Method::TimelineRedo(Some(params))).await
+    }
+
+    #[tool(
+        description = "Point an offline clip (its take isn't where the timeline says: the \
+                       project folder was moved or copied) at where its take is now: `path` is \
+                       the take's manifest (….session.json) or the folder holding it; given a \
+                       folder, every take that was in the clip's old folder is looked for there \
+                       too. The take's files are never touched. Returns the timeline.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn relink_clip(
+        &self,
+        Parameters(Strict(params)): Parameters<Strict<TimelineRelinkParams>>,
+    ) -> Result<Json<TimelineInfo>, String> {
+        self.call(Method::TimelineRelink(params)).await
+    }
+
+    #[tool(
+        description = "Open a project file (`<name>.isoprj`, in every project folder) or a \
+                       project folder by full `path`: its timelines join the engine's (taken in \
+                       if the folder was copied from elsewhere, paths resolved where it is now), \
+                       one becomes the current timeline (`timeline`, else the current one if it \
+                       is the project's, else its newest; a project with none gets one of its \
+                       takes), and the app shows the editor on it unless `editor` is false. \
+                       Missing takes are listed in `offline` (relink_clip), never an error. \
+                       Allowed while recording. Whether the app opens the editor when a \
+                       recording stops is the setup's `recording.open_editor` (apply_change \
+                       with patch {\"recording\": {\"open_editor\": true}}). Returns the \
+                       project, its timelines and the one opened.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn open_project(
+        &self,
+        Parameters(Strict(params)): Parameters<Strict<ProjectOpenParams>>,
+    ) -> Result<Json<ProjectOpened>, String> {
+        self.call(Method::ProjectOpen(params)).await
+    }
+
+    #[tool(
+        description = "The project files opened lately (File › Open Recent), newest first, \
+                       each with whether it is still there; `clear` forgets them.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn recent_projects(
+        &self,
+        Parameters(Strict(params)): Parameters<Strict<RecentProjectsParams>>,
+    ) -> Result<Json<RecentProjects>, String> {
+        self.call(Method::RecentProjects(Some(params))).await
+    }
+
+    #[tool(
         description = "Record the last take again, on the current timeline. Not recording: take \
                        the last clip off (its files stay) and start recording in the same folder \
                        (or `folder`; `seconds` stops it on its own); while a stop is \
@@ -774,9 +1115,14 @@ impl Isocast {
 
     #[tool(
         description = "Join a timeline's clips (the current one unless `timeline` is given), in \
-                       order, into one program file and one file per ISO source every clip has \
-                       (video copied as recorded, audio re-encoded once so it stays in sync at \
-                       every join), plus an .export.json manifest, next to the first take (or in \
+                       order, into one program file and one file per ISO source every clip has, \
+                       each cut frame-accurately to the clips' in and out points (video copied \
+                       as recorded except from a cut to the next keyframe; audio re-encoded once \
+                       and cross-faded so it stays in sync at every join), an EDITED file when \
+                       clips show other angles (set_angle) or crops (crop_clip), a VERTICAL \
+                       (9:16) edited file with `vertical` (a 9:16 crop fills it), plus an \
+                       .export.json manifest, next \
+                       to the first take (or in \
                        `folder`). Sources some clips lack are skipped, saying why. It runs in \
                        the background: returns at once with the files it will write; \
                        get_events shows export_progress and export_finished.",
@@ -794,12 +1140,45 @@ impl Isocast {
     }
 
     #[tool(
+        description = "Write a timeline (the current one unless `timeline` is given) as a \
+                       project another editor opens: `format` fcpxml (Final Cut Pro), xmeml \
+                       (Premiere Pro; with `app` resolve, DaVinci Resolve) or otio \
+                       (OpenTimelineIO). Every ISO source \
+                       on its own video track with the program on top, each clip's angle the \
+                       one track on at that clip, crops as crop and transform, markers, and each file's \
+                       audio on its own tracks (the program's on, the ISO files' off), lined up \
+                       from the take manifests. It points at the takes' own files: nothing is \
+                       encoded, copied or changed. Written next to the first take (or in \
+                       `folder`, numbered so nothing is overwritten), or exactly at `path` \
+                       (replacing an earlier Isocast export there, or any file with \
+                       `replace`). \
+                       Returns the file, its tracks and notes on anything not as in Isocast's \
+                       export.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
+    )]
+    async fn export_timeline_nle(
+        &self,
+        Parameters(Strict(params)): Parameters<Strict<TimelineExportNleParams>>,
+    ) -> Result<Json<NleExported>, String> {
+        self.call(Method::TimelineExportNle(params)).await
+    }
+
+    #[tool(
         description = "Go live: stream the program (canvas and program mix) as H.264/AAC over \
-                       RTMP or RTMPS to the live setup's [stream] service (twitch, youtube, \
-                       kick, facebook or a custom server), starting the live engine if needed; \
-                       recordings start and stop independently. Needs a stream key set. Returns \
-                       the stream's status once live, or an error saying what to do. get_status \
-                       shows the stream's health.",
+                       RTMP or RTMPS to the live setup's [stream] destinations (twitch, youtube, \
+                       kick, facebook or custom servers; every enabled one, or `only` those \
+                       ids), starting the live engine if needed; destinations already live are \
+                       left alone, and recordings start and stop independently. Destinations \
+                       with the same bitrate and size share one encoder. Each needs its stream \
+                       key set. Returns the first destination's status plus every \
+                       destination's (`destinations`) once each is live or failed, or an error \
+                       saying what to do. get_status shows each one's health (`streams`). With \
+                       canvas \"vertical\", the vertical canvas's program to its own \
+                       [vertical.stream] destinations and keys (`vertical_streams`).",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -807,25 +1186,343 @@ impl Isocast {
             open_world_hint = true
         )
     )]
-    async fn start_stream(&self) -> Result<Json<StreamStatus>, String> {
-        self.call(Method::StreamStart).await
+    async fn start_stream(
+        &self,
+        Parameters(Strict(params)): Parameters<Strict<StreamStartParams>>,
+    ) -> Result<Json<Streaming>, String> {
+        self.call(Method::StreamStart(Some(params))).await
     }
 
     #[tool(
-        description = "Stop streaming. Returns the stream's final status: frames sent and \
-                       dropped, reconnects and the last error.",
+        description = "Add a stream destination to the live setup: a service (twitch, youtube, \
+                       kick, facebook, custom), its server (custom and kick need one; never with \
+                       the key in it), optional id (made from the service), enabled, and its \
+                       own video_bitrate_kbps or width/height (else the main destination's; a \
+                       different bitrate or size needs an encoder of its own, refused at start \
+                       when this Mac's encoders lack room). The first one becomes the [stream] \
+                       section itself (id main). Then set_stream_key with its destination id. \
+                       Returns every destination's status.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
             idempotent_hint = false
         )
     )]
-    async fn stop_stream(&self) -> Result<Json<StreamStatus>, String> {
-        self.call(Method::StreamStop).await
+    async fn stream_destination_add(
+        &self,
+        Parameters(Strict(params)): Parameters<Strict<StreamDestinationParams>>,
+    ) -> Result<Json<StreamDestinations>, String> {
+        self.call(Method::StreamDestinationAdd(Box::new(params)))
+            .await
     }
 
     #[tool(
-        description = "Start Isocast Virtual Camera. Takes no arguments: configure virtual_camera.target/scene/source/width/height through plan_change and apply_change first. Requires its signed/approved extension; never installs it. Recording and streaming stay independent.",
+        description = "Add a canvas (#84) to stream or record another shape of the show at \
+                       once, like 9:16 for Shorts/TikTok beside a 16:9 main canvas: canvas \
+                       \"vertical\" turns on the [vertical] canvas, any other id adds a \
+                       [[canvases]] entry. Optional name, width/height (default 1080x1920), \
+                       fps (else main's), follow_main (default true: shows the main scene, \
+                       letterboxed unless a scene has an arrangement for it under \
+                       scenes[].canvases.<id>; false: it switches its own scenes with \
+                       switch_scene/preview/take and canvas), record. Then add its stream \
+                       destinations with stream_destination_add and canvas set to its id \
+                       (each destination its own key, bitrate, size, rate control, keyframes \
+                       and audio bitrate; equal ones share one encoder). Returns every canvas.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    async fn canvas_add(
+        &self,
+        Parameters(Strict(params)): Parameters<Strict<isocast_protocol::api::CanvasParams>>,
+    ) -> Result<Json<isocast_protocol::api::Canvases>, String> {
+        self.call(Method::CanvasAdd(Box::new(params))).await
+    }
+
+    #[tool(
+        description = "Change a canvas (\"vertical\" or a [[canvases]] id): name, \
+                       width/height, fps, follow_main, record, or `clear` some of name, fps, \
+                       stream. Size and frame rate wait while it records or streams. Returns \
+                       every canvas.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn canvas_set(
+        &self,
+        Parameters(Strict(params)): Parameters<Strict<isocast_protocol::api::CanvasParams>>,
+    ) -> Result<Json<isocast_protocol::api::Canvases>, String> {
+        self.call(Method::CanvasSet(Box::new(params))).await
+    }
+
+    #[tool(
+        description = "Remove a canvas with its scene arrangements, recording and stream \
+                       destinations (not while it records or streams; its keys stay in the \
+                       Keychain). Returns every canvas left.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
+    )]
+    async fn canvas_remove(
+        &self,
+        Parameters(Strict(params)): Parameters<Strict<CanvasIdParams>>,
+    ) -> Result<Json<isocast_protocol::api::Canvases>, String> {
+        self.call(Method::CanvasRemove {
+            canvas: params.canvas,
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Change a stream destination by id (main is the [stream] section): \
+                       service, server, enabled, video_bitrate_kbps, width/height, \
+                       rate_control, keyframe_interval_seconds, audio_bitrate_kbps, or `clear` \
+                       some of those. With canvas, that canvas's destinations (vertical or a \
+                       [[canvases]] id). Takes effect at its next start. Returns every \
+                       destination's status.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn stream_destination_set(
+        &self,
+        Parameters(Strict(params)): Parameters<Strict<StreamDestinationParams>>,
+    ) -> Result<Json<StreamDestinations>, String> {
+        self.call(Method::StreamDestinationSet(Box::new(params)))
+            .await
+    }
+
+    #[tool(
+        description = "Remove a stream destination by id (not main: turn it off with \
+                       stream_destination_set instead; not while it streams). Its stored key \
+                       stays in the Keychain until clear_stream_key. Returns every \
+                       destination's status.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
+    )]
+    async fn stream_destination_remove(
+        &self,
+        Parameters(Strict(params)): Parameters<Strict<DestinationIdParams>>,
+    ) -> Result<Json<StreamDestinations>, String> {
+        self.call(Method::StreamDestinationRemove {
+            id: params.id,
+            canvas: params.canvas,
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Start the replay buffer: keep the last recording.replay.seconds (30 by \
+                       default) of the encoded program, video and program mix, in memory, \
+                       starting the live engine if needed; recording and streaming are \
+                       independent of it. It shares the stream's encoder when the setup has a \
+                       [stream]. Then save_replay writes the last seconds to a file. With \
+                       canvas \"vertical\", the vertical canvas's program in a buffer of its \
+                       own (same settings; sharing a [vertical.stream]'s encoder); each canvas's \
+                       buffer starts, stops and saves independently. Returns its status.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    async fn start_replay(
+        &self,
+        Parameters(Strict(params)): Parameters<Strict<ReplayParams>>,
+    ) -> Result<Json<ReplayStatus>, String> {
+        self.call(Method::ReplayStart(ReplayParams::of(params.canvas)))
+            .await
+    }
+
+    #[tool(
+        description = "Stop the replay buffer, discarding what it holds (save_replay first to \
+                       keep it); canvas \"vertical\" stops the vertical canvas's buffer only. \
+                       Returns its final status.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
+    )]
+    async fn stop_replay(
+        &self,
+        Parameters(Strict(params)): Parameters<Strict<ReplayParams>>,
+    ) -> Result<Json<ReplayStatus>, String> {
+        self.call(Method::ReplayStop(ReplayParams::of(params.canvas)))
+            .await
+    }
+
+    #[tool(
+        description = "Save the replay buffer: write the last recording.replay.seconds of the \
+                       program, up to this moment, to a new MOV/MP4 in the recordings folder \
+                       (the running recording's project folder, if one records), without \
+                       interrupting recording or streaming. Canvas \"vertical\" saves the \
+                       vertical canvas's buffer (its file name ends in \"vertical\"). Returns the \
+                       file's path, length, frames and any missed frames.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    async fn save_replay(
+        &self,
+        Parameters(Strict(params)): Parameters<Strict<ReplayParams>>,
+    ) -> Result<Json<ReplaySaved>, String> {
+        self.call(Method::ReplaySave(ReplayParams::of(params.canvas)))
+            .await
+    }
+
+    #[tool(
+        description = "Open a projector: the program, studio mode's preview, a scene (`scene` \
+                       id), a video source (`source` id) or a multiview grid (`layout`: top-8, \
+                       3x3 or 2x2; preview, program and scenes with labels and tally; \
+                       `vertical` true puts the vertical program in its last tile, \
+                       `canvases` [ids] puts those extra canvases' programs in its last \
+                       tiles), with `canvas` \"vertical\" or a [[canvases]] id that canvas's \
+                       program, preview or scene, full \
+                       screen on a display (`fullscreen`, `display`: main, an id or a name from \
+                       list_projectors) or in a window (`fullscreen` false, optional `frame` in \
+                       points). The Isocast app shows it, and opens it when it next starts if \
+                       it isn't running (`shown` says whether a window shows it). Opening a \
+                       view that is already open moves it. Absent placement: where that view \
+                       was last.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn open_projector(
+        &self,
+        Parameters(Strict(params)): Parameters<Strict<isocast_protocol::projector::OpenParams>>,
+    ) -> Result<Json<isocast_protocol::projector::Projector>, String> {
+        self.call(Method::ProjectorOpen(Box::new(params))).await
+    }
+
+    #[tool(
+        description = "Close a projector by `id` (from list_projectors), or every one with \
+                       `all`. Where each was is remembered for the next time its view opens. \
+                       Returns the projectors still open.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    async fn close_projector(
+        &self,
+        Parameters(Strict(params)): Parameters<Strict<isocast_protocol::projector::CloseParams>>,
+    ) -> Result<Json<isocast_protocol::projector::Projectors>, String> {
+        self.call(Method::ProjectorClose(params)).await
+    }
+
+    #[tool(
+        description = "The open projectors (what each shows, full screen on which display or \
+                       where its window is, whether the app shows it) and the displays a \
+                       projector can fill.",
+        annotations(read_only_hint = true, idempotent_hint = true)
+    )]
+    async fn list_projectors(
+        &self,
+        Parameters(Strict(_)): Parameters<Strict<CameraNoArgs>>,
+    ) -> Result<Json<isocast_protocol::projector::Projectors>, String> {
+        self.call(Method::ProjectorList).await
+    }
+
+    #[tool(
+        description = "The replay buffer's state, seconds held, memory used and its limit, \
+                       format, whether it shares the stream's encoder, missed frames and the \
+                       last save; canvas \"vertical\" for the vertical canvas's buffer.",
+        annotations(read_only_hint = true, idempotent_hint = true)
+    )]
+    async fn replay_status(
+        &self,
+        Parameters(Strict(params)): Parameters<Strict<ReplayParams>>,
+    ) -> Result<Json<ReplayStatus>, String> {
+        self.call(Method::ReplayStatus(ReplayParams::of(params.canvas)))
+            .await
+    }
+
+    #[tool(
+        description = "The obs-websocket v5 compatibility server (OBS tools such as Stream \
+                       Deck, Touch Portal and Streamer.bot drive Isocast through it): whether \
+                       it is on and listening, its ws:// address, whether it asks for a \
+                       password, connected clients, and why it isn't listening if it should be.",
+        annotations(read_only_hint = true, idempotent_hint = true)
+    )]
+    async fn websocket_status(&self) -> Result<Json<WebsocketStatus>, String> {
+        self.call(Method::WebsocketStatus).await
+    }
+
+    #[tool(
+        description = "Turn on the obs-websocket v5 server (off by default; kept across \
+                       restarts), optionally setting port (4455), bind (127.0.0.1, this Mac \
+                       only; 0.0.0.0 for every network), password (kept in the Keychain) or \
+                       no_password (loopback bind only; web pages are then refused and logged; kept \
+                       until a password is given). Settings left out stay as they were. With \
+                       a password required and none stored, one is generated and returned \
+                       once as generated_password, for the user to enter in the OBS tool. \
+                       Returns its status, with a warning if ISOCAST_WEBSOCKET_PASSWORD \
+                       overrides the stored password.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn websocket_enable(
+        &self,
+        Parameters(Strict(params)): Parameters<Strict<WebsocketEnableParams>>,
+    ) -> Result<Json<WebsocketStatus>, String> {
+        self.call(Method::WebsocketEnable(Some(params))).await
+    }
+
+    #[tool(
+        description = "Turn off the obs-websocket server, disconnecting its clients. Returns \
+                       its status.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn websocket_disable(&self) -> Result<Json<WebsocketStatus>, String> {
+        self.call(Method::WebsocketDisable).await
+    }
+
+    #[tool(
+        description = "Stop streaming (to every destination, or `only` those ids; the others \
+                       keep going). Returns the final status of the first stopped, plus every \
+                       destination's: frames sent and dropped, reconnects and the last error. \
+                       Stops one canvas's streams: canvas \"main\" (the default) or \
+                       \"vertical\".",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    async fn stop_stream(
+        &self,
+        Parameters(Strict(params)): Parameters<Strict<StreamStartParams>>,
+    ) -> Result<Json<Streaming>, String> {
+        self.call(Method::StreamStop(Some(params))).await
+    }
+
+    #[tool(
+        description = "Start Isocast Virtual Camera. Takes no arguments: configure virtual_camera.target/scene/source/width/height through plan_change and apply_change first (target \"vertical\" shows the vertical program, 1080x1920 by default; it needs the vertical canvas on). Requires its signed/approved extension; never installs it. Recording and streaming stay independent.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -852,6 +1549,21 @@ impl Isocast {
         Parameters(Strict(_)): Parameters<Strict<CameraNoArgs>>,
     ) -> Result<Json<isocast_protocol::virtual_camera::VirtualCameraStatus>, String> {
         self.call(Method::VirtualCameraStop).await
+    }
+
+    #[tool(
+        description = "Remove Isocast Virtual Camera from macOS (the release app's camera extension), for deleting Isocast cleanly: stops the camera, then macOS asks the user for an administrator password; waits for it (up to about 4 minutes). Ask the user first. A later virtual_camera_start installs it again.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true
+        )
+    )]
+    async fn virtual_camera_remove(
+        &self,
+        Parameters(Strict(_)): Parameters<Strict<CameraNoArgs>>,
+    ) -> Result<Json<isocast_protocol::virtual_camera::VirtualCameraRemoval>, String> {
+        self.call(Method::VirtualCameraRemove).await
     }
 
     #[tool(
@@ -909,8 +1621,10 @@ impl Isocast {
         self.call(Method::StreamKeySet(Box::new(StreamKeyParams {
             key: params.key,
             target: StreamKeyTarget {
+                destination: params.destination,
                 service: params.service,
                 server: params.server,
+                canvas: params.canvas,
             },
         })))
         .await
@@ -930,8 +1644,10 @@ impl Isocast {
         Parameters(Strict(params)): Parameters<Strict<StreamKeyTargetParams>>,
     ) -> Result<Json<StreamKey>, String> {
         self.call(Method::StreamKeyClear(Box::new(StreamKeyTarget {
+            destination: params.destination,
             service: params.service,
             server: params.server,
+            canvas: params.canvas,
         })))
         .await
     }
@@ -1054,9 +1770,10 @@ impl Isocast {
         &self,
         Parameters(Strict(params)): Parameters<Strict<GetSetupParams>>,
     ) -> Result<Json<Live>, String> {
-        let params = params
-            .resolved
-            .then_some(isocast_protocol::api::GetParams { resolved: true });
+        let params = params.resolved.then_some(isocast_protocol::api::GetParams {
+            resolved: true,
+            canvas: params.canvas,
+        });
         self.call(Method::Get(params)).await
     }
 
@@ -1089,6 +1806,55 @@ impl Isocast {
             folder: params.folder.map(Into::into),
         })))
         .await
+    }
+
+    #[tool(
+        description = "Predict instantly, without benchmarking, whether a setup's files (the \
+                       live setup's if none is given) fit this Mac's H.264/HEVC media engines, \
+                       from measured per-chip data: `capacity` is fits, no_margin or \
+                       cannot_keep_up, `load` the busiest engine's share, and `suggestions` \
+                       the closest changes that fit (each a patch for plan_change, or a \
+                       method like stream_stop; `after_take` ones wait for the recording to \
+                       end). With add_iso, `admission` says how to turn that ISO file on so it \
+                       fits (smaller, slower, or left off). tune_encoders measures instead.",
+        annotations(read_only_hint = true)
+    )]
+    async fn estimate_capacity(
+        &self,
+        Parameters(Strict(params)): Parameters<Strict<EstimateCapacityParams>>,
+    ) -> Result<Json<CapacityEstimate>, String> {
+        self.call(Method::EstimateCapacity(Box::new(CapacityParams {
+            setup: parse_setup(params.setup)?,
+            stream: params.stream,
+            add_iso: params.add_iso,
+        })))
+        .await
+    }
+
+    #[tool(
+        description = "Show this machine's measured capabilities and calibration state; missing or stale measurements fall back to the per-chip table.",
+        annotations(read_only_hint = true)
+    )]
+    async fn machine_profile(
+        &self,
+    ) -> Result<Json<isocast_protocol::machine::MachineStatus>, String> {
+        self.call(Method::MachineProfile).await
+    }
+
+    #[tool(
+        description = "Start a silent synthetic self-test, at most 30 seconds, without capture, windows or network access. Refused while outputs are active; starting an output cancels it. Poll machine_profile for completion."
+    )]
+    async fn machine_calibrate(
+        &self,
+    ) -> Result<Json<isocast_protocol::machine::MachineStatus>, String> {
+        self.call(Method::MachineCalibrate).await
+    }
+
+    #[tool(description = "Cancel machine calibration and retain the previous valid profile.")]
+    async fn machine_cancel(
+        &self,
+    ) -> Result<Json<isocast_protocol::machine::MachineStatus>, String> {
+        self.call(Method::MachineCancel).await
     }
 
     #[tool(
@@ -1159,9 +1925,14 @@ impl Isocast {
         &self,
         Parameters(Strict(params)): Parameters<Strict<LiveFrameParams>>,
     ) -> Result<CallToolResult, String> {
+        let target = crate::canvas_target(
+            params.canvas,
+            params.target.unwrap_or_else(|| "program".into()),
+        )
+        .map_err(|err| err.to_string())?;
         let Json(frame): Json<Frame> = self
             .call(Method::Frame(FrameParams {
-                target: params.target.unwrap_or_else(|| "program".into()),
+                target,
                 max_width: Some(params.width.unwrap_or(1280)),
                 after: None,
                 timeout_ms: Some(5000),
@@ -1200,6 +1971,67 @@ impl Isocast {
             })
             .await?;
         Ok(Json(LiveEngine { engine }))
+    }
+
+    #[tool(
+        description = "Find OBS Studio's scene collections and profiles on this Mac (its \
+                       settings folder, or `folder`) without importing anything: each \
+                       collection with scene and source counts and the profile an import would \
+                       use (`profile`, a basic.ini path), each profile's canvas, frame rate, \
+                       recording encoder, format and folder, and stream service and bitrate \
+                       (never the key; `key_in_file` says OBS keeps one in plain text), and \
+                       files that couldn't be read. Offer the collections to the user, then \
+                       import_obs_collection_or_profile with the collection's `file` and its \
+                       `profile` (stream_key only if the user agreed to move the key).",
+        annotations(read_only_hint = true)
+    )]
+    async fn discover_obs(
+        &self,
+        Parameters(Strict(params)): Parameters<Strict<ObsDiscoverParams>>,
+    ) -> Result<Json<Discovery>, String> {
+        self.call(Method::ObsDiscover(Some(params))).await
+    }
+
+    #[tool(
+        description = "Measure the upload speed to a streaming service's ingest (the live \
+                       setup's unless `service`/`server` say) with a few seconds of filler \
+                       video: Twitch's bandwidth test mode (never on air) or a custom server \
+                       (a relay would put the filler on air for a few seconds: ask the user \
+                       first), using the stored stream key. YouTube, Facebook and Kick have no test \
+                       mode, and without a key nothing can be tested: then `measured` is false, \
+                       `reason` says why, and `recommended_kbps` is a safe default. Refused \
+                       while streaming.",
+        annotations(read_only_hint = true)
+    )]
+    async fn test_upload_speed(
+        &self,
+        Parameters(Strict(params)): Parameters<Strict<SpeedTestParams>>,
+    ) -> Result<Json<SpeedTest>, String> {
+        self.call(Method::SpeedTest(Box::new(params))).await
+    }
+
+    #[tool(
+        description = "Optimize the live setup for `goal` recording, streaming or both (OBS's \
+                       Auto-Configuration Wizard). Recording favours quality and ISO files \
+                       (HEVC High, an ISO file per captured source); streaming sets the \
+                       service and a bitrate from the upload speed (upload_kbps, or measured \
+                       like test_upload_speed; never for a custom server, test it first) and sizes \
+                       the stream to it. Then it benchmarks \
+                       this Mac like tune_encoders and steps down where it can't keep up. \
+                       Returns a one-line `summary`, the optimized setup, its differences from \
+                       the live setup, the benchmark and notes; with apply it becomes the live \
+                       setup. Takes a minute or two; refused while recording or streaming.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    async fn optimize_setup(
+        &self,
+        Parameters(Strict(params)): Parameters<Strict<OptimizeParams>>,
+    ) -> Result<Json<Optimized>, String> {
+        self.call(Method::Optimize(Box::new(params))).await
     }
 
     #[tool(
@@ -1289,21 +2121,31 @@ impl Isocast {
 
     #[tool(
         description = "Ask macOS for screen recording, camera and microphone access where it \
-                       hasn't been decided yet. Its prompts appear on the user's screen; waits up \
-                       to a minute for answers and returns the permissions with next steps.",
+                       hasn't been decided yet (or only `permission`). Its prompts appear on the \
+                       user's screen; waits up to a minute for answers and returns the \
+                       permissions with next steps.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
             idempotent_hint = true
         )
     )]
-    async fn request_permissions(&self) -> Result<Json<PermissionsReport>, String> {
-        self.call(Method::RequestPermissions).await
+    async fn request_permissions(
+        &self,
+        Parameters(Strict(params)): Parameters<Strict<RequestPermissionsToolParams>>,
+    ) -> Result<Json<PermissionsReport>, String> {
+        self.call(Method::RequestPermissions(params.permission.map(
+            |permission| isocast_protocol::api::RequestPermissionsParams {
+                permission: Some(permission),
+            },
+        )))
+        .await
     }
 
     #[tool(
         description = "Open System Settings on the user's screen at the pane where a \
-                       permission (screen_recording, camera or microphone) is turned on by \
+                       permission (screen_recording, camera, microphone or system_audio) is \
+                       turned on by \
                        hand, for one that was refused.",
         annotations(
             read_only_hint = false,
@@ -1363,7 +2205,10 @@ impl Isocast {
     #[tool(
         description = "Start recording the live setup (or the given setup, which then replaces \
                        the live setup): the program and every ISO source, each to its own file. \
-                       Returns once every file is created.",
+                       Its takes go where record_target says: a new project folder with its own \
+                       timeline unless a timeline was chosen (`new_project` or `into` choose for \
+                       this recording only). Returns once every file is created, with the \
+                       timeline its takes go to.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1378,6 +2223,8 @@ impl Isocast {
             setup: parse_setup(params.setup)?,
             folder: params.folder.map(Into::into),
             seconds: params.seconds,
+            new_project: params.new_project,
+            into: params.into,
         })))
         .await
     }
@@ -1472,10 +2319,39 @@ impl Isocast {
     }
 
     #[tool(
+        description = "Choose the audio tracks of one source's ISO file in the live setup \
+                       (recording.iso.source_audio): a camera's file with the mic only, a \
+                       screen's with desktop audio only. Other ISO files keep \
+                       recording.iso.audio, or their own sound. Applies from the next \
+                       recording; the manifest lists each file's tracks.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn set_iso_audio(
+        &self,
+        Parameters(Strict(params)): Parameters<Strict<SetIsoAudioParams>>,
+    ) -> Result<Json<Applied>, String> {
+        let events = self.events.clone();
+        tokio::task::spawn_blocking(move || {
+            events.ensure_watching();
+            let mut client = Client::connect_or_launch()?;
+            crate::client::set_iso_audio(&mut client, &params.source, params.audio.as_deref())
+        })
+        .await
+        .map_err(|err| format!("{err}"))?
+        .map(Json)
+        .map_err(|err| format!("{err:#}"))
+    }
+
+    #[tool(
         description = "Put a scene on air, by id, with a transition: cut, fade, swipe, slide, \
                        fade_to_color, luma_wipe, stinger or move (the scene's transition, else \
                        the setup's, by default). While recording, the switch is written to the \
-                       manifest's scene timeline.",
+                       manifest's scene timeline. canvas \"vertical\" switches the vertical \
+                       canvas, once vertical.follow_main is false.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1489,6 +2365,7 @@ impl Isocast {
         self.call(Method::SwitchScene {
             scene: params.scene,
             transition: params.transition,
+            canvas: params.canvas,
         })
         .await
     }
@@ -1508,6 +2385,7 @@ impl Isocast {
     ) -> Result<Json<Switched>, String> {
         self.call(Method::Preview {
             scene: params.scene,
+            canvas: params.canvas,
         })
         .await
     }
@@ -1520,8 +2398,18 @@ impl Isocast {
             idempotent_hint = true
         )
     )]
-    async fn clear_preview(&self) -> Result<Json<Switched>, String> {
-        self.call(Method::ClearPreview).await
+    async fn clear_preview(
+        &self,
+        Parameters(Strict(params)): Parameters<Strict<ClearPreviewParams>>,
+    ) -> Result<Json<Switched>, String> {
+        if params.canvas.is_main() {
+            self.call(Method::ClearPreview).await
+        } else {
+            self.call(Method::ClearCanvasPreview {
+                canvas: params.canvas,
+            })
+            .await
+        }
     }
 
     #[tool(
@@ -1539,6 +2427,7 @@ impl Isocast {
     ) -> Result<Json<Switched>, String> {
         self.call(Method::Take {
             transition: params.transition,
+            canvas: params.canvas,
         })
         .await
     }
@@ -1599,11 +2488,15 @@ Plugins (local folders with an isocast-plugin.toml) are installed with add_plugi
 exactly the permissions they ask for, and listed with list_plugins. \
 Text in scenes can show a data key (`data = \"score.home\"`); set_data changes it live \
 (get_data reads it), with no setup change. \
-Timelines line takes up like a clip bar: new_timeline makes one current, and every take that \
-finishes is added to it; retake records the last one again, remove_clip and move_clip edit \
-it (takes' files are never deleted), export_timeline joins it into one file. \
+Timelines line takes up like a clip bar: each recording starts a new project with its own \
+timeline unless record_target (or new_timeline) chose one to add takes to; retake records the last one again, remove_clip and move_clip edit \
+it, trim_clip, split_clip, delete_range, roll_cut, set_angle and crop_clip cut it (undo_edit, \
+redo_edit; takes' files are never touched), export_timeline joins it into one file, and \
+export_timeline_nle writes it as a Final Cut Pro, Premiere Pro or Resolve project. \
 Each recording session writes into its own project folder; list_projects finds them and \
-rename_project names one once it has stopped. \
+rename_project names one once it has stopped. Each has a `<name>.isoprj` project file that \
+open_project opens in the editor, wherever the folder was copied (recent_projects lists those \
+opened lately; relink_clip finds offline takes). \
 Sources and scenes are addressed by id. Errors name the field and list valid options."
 )]
 impl ServerHandler for Isocast {}
@@ -1692,7 +2585,12 @@ impl Isocast {
         let events = self.events.clone();
         tokio::task::spawn_blocking(move || {
             events.ensure_watching();
-            Client::connect_or_launch()?.call(method)
+            let mut client = Client::connect_or_launch()?;
+            // Like the CLI's status/start: warn (stderr, the MCP host's
+            // log) once if the engine is older than this isocast (#49).
+            static STALE_CHECK: std::sync::Once = std::sync::Once::new();
+            STALE_CHECK.call_once(|| crate::client::check_engine(&mut client));
+            client.call(method)
         })
         .await
         .map_err(|err| format!("{err}"))?

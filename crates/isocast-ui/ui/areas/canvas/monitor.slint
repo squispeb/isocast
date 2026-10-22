@@ -53,8 +53,8 @@ export component Monitor inherits Rectangle {
     in property <image> picture;
     // The canvas editor goes over this one.
     in property <bool> editor: true;
-    // The program while streaming (live): a 2px green (`onair`) ring.
-    // Recording alone keeps the 1px `line` ring: red is the LCD's.
+    // The program while streaming (live): a 2px red (`danger`) tally ring
+    // (#95). Recording alone keeps the 1px `line` ring.
     in property <bool> program-live;
     // Instead of a picture.
     in property <string> empty-text;
@@ -64,6 +64,10 @@ export component Monitor inherits Rectangle {
     in property <length> pad: 0px;
     // One canvas pixel to a screen pixel (Preview Scaling → Canvas).
     in property <bool> actual-size;
+    // The canvas shown: the edited one, or the vertical one (#86).
+    in property <int> canvas-width: max(1, Ui.canvas-width);
+    in property <int> canvas-height: max(1, Ui.canvas-height);
+    in property <string> label: root.editor ? "Preview" : "Program";
 
     // The picture's size on screen, in physical pixels: the texture is
     // drawn at this size so it is shown 1:1.
@@ -89,8 +93,6 @@ export component Monitor inherits Rectangle {
     // Points per canvas pixel.
     out property <float> scale: k;
 
-    property <int> canvas-width: max(1, Ui.canvas-width);
-    property <int> canvas-height: max(1, Ui.canvas-height);
     property <bool> has-selection: root.editor && Ui.selected-item != "";
     property <float> fit: max(0.0001, min((root.width - 2 * root.pad) / 1px / root.canvas-width, (root.height - 2 * root.pad) / 1px / root.canvas-height));
     property <float> k: root.actual-size ? 1phx / 1px : root.fit;
@@ -113,10 +115,10 @@ export component Monitor inherits Rectangle {
 
     background: transparent;
     accessible-role: image;
-    accessible-label: root.editor ? "Preview" : "Program";
+    accessible-label: root.label;
     accessible-description: root.has-selection ? "Selected: " + Ui.selected-name : "";
 
-    // The monitor's ring: 1px `line`, or 2px `onair` while the program is
+    // The monitor's ring: 1px `line`, or 2px `danger` while the program is
     // live. A frame only, so a native picture under it shows through.
     // Before there is a setup: the empty monitor instead, no ring (Paper's
     // Welcome board).
@@ -133,7 +135,7 @@ export component Monitor inherits Rectangle {
         width: pic-w + (root.program-live ? 4px : 2px);
         height: pic-h + (root.program-live ? 4px : 2px);
         border-width: root.program-live ? 2px : 1px;
-        border-color: root.program-live ? Theme.onair : Theme.line;
+        border-color: root.program-live ? Theme.danger : Theme.line;
     }
     if !CanvasArea.native-picture && Ui.has-setup: Rectangle {
         x: pic-x;

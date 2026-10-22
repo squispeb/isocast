@@ -6,6 +6,8 @@
 //! manifest is written when the session starts, again once every file has
 //! started, and when it ends, so it survives a crash.
 
+use std::collections::BTreeMap;
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -34,11 +36,64 @@ pub struct SessionManifest {
     /// start of the session.
     #[serde(default)]
     pub scenes: Vec<SceneChange>,
+    /// Scene switches on the second canvas, on the same recording clock.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vertical_scenes: Vec<SceneChange>,
+    /// Scene switches on each other recorded canvas (`[[canvases]]`, #84),
+    /// by canvas id, on the same recording clock.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub canvas_scenes: std::collections::BTreeMap<String, Vec<SceneChange>>,
     /// Spans cut out of this take. Old manifests have no pauses.
     #[serde(default)]
     pub pauses: Vec<Pause>,
     /// Problems during recording.
     pub errors: Vec<String>,
+    /// Camera capture metadata by source id: every camera source running
+    /// when the session started, including cameras recorded only through
+    /// the program. Absent when the platform reports none.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub cameras: BTreeMap<String, CameraCaptureMetadata>,
+}
+
+/// What a camera's driver said about its frames, as observed by the
+/// capture over its lifetime (from when it opened until the manifest was
+/// written), not counts of the frames in the encoded files.
+///
+/// Each `sample_*` list holds the distinct states seen for one per-sample
+/// flag, at most once each: `null` (the sample didn't carry the flag),
+/// `false` and `true`. It is not a per-frame log.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct CameraCaptureMetadata {
+    /// The platform's identifier for the device.
+    pub device_id: String,
+    /// The device's name.
+    pub device_name: String,
+    /// The interlace mode the negotiated media type declares, as the
+    /// platform's raw value (Windows: `MFVideoInterlaceMode`).
+    #[serde(default)]
+    pub media_type_interlace_mode: u32,
+    /// How interlaced fields are handled: currently always "weave", both
+    /// fields kept in one frame as delivered. Weave preserves the pixels;
+    /// it does not remove temporal combing, and the codec may still be
+    /// lossy.
+    #[serde(default)]
+    pub field_handling: String,
+    /// Native delivery path. Windows distinguishes GPU NV12 copies from
+    /// shared MJPEG software decoding followed by a BGRA GPU upload.
+    #[serde(default)]
+    pub delivery: String,
+    /// Distinct "interlaced" sample flags seen.
+    #[serde(default)]
+    pub sample_interlaced: Vec<Option<bool>>,
+    /// Distinct "bottom field first" sample flags seen.
+    #[serde(default)]
+    pub sample_bottom_field_first: Vec<Option<bool>>,
+    /// Distinct "single field" sample flags seen.
+    #[serde(default)]
+    pub sample_single_field: Vec<Option<bool>>,
+    /// Distinct "repeat first field" sample flags seen.
+    #[serde(default)]
+    pub sample_repeat_first_field: Vec<Option<bool>>,
 }
 
 /// One pause: start/end on the uncut take clock, and the resulting join on
@@ -120,6 +175,32 @@ pub struct ManifestFile {
     pub repeated_frames: Option<u64>,
     pub dropped_frames: Option<u64>,
     pub audio_dropouts: Option<u64>,
+    /// Audio sources that stopped while this file recorded (a microphone
+    /// unplugged, a picked input gone, an app's audio tap ended): the
+    /// track that carries each is missing its audio from then on. Absent
+    /// when none did, and in manifests written before it existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audio_stops: Vec<AudioStop>,
+}
+
+/// An audio source that stopped while recording, in one file's track.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct AudioStop {
+    /// The id of the audio source that stopped.
+    pub source: String,
+    /// The audio track (from 0, in `audio` order) missing its audio: the
+    /// source's own track, or the program mix it was mixed into.
+    pub track: u32,
+    /// When its audio stopped, on the take's timeline (like markers); 0 if
+    /// it had already stopped when this take began.
+    pub time_seconds: f64,
+    /// When it came back in this track, if the engine opened it again (only
+    /// the program mix picks a reopened source up; an ISO track stays
+    /// silent to the end of the recording).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumed_seconds: Option<f64>,
+    /// Why it stopped.
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

@@ -8,8 +8,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, sync_channel};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, sync_channel};
+use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -18,6 +18,7 @@ use isocast_protocol::{
     CameraSource, MediaSource, Setup, SlideshowSource, SourceKind, TestPatternSource, TextSource,
     ToneSource,
 };
+use parking_lot::{Condvar, Mutex};
 
 use crate::data::DataStore;
 use crate::picture::{self, Picture};
@@ -25,8 +26,9 @@ use crate::record::expand_home;
 use crate::synthetic::{TestPattern, Tone};
 use crate::text;
 use crate::{
-    AudioSink, BrowserControl, BrowserPage, CameraRequest, CaptureFormat, FramePool, MediaInfo,
-    MediaPart, MediaReader, PageLocation, Platform, SAMPLE_RATE, ScreenTarget, Time, VideoSink,
+    AudioSink, BrowserControl, BrowserPage, CameraMetadataReader, CameraRequest, CaptureFormat,
+    FramePool, MediaInfo, MediaPart, MediaReader, PageLocation, Platform, SAMPLE_RATE,
+    ScreenTarget, Time, VideoSink,
 };
 
 /// Audio is delivered in 10 ms chunks by generators, like a capture device.
@@ -44,7 +46,9 @@ pub(crate) struct Timeline {
     /// Source ids on air in the program and when each came on air; `None`
     /// when there is no program, so every source counts as on air from the
     /// start.
-    on_air: Mutex<Option<HashMap<String, Time>>>,
+    on_air: Mutex<Option<HashMap<String, (Time, u64)>>>,
+    /// Which bit of an on-air entry each canvas has (#84), main first.
+    canvas_bits: Mutex<Vec<isocast_protocol::CanvasId>>,
     /// The program has said what it shows at least once.
     published: AtomicBool,
 }
@@ -73,19 +77,49 @@ impl Timeline {
 
     /// Start tracking which sources the program has on air.
     pub(crate) fn track_on_air(&self) {
-        self.on_air.lock().unwrap().get_or_insert_with(HashMap::new);
+        self.on_air.lock().get_or_insert_with(HashMap::new);
     }
 
-    /// The program shows `sources` from `at`: those new on air since then.
-    pub(crate) fn set_on_air<'a>(&self, sources: impl IntoIterator<Item = &'a str>, at: Time) {
-        let mut on_air = self.on_air.lock().unwrap();
+    /// A canvas shows `sources` from `at`. A source stays on air while
+    /// either canvas shows it, so switching one cannot stop the other's media.
+    pub(crate) fn set_on_air<'a>(
+        &self,
+        canvas: isocast_protocol::CanvasId,
+        sources: impl IntoIterator<Item = &'a str>,
+        at: Time,
+    ) {
+        let mut on_air = self.on_air.lock();
         let Some(on_air) = on_air.as_mut() else {
             return;
         };
         let now: HashSet<&str> = sources.into_iter().collect();
-        on_air.retain(|id, _| now.contains(id.as_str()));
+        let bit = {
+            let mut bits = self.canvas_bits.lock();
+            if bits.is_empty() {
+                bits.extend([
+                    isocast_protocol::CanvasId::Main,
+                    isocast_protocol::CanvasId::Vertical,
+                ]);
+            }
+            let index = match bits.iter().position(|c| *c == canvas) {
+                Some(index) => index,
+                None => {
+                    bits.push(canvas);
+                    bits.len() - 1
+                }
+            };
+            // An engine has at most 17 canvases in its life; past 64 they
+            // share the last bit, which only keeps a source on air longer.
+            1u64 << index.min(63)
+        };
+        on_air.retain(|id, (_, shown)| {
+            if !now.contains(id.as_str()) {
+                *shown &= !bit;
+            }
+            *shown != 0
+        });
         for id in now {
-            on_air.entry(id.to_string()).or_insert(at);
+            on_air.entry(id.to_string()).or_insert((at, 0)).1 |= bit;
         }
         self.published.store(true, Ordering::SeqCst);
     }
@@ -93,14 +127,14 @@ impl Timeline {
     /// Whether what's on air is known yet: with a program, once it has
     /// drawn its first frame.
     fn on_air_known(&self) -> bool {
-        self.on_air.lock().unwrap().is_none() || self.published.load(Ordering::SeqCst)
+        self.on_air.lock().is_none() || self.published.load(Ordering::SeqCst)
     }
 
     /// Since when source `id` has been on air, if it is; with no program,
     /// since the start.
     fn on_air_since(&self, id: &str) -> Option<Time> {
-        match self.on_air.lock().unwrap().as_ref() {
-            Some(on_air) => on_air.get(id).copied(),
+        match self.on_air.lock().as_ref() {
+            Some(on_air) => on_air.get(id).map(|(since, _)| *since),
             None => self.start(),
         }
     }
@@ -109,6 +143,9 @@ impl Timeline {
 /// The latest frames from a source, for frame clocks to choose from.
 pub(crate) struct FrameSlot<F> {
     frames: Mutex<VecDeque<(F, Time)>>,
+    /// Media's decoded next pictures. Timed readers can select them without
+    /// waiting for the producer's delivery wake; untimed readers cannot.
+    ahead: Option<Mutex<VecDeque<(F, Time)>>>,
     /// The most frames kept.
     capacity: usize,
     /// Signalled when a frame arrives.
@@ -122,8 +159,10 @@ pub(crate) struct FrameSlot<F> {
 }
 
 impl<F: Clone> FrameSlot<F> {
-    /// Frames kept if a frame clock falls behind.
-    const CAPACITY: usize = 6;
+    /// The compositor's newest frame and the ISO clock's half-frame older
+    /// selection, plus one arriving frame. Capture (notably SCK's eight
+    /// surfaces) needs the rest back rather than a six-frame history.
+    const CAPACITY: usize = 3;
 
     pub(crate) fn new(timeline: Arc<Timeline>) -> Self {
         Self::with_capacity(timeline, Self::CAPACITY)
@@ -134,6 +173,7 @@ impl<F: Clone> FrameSlot<F> {
     pub(crate) fn with_capacity(timeline: Arc<Timeline>, capacity: usize) -> Self {
         Self {
             frames: Mutex::new(VecDeque::with_capacity(capacity)),
+            ahead: None,
             capacity: capacity.max(1),
             arrived: Condvar::new(),
             stopped: Mutex::new(None),
@@ -145,7 +185,7 @@ impl<F: Clone> FrameSlot<F> {
 
     pub(crate) fn push(&self, frame: F, at: Time) {
         let now = Instant::now();
-        let mut arrivals = self.arrivals.lock().unwrap();
+        let mut arrivals = self.arrivals.lock();
         while arrivals
             .front()
             .is_some_and(|t| now - *t > Duration::from_secs(1))
@@ -158,7 +198,7 @@ impl<F: Clone> FrameSlot<F> {
         if self.timeline.start().is_some_and(|start| at >= start) {
             self.captured.fetch_add(1, Ordering::Relaxed);
         }
-        let mut frames = self.frames.lock().unwrap();
+        let mut frames = self.frames.lock();
         while frames.len() >= self.capacity {
             frames.pop_front();
         }
@@ -167,33 +207,44 @@ impl<F: Clone> FrameSlot<F> {
         self.arrived.notify_all();
     }
 
+    /// The newest decoded media frame whose timestamp is in the reader's
+    /// presentation window. Readers share the buffers without copying pixels.
+    fn ahead_until(&self, limit: Time) -> Option<(F, Time)> {
+        self.ahead
+            .as_ref()?
+            .lock()
+            .iter()
+            .rev()
+            .find(|(_, at)| *at <= limit)
+            .cloned()
+    }
+
     /// The newest frame captured at or after `from`, and when, waiting up
     /// to `timeout` for one to arrive; leaves it for the frame clock.
     pub(crate) fn wait_from(&self, from: Time, timeout: Duration) -> Option<(F, Time)> {
-        let frames = self.frames.lock().unwrap();
-        let (frames, _) = self
-            .arrived
-            .wait_timeout_while(frames, timeout, |frames| {
-                frames.back().is_none_or(|(_, at)| *at < from)
-            })
-            .unwrap();
+        let mut frames = self.frames.lock();
+        self.arrived.wait_while_for(
+            &mut frames,
+            |frames| frames.back().is_none_or(|(_, at)| *at < from),
+            timeout,
+        );
         frames.back().filter(|(_, at)| *at >= from).cloned()
     }
 
-    /// The newest frame captured no later than `limit`. Older frames are
-    /// released, since later ticks will never choose them.
+    /// The newest frame captured no later than `limit`. Other readers may
+    /// still be drawing an earlier tick, so only the producer trims history.
     pub(crate) fn newest_until(&self, limit: Time) -> Option<F> {
-        let mut frames = self.frames.lock().unwrap();
-        let index = frames.iter().rposition(|(_, at)| *at <= limit)?;
-        frames.drain(..index);
-        frames.front().map(|(frame, _)| frame.clone())
+        self.peek_until_timed(limit).map(|(frame, _)| frame)
     }
 
     /// The newest frame captured no later than `limit`, and when (which
     /// tells it from the frame before), leaving it (and older ones) for the
     /// frame clock.
     pub(crate) fn peek_until_timed(&self, limit: Time) -> Option<(F, Time)> {
-        let frames = self.frames.lock().unwrap();
+        if let Some(frame) = self.ahead_until(limit) {
+            return Some(frame);
+        }
+        let frames = self.frames.lock();
         let (frame, at) = frames.iter().rev().find(|(_, at)| *at <= limit)?;
         Some((frame.clone(), *at))
     }
@@ -201,7 +252,10 @@ impl<F: Clone> FrameSlot<F> {
     /// The newest frame captured from `from` to `until`, and when, leaving
     /// it for the frame clock.
     pub(crate) fn peek_between(&self, from: Time, until: Time) -> Option<(F, Time)> {
-        let frames = self.frames.lock().unwrap();
+        if let Some(frame) = self.ahead_until(until).filter(|(_, at)| *at >= from) {
+            return Some(frame);
+        }
+        let frames = self.frames.lock();
         let (frame, at) = frames
             .iter()
             .rev()
@@ -213,7 +267,7 @@ impl<F: Clone> FrameSlot<F> {
     /// two came, or none for half a second.
     pub(crate) fn received_fps(&self) -> f64 {
         let now = Instant::now();
-        let arrivals = self.arrivals.lock().unwrap();
+        let arrivals = self.arrivals.lock();
         let recent = arrivals
             .iter()
             .filter(|t| now - **t <= Duration::from_secs(1));
@@ -230,34 +284,61 @@ impl<F: Clone> FrameSlot<F> {
 
     /// Forget every frame.
     pub(crate) fn clear(&self) {
-        self.frames.lock().unwrap().clear();
+        // Same lock order as media delivery: invalidation and promotion
+        // of a pending picture must not leave either store selectable.
+        let mut ahead = self.ahead.as_ref().map(|ahead| ahead.lock());
+        let mut frames = self.frames.lock();
+        frames.clear();
+        if let Some(ahead) = ahead.as_mut() {
+            ahead.clear();
+        }
+    }
+
+    /// A stinger starts a new play only after every canvas let it go.
+    /// Hold the on-air lock through invalidation so a concurrent canvas
+    /// cannot activate the shared source between the check and the clear.
+    pub(crate) fn clear_if_inactive(&self, id: &str) {
+        let on_air = self.timeline.on_air.lock();
+        if on_air
+            .as_ref()
+            .is_none_or(|sources| !sources.contains_key(id))
+        {
+            self.clear();
+        }
     }
 
     /// The newest frame and when it was captured, leaving it for the frame
     /// clock.
     pub(crate) fn newest_timed(&self) -> Option<(F, Time)> {
-        self.frames.lock().unwrap().back().cloned()
+        self.frames.lock().back().cloned()
     }
 
     /// The newest frame, leaving it for the frame clock.
     pub(crate) fn newest(&self) -> Option<F> {
-        self.frames
-            .lock()
-            .unwrap()
-            .back()
-            .map(|(frame, _)| frame.clone())
+        self.frames.lock().back().map(|(frame, _)| frame.clone())
     }
 
     pub(crate) fn has_frame(&self) -> bool {
-        !self.frames.lock().unwrap().is_empty()
+        !self.frames.lock().is_empty()
     }
 
     pub(crate) fn stop(&self, reason: String) {
-        self.stopped.lock().unwrap().get_or_insert(reason);
+        self.stopped.lock().get_or_insert(reason);
     }
 
     pub(crate) fn stopped(&self) -> Option<String> {
-        self.stopped.lock().unwrap().clone()
+        self.stopped.lock().clone()
+    }
+
+    /// Update a stopped output's reason without briefly making it healthy.
+    pub(crate) fn replace_stop(&self, reason: String) {
+        *self.stopped.lock() = Some(reason);
+    }
+
+    /// Forget why it stopped: something feeds it again (a new compositor
+    /// for a canvas whose last one failed).
+    pub(crate) fn resume(&self) {
+        self.stopped.lock().take();
     }
 }
 
@@ -297,6 +378,8 @@ pub(crate) struct Opened<P: Platform> {
 enum Running<P: Platform> {
     Capture {
         _capture: P::Capture,
+        /// A camera's metadata reader, from [`Platform::camera_metadata`].
+        camera: Option<CameraMetadataReader>,
     },
     Generator {
         _generator: Generator,
@@ -318,11 +401,18 @@ enum Running<P: Platform> {
 
 impl<P: Platform> Opened<P> {
     pub(crate) fn failure(&self) -> Option<String> {
-        let get = |g: &Generator| g.failure.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let get = |g: &Generator| g.failure.lock().clone();
         match &self._running {
             Running::Generator { _generator } => get(_generator),
             Running::Generators { _generators } => _generators.iter().find_map(get),
             Running::Browser { _watcher, .. } => _watcher.as_ref().and_then(get),
+            _ => None,
+        }
+    }
+    /// What a camera source's capture has observed, if its platform says.
+    pub(crate) fn camera_metadata(&self) -> Option<CameraMetadataReader> {
+        match &self._running {
+            Running::Capture { camera, .. } => camera.clone(),
             _ => None,
         }
     }
@@ -359,7 +449,7 @@ impl Generator {
                         "source worker failed",
                         serde_json::json!({"error":message}),
                     );
-                    *failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(message);
+                    *failure.lock() = Some(message);
                 }
             }
         });
@@ -380,54 +470,179 @@ impl Drop for Generator {
     }
 }
 
-/// Open the setup's source `id`, on the timeline that starts at `timeline`;
-/// text showing a data key shows `data`'s value.
-/// Bound native opening, including time spent behind macOS prompts. A
-/// timed-out native call cannot be cancelled; keep its slot until it exits
-/// so repeated requests cannot accumulate another opener for that source.
-fn bounded_open<T: Send + 'static>(
-    key: String,
+/// How long opening a source may take before it is given up on.
+const OPEN_TIMEOUT: Duration = Duration::from_secs(8);
+/// Given-up opens of one source that may still be stuck in macOS at once.
+/// A native call can't be cancelled, so each holds its thread until macOS
+/// returns (a driver that stops answering made Core Audio wait 11 minutes,
+/// #82); a retry still starts a fresh open, since the device may answer
+/// again, but no more than this many pile up.
+const STUCK_PER_SOURCE: usize = 2;
+/// Opens, stuck or not, of all sources at once.
+const OPENS_AT_MOST: usize = 32;
+
+/// What the user can do about a source that doesn't answer.
+pub(crate) struct OpenHelp {
+    /// What is opened, for messages: `microphone "Studio Audio"`.
+    what: String,
+    /// What may be waiting, in the platform's words (its own prompt,
+    /// picker or folder: [`Platform::source_permission`]), if anything.
     permission: Option<String>,
+    /// A device with a driver of its own (a camera or microphone).
+    device: bool,
+}
+
+impl OpenHelp {
+    fn context(&self) -> String {
+        match (&self.permission, self.device) {
+            (Some(p), _) => p.clone(),
+            (None, true) => "its driver, or the app that provides it, isn't answering macOS: \
+                 quit and reopen that app or unplug and replug the device (or choose another \
+                 device), then start again"
+                .into(),
+            (None, false) => "check its file/device, then start again".into(),
+        }
+    }
+}
+
+/// Run a native open on its own thread for at most [`OPEN_TIMEOUT`],
+/// including time spent behind macOS prompts. `slot` names what is opened
+/// (a source and its device): a timed-out open is given up on and the next
+/// one starts afresh, while at most [`STUCK_PER_SOURCE`] given-up opens of
+/// one slot may still be running.
+fn bounded_open<T: Send + 'static>(
+    slot: String,
+    help: OpenHelp,
     run: impl FnOnce() -> Result<T> + Send + 'static,
 ) -> Result<T> {
-    static PENDING: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    /// The opens still running, by slot: each one's token and when it
+    /// began; notified as each returns.
+    type Running = (Mutex<HashMap<String, Vec<(u64, Instant)>>>, Condvar);
+    static PENDING: OnceLock<Running> = OnceLock::new();
+    static NEXT: AtomicU64 = AtomicU64::new(0);
     let pending = PENDING.get_or_init(Default::default);
-    // The platform says what may be waiting (its own prompt, picker or
-    // folder); this fallback is for everything that just opens slowly.
-    let context =
-        permission.unwrap_or_else(|| "source is still opening; check its file/device".into());
+    let context = help.context();
+    let what = &help.what;
+    let token = NEXT.fetch_add(1, Ordering::Relaxed);
+    let deadline = Instant::now() + OPEN_TIMEOUT;
     {
-        let mut slots = pending.lock().unwrap();
-        if slots.contains(&key) {
-            bail!("{key}: {context}; previous open is still pending (8 s timeout)");
+        let mut slots = pending.0.lock();
+        // With too many stuck, wait (within the same time) for one to
+        // return: a device that answers again opens at once.
+        loop {
+            let running = slots.get(&slot).map_or(&[][..], Vec::as_slice);
+            if running.len() < STUCK_PER_SOURCE {
+                break;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                let oldest = running.iter().map(|(_, began)| began.elapsed()).max();
+                bail!(
+                    "{what} is not answering: {} earlier opens are still waiting on macOS \
+                     (the oldest for {} s); {context}",
+                    running.len(),
+                    oldest.unwrap_or_default().as_secs()
+                );
+            }
+            pending.1.wait_for(&mut slots, deadline - now);
         }
-        if slots.len() >= 32 {
-            bail!("{key}: too many pending source opens (maximum 32); check permissions/devices");
+        if slots.values().map(Vec::len).sum::<usize>() >= OPENS_AT_MOST {
+            bail!(
+                "too many sources are opening at once (at most {OPENS_AT_MOST}); check \
+                 permissions and devices"
+            );
         }
-        slots.insert(key.clone());
+        slots
+            .entry(slot.clone())
+            .or_default()
+            .push((token, Instant::now()));
     }
-    struct Pending(&'static Mutex<HashSet<String>>, String);
+    // Frees the slot when the native call returns, however late, and says
+    // how a given-up open ended (devices that wake up again, or fail).
+    struct Pending {
+        pending: &'static Running,
+        slot: String,
+        what: String,
+        token: u64,
+        abandoned: Arc<AtomicBool>,
+        outcome: Option<String>,
+    }
     impl Drop for Pending {
         fn drop(&mut self) {
-            self.0
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .remove(&self.1);
+            let mut slots = self.pending.0.lock();
+            let mut began = None;
+            if let Some(running) = slots.get_mut(&self.slot) {
+                if let Some(at) = running.iter().position(|(t, _)| *t == self.token) {
+                    began = Some(running.remove(at).1);
+                }
+                if running.is_empty() {
+                    slots.remove(&self.slot);
+                }
+            }
+            drop(slots);
+            self.pending.1.notify_all();
+            if self.abandoned.load(Ordering::SeqCst) {
+                isocast_diagnostics::emit(
+                    "warn",
+                    "source",
+                    "given-up source open returned",
+                    serde_json::json!({
+                        "source": self.what,
+                        "seconds": began.map(|b| b.elapsed().as_secs_f64()),
+                        "outcome": self.outcome.as_deref().unwrap_or("crashed"),
+                    }),
+                );
+            }
         }
     }
-    let guard = Pending(pending, key.clone());
+    let abandoned = Arc::new(AtomicBool::new(false));
+    let mut guard = Pending {
+        pending,
+        slot,
+        what: what.clone(),
+        token,
+        abandoned: abandoned.clone(),
+        outcome: None,
+    };
     let (tx, rx) = sync_channel(1);
     thread::spawn(move || {
-        let _guard = guard;
         let result = isocast_diagnostics::contain("native source open", run)
             .map_err(anyhow::Error::msg)
             .and_then(|r| r);
+        guard.outcome = Some(match &result {
+            Ok(_) => "opened, then closed".into(),
+            Err(err) => format!("failed: {err:#}"),
+        });
+        // A given-up open's capture is dropped (closed) here, unused.
         let _ = tx.send(result);
+        drop(guard);
     });
-    rx.recv_timeout(Duration::from_secs(8))
-        .with_context(|| format!("{key}: timed out opening after 8 s; {context}"))?
+    match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(result) => result,
+        Err(RecvTimeoutError::Timeout) => {
+            abandoned.store(true, Ordering::SeqCst);
+            // It may have finished just now: then use it after all.
+            if let Ok(result) = rx.try_recv() {
+                abandoned.store(false, Ordering::SeqCst);
+                return result;
+            }
+            isocast_diagnostics::emit(
+                "warn",
+                "source",
+                "source open given up",
+                serde_json::json!({"source": what, "seconds": OPEN_TIMEOUT.as_secs()}),
+            );
+            bail!(
+                "{what} did not open within {} s; {context}",
+                OPEN_TIMEOUT.as_secs()
+            )
+        }
+        Err(RecvTimeoutError::Disconnected) => bail!("opening {what} crashed"),
+    }
 }
 
+/// Open the setup's source `id`, on the timeline that starts at `timeline`;
+/// text showing a data key shows `data`'s value.
 pub(crate) fn open<P: Platform>(
     platform: &P,
     setup: &Setup,
@@ -435,9 +650,32 @@ pub(crate) fn open<P: Platform>(
     timeline: &Arc<Timeline>,
     data: &Arc<DataStore>,
 ) -> Result<Opened<P>> {
-    let permission = setup
-        .source(id)
-        .and_then(|s| platform.source_permission(&s.kind));
+    let kind = setup.source(id).map(|s| &s.kind);
+    let permission = kind.and_then(|kind| platform.source_permission(kind));
+    // Opens are told apart by source and device, so choosing another
+    // device opens at once even while the old one is stuck.
+    let slot = format!(
+        "source {id:?} {}",
+        kind.and_then(|k| serde_json::to_string(k).ok())
+            .unwrap_or_default()
+    );
+    let help = match kind {
+        Some(SourceKind::Microphone(m)) => OpenHelp {
+            what: format!("microphone {:?}", m.device),
+            permission,
+            device: true,
+        },
+        Some(SourceKind::Camera(c)) => OpenHelp {
+            what: format!("camera {:?}", c.device),
+            permission,
+            device: true,
+        },
+        _ => OpenHelp {
+            what: "the source".into(),
+            permission,
+            device: false,
+        },
+    };
     let (platform, setup, id, timeline, data) = (
         platform.clone(),
         setup.clone(),
@@ -446,7 +684,7 @@ pub(crate) fn open<P: Platform>(
         data.clone(),
     );
     let (key, began) = (format!("source {id:?}"), std::time::Instant::now());
-    let opened = bounded_open(key.clone(), permission, move || {
+    let opened = bounded_open(slot, help, move || {
         open_native(&platform, &setup, &id, &timeline, &data)
     });
     isocast_diagnostics::debug!(
@@ -511,17 +749,23 @@ fn open_native<P: Platform>(
             let sink = slot_sink(&slot);
             let (capture, format) =
                 platform.capture_camera(device, request, &setup.canvas, sink)?;
-            Ok(captured_video(slot, capture, format))
+            let camera = platform.camera_metadata(&capture);
+            Ok(captured_video(slot, capture, format, camera))
         }
         SourceKind::Microphone(microphone) => {
             let (feed, sink, chunks) = audio_feed();
-            let (capture, channels) = platform.capture_microphone(&microphone.device, sink)?;
+            let (capture, channels) = platform.capture_microphone(
+                &microphone.device,
+                microphone.channels.as_deref(),
+                sink,
+            )?;
             Ok(captured_audio(feed, chunks, capture, channels))
         }
-        SourceKind::SystemAudio(_) => {
+        SourceKind::SystemAudio(system) => {
             let (feed, sink, chunks) = audio_feed();
             // What monitoring plays would otherwise be recorded again.
-            let (capture, channels) = platform.capture_system_audio(sink, setup.monitors())?;
+            let (capture, channels) =
+                platform.capture_system_audio(&system.exclude, sink, setup.monitors())?;
             Ok(captured_audio(feed, chunks, capture, channels))
         }
         SourceKind::ApplicationAudio(application) => {
@@ -647,7 +891,7 @@ fn screen<P: Platform>(
     let sink = slot_sink(&slot);
     let (capture, format) =
         platform.capture_screen(target, setup.canvas.fps, ten_bit, cursor, sink)?;
-    Ok(captured_video(slot, capture, format))
+    Ok(captured_video(slot, capture, format, None))
 }
 
 /// Unload a browser source's page while the program doesn't show it
@@ -700,6 +944,7 @@ fn captured_video<P: Platform>(
     slot: Arc<FrameSlot<P::Frame>>,
     capture: P::Capture,
     format: CaptureFormat,
+    camera: Option<CameraMetadataReader>,
 ) -> Opened<P> {
     Opened {
         video: Some(Video {
@@ -709,7 +954,10 @@ fn captured_video<P: Platform>(
             fps: format.fps,
         }),
         audio: None,
-        _running: Running::Capture { _capture: capture },
+        _running: Running::Capture {
+            _capture: capture,
+            camera,
+        },
     }
 }
 
@@ -726,7 +974,10 @@ fn captured_audio<P: Platform>(
             chunks,
             channels,
         }),
-        _running: Running::Capture { _capture: capture },
+        _running: Running::Capture {
+            _capture: capture,
+            camera: None,
+        },
     }
 }
 
@@ -759,7 +1010,7 @@ fn audio_feed() -> (Arc<AudioFeed>, AudioSink, AudioChunks) {
         stopped: Box::new({
             let feed = feed.clone();
             move |reason| {
-                feed.stopped.lock().unwrap().get_or_insert(reason);
+                feed.stopped.lock().get_or_insert(reason);
             }
         }),
     };
@@ -776,6 +1027,18 @@ fn test_pattern<P: Platform>(
 ) -> Result<Opened<P>> {
     let &TestPatternSource { width, height, fps } = settings;
     let pattern = TestPattern::new(id, width, height, fps);
+    // Opt-in fault exercise for an isolated developer-mode engine: e.g.
+    // ISOCAST_TEST_PATTERN_FAIL_AFTER=bars=5 stops that synthetic capture
+    // five seconds into the live clock. Real capture sources are unaffected.
+    let fail_after = std::env::var("ISOCAST_TEST_PATTERN_FAIL_AFTER")
+        .ok()
+        .and_then(|value| {
+            let (source, seconds) = value.split_once('=')?;
+            let seconds: f64 = seconds.parse().ok()?;
+            (source == id && seconds.is_finite() && seconds >= 0.0)
+                .then(|| Duration::try_from_secs_f64(seconds).ok())
+                .flatten()
+        });
     let mut clock = timeline
         .clocks
         .start(format!("source:{id}:video"), Duration::from_secs(1) / fps);
@@ -789,6 +1052,9 @@ fn test_pattern<P: Platform>(
     let generator = Generator::spawn({
         let (platform, slot, timeline) = (platform.clone(), slot.clone(), timeline.clone());
         move |stop| {
+            // On time like a device's frames (#78): at the default QoS its
+            // wakes ran up to 100 ms late, showing a pulse frames late.
+            platform.real_time_thread();
             let Some(start) = timeline.wait(stop) else {
                 return;
             };
@@ -804,6 +1070,10 @@ fn test_pattern<P: Platform>(
                     continue;
                 }
                 let since_start = pts.saturating_since(start);
+                if fail_after.is_some_and(|after| since_start >= after) && crate::trace::on() {
+                    slot.stop("test_pattern: injected capture failure (developer mode)".into());
+                    return;
+                }
                 match pool.draw(&mut |pixels, stride| pattern.draw(n, since_start, pixels, stride))
                 {
                     Ok(Some(frame)) => slot.push(frame, pts),
@@ -1161,7 +1431,7 @@ fn text_data<P: Platform>(
         let (changed, key) = (changed.clone(), key.clone());
         Arc::new(move |keys: &[Arc<str>]| {
             if keys.contains(&key) {
-                *changed.0.lock().unwrap() = true;
+                *changed.0.lock() = true;
                 changed.1.notify_all();
             }
         })
@@ -1182,9 +1452,9 @@ fn text_data<P: Platform>(
             while !stop.load(Ordering::SeqCst) {
                 {
                     let (flag, wake) = &*changed;
-                    let mut flag = flag.lock().unwrap();
+                    let mut flag = flag.lock();
                     while !*flag {
-                        flag = wake.wait_timeout(flag, TEXT_DATA_WAIT).unwrap().0;
+                        wake.wait_for(&mut flag, TEXT_DATA_WAIT);
                         if stop.load(Ordering::SeqCst) {
                             return;
                         }
@@ -1279,7 +1549,14 @@ fn media<P: Platform>(
                 format!("source:{id}:video"),
                 Duration::from_secs(1) / setup.canvas.fps,
             );
-            let slot = Arc::new(FrameSlot::new(timeline.clone()));
+            // Canvases may draw up to three ticks late, independently of
+            // the ISOs. Five delivered pictures cover that window at up to
+            // 1.5 times the canvas cadence; with two decoded next pictures
+            // this holds at most seven of macOS's base eight production
+            // buffers. A decoder adds its own reorder depth to that budget.
+            let mut slot = FrameSlot::with_capacity(timeline.clone(), 5);
+            slot.ahead = Some(Mutex::new(VecDeque::with_capacity(2)));
+            let slot = Arc::new(slot);
             // The first frame now, so the source is ready at once.
             let first = playlist
                 .files
@@ -1298,6 +1575,8 @@ fn media<P: Platform>(
                     playlist.clone(),
                 );
                 move |stop| {
+                    // Decode the following frame promptly too (#126).
+                    platform.real_time_thread();
                     // Reported like a capture that stopped, so the engine
                     // says so and opens it again once the file is back.
                     let failed = |err: anyhow::Error| slot.stop(format!("{err:#}"));
@@ -1308,18 +1587,74 @@ fn media<P: Platform>(
                         stop,
                         &failed,
                         |reader, base, on| {
-                            while let Some((frame, at)) = reader.next_video()? {
-                                if !on() {
+                            let ahead = slot.ahead.as_ref().expect("media slot");
+                            let mut ended = false;
+                            loop {
+                                if stop.load(Ordering::SeqCst) || !on() {
+                                    ahead.lock().clear();
                                     return Ok(false);
                                 }
-                                let pts = base + at.div_f64(speed);
-                                // Off air while waiting: the frame is stale.
-                                if !sleep_until(&platform, &mut clock, pts, stop) || !on() {
-                                    return Ok(false);
+                                // Keep two pictures decoded before pacing
+                                // delivery. A transient decoder stall must
+                                // not hide the next presentation's picture.
+                                if !ended && ahead.lock().len() < 2 {
+                                    let Some((frame, at)) = reader.next_video()? else {
+                                        // On a looping playlist, open the
+                                        // next file while this one's last
+                                        // picture is still queued. Reorder
+                                        // priming must not start at its first
+                                        // presentation deadline.
+                                        if playlist.repeat {
+                                            return Ok(true);
+                                        }
+                                        ended = true;
+                                        continue;
+                                    };
+                                    if !on() {
+                                        ahead.lock().clear();
+                                        return Ok(false);
+                                    }
+                                    let pts = base + at.div_f64(speed);
+                                    ahead.lock().push_back((frame, pts));
+                                    continue;
                                 }
+                                let Some(pts) = ahead.lock().front().map(|(_, at)| *at) else {
+                                    if ended {
+                                        return Ok(true);
+                                    }
+                                    continue;
+                                };
+                                loop {
+                                    if stop.load(Ordering::SeqCst) || !on() {
+                                        ahead.lock().clear();
+                                        return Ok(false);
+                                    }
+                                    let now = platform.now();
+                                    if now >= pts {
+                                        break;
+                                    }
+                                    // A restart cancels its pending frame
+                                    // even in a low-frame-rate file.
+                                    let until = if playlist.restart {
+                                        pts.min(now + Duration::from_millis(5))
+                                    } else {
+                                        pts
+                                    };
+                                    if !sleep_until(&platform, &mut clock, until, stop) {
+                                        ahead.lock().clear();
+                                        return Ok(false);
+                                    }
+                                }
+                                let mut pending = ahead.lock();
+                                let Some((frame, pts)) = pending.pop_front() else {
+                                    // A second canvas can clear the shared
+                                    // slot without ending this activation.
+                                    // Discard only this picture; on() above
+                                    // decides whether the play has ended.
+                                    continue;
+                                };
                                 slot.push(frame, pts);
                             }
-                            Ok(true)
                         },
                     );
                 }
@@ -1350,10 +1685,7 @@ fn media<P: Platform>(
             );
             move |stop| {
                 let failed = |err: anyhow::Error| {
-                    feed.stopped
-                        .lock()
-                        .unwrap()
-                        .get_or_insert(format!("{err:#}"));
+                    feed.stopped.lock().get_or_insert(format!("{err:#}"));
                 };
                 playlist.run(
                     &platform,
@@ -1426,7 +1758,12 @@ pub(crate) fn stinger<P: Platform>(
         file.to_string(),
         timeline.clone(),
     );
-    bounded_open(format!("stinger {id:?}"), permission, move || {
+    let help = OpenHelp {
+        what: format!("the stinger video {file:?}"),
+        permission,
+        device: false,
+    };
+    bounded_open(format!("stinger {id:?} {file:?}"), help, move || {
         stinger_native(&platform, &setup, &id, &file, &timeline)
     })
 }

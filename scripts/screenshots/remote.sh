@@ -119,14 +119,63 @@ time.sleep(3600)
         echo Basic >"$S/terminal-default"
     defaults write com.apple.Terminal "Default Window Settings" Pro
     defaults write com.apple.Terminal "Startup Window Settings" Pro
-    open -a Terminal "$E/cli.command"
-    sleep 3
+    # A Terminal left running with no shells in it can be wedged (on
+    # isocast-m2-a one from 5 days before answered neither `open` nor
+    # Accessibility, #85): with nothing of anyone's in it, start it afresh.
+    for p in $(pgrep -x Terminal); do
+        [ -z "$(pgrep -P "$p")" ] || continue
+        log "restarting Terminal (pid $p, no shells in it)"
+        kill -TERM "$p" 2>/dev/null
+        n=0
+        while kill -0 "$p" 2>/dev/null && [ $n -lt 10 ]; do sleep 1; n=$((n + 1)); done
+        kill -KILL "$p" 2>/dev/null
+    done
+    open -a Terminal "$E/cli.command" || log "open -a Terminal failed ($?)"
+    # Its window can take a while on a Mac where Terminal hasn't run in
+    # this session (#85): wait for it, and say why if it never comes.
+    waited=0 w=""
+    while :; do
+        w="$(window_of Terminal cli.command)"
+        [ -z "$w" ] && [ $waited -lt 30 ] || break
+        sleep 1; waited=$((waited + 1))
+    done
+    if [ -z "$w" ]; then
+        log "no Terminal window for cli.command after ${waited}s; see $out/terminal.txt"
+        {
+            echo "== Terminal processes"; pgrep -lf Terminal
+            echo "== Terminal windows (all, on screen or not)"
+            cua list_windows '{"on_screen_only":false}' | python3 -c '
+import json, sys
+for w in json.load(sys.stdin)["windows"]:
+    if w.get("app_name") == "Terminal":
+        print(w.get("window_id"), repr(w.get("title")), w.get("bounds"), "on screen" if w.get("is_on_screen") else "")
+'
+            echo "== log (Terminal, LaunchServices, Gatekeeper)"
+            /usr/bin/log show --last 2m --style compact --predicate \
+                'process == "Terminal" OR process == "launchservicesd" OR process == "syspolicyd"' 2>/dev/null | tail -60
+        } >"$out/terminal.txt" 2>&1
+        screencapture -x "$out/terminal-missing.png" 2>/dev/null
+        return 1
+    fi
+    log "Terminal window after ${waited}s"
     frame Terminal 32 60 896 504 cli.command
     # The isolated engine with the screenshot setup.
     "$isocast" apply --revision 0 "$E/setup.toml" >/dev/null || return 1
     "$isocast" engine start >/dev/null || return 1
+    # The silent machine self-test (#110), so Optimize and the status show a
+    # measured profile; a recording would refuse it, so it runs before the take.
+    "$isocast" machine calibrate >/dev/null 2>&1 || log "couldn't start the machine self-test"
+    waited=0
+    while [ $waited -lt 60 ] && ! "$isocast" machine show 2>/dev/null | grep -q calibrated; do sleep 2; waited=$((waited + 2)); done
+    log "machine profile after ${waited}s: $("$isocast" machine show 2>&1 | head -1)"
     touch "$S/demo.go"
     # The app, as a bundle so macOS calls it Isocast.
+    # SHOTS_PREBUILT=1: the pushed isocast-ui is bundled as it is (a no-op
+    # cargo first on PATH), instead of a build of more than 10 minutes here.
+    if [ -n "${SHOTS_PREBUILT:-}" ]; then
+        mkdir -p "$S/nocargo" && printf '#!/bin/sh\nexit 0\n' >"$S/nocargo/cargo" && chmod +x "$S/nocargo/cargo"
+        PATH="$S/nocargo:$PATH"
+    fi
     ISOCAST_UI_APP="$app" sh scripts/ui-dev.sh --release >/dev/null 2>&1 || {
         log "ui-dev.sh failed"; return 1; }
     env ISOCAST_SOCKET="$ISOCAST_SOCKET" "$app/Contents/MacOS/isocast-ui" >"$S/app.log" 2>&1 &
@@ -163,6 +212,7 @@ stop() {
         [ "$w" = "$(window_of Terminal isocast-shots)" ] && break
     done
     close_window Finder Recordings
+    close_window Finder Untitled
     if [ -e "$S/terminal-default" ]; then
         defaults write com.apple.Terminal "Default Window Settings" "$(cat "$S/terminal-default")"
         defaults write com.apple.Terminal "Startup Window Settings" "$(cat "$S/terminal-default")"
@@ -181,6 +231,6 @@ case "${1:-all}" in
 start) start ;;
 stop) stop ;;
 shoot) . "$S/shoot.sh" ;;
-all) start && . "$S/shoot.sh"; stop ;;
+all) if start; then . "$S/shoot.sh"; ok=0; else ok=1; fi; stop; exit $ok ;;
 *) sed -n 2,10p "$0"; exit 2 ;;
 esac

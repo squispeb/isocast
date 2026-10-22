@@ -1,6 +1,7 @@
 //! Decoding video and audio files with AVAssetReader: hardware-decoded
 //! IOSurface frames (BGRA for video with alpha), and stereo float audio at
-//! the session sample rate.
+//! the session sample rate. Matroska and WebM files, which AVFoundation
+//! can't open, go to `webm.rs` instead (recognised by their first bytes).
 
 use std::mem::ManuallyDrop;
 use std::path::Path;
@@ -31,15 +32,23 @@ use crate::audio::{interleaved_f32, pcm_settings};
 use crate::frames::PixelBuffer;
 use crate::writer::catch;
 
-pub struct MediaReader {
+/// A file being decoded: by AVFoundation, or (Matroska and WebM) by our
+/// demuxer and VideoToolbox.
+pub enum MediaReader {
+    AvFoundation(AvReader),
+    Matroska(crate::webm::Reader),
+}
+
+pub struct AvReader {
     // Released in `drop`, inside its autorelease pool.
     reader: ManuallyDrop<Retained<AVAssetReader>>,
     output: ManuallyDrop<Retained<AVAssetReaderTrackOutput>>,
     path: String,
+    frames: std::sync::Arc<crate::frames::Budget>,
 }
 
 // SAFETY: the reader and its output are used by one thread at a time.
-unsafe impl Send for MediaReader {}
+unsafe impl Send for AvReader {}
 
 fn asset(path: &Path) -> Retained<AVURLAsset> {
     let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
@@ -88,6 +97,9 @@ fn seconds(time: CMTime) -> f64 {
 }
 
 pub fn media_info(path: &Path) -> Result<MediaInfo> {
+    if crate::matroska::sniff(path) {
+        return autoreleasepool(|_| crate::webm::media_info(path));
+    }
     // The engine's threads have no autorelease pool of their own; without
     // one, what AVFoundation autoreleases here would stay until the thread
     // ends.
@@ -120,10 +132,13 @@ fn read_media_info(path: &Path) -> Result<MediaInfo> {
 /// own: otherwise every reader opened (one per play) would stay alive, with
 /// its decoding threads, until the source closes.
 pub fn open_media(path: &Path, part: MediaPart) -> Result<MediaReader> {
-    autoreleasepool(|_| open_reader(path, part))
+    if crate::matroska::sniff(path) {
+        return autoreleasepool(|_| crate::webm::open(path, part)).map(MediaReader::Matroska);
+    }
+    autoreleasepool(|_| open_reader(path, part)).map(MediaReader::AvFoundation)
 }
 
-fn open_reader(path: &Path, part: MediaPart) -> Result<MediaReader> {
+fn open_reader(path: &Path, part: MediaPart) -> Result<AvReader> {
     let shown = path.display().to_string();
     // A missing file would otherwise read as one without that part.
     if !path.exists() {
@@ -186,14 +201,15 @@ fn open_reader(path: &Path, part: MediaPart) -> Result<MediaReader> {
         );
         bail!("could not read {shown}: {reason}");
     }
-    Ok(MediaReader {
+    Ok(AvReader {
         reader: ManuallyDrop::new(reader),
         output: ManuallyDrop::new(output),
         path: shown,
+        frames: crate::frames::Budget::new("decoder", (0, 0), 0),
     })
 }
 
-impl MediaReader {
+impl AvReader {
     /// The next sample buffer, `None` at the end.
     fn next(&mut self) -> Result<Option<Retained<objc2_core_media::CMSampleBuffer>>> {
         autoreleasepool(|_| self.read_next())
@@ -212,7 +228,7 @@ impl MediaReader {
     }
 }
 
-impl Drop for MediaReader {
+impl Drop for AvReader {
     fn drop(&mut self) {
         // A reader dropped part way (its source went off air) stops its
         // decoding now rather than whenever it is deallocated. Releasing
@@ -233,12 +249,36 @@ impl isocast_engine::MediaReader for MediaReader {
     type Frame = PixelBuffer;
 
     fn next_video(&mut self) -> Result<Option<(PixelBuffer, Duration)>> {
+        match self {
+            MediaReader::AvFoundation(reader) => reader.next_video(),
+            // Its decoders autorelease too, on this long-lived thread.
+            MediaReader::Matroska(reader) => {
+                autoreleasepool(|_| isocast_engine::MediaReader::next_video(reader))
+            }
+        }
+    }
+
+    fn next_audio(&mut self) -> Result<Option<(Vec<f32>, Duration)>> {
+        match self {
+            MediaReader::AvFoundation(reader) => reader.next_audio(),
+            MediaReader::Matroska(reader) => {
+                autoreleasepool(|_| isocast_engine::MediaReader::next_audio(reader))
+            }
+        }
+    }
+}
+
+impl AvReader {
+    fn next_video(&mut self) -> Result<Option<(PixelBuffer, Duration)>> {
         while let Some(sample) = self.next()? {
             let Some(image) = (unsafe { sample.image_buffer() }) else {
                 continue;
             };
             let at = seconds(unsafe { sample.presentation_time_stamp() }).max(0.0);
-            return Ok(Some((PixelBuffer(image), Duration::from_secs_f64(at))));
+            return Ok(Some((
+                self.frames.wrap(image)?,
+                Duration::from_secs_f64(at),
+            )));
         }
         Ok(None)
     }

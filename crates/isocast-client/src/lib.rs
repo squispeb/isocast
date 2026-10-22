@@ -2,12 +2,17 @@
 //! calling methods and watching events. The CLI, MCP and the app all use
 //! this one client.
 
+mod isolated;
 pub mod library;
 #[cfg(feature = "shared")]
 pub mod shared;
+#[cfg(windows)]
+mod windows;
 
+pub use isolated::IsolatedDaemon;
+
+use isocast_ipc::Stream as UnixStream;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -58,6 +63,18 @@ impl Client {
 
     pub fn encoder_options(&mut self) -> Result<Vec<isocast_protocol::EncoderOption>> {
         self.call(Method::EncoderOptions)
+    }
+
+    pub fn machine_profile(&mut self) -> Result<isocast_protocol::machine::MachineStatus> {
+        self.call(Method::MachineProfile)
+    }
+
+    pub fn machine_calibrate(&mut self) -> Result<isocast_protocol::machine::MachineStatus> {
+        self.call(Method::MachineCalibrate)
+    }
+
+    pub fn machine_cancel(&mut self) -> Result<isocast_protocol::machine::MachineStatus> {
+        self.call(Method::MachineCancel)
     }
 
     /// Forward a focused fallback key edge. Reuse this connection for both
@@ -173,6 +190,7 @@ impl Client {
         if line.is_empty() {
             bail!("isocastd closed the connection");
         }
+        isocast_diagnostics::daemon_answered();
         let response: Response = serde_json::from_str(&line)
             .with_context(|| format!("isocastd sent an unreadable response: {line}"))?;
         if let Some(error) = response.error {
@@ -272,8 +290,24 @@ fn launch() -> Result<()> {
 /// whichever terminal or agent app started it, so they are granted once.
 #[cfg(target_os = "macos")]
 fn spawn_daemon(daemon: &Path, log: &Path) -> std::io::Result<()> {
+    let pid = spawn_daemon_with(daemon, log, None)?;
+    // Reap it if it exits while this process is still running.
+    std::thread::spawn(move || unsafe {
+        let mut status = 0;
+        libc::waitpid(pid, &mut status, 0);
+    });
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_daemon_with(
+    daemon: &Path,
+    log: &Path,
+    isolated: Option<&isolated::SpawnOptions>,
+) -> std::io::Result<libc::pid_t> {
     use std::ffi::{CString, c_char, c_int};
-    use std::os::unix::ffi::OsStrExt;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::ptr;
 
     unsafe extern "C" {
@@ -296,7 +330,44 @@ fn spawn_daemon(daemon: &Path, log: &Path) -> std::io::Result<()> {
     let program = CString::new(daemon.as_os_str().as_bytes())?;
     let log = CString::new(log.as_os_str().as_bytes())?;
     let null = c"/dev/null";
-    let argv = [program.as_ptr(), ptr::null()];
+    let mut argv = vec![program.as_ptr()];
+    if isolated.is_some() {
+        argv.push(c"--exit-on-stdin-close".as_ptr());
+    }
+    argv.push(ptr::null());
+    // Only the isolated path takes an environment snapshot. Normal launch
+    // still passes the process environment straight through _NSGetEnviron.
+    let environment = isolated
+        .map(|options| {
+            std::env::vars_os()
+                .filter(|(key, _)| {
+                    !options
+                        .env
+                        .iter()
+                        .any(|(name, _)| key.as_os_str() == std::ffi::OsStr::new(name))
+                })
+                .chain(
+                    options
+                        .env
+                        .iter()
+                        .map(|(key, value)| ((*key).into(), value.as_os_str().to_owned())),
+                )
+                .map(|(key, value)| {
+                    let mut entry = key.into_vec();
+                    entry.push(b'=');
+                    entry.extend_from_slice(value.as_bytes());
+                    CString::new(entry).map_err(std::io::Error::from)
+                })
+                .collect::<std::io::Result<Vec<_>>>()
+        })
+        .transpose()?;
+    let envp = environment.as_ref().map(|entries| {
+        entries
+            .iter()
+            .map(|entry| entry.as_ptr())
+            .chain([ptr::null()])
+            .collect::<Vec<_>>()
+    });
     unsafe {
         let mut attrs: libc::posix_spawnattr_t = ptr::null_mut();
         check(libc::posix_spawnattr_init(&mut attrs))?;
@@ -309,13 +380,27 @@ fn spawn_daemon(daemon: &Path, log: &Path) -> std::io::Result<()> {
             ))?;
             check(libc::posix_spawnattr_setpgroup(&mut attrs, 0))?;
             check(responsibility_spawnattrs_setdisclaim(&mut attrs, 1))?;
-            check(libc::posix_spawn_file_actions_addopen(
-                &mut actions,
-                0,
-                null.as_ptr(),
-                libc::O_RDONLY,
-                0,
-            ))?;
+            if let Some(options) = isolated {
+                let input = options.input.as_raw_fd();
+                check(libc::posix_spawn_file_actions_adddup2(
+                    &mut actions,
+                    input,
+                    0,
+                ))?;
+                // A descriptor mentioned in file actions escapes CLOEXEC_DEFAULT;
+                // keep the pipe reader only as stdin, never at its old fd too.
+                if input != 0 {
+                    check(libc::posix_spawn_file_actions_addclose(&mut actions, input))?;
+                }
+            } else {
+                check(libc::posix_spawn_file_actions_addopen(
+                    &mut actions,
+                    0,
+                    null.as_ptr(),
+                    libc::O_RDONLY,
+                    0,
+                ))?;
+            }
             check(libc::posix_spawn_file_actions_addopen(
                 &mut actions,
                 1,
@@ -331,14 +416,12 @@ fn spawn_daemon(daemon: &Path, log: &Path) -> std::io::Result<()> {
                 &actions,
                 &attrs,
                 argv.as_ptr().cast(),
-                (*_NSGetEnviron()).cast(),
+                envp.as_ref().map_or_else(
+                    || (*_NSGetEnviron()).cast(),
+                    |entries| entries.as_ptr().cast(),
+                ),
             ))?;
-            // Reap it if it exits while this process is still running.
-            std::thread::spawn(move || {
-                let mut status = 0;
-                libc::waitpid(pid, &mut status, 0);
-            });
-            Ok(())
+            Ok(pid)
         })();
         libc::posix_spawn_file_actions_destroy(&mut actions);
         libc::posix_spawnattr_destroy(&mut attrs);
@@ -346,7 +429,7 @@ fn spawn_daemon(daemon: &Path, log: &Path) -> std::io::Result<()> {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn spawn_daemon(daemon: &Path, log: &Path) -> std::io::Result<()> {
     use std::os::unix::process::CommandExt;
     let log = std::fs::OpenOptions::new()
@@ -362,6 +445,11 @@ fn spawn_daemon(daemon: &Path, log: &Path) -> std::io::Result<()> {
         .map(|_| ())
 }
 
+#[cfg(windows)]
+fn spawn_daemon(daemon: &Path, log: &Path) -> std::io::Result<()> {
+    windows::spawn_daemon(daemon, log)
+}
+
 /// The daemon to launch: `$ISOCAST_DAEMON`; else this distribution's bundled
 /// helper; else the signed development app from `scripts/sign-dev.sh`, which
 /// keeps its privacy permissions across rebuilds; else the adjacent build.
@@ -373,31 +461,33 @@ fn daemon_path() -> Result<PathBuf> {
     // Resolve a CLI symlink installed on PATH. A distribution must use its own
     // engine, even on a developer's Mac with an older Isocast Dev.app present.
     let exe = exe.canonicalize().unwrap_or(exe);
-    if let Some(contents) = exe.parent().and_then(Path::parent)
-        && contents.file_name().is_some_and(|name| name == "Contents")
-    {
-        let helper = contents.join("Helpers/Isocast Engine.app/Contents/MacOS/isocastd");
-        if helper.is_file() {
-            return Ok(helper);
-        }
+    if let Some(helper) = bundled_helper(&exe) {
+        return Ok(helper);
     }
-    let built = exe.with_file_name("isocastd");
-    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
-    let app = std::env::var_os("ISOCAST_DEV_APP").map_or_else(
-        || home.join("Library/Application Support/Isocast/Isocast Dev.app"),
-        PathBuf::from,
-    );
-    let signed = app.join("Contents/MacOS/isocastd");
-    if signed.exists() {
-        let modified = |path: &Path| std::fs::metadata(path).and_then(|m| m.modified()).ok();
-        if modified(&built) > modified(&signed) {
-            isocast_diagnostics::diagnostic!("warn";
-                "warning: {} is newer than the signed daemon in {}; run scripts/sign-dev.sh",
-                built.display(),
-                app.display()
-            );
+    let built = exe.with_file_name(if cfg!(windows) {
+        "isocastd.exe"
+    } else {
+        "isocastd"
+    });
+    #[cfg(target_os = "macos")]
+    {
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+        let app = std::env::var_os("ISOCAST_DEV_APP").map_or_else(
+            || home.join("Library/Application Support/Isocast/Isocast Dev.app"),
+            PathBuf::from,
+        );
+        let signed = app.join("Contents/MacOS/isocastd");
+        if signed.exists() {
+            let modified = |path: &Path| std::fs::metadata(path).and_then(|m| m.modified()).ok();
+            if modified(&built) > modified(&signed) {
+                isocast_diagnostics::diagnostic!("warn";
+                    "warning: {} is newer than the signed daemon in {}; run scripts/sign-dev.sh",
+                    built.display(),
+                    app.display()
+                );
+            }
+            return Ok(signed);
         }
-        return Ok(signed);
     }
     if !built.exists() {
         bail!(
@@ -406,6 +496,97 @@ fn daemon_path() -> Result<PathBuf> {
         );
     }
     Ok(built)
+}
+
+/// The engine a distribution bundles next to `exe` (its
+/// `Contents/MacOS/…`): `Contents/Helpers/Isocast Engine.app`'s
+/// "Isocast Engine" (#83), or its `isocastd` in releases made before that.
+#[cfg(target_os = "macos")]
+fn bundled_helper(exe: &Path) -> Option<PathBuf> {
+    use isocast_protocol::api::{ENGINE_EXECUTABLE, OLD_ENGINE_EXECUTABLE};
+    let contents = exe.parent().and_then(Path::parent)?;
+    if contents.file_name().is_none_or(|name| name != "Contents") {
+        return None;
+    }
+    let macos = contents.join("Helpers/Isocast Engine.app/Contents/MacOS");
+    [ENGINE_EXECUTABLE, OLD_ENGINE_EXECUTABLE]
+        .into_iter()
+        .map(|name| macos.join(name))
+        .find(|helper| helper.is_file())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn bundled_helper(_exe: &Path) -> Option<PathBuf> {
+    None
+}
+
+/// An isocastd older than the one this client would launch: left running
+/// from before an update (Sparkle replaced the app while it ran), or
+/// another, older copy's engine on the same socket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleEngine {
+    /// The running engine's version and build, as people read it
+    /// (`0.0.4 (build 1760400000)`), or that it is too old to say.
+    pub running: String,
+    /// Its pid, when it reports one.
+    pub pid: Option<u32>,
+    /// The build this client bundles (`CFBundleVersion`).
+    pub expected: String,
+}
+
+/// Whether the engine that answered `status` (its `daemon`; `None` from an
+/// engine older than that field) is older than the one this distribution
+/// bundles. Only a distribution knows: a development client (no bundled
+/// engine, or `$ISOCAST_DAEMON`) never calls an engine stale. Builds are
+/// compared as numbers (release and development builds both number them
+/// by time), so a newer engine is never called stale and two copies of
+/// Isocast don't restart each other's engines in turn.
+pub fn stale_engine(daemon: Option<&isocast_protocol::api::DaemonBuild>) -> Option<StaleEngine> {
+    older_engine(daemon, &bundled_build()?)
+}
+
+/// The build (`CFBundleVersion`) of the engine this distribution bundles
+/// and launches; `None` for a development client or `$ISOCAST_DAEMON`.
+pub fn bundled_build() -> Option<String> {
+    if std::env::var_os("ISOCAST_DAEMON").is_some() {
+        return None;
+    }
+    let exe = std::env::current_exe().ok()?;
+    let exe = exe.canonicalize().unwrap_or(exe);
+    let helper = bundled_helper(&exe)?;
+    let plist = std::fs::read_to_string(helper.parent()?.parent()?.join("Info.plist")).ok()?;
+    plist_string(&plist, "CFBundleVersion")
+}
+
+/// [`stale_engine`]'s comparison, against the bundled build `expected`.
+fn older_engine(
+    daemon: Option<&isocast_protocol::api::DaemonBuild>,
+    expected: &str,
+) -> Option<StaleEngine> {
+    let own: u64 = expected.parse().ok()?;
+    let Some(daemon) = daemon else {
+        return Some(StaleEngine {
+            running: "an engine too old to report its version".into(),
+            pid: None,
+            expected: expected.into(),
+        });
+    };
+    // A build that isn't a number ("unknown") predates numbered builds.
+    let older =
+        daemon.build.parse::<u64>().is_ok_and(|b| b < own) || daemon.build.parse::<u64>().is_err();
+    older.then(|| StaleEngine {
+        running: format!("{} (build {})", daemon.version, daemon.build),
+        pid: Some(daemon.pid),
+        expected: expected.into(),
+    })
+}
+
+/// A `<string>` value from an XML property list (as `plistlib` and the
+/// build scripts write them), by key.
+fn plist_string(plist: &str, key: &str) -> Option<String> {
+    let after = &plist[plist.find(&format!("<key>{key}</key>"))? + key.len() + 11..];
+    let value = after.trim_start().strip_prefix("<string>")?;
+    Some(value[..value.find("</string>")?].trim().to_string())
 }
 
 /// The pid of the daemon holding the socket's lock ([`lock_path`]), if one

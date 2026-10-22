@@ -44,9 +44,168 @@ leaves live. Warnings do not change the configured bitrate or rate control.
 
 The stream key is never part of a setup, `get`, `status`, logs, errors or
 `--json` output (errors have it replaced by `<stream key>`). It is a
-generic password in the login Keychain: service `dev.isocast.stream`,
+generic password in the login Keychain: service `<app bundle id>.stream`
+(`dev.isocast.release.stream` for Isocast.app, `dev.isocast.isocastd.stream`
+for the dev app, `dev.isocast.unbundled.stream` for a bare `isocastd`),
 account the service name (`twitch`), or the server address for `custom`.
+Each build has its own service because macOS lets only the build that saved
+an item replace it. Up to 0.0.3 every build used `dev.isocast.stream`; a
+build moves a key from there to its own service once, when it may read it
+without a prompt, and ignores one another build saved (#63).
 For local testing the daemon also takes a key from `ISOCAST_STREAM_KEY`.
+
+A server on the local network (an RTMP relay or another Mac) needs macOS's
+Local Network permission: the first stream to it asks to allow "Isocast
+Engine". Turned off, a `.local` name can't be looked up and an address
+fails with "No route to host"; the error says where to turn it on (System Settings → Privacy & Security → Local
+Network). Isocast can't read that setting, so `isocast permissions` doesn't
+list it (#57).
+
+## Several destinations at once
+
+The `[stream]` section is the main destination (id `main`). More go in
+`[[stream.destinations]]`, and `isocast stream start` streams the same
+program to every one that is on, each with its own key, connection,
+state, reconnects and counters: one failing (a wrong key, an ingest that
+drops) never stops the others or a recording.
+
+```toml
+[stream]
+service = "youtube"
+video_bitrate_kbps = 6000
+
+[[stream.destinations]]
+id = "twitch"
+service = "twitch"
+
+[[stream.destinations]]
+id = "backup"
+service = "custom"
+server = "rtmp://relay.local/live"
+video_bitrate_kbps = 3000     # its own bitrate and size need an encoder
+width = 1280                  #   of their own
+height = 720
+# enabled = false             # `stream start` skips it unless --only names it
+```
+
+A destination sets its service, server, `enabled`, and optionally its own
+`video_bitrate_kbps` and `width`/`height`; everything else (rate control,
+keyframes, audio, reconnecting) is the main destination's, which stays
+the default for the others even while the main one is turned off.
+Destinations that send the same size at the same bitrate share one H.264
+encoder (one hardware session, encoded once and sent to each connection);
+one with its own bitrate or size gets an encoder of its own only if this
+Mac's encoders have room by the capacity estimate (#66, counting the
+recording only while one runs); otherwise `stream start` refuses, naming
+those destinations and how to share an encoder instead.
+
+```sh
+isocast stream destination add twitch            # id "twitch"
+isocast stream destination add custom --id backup --server rtmp://relay.local/live \
+    --video-bitrate-kbps 3000 --width 1280 --height 720
+isocast stream destination set backup --enabled false
+isocast stream destination set backup --clear video_bitrate_kbps --clear size
+isocast stream destination remove backup         # not main, not while it streams
+isocast stream key set --destination twitch      # each has its own key
+isocast stream start [--only twitch]…            # every enabled one, or these
+isocast stream stop [--only twitch]…             # the others keep going
+isocast stream status [--json]                   # every destination
+```
+
+Each destination's key is its own Keychain item under the build's service
+(see above): the main one keeps the account it always had (`twitch`, or a
+custom server), an added one's is that account with its id (`twitch
+[alt]`), so two channels on one service keep two keys. MCP has
+`stream_destination_add`, `stream_destination_set`,
+`stream_destination_remove`, `only` on `start_stream` and `stop_stream`,
+and `destination` on the key tools. `stream_start` and `stream_stop`
+return the first destination's status (the main one's if it took part)
+with every destination's in `destinations`; `status.stream` stays the
+main destination's and `status.streams` lists them all; `stream` events
+carry the destination's `id`. Settings › Stream lists the destinations
+(on/off, state, service, server, key, own bitrate and size), and the
+status bar's LIVE details show each one's state.
+
+## The vertical canvas's stream
+
+A setup's vertical canvas (`[vertical]`) streams its own program to its
+own `[vertical.stream]` destinations, with keys of its own: their
+Keychain accounts start `canvas:vertical:<id>:` (for example
+`canvas:vertical:main:twitch`), so a vertical key never replaces the main
+canvas's. The CLI and MCP take `--canvas vertical` / `canvas: "vertical"`
+on every stream and key command. In the app, Settings › Stream has a
+**Streams of: Main Canvas / Vertical Canvas** choice (shown once there is
+a vertical canvas) and the same service, server, key and destination
+steps for each. Start Streaming starts the vertical canvas's streams too
+when they are set up with keys (else it says what's missing, with a way
+to Settings), and stops them with the main one's; the canvas monitor's
+menu starts or stops them alone. The status bar adds the vertical
+canvas's state (`vertical live for 00:12:34`, `vertical reconnecting`).
+
+## More canvases: a shape per platform (#84)
+
+Beside the main canvas and `[vertical]`, a setup can have up to seven
+more canvases (eight with the vertical one), each with its own id, size,
+frame rate, scene and destinations: 16:9 to Twitch from the main canvas,
+9:16 to YouTube Shorts and TikTok, 1:1 to a feed, at once.
+
+```toml
+[[canvases]]
+id = "shorts"
+name = "YouTube Shorts"
+width = 1080
+height = 1920
+fps = 60                 # the main canvas's if absent
+follow_main = true       # false: it switches its own scenes
+recording = {}           # record its program too ("{date} {time} shorts")
+
+[canvases.stream]
+service = "youtube"
+video_bitrate_kbps = 5000
+
+[[canvases.stream.destinations]]
+id = "tiktok"
+service = "custom"
+server = "rtmps://push.example/live"
+keyframe_interval_seconds = 1   # each destination may set its own
+audio_bitrate_kbps = 128        # rate_control, keyframes and audio too
+```
+
+A scene is drawn on a canvas by its arrangement for it,
+`[scenes.canvases.shorts]` (`layout`, `items` in that canvas's pixels),
+else the main picture letterboxed. Destinations of one canvas with the
+same format share one encoder. The CLI has `isocast canvas list|add|set|
+remove`, and every stream command takes `--canvas ID`; MCP has
+`canvas_add`, `canvas_set`, `canvas_remove` and `canvas` on the stream
+tools; Settings › Video › Canvases and Stream › Streams of do the same.
+Keys are each canvas's own (`canvas:<id>:<destination>:<account>`).
+obs-websocket's `GetCanvasList` lists every canvas. Aitum Vertical
+Canvas's vendor requests (`aitum-vertical-canvas`) answer in the plugin's
+shapes: `width`/`height` pick the first canvas of that size (none
+matching is `success: false`); `version`, `current_scene`, `get_scenes`,
+`status`, `start|stop|toggle_streaming`, `start|stop|save_backtrack`
+(that canvas's replay buffer), `update_stream_key` and
+`update_stream_server` (by destination `index`) work; `switch_scene`
+switches every canvas that picks its own scenes (one following the main
+scene keeps following it). A canvas isn't recorded, paused or given
+chapters on its own (the main recording takes every recorded canvas), so
+those requests and the virtual camera ones answer `success: false` with
+why.
+Importing an OBS profile brings Aitum Multistream's outputs (as
+destinations) and Vertical Canvas's canvases and outputs; their keys stay
+in OBS.
+
+In the app (#120), the canvas monitor at the stage's right shows one extra
+canvas at a time; its line's ⌄ menu switches between them and has Edit
+<name> Canvas (the editor then edits that canvas's arrangements), Record,
+Start/Stop Stream, Start/Stop/Save Replay Buffer and Program/Preview
+Projector for the canvas it shows. A scene's right-click menu opens a
+Scene Projector on any canvas, and Multiview shows the extra canvases'
+programs in its last tiles. On the method table a projector takes
+`canvas: ID` (`isocast projector open program --canvas shorts`) and a
+multiview `canvases: [ID, …]` (`--canvases shorts,square`; at most half
+its scene tiles). The virtual camera shows a canvas's program with
+`virtual_camera.target = "canvas"` and `canvas = "shorts"`.
 
 ## Service presets
 

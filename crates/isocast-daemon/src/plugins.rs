@@ -26,12 +26,13 @@
 //! it exits on its own it is restarted (1 s, doubling to 60 s, counted from
 //! its last start), and turned off after 5 crashes in 5 minutes.
 
+use isocast_ipc::{Listener as UnixListener, Stream as UnixStream};
+use parking_lot::{Condvar, Mutex, RwLock};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io;
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -40,18 +41,13 @@ use isocast_protocol::api::{Check, CheckStatus, Event, Method, RpcError, plugins
 use isocast_protocol::plugin::{
     AudioFilterSpec, Installed, KindClass, MANIFEST, Manifest, Permissions, PluginAction,
     PluginAddParams, PluginChange, PluginEnableParams, PluginInfo, PluginState, Plugins,
-    ProcessInfo, ProcessState, Version,
+    ProcessInfo, ProcessState, RecordingsAccess, Version,
 };
-// The plugin launcher on macOS grants recordings access; Linux's
-// unsandboxed runtime touches the type only through this import.
-#[cfg(target_os = "macos")]
-use isocast_protocol::plugin::RecordingsAccess;
 use isocast_protocol::{Issue, Setup};
 use serde::{Deserialize, Serialize};
 
 /// How long reading a plugin's manifest may take: a folder macOS protects
 /// (Documents, Downloads, Desktop) waits for a permission prompt.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a process has to exit after SIGTERM before it is killed.
 const STOP_GRACE: Duration = Duration::from_secs(3);
@@ -67,6 +63,11 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// A folder bigger than this isn't copied (use `--link`).
 const MAX_COPY_FILES: usize = 20_000;
 const MAX_COPY_BYTES: u64 = 1 << 30;
+/// How often the recordings folders are looked at again for the sandboxes
+/// of running plugins, for changes no request makes: a standalone
+/// `isocast record` into a new folder, or a folder named like a project
+/// made while idle (#56).
+const SANDBOX_POLL: Duration = Duration::from_secs(5);
 
 /// What isocastd gives the registry: a way to tell watchers, and to serve
 /// a plugin's connection with its scope.
@@ -88,6 +89,7 @@ impl Default for Registry {
             pids: Mutex::default(),
             hooks: OnceLock::new(),
             admin: Mutex::new(()),
+            polling: std::sync::Once::new(),
         }))
     }
 }
@@ -101,6 +103,8 @@ struct Shared {
     hooks: OnceLock<Hooks>,
     /// Held through each add, remove, enable and disable.
     admin: Mutex<()>,
+    /// The sandbox poll (`SANDBOX_POLL`) runs, from the first process on.
+    polling: std::sync::Once,
 }
 
 /// One installed plugin.
@@ -256,7 +260,15 @@ impl Scope {
             .and_then(|value| value.get("method"))
             .and_then(serde_json::Value::as_str)
             .unwrap_or("?");
-        let methods = self.methods.read().unwrap();
+        // Never, even if granted before it became ungrantable (an
+        // install.toml from an earlier version).
+        if let Some(reason) = isocast_protocol::plugin::ungrantable_reason(name) {
+            return Some(format!(
+                "methods.{name}: {} can't call {name}: {reason}",
+                self.id
+            ));
+        }
+        let methods = self.methods.read();
         if methods.iter().any(|m| *m == name) {
             return self.data_refusal(method);
         }
@@ -277,7 +289,7 @@ impl Scope {
         let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
         let clone = stream.try_clone().ok()?;
         let key = self.next.fetch_add(1, Ordering::SeqCst);
-        self.connections.lock().unwrap().insert(key, clone);
+        self.connections.lock().insert(key, clone);
         Some(Tracked {
             scope: self.clone(),
             key,
@@ -286,7 +298,7 @@ impl Scope {
 
     fn revoke(&self) {
         self.revoked.store(true, Ordering::SeqCst);
-        for (_, stream) in self.connections.lock().unwrap().drain() {
+        for (_, stream) in self.connections.lock().drain() {
             let _ = stream.shutdown(std::net::Shutdown::Both);
         }
     }
@@ -300,7 +312,7 @@ pub struct Tracked {
 
 impl Drop for Tracked {
     fn drop(&mut self) {
-        self.scope.connections.lock().unwrap().remove(&self.key);
+        self.scope.connections.lock().remove(&self.key);
     }
 }
 
@@ -360,6 +372,9 @@ struct Process {
     state: Mutex<Run>,
     changed: Condvar,
     stop: AtomicBool,
+    /// Its process was stopped to start again with new sandbox rules
+    /// (`Registry::refresh_sandboxes`): not a crash.
+    refresh: AtomicBool,
 }
 
 struct Run {
@@ -369,13 +384,84 @@ struct Run {
     crashes: VecDeque<Instant>,
     last_exit: Option<(String, Instant)>,
     sandboxed: bool,
+    /// The recordings folders its sandbox was made with, while it runs
+    /// sandboxed.
+    recordings: Option<RecordingFolders>,
     /// The supervisor has finished.
     done: bool,
 }
 
+/// The recordings folders a sandbox is made with: the recordings folders
+/// (resolved), and, for a `write` grant, the folders in them named like
+/// projects that aren't (`isocast_protocol::project::named_like_but_not`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RecordingFolders {
+    roots: Vec<PathBuf>,
+    not_projects: Vec<PathBuf>,
+}
+
+/// A recordings folder as Seatbelt will match it: resolved, or for one not
+/// made yet, its nearest existing parent resolved plus the rest. Its rules
+/// are then in place before it is made, so making it (the first recording
+/// into a new folder) restarts no plugin; made as a link somewhere else,
+/// it resolves differently and `refresh_sandboxes` still restarts them.
+fn resolved(root: &Path) -> Option<PathBuf> {
+    if let Ok(real) = root.canonicalize() {
+        return Some(real);
+    }
+    if !root.is_absolute() {
+        return None;
+    }
+    let existing = root.ancestors().skip(1).find(|parent| parent.exists())?;
+    let rest = root.strip_prefix(existing).ok()?;
+    rest.components()
+        .all(|part| matches!(part, std::path::Component::Normal(_)))
+        .then(|| Some(existing.canonicalize().ok()?.join(rest)))?
+}
+
+impl RecordingFolders {
+    fn new(roots: &[PathBuf], granted: &Permissions) -> Self {
+        let mut roots: Vec<PathBuf> = roots.iter().filter_map(|root| resolved(root)).collect();
+        roots.sort();
+        roots.dedup();
+        let not_projects = match granted.recordings {
+            Some(RecordingsAccess::Write) => roots
+                .iter()
+                .flat_map(|root| isocast_protocol::project::named_like_but_not(root))
+                .collect(),
+            _ => Vec::new(),
+        };
+        Self {
+            roots,
+            not_projects,
+        }
+    }
+
+    /// A folder here that `self`'s sandbox has no rule for.
+    fn adds_to(&self, earlier: &Self) -> bool {
+        self.roots.iter().any(|r| !earlier.roots.contains(r))
+            || self
+                .not_projects
+                .iter()
+                .any(|p| !earlier.not_projects.contains(p))
+    }
+
+    /// Whether a sandbox made with `earlier` misses something there is
+    /// now: a folder (`adds_to`), or a project in a folder it denies
+    /// because it wasn't one yet (a recording's project folder seen
+    /// between being made and getting its project file).
+    fn outdates(&self, earlier: &Self) -> bool {
+        self.adds_to(earlier)
+            || earlier.not_projects.iter().any(|folder| {
+                !self.not_projects.contains(folder)
+                    && isocast_protocol::project::read(folder).is_some()
+            })
+    }
+}
+
 impl Process {
     fn info(&self, dir: &Path) -> ProcessInfo {
-        let run = self.state.lock().unwrap();
+        let run = self.state.lock();
         ProcessInfo {
             state: run.phase,
             command: self.command.clone(),
@@ -395,10 +481,10 @@ impl Process {
     /// gone after a grace period. Waits for the supervisor to finish.
     fn stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
-        let mut run = self.state.lock().unwrap();
+        let mut run = self.state.lock();
         self.changed.notify_all();
         if let Some(pid) = run.pid {
-            signal_group(pid, libc::SIGTERM);
+            signal_group(pid, Signal::Terminate);
         }
         let deadline = Instant::now() + STOP_GRACE;
         while !run.done {
@@ -406,28 +492,50 @@ impl Process {
             if left.is_zero() {
                 break;
             }
-            run = self.changed.wait_timeout(run, left).unwrap().0;
+            self.changed.wait_for(&mut run, left);
         }
         if !run.done {
             if let Some(pid) = run.pid {
-                signal_group(pid, libc::SIGKILL);
+                signal_group(pid, Signal::Kill);
             }
-            run = self
-                .changed
-                .wait_timeout_while(run, Duration::from_secs(2), |run| !run.done)
-                .unwrap()
-                .0;
+            self.changed
+                .wait_while_for(&mut run, |run| !run.done, Duration::from_secs(2));
         }
         drop(run);
     }
 }
 
-fn signal_group(pid: u32, signal: libc::c_int) {
+/// How [`signal_group`] stops a plugin process group.
+#[derive(Clone, Copy)]
+enum Signal {
+    /// SIGTERM: asks it to exit.
+    Terminate,
+    /// SIGKILL: ends it at once.
+    Kill,
+}
+
+#[cfg(unix)]
+fn signal_group(pid: u32, signal: Signal) {
+    let signal = match signal {
+        Signal::Terminate => libc::SIGTERM,
+        Signal::Kill => libc::SIGKILL,
+    };
     // SAFETY: kill has no memory effects; a negative pid names the process
     // group the plugin leads (it was started in a group of its own).
     unsafe {
         libc::kill(-(pid as libc::pid_t), signal);
     }
+}
+
+/// On Windows no plugin process can be started ([`find_program`] and
+/// [`spawn`] refuse before a child exists, and [`process_info`] knows no
+/// leftover), so there is never a pid to signal.
+#[cfg(windows)]
+fn signal_group(pid: u32, _signal: Signal) {
+    unreachable!(
+        "plugin process {pid}: plugin processes can't be started on Windows, so there is none \
+         to stop"
+    );
 }
 
 fn failed(message: impl Into<String>) -> RpcError {
@@ -453,7 +561,7 @@ impl Registry {
         let Ok(dirs) = std::fs::read_dir(&shared.folder) else {
             return;
         };
-        let _admin = shared.admin.lock().unwrap();
+        let _admin = shared.admin.lock();
         for dir in dirs.flatten() {
             let id = dir.file_name().to_string_lossy().into_owned();
             let dir = dir.path();
@@ -480,7 +588,7 @@ impl Registry {
                 process: None,
                 listener: None,
             };
-            shared.entries.lock().unwrap().insert(id.clone(), entry);
+            shared.entries.lock().insert(id.clone(), entry);
             if let Err(err) = shared.run(&id) {
                 isocast_diagnostics::diagnostic!("error"; "isocastd: plugin {id}: {}", err.message);
             }
@@ -492,7 +600,7 @@ impl Registry {
     /// `plan`): an installed plugin's kind used wrongly is a problem, one
     /// that is bypassed (not installed, turned off) a note.
     pub fn check_kinds(&self, setup: &Setup) -> (Vec<Issue>, Vec<String>) {
-        let entries = self.0.entries.lock().unwrap();
+        let entries = self.0.entries.lock();
         let installed: BTreeMap<String, Installed> = entries
             .values()
             .filter_map(|entry| {
@@ -512,7 +620,7 @@ impl Registry {
     /// Stop every plugin process (isocastd is exiting).
     pub fn stop_all(&self) {
         let processes: Vec<Arc<Process>> = {
-            let mut entries = self.0.entries.lock().unwrap();
+            let mut entries = self.0.entries.lock();
             entries
                 .values_mut()
                 .filter_map(|entry| {
@@ -528,10 +636,21 @@ impl Registry {
         }
     }
 
+    /// Restart, in the background, each sandboxed plugin process whose
+    /// sandbox has no rule for a recordings folder (or, with a `write`
+    /// grant, a folder named like a project that isn't one) that exists
+    /// now: Seatbelt rules can't change in a running process (#56).
+    pub fn refresh_sandboxes(&self) {
+        let shared = self.0.clone();
+        let _ = thread::Builder::new()
+            .name("plugin sandboxes".into())
+            .spawn(move || shared.refresh_sandboxes());
+    }
+
     /// The plugin a connection on the main socket belongs to, if its peer
     /// process or one of its parents is a plugin process isocastd started.
     pub fn scope_of_peer(&self, stream: &UnixStream) -> Option<Arc<Scope>> {
-        let pids = self.0.pids.lock().unwrap();
+        let pids = self.0.pids.lock();
         if pids.is_empty() {
             return None;
         }
@@ -549,7 +668,7 @@ impl Registry {
     }
 
     pub fn list(&self) -> Plugins {
-        let entries = self.0.entries.lock().unwrap();
+        let entries = self.0.entries.lock();
         Plugins {
             folder: self.0.folder.clone(),
             plugins: entries.values().map(Entry::info).collect(),
@@ -559,7 +678,7 @@ impl Registry {
     /// A `doctor` check on how plugin processes are isolated, if any are
     /// installed.
     pub fn doctor_check(&self) -> Option<Check> {
-        let entries = self.0.entries.lock().unwrap();
+        let entries = self.0.entries.lock();
         let processes = entries
             .values()
             .filter(
@@ -597,7 +716,7 @@ impl Registry {
 
     pub fn add(&self, params: PluginAddParams) -> Result<PluginChange, RpcError> {
         let shared = &self.0;
-        let _admin = shared.admin.lock().unwrap();
+        let _admin = shared.admin.lock();
         let source = params.path.clone();
         if !source.is_absolute() {
             return Err(failed(format!(
@@ -611,7 +730,6 @@ impl Registry {
         let old = shared
             .entries
             .lock()
-            .unwrap()
             .get(&id)
             .map(|entry| (entry.record.clone(), entry.version()));
         let action = match &old {
@@ -675,7 +793,7 @@ impl Registry {
             })?)
         };
         // Its process stops while its files change.
-        let running = shared.entries.lock().unwrap().get_mut(&id).map(|entry| {
+        let running = shared.entries.lock().get_mut(&id).map(|entry| {
             entry.scope.revoke();
             (entry.listener.take(), entry.process.take())
         });
@@ -786,7 +904,7 @@ impl Registry {
             process: None,
             listener: None,
         };
-        shared.entries.lock().unwrap().insert(id.clone(), entry);
+        shared.entries.lock().insert(id.clone(), entry);
         if let Err(err) = shared.run(&id) {
             notes.push(err.message);
         }
@@ -801,8 +919,8 @@ impl Registry {
 
     pub fn remove(&self, id: &str) -> Result<PluginChange, RpcError> {
         let shared = &self.0;
-        let _admin = shared.admin.lock().unwrap();
-        let entry = shared.entries.lock().unwrap().remove(id);
+        let _admin = shared.admin.lock();
+        let entry = shared.entries.lock().remove(id);
         let Some(mut entry) = entry else {
             return Err(shared.unknown(id));
         };
@@ -856,10 +974,10 @@ impl Registry {
 
     pub fn set_enabled(&self, params: PluginEnableParams) -> Result<PluginChange, RpcError> {
         let shared = &self.0;
-        let _admin = shared.admin.lock().unwrap();
+        let _admin = shared.admin.lock();
         let id = params.id.as_str();
         let stopping = {
-            let mut entries = shared.entries.lock().unwrap();
+            let mut entries = shared.entries.lock();
             let Some(entry) = entries.get_mut(id) else {
                 drop(entries);
                 return Err(shared.unknown(id));
@@ -868,7 +986,7 @@ impl Registry {
             let running = entry
                 .process
                 .as_ref()
-                .is_some_and(|process| !process.state.lock().unwrap().done);
+                .is_some_and(|process| !process.state.lock().done);
             if entry.record.enabled == params.enabled && (!params.enabled || running) {
                 let info = entry.info();
                 return Ok(PluginChange {
@@ -909,7 +1027,7 @@ impl Registry {
                 // A fresh start: a manifest that changed (linked), a new
                 // crash count.
                 {
-                    let mut entries = shared.entries.lock().unwrap();
+                    let mut entries = shared.entries.lock();
                     let entry = entries.get_mut(id).expect("checked");
                     entry.manifest = load_manifest(id, &entry.dir, &entry.record);
                     entry.scope = Arc::new(Scope::new(id, &entry.record.granted));
@@ -943,7 +1061,7 @@ impl Registry {
 
 impl Shared {
     fn unknown(&self, id: &str) -> RpcError {
-        let entries = self.entries.lock().unwrap();
+        let entries = self.entries.lock();
         let ids: Vec<&str> = entries.keys().map(String::as_str).collect();
         failed(format!(
             "no plugin {id:?} is installed; installed: {}",
@@ -956,13 +1074,13 @@ impl Shared {
     }
 
     fn info(&self, id: &str) -> Option<PluginInfo> {
-        self.entries.lock().unwrap().get(id).map(Entry::info)
+        self.entries.lock().get(id).map(Entry::info)
     }
 
     /// Tell the engine which plugins' audio filters are installed, and
     /// which of them are bypassed.
     fn publish_kinds(&self) {
-        let entries = self.entries.lock().unwrap();
+        let entries = self.entries.lock();
         let filters: Vec<AudioFilterPlugin> = entries
             .values()
             .flat_map(|entry| {
@@ -1007,7 +1125,7 @@ impl Shared {
     /// Start the plugin's process (and its socket) if it should run: it
     /// has one, starts on its own, and is enabled and compatible.
     fn run(self: &Arc<Self>, id: &str) -> Result<(), RpcError> {
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.lock();
         let Some(entry) = entries.get_mut(id) else {
             return Ok(());
         };
@@ -1038,10 +1156,12 @@ impl Shared {
                 crashes: VecDeque::new(),
                 last_exit: None,
                 sandboxed: false,
+                recordings: None,
                 done: false,
             }),
             changed: Condvar::new(),
             stop: AtomicBool::new(false),
+            refresh: AtomicBool::new(false),
         });
         entry.listener = Some(listener);
         entry.process = Some(process.clone());
@@ -1058,14 +1178,24 @@ impl Shared {
             .name(format!("plugin {id}"))
             .spawn(move || shared.supervise(&supervised, &launch))
             .map_err(|err| failed(format!("{id}'s process couldn't start: {err}")))?;
+        self.polling.call_once(|| {
+            let shared = self.clone();
+            let _ = thread::Builder::new()
+                .name("plugin sandbox poll".into())
+                .spawn(move || {
+                    loop {
+                        thread::sleep(SANDBOX_POLL);
+                        shared.refresh_sandboxes();
+                    }
+                });
+        });
         // Replies say how the first start went.
-        let run = process.state.lock().unwrap();
-        let _ = process
-            .changed
-            .wait_timeout_while(run, Duration::from_secs(2), |run| {
-                run.pid.is_none() && run.last_exit.is_none() && !run.done
-            })
-            .unwrap();
+        let mut run = process.state.lock();
+        let _ = process.changed.wait_while_for(
+            &mut run,
+            |run| run.pid.is_none() && run.last_exit.is_none() && !run.done,
+            Duration::from_secs(2),
+        );
         Ok(())
     }
 
@@ -1080,31 +1210,36 @@ impl Shared {
                 break;
             }
             let started = Instant::now();
-            // The recordings folders as they are now (a folder recorded to
-            // later is in its sandbox from its next start).
+            // The recordings folders as they are now (one used later, or a
+            // folder named like a project made later, restarts it:
+            // `refresh_sandboxes`).
             let roots = self
                 .hooks
                 .get()
                 .map(|hooks| (hooks.recording_roots)())
                 .unwrap_or_default();
-            let outcome = launch.start(&process.command, &roots);
+            let recordings = RecordingFolders::new(&roots, &launch.granted);
+            let outcome = launch.start(&process.command, &recordings);
             let exit = match outcome {
                 Ok((pid, sandboxed)) => {
-                    self.pids.lock().unwrap().insert(pid, launch.scope.clone());
+                    self.pids.lock().insert(pid, launch.scope.clone());
                     {
-                        let mut run = process.state.lock().unwrap();
+                        let mut run = process.state.lock();
                         run.pid = Some(pid);
                         run.phase = ProcessState::Running;
                         run.sandboxed = sandboxed;
+                        run.recordings = sandboxed.then_some(recordings);
                         process.changed.notify_all();
                     }
                     if !first {
                         self.changed(&id, PluginAction::Restarted);
                     }
                     let exit = wait(pid);
-                    self.pids.lock().unwrap().remove(&pid);
+                    self.pids.lock().remove(&pid);
                     let _ = std::fs::remove_file(launch.dir.join("pid"));
-                    process.state.lock().unwrap().pid = None;
+                    let mut run = process.state.lock();
+                    run.pid = None;
+                    run.recordings = None;
                     exit
                 }
                 Err(err) => format!("couldn't start: {err}"),
@@ -1113,9 +1248,14 @@ impl Shared {
             if process.stop.load(Ordering::SeqCst) {
                 break;
             }
+            // Stopped for new sandbox rules: start it again at once.
+            if process.refresh.swap(false, Ordering::SeqCst) {
+                process.state.lock().restarts += 1;
+                continue;
+            }
             // It ended on its own: a crash.
             let now = Instant::now();
-            let mut run = process.state.lock().unwrap();
+            let mut run = process.state.lock();
             run.crashes.push_back(now);
             while run
                 .crashes
@@ -1150,26 +1290,68 @@ impl Shared {
                 at.saturating_duration_since(Instant::now()).as_secs_f64()
             ));
             self.changed(&id, PluginAction::Crashed);
-            let mut run = process.state.lock().unwrap();
+            let mut run = process.state.lock();
             while !process.stop.load(Ordering::SeqCst) {
                 let left = at.saturating_duration_since(Instant::now());
                 if left.is_zero() {
                     break;
                 }
-                run = process.changed.wait_timeout(run, left).unwrap().0;
+                process.changed.wait_for(&mut run, left);
             }
             run.restarts += 1;
         }
-        let mut run = process.state.lock().unwrap();
+        let mut run = process.state.lock();
         run.phase = ProcessState::Stopped;
         run.done = true;
         process.changed.notify_all();
     }
 
+    fn refresh_sandboxes(&self) {
+        let running: Vec<(Arc<Process>, Permissions)> = {
+            let entries = self.entries.lock();
+            entries
+                .values()
+                .filter_map(|e| Some((e.process.clone()?, e.record.granted.clone())))
+                .collect()
+        };
+        if running.is_empty() {
+            return;
+        }
+        let roots = self
+            .hooks
+            .get()
+            .map(|hooks| (hooks.recording_roots)())
+            .unwrap_or_default();
+        for (process, granted) in running {
+            let now = RecordingFolders::new(&roots, &granted);
+            let pid = {
+                let run = process.state.lock();
+                match (&run.recordings, run.pid) {
+                    (Some(earlier), Some(pid)) if now.outdates(earlier) => pid,
+                    _ => continue,
+                }
+            };
+            isocast_diagnostics::diagnostic!(
+                "isocastd: plugin {}: restarting it so its sandbox has the recordings folders \
+                 as they are now",
+                process.id
+            );
+            process.refresh.store(true, Ordering::SeqCst);
+            signal_group(pid, Signal::Terminate);
+            let process = process.clone();
+            thread::spawn(move || {
+                thread::sleep(STOP_GRACE);
+                if process.state.lock().pid == Some(pid) {
+                    signal_group(pid, Signal::Kill);
+                }
+            });
+        }
+    }
+
     /// Turn a plugin off after it crashed too often (kept across restarts
     /// of isocastd until it is turned on again).
     fn turn_off(&self, id: &str, reason: &str) {
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.lock();
         let Some(entry) = entries.get_mut(id) else {
             return;
         };
@@ -1304,16 +1486,17 @@ struct Launch {
     dir: PathBuf,
     /// Its files.
     folder: PathBuf,
-    /// The grants: enforced by the launcher on macOS; on Linux plugins
-    /// run unsandboxed until Landlock lands (docs/port-omarchy.md L.6).
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     granted: Permissions,
     scope: Arc<Scope>,
 }
 
 impl Launch {
     /// Start the process; its id and whether it is sandboxed.
-    fn start(&self, command: &[String], recordings: &[PathBuf]) -> Result<(u32, bool), String> {
+    fn start(
+        &self,
+        command: &[String],
+        recordings: &RecordingFolders,
+    ) -> Result<(u32, bool), String> {
         let program = find_program(&command[0], &self.folder)?;
         let data = self.dir.join("data");
         let tmp = data.join("tmp");
@@ -1371,7 +1554,7 @@ impl Launch {
         program: &Path,
         socket: &Path,
         data: &Path,
-        recordings: &[PathBuf],
+        recordings: &RecordingFolders,
     ) -> String {
         let real = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         let home = real(Path::new(&std::env::var_os("HOME").unwrap_or_default()));
@@ -1390,8 +1573,8 @@ impl Launch {
             (Some(parent), Some(name)) => real(parent).join(name),
             _ => socket.to_path_buf(),
         };
-        // Canonical, as Seatbelt matches resolved paths; folders not made
-        // yet are left out (no file can be in them), and so is a recordings
+        // Canonical, as Seatbelt matches resolved paths (a recordings folder
+        // not made yet as it will resolve: `resolved`); left out is a recordings
         // folder holding the home folder, the plugin's own folders or its
         // program (`/`, say): denying or granting all of that isn't what
         // the grant means, and the home folder's own rule still applies.
@@ -1402,14 +1585,21 @@ impl Launch {
             program_real.clone(),
         ];
         own.extend(program_folders.iter().cloned());
-        let recordings: Vec<PathBuf> = recordings
-            .iter()
-            .filter_map(|root| root.canonicalize().ok())
-            .filter(|root| !own.iter().any(|path| path.starts_with(root)))
-            .collect();
         let not_projects = recordings
+            .not_projects
             .iter()
-            .flat_map(|root| isocast_protocol::project::named_like_but_not(root))
+            .filter(|folder| {
+                folder
+                    .parent()
+                    .is_some_and(|root| !own.iter().any(|path| path.starts_with(root)))
+            })
+            .cloned()
+            .collect();
+        let recordings: Vec<PathBuf> = recordings
+            .roots
+            .iter()
+            .filter(|root| !own.iter().any(|path| path.starts_with(root)))
+            .cloned()
             .collect();
         isocast_platform_macos::plugin::Sandbox {
             home,
@@ -1436,7 +1626,7 @@ impl Launch {
         _program: &Path,
         _socket: &Path,
         _data: &Path,
-        _recordings: &[PathBuf],
+        _recordings: &RecordingFolders,
     ) -> String {
         String::new()
     }
@@ -1445,9 +1635,7 @@ impl Launch {
 /// The folders a program's own installation may run programs from: a
 /// framework version (Python re-runs itself from its app bundle), a
 /// Homebrew keg, or for macOS's /usr/bin tool stubs, the developer tools.
-/// (The launcher uses this on macOS; Linux's unsandboxed runtime until
-/// L.6 doesn't.)
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(target_os = "macos")]
 fn installation(program: &Path) -> Vec<PathBuf> {
     let mut folders = Vec::new();
     let parts: Vec<_> = program.components().collect();
@@ -1498,8 +1686,22 @@ fn search_path() -> String {
     dirs.join(":")
 }
 
+/// Plugin processes on Windows: refused until they can run sandboxed with
+/// their output passed through the redacting log.
+#[cfg(windows)]
+const WINDOWS_PROCESS_UNSUPPORTED: &str = "plugin processes aren't supported on Windows yet \
+     (they need a sandbox and a redacted log, which aren't built); use a plugin without a process";
+
+/// On Windows: refused (see [`WINDOWS_PROCESS_UNSUPPORTED`]), so no plugin
+/// with a process installs or starts.
+#[cfg(windows)]
+fn find_program(_name: &str, _folder: &Path) -> Result<PathBuf, String> {
+    Err(WINDOWS_PROCESS_UNSUPPORTED.into())
+}
+
 /// The program a command names: a path inside the plugin's folder, or a
 /// program on the plugins' PATH.
+#[cfg(unix)]
 fn find_program(name: &str, folder: &Path) -> Result<PathBuf, String> {
     use std::os::unix::fs::PermissionsExt;
     let runnable = |path: &Path| {
@@ -1698,8 +1900,37 @@ fn copy_tree(from: &Path, to: &Path, budget: &mut (usize, u64)) -> io::Result<()
         budget.0 -= 1;
         let kind = item.file_type()?;
         let (source, target) = (item.path(), to.join(&name));
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+            // Refuse every reparse point, including junctions/cloud placeholders,
+            // rather than following something outside the requested source tree.
+            if std::fs::symlink_metadata(&source)?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT
+                != 0
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!(
+                        "copying a Windows reparse point is unsupported: {}",
+                        source.display()
+                    ),
+                ));
+            }
+        }
         if kind.is_symlink() {
+            #[cfg(unix)]
             std::os::unix::fs::symlink(std::fs::read_link(&source)?, &target)?;
+            // Windows links (and junctions) aren't recreated or followed: a
+            // copy must not pull in what they point at.
+            #[cfg(windows)]
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "{} is a link, which isn't copied on Windows; add it with --link instead",
+                    source.display()
+                ),
+            ));
         } else if kind.is_dir() {
             copy_tree(&source, &target, budget)?;
         } else {
@@ -1779,12 +2010,13 @@ fn stop_leftover(dir: &Path) {
         && let Some((_, started)) = process_info(pid as u32)
         && started == (seconds, micros)
     {
-        signal_group(pid as u32, libc::SIGKILL);
+        signal_group(pid as u32, Signal::Kill);
     }
     let _ = std::fs::remove_file(path);
 }
 
 /// Wait for a child to end; how it ended, in words.
+#[cfg(unix)]
 fn wait(pid: u32) -> String {
     let mut status: libc::c_int = 0;
     loop {
@@ -1805,6 +2037,16 @@ fn wait(pid: u32) -> String {
     } else {
         format!("ended (status {status})")
     }
+}
+
+/// On Windows no plugin process can be started (see [`signal_group`]), so
+/// there is never a child to wait for.
+#[cfg(windows)]
+fn wait(pid: u32) -> String {
+    unreachable!(
+        "plugin process {pid}: plugin processes can't be started on Windows, so there is none \
+         to wait for"
+    );
 }
 
 /// The plugin API versions this Isocast runs, for messages: "1".
@@ -1855,8 +2097,8 @@ fn spawn(
     })
 }
 
-/// Elsewhere: unsandboxed, in its own process group.
-#[cfg(not(target_os = "macos"))]
+/// Other Unix systems: unsandboxed, in its own process group.
+#[cfg(all(unix, not(target_os = "macos")))]
 fn spawn(
     program: &Path,
     args: &[String],
@@ -1880,13 +2122,36 @@ fn spawn(
     Ok(child.id())
 }
 
+/// On Windows: refused before any child exists (see
+/// [`WINDOWS_PROCESS_UNSUPPORTED`]); there's no sandbox or redacted log.
+#[cfg(windows)]
+fn spawn(
+    _program: &Path,
+    _args: &[String],
+    _env: &[(String, String)],
+    _cwd: &Path,
+    _log: &Path,
+    _profile: Option<&str>,
+) -> io::Result<u32> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        WINDOWS_PROCESS_UNSUPPORTED,
+    ))
+}
+
 #[cfg(target_os = "macos")]
 fn peer_pid(stream: &UnixStream) -> Option<u32> {
     use std::os::fd::AsRawFd;
     isocast_platform_macos::plugin::peer_pid(stream.as_raw_fd())
 }
 
-#[cfg(not(target_os = "macos"))]
+/// The pipe's client process, as the kernel reports it.
+#[cfg(windows)]
+fn peer_pid(stream: &UnixStream) -> Option<u32> {
+    isocast_ipc::peer_pid(stream).ok()
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
 fn peer_pid(_stream: &UnixStream) -> Option<u32> {
     None
 }
@@ -1910,6 +2175,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn interpreters_may_run_their_own_installation() {
         assert_eq!(
             installation(Path::new(

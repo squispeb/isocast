@@ -245,7 +245,25 @@ macro_rules! arguments {
     };
 }
 arguments!(Empty {});
-arguments!(SceneArgs { scene: String });
+/// A scene, on the main canvas unless `canvas` says `vertical`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SceneArgs {
+    pub scene: String,
+    /// `main` (the default) or `vertical` (which must not follow the main
+    /// canvas).
+    #[serde(default, skip_serializing_if = "crate::CanvasId::is_main")]
+    pub canvas: crate::CanvasId,
+}
+
+/// Which canvas's streams: the main one's unless `canvas` says
+/// `vertical`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StreamArgs {
+    #[serde(default, skip_serializing_if = "crate::CanvasId::is_main")]
+    pub canvas: crate::CanvasId,
+}
 arguments!(IndexArgs { index: u32 });
 arguments!(SourceArgs { source: String });
 arguments!(ItemArgs {
@@ -256,6 +274,23 @@ arguments!(MarkerArgs { label: String });
 arguments!(TransitionArgs {
     transition: Transition
 });
+/// Which canvas's preview `transition.take` puts on air: the main one's
+/// unless `canvas` says `vertical` (which must not follow the main one).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TakeArgs {
+    #[serde(default, skip_serializing_if = "crate::CanvasId::is_main")]
+    pub canvas: crate::CanvasId,
+}
+/// `transition.take_with`: the transition, on the main canvas unless
+/// `canvas` says `vertical`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TakeWithArgs {
+    pub transition: Transition,
+    #[serde(default, skip_serializing_if = "crate::CanvasId::is_main")]
+    pub canvas: crate::CanvasId,
+}
 arguments!(IdArgs { id: String });
 /// The old reserved actions used `id`; retain that spelling as an alias while
 /// exposing the real timeline method's `clip`/`timeline` fields in the schema.
@@ -283,6 +318,9 @@ pub struct TimelineExportArgs {
     #[serde(alias = "id")]
     pub timeline: Option<String>,
     pub folder: Option<std::path::PathBuf>,
+    /// Also the vertical (9:16) edited file, as timeline_export's.
+    #[serde(default)]
+    pub vertical: bool,
 }
 arguments!(ScreenshotArgs {
     path: std::path::PathBuf
@@ -292,12 +330,16 @@ arguments!(ScreenshotArgs {
 #[derive(Debug)]
 pub enum Arguments {
     Empty,
+    Stream(StreamArgs),
+    Replay(crate::replay::ReplayParams),
     Scene(SceneArgs),
     Index(IndexArgs),
     Source(SourceArgs),
     Item(ItemArgs),
     Marker(MarkerArgs),
     Transition(TransitionArgs),
+    Take(TakeArgs),
+    TakeWith(TakeWithArgs),
     Id(IdArgs),
     Retake(RetakeParams),
     TimelineNew(TimelineNewParams),
@@ -306,6 +348,19 @@ pub enum Arguments {
     TimelineMove(TimelineMoveArgs),
     TimelineExport(TimelineExportArgs),
     Screenshot(ScreenshotArgs),
+}
+
+/// A hotkey's transition's problems, under `args.transition`.
+fn transition_problem(transition: &Transition) -> Result<(), String> {
+    let issues = transition.issues("args.transition");
+    if issues.is_empty() {
+        return Ok(());
+    }
+    Err(issues
+        .iter()
+        .map(|i| format!("{}: {}", i.path, i.message))
+        .collect::<Vec<_>>()
+        .join("; "))
 }
 
 fn parse<T: DeserializeOwned>(value: &Value) -> Result<T, String> {
@@ -325,13 +380,18 @@ impl Binding {
             | "recording.resume"
             | "recording.pause_toggle"
             | "recording.split"
-            | "streaming.start"
-            | "streaming.stop"
-            | "streaming.toggle"
             | "studio.toggle"
-            | "transition.take"
             | "timeline.close"
             | "timeline.clear" => parse::<Empty>(&self.args).map(|_| Arguments::Empty),
+            "streaming.start" | "streaming.stop" | "streaming.toggle" => {
+                parse(&self.args).map(Arguments::Stream)
+            }
+            // A canvas's buffer; the main one's unless args say vertical
+            // (as before canvases, with no args).
+            "replay.start" | "replay.stop" | "replay.toggle" | "replay.save" => {
+                parse(&self.args).map(Arguments::Replay)
+            }
+            "transition.take" => parse(&self.args).map(Arguments::Take),
             "recording.marker" | "timeline.marker" => parse(&self.args).map(Arguments::Marker),
             "timeline.retake" => parse(&self.args).map(Arguments::Retake),
             "timeline.new" => parse(&self.args).map(Arguments::TimelineNew),
@@ -350,17 +410,15 @@ impl Binding {
             "item.show" | "item.hide" | "item.toggle" => parse(&self.args).map(Arguments::Item),
             "audio.mute" | "audio.unmute" | "audio.toggle" | "audio.push_to_talk"
             | "audio.push_to_mute" => parse(&self.args).map(Arguments::Source),
-            "transition.set" | "transition.take_with" => {
+            "transition.set" => {
                 let args: TransitionArgs = parse(&self.args)?;
-                let issues = args.transition.issues("args.transition");
-                if !issues.is_empty() {
-                    return Err(issues
-                        .iter()
-                        .map(|i| format!("{}: {}", i.path, i.message))
-                        .collect::<Vec<_>>()
-                        .join("; "));
-                }
+                transition_problem(&args.transition)?;
                 Ok(Arguments::Transition(args))
+            }
+            "transition.take_with" => {
+                let args: TakeWithArgs = parse(&self.args)?;
+                transition_problem(&args.transition)?;
+                Ok(Arguments::TakeWith(args))
             }
             "program.screenshot" => {
                 let args: ScreenshotArgs = parse(&self.args)?;
@@ -411,12 +469,26 @@ pub fn catalogue() -> Catalogue {
     let mut actions = Vec::new();
     for (prefix, group) in [("recording", "Recording"), ("streaming", "Streaming")] {
         for (suffix, label) in [("start", "Start"), ("stop", "Stop"), ("toggle", "Toggle")] {
-            actions.push(action::<Empty>(
-                &format!("{prefix}.{suffix}"),
-                &format!("{label} {prefix}"),
-                group,
-            ));
+            let id = format!("{prefix}.{suffix}");
+            let label = format!("{label} {prefix}");
+            actions.push(if prefix == "streaming" {
+                action::<StreamArgs>(&id, &label, group)
+            } else {
+                action::<Empty>(&id, &label, group)
+            });
         }
+    }
+    for (id, label) in [
+        ("start", "Start replay buffer"),
+        ("stop", "Stop replay buffer"),
+        ("toggle", "Toggle replay buffer"),
+        ("save", "Save replay"),
+    ] {
+        actions.push(action::<crate::replay::ReplayParams>(
+            &format!("replay.{id}"),
+            label,
+            "Replay Buffer",
+        ));
     }
     for (id, label) in [
         ("pause", "Pause recording"),
@@ -433,7 +505,7 @@ pub fn catalogue() -> Catalogue {
     actions.extend([
         action::<MarkerArgs>("recording.marker", "Add marker", "Recording"),
         action::<Empty>("studio.toggle", "Toggle Studio Mode", "Scenes"),
-        action::<Empty>("transition.take", "Take preview to program", "Transitions"),
+        action::<TakeArgs>("transition.take", "Take preview to program", "Transitions"),
         action::<SceneArgs>(
             "scene.switch",
             "Select scene (preview in Studio Mode)",
@@ -443,7 +515,7 @@ pub fn catalogue() -> Catalogue {
         action::<IndexArgs>("scene.switch_index", "Select scene by position", "Scenes"),
         action::<IndexArgs>("scene.preview_index", "Preview scene by position", "Scenes"),
         action::<TransitionArgs>("transition.set", "Set default transition", "Transitions"),
-        action::<TransitionArgs>(
+        action::<TakeWithArgs>(
             "transition.take_with",
             "Take with transition",
             "Transitions",
@@ -488,6 +560,7 @@ pub fn catalogue() -> Catalogue {
         ),
         ("studio", "ctrl+alt+cmd+d", "studio.toggle", json!({})),
         ("take", "ctrl+alt+cmd+return", "transition.take", json!({})),
+        ("replay", "ctrl+alt+cmd+y", "replay.save", json!({})),
     ]
     .into_iter()
     .map(|(id, keys, action, args)| {

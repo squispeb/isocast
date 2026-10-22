@@ -169,6 +169,88 @@ pub fn microphone_options(devices: Option<&Devices>, value: &str) -> Vec<Choice>
     keep(options, value, "not connected")
 }
 
+/// The microphone a source's `device` names ("default": the system's).
+pub fn find_microphone<'a>(
+    devices: Option<&'a Devices>,
+    device: &str,
+) -> Option<&'a isocast_protocol::devices::Microphone> {
+    let mics = devices
+        .map(|d| d.microphones.as_slice())
+        .unwrap_or_default();
+    if device == "default" {
+        return mics.iter().find(|m| m.default);
+    }
+    match_device(mics, device)
+}
+
+/// The value a microphone's `channels` has in its dropdown: "" for the
+/// default, else the channels joined with "," ("1", "3,4").
+pub fn channels_value(channels: &serde_json::Value) -> String {
+    channels
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .map(crate::form::text_of)
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default()
+}
+
+/// A microphone's channel choices: the default (its own stereo, a larger
+/// interface's inputs 1 + 2), each
+/// input alone as mono, then each odd-even pair as stereo, with the names
+/// the device gives them. `value` (as [`channels_value`] writes it) stays
+/// an option even if the device doesn't have it.
+pub fn channel_options(devices: Option<&Devices>, device: &str, value: &str) -> Vec<Choice> {
+    let mic = find_microphone(devices, device);
+    let count = mic.map_or(0, |m| m.channels);
+    let name = |c: u32| {
+        mic.and_then(|m| m.channel_names.get(c as usize - 1))
+            .filter(|n| !n.is_empty())
+            .cloned()
+    };
+    let default_detail = match count {
+        0 => String::new(),
+        1 => "input 1".to_string(),
+        _ => "inputs 1 + 2, stereo".to_string(),
+    };
+    let mut options = vec![choice("", "Default", default_detail)];
+    for c in 1..=count {
+        let detail = match name(c) {
+            Some(n) => format!("{n}, mono"),
+            None => "mono".to_string(),
+        };
+        options.push(choice(c.to_string(), format!("Input {c}"), detail));
+    }
+    for left in (1..count).step_by(2) {
+        let right = left + 1;
+        let detail = match (name(left), name(right)) {
+            (Some(l), Some(r)) => format!("{l} + {r}, stereo"),
+            _ => "stereo".to_string(),
+        };
+        options.push(choice(
+            format!("{left},{right}"),
+            format!("Inputs {left} + {right}"),
+            detail,
+        ));
+    }
+    if value.is_empty() || options.iter().any(|o| o.0 == value) {
+        return options;
+    }
+    let label = match value.split_once(',') {
+        Some((l, r)) => format!("Inputs {l} + {r}"),
+        None => format!("Input {value}"),
+    };
+    let detail = if mic.is_some() {
+        "not on this device"
+    } else {
+        ""
+    };
+    options.push(choice(value, label, detail));
+    options
+}
+
 /// Audio outputs (monitoring): "Default" (whichever is current), then
 /// each by name.
 pub fn output_options(devices: Option<&Devices>, value: &str) -> Vec<Choice> {
@@ -302,6 +384,69 @@ pub fn app_options(devices: Option<&Devices>, value: &str) -> Vec<Choice> {
         })
         .collect();
     prompt(keep(options, value, "not open"), value, "Choose an app…")
+}
+
+/// Apps whose sound can be captured or left out: those that have opened
+/// audio (playing ones first), then other apps with windows. Each by
+/// bundle id where it has one, else its name (tools like `afplay`).
+fn audio_apps(devices: Option<&Devices>) -> Vec<(String, String, String)> {
+    let mut found: Vec<(String, String, String)> = Vec::new();
+    for a in devices.map(|d| d.audio_apps.as_slice()).unwrap_or_default() {
+        let key = a.bundle_id.clone().unwrap_or_else(|| a.name.clone());
+        if found.iter().all(|f| f.0 != key) {
+            let detail = if a.playing { "playing" } else { "audio" };
+            found.push((key, a.name.clone(), detail.into()));
+        }
+    }
+    for a in apps(devices) {
+        if found.iter().all(|f| f.0 != a.key) {
+            found.push((a.key, a.name, String::new()));
+        }
+    }
+    found
+}
+
+/// Apps for an application audio source's `app`.
+pub fn audio_app_options(devices: Option<&Devices>, value: &str) -> Vec<Choice> {
+    let lower = value.to_lowercase();
+    let options = audio_apps(devices)
+        .into_iter()
+        .map(|(key, name, detail)| {
+            // Keep a setup's own spelling of the app it names.
+            let v = if !value.is_empty()
+                && (key.to_lowercase() == lower || name.to_lowercase() == lower)
+            {
+                value.to_string()
+            } else {
+                key
+            };
+            choice(v, name, detail)
+        })
+        .collect();
+    prompt(keep(options, value, "not open"), value, "Choose an app…")
+}
+
+/// Apps a system audio source could leave out, besides those it does.
+pub fn exclude_options(devices: Option<&Devices>, excluded: &[String]) -> Vec<Choice> {
+    let left_out = |key: &str, name: &str| {
+        excluded
+            .iter()
+            .any(|e| e.eq_ignore_ascii_case(key) || e.eq_ignore_ascii_case(name))
+    };
+    let options = audio_apps(devices)
+        .into_iter()
+        .filter(|(key, name, _)| !left_out(key, name))
+        .map(|(key, name, detail)| choice(key, name, detail))
+        .collect();
+    prompt(options, "", "Leave out an app…")
+}
+
+/// The name an excluded app is shown by: its name if it's running.
+pub fn app_name(devices: Option<&Devices>, value: &str) -> String {
+    audio_apps(devices)
+        .into_iter()
+        .find(|(key, name, _)| key.eq_ignore_ascii_case(value) || name.eq_ignore_ascii_case(value))
+        .map_or_else(|| value.to_string(), |(_, name, _)| name)
 }
 
 /// The window of `app` a window source with `title` captures: the

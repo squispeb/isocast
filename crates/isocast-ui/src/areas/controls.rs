@@ -9,8 +9,10 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use isocast_protocol::api::{EngineState, Event, LiveFile, Method};
+use isocast_protocol::api::{Capacity, EngineState, Event, LiveFile, Method, Overload};
+use isocast_protocol::replay::{ReplaySaved, ReplayState, ReplayStatus};
 use isocast_protocol::stream::{StreamService, StreamState, StreamStatus};
+use isocast_protocol::timeline::{RecordTarget, RecordTargetParams, RecordingInto};
 use isocast_protocol::virtual_camera::{
     SIZES as VCAM_SIZES, Target as VcamTarget, VirtualCameraState, VirtualCameraStatus,
 };
@@ -20,7 +22,7 @@ use slint::{ComponentHandle, SharedString};
 use super::{Area, Changed};
 use crate::app::App;
 use crate::form::{self, Context, FormEvent, FormModel, Outcome, Target};
-use crate::kit::{self, model};
+use crate::kit::{self, MenuBuilder, model};
 use crate::session::EditOptions;
 use crate::toasts::Toast;
 use crate::{AppWindow, ControlsArea, FileRow, ToastKind, ToastRow};
@@ -32,14 +34,23 @@ pub const STATES: &[&str] = &[
     "stop-record",
     "go-live",
     "stop-stream",
-    "stream:live|reconnecting|connecting|short",
+    "stream:live|reconnecting|connecting|short|key-problem",
+    "vertical-stream:live|reconnecting|connecting|failed|off",
+    "vertical-stopped[:WHY]",
     "details:rec|live",
     "toasts",
     "toast-drops",
+    "toast-overload[:fits|EVENT.json]",
+    "toast-audio-stops:REPORT.json",
     "transition:KIND",
-    "vcam[:missing|running|failed]",
+    "vcam[:missing|approval|running|failed|removable]",
+    "vcam-target:program|preview|scene|source|vertical|canvas:ID (as its Shows menu picks it)",
+    "replay[:running|failed|saved]",
     "pause",
     "resume",
+    "record-target:new|last|TIMELINE (choose where the next recording goes)",
+    "record-target-menu (open the menu next to Start Recording)",
+    "toast-saved:new|take|takes (the toast a stopped recording shows)",
 ];
 
 /// The transition kinds, in the web app's order and words.
@@ -84,9 +95,9 @@ impl Since {
             self.0.set(None);
             return;
         };
-        let at = Instant::now()
+        let at = crate::clock::now()
             .checked_sub(Duration::from_secs_f64(elapsed.max(0.0)))
-            .unwrap_or_else(Instant::now);
+            .unwrap_or_else(crate::clock::now);
         let keep = self.0.get().is_some_and(|old| {
             let off = if old > at { old - at } else { at - old };
             off <= Duration::from_millis(1500)
@@ -100,7 +111,9 @@ impl Since {
         if let Some(seconds) = self.1.get() {
             return seconds.max(0.0) as u64;
         }
-        self.0.get().map_or(0, |at| at.elapsed().as_secs())
+        self.0
+            .get()
+            .map_or(0, |at| crate::clock::since(at).as_secs())
     }
 
     fn pause(&self, elapsed: f64) {
@@ -111,7 +124,7 @@ impl Since {
     /// Until just after its next whole second.
     fn next_tick(&self) -> Option<Duration> {
         let at = self.0.get()?;
-        let ms = at.elapsed().as_millis() as u64 % 1000;
+        let ms = crate::clock::since(at).as_millis() as u64 % 1000;
         Some(Duration::from_millis(1000 - ms + 5))
     }
 }
@@ -147,6 +160,17 @@ pub struct Controls {
     paused_for: Since,
     /// A pause or resume is on its way.
     busy_pause: Cell<bool>,
+    /// This take's encoder overload (#66), once one came: its notice shows
+    /// once, and the drops toast stays quiet for the rest of the take.
+    overload: RefCell<Option<Overload>>,
+    /// A fix chosen while recording, applied when the recording stops:
+    /// its description and patch.
+    pending_fix: RefCell<Option<(String, Value)>>,
+    /// Overload notices hidden for good this run (and in the prefs).
+    hidden: RefCell<Vec<String>>,
+    /// Why the vertical canvas stopped, once told (#96): its notice shows
+    /// once per failure.
+    vertical_stopped: RefCell<Option<String>>,
 }
 
 impl Area for Controls {
@@ -177,12 +201,35 @@ impl Area for Controls {
             }
         });
         let weak = Rc::downgrade(app);
+        area.on_toggle_replay(move || {
+            if let Some(app) = weak.upgrade() {
+                toggle_replay(&app, isocast_protocol::CanvasId::Main);
+            }
+        });
+        let weak = Rc::downgrade(app);
+        area.on_save_replay(move || {
+            if let Some(app) = weak.upgrade() {
+                save_replay(&app, isocast_protocol::CanvasId::Main);
+            }
+        });
+        let weak = Rc::downgrade(app);
+        area.on_remove_vcam(move || {
+            if let Some(app) = weak.upgrade() {
+                remove_vcam(&app);
+            }
+        });
+        let weak = Rc::downgrade(app);
         area.on_set_vcam(move |field, value| {
             if let Some(app) = weak.upgrade() {
                 set_vcam(&app, &field, &value);
             }
         });
         area.on_copy_text(|text| crate::platform::copy_text(&text));
+        area.on_open_vcam_settings(|| {
+            crate::platform::open_url(
+                "x-apple.systempreferences:com.apple.LoginItems-Settings.extension",
+            )
+        });
         let weak = Rc::downgrade(app);
         area.on_marker(move |label| {
             if let Some(app) = weak.upgrade() {
@@ -249,18 +296,24 @@ impl Area for Controls {
         if changed.any(Changed::STATUS | Changed::BUSY | Changed::SETUP) {
             self.show_recording(app, &area);
         }
+        if changed.any(Changed::STATUS) {
+            self.vertical_came_or_went(app);
+        }
         if changed.any(Changed::STREAM | Changed::BUSY) {
             self.show_stream(app, &area);
         }
         if changed.any(Changed::VCAM | Changed::BUSY | Changed::SETUP | Changed::STATUS) {
             show_vcam(app, &area);
         }
+        if changed.any(Changed::REPLAY | Changed::BUSY | Changed::SETUP | Changed::STATUS) {
+            show_replay(app, &area);
+        }
         if changed.any(Changed::SETUP) {
             show_transition(app, &area);
             self.show_dialog(app, &area);
         }
         if changed.any(Changed::SETUP | Changed::SCENES) {
-            area.set_can_take(app.session.borrow().preview.is_some());
+            area.set_can_take(app.session.borrow().staged().is_some());
         }
         self.show_times(app, window);
         self.arm_ticker(app);
@@ -274,6 +327,25 @@ impl Area for Controls {
             }
             "take" => app.take(None),
             _ => return false,
+        }
+        true
+    }
+
+    fn context_menu(&self, app: &Rc<App>, owner: &str) -> Option<MenuBuilder> {
+        (owner == TARGET_MENU).then(|| target_menu(app))
+    }
+
+    fn menu_chosen(&self, app: &Rc<App>, owner: &str, id: &str) -> bool {
+        if owner != TARGET_MENU {
+            return false;
+        }
+        match id {
+            "new" => choose_target(app, "new"),
+            id => {
+                if let Some(timeline) = id.strip_prefix("timeline:") {
+                    choose_target(app, timeline);
+                }
+            }
         }
         true
     }
@@ -300,7 +372,10 @@ impl Area for Controls {
             Event::Started { .. } => {
                 self.drops.borrow_mut().files.clear();
                 self.pauses.borrow_mut().clear();
+                // Once per take.
+                self.overload.replace(None);
             }
+            Event::EncoderOverload { overload } => self.overload_came(app, overload),
             Event::RecordingPaused { recording, .. } => {
                 {
                     let mut pauses = self.pauses.borrow_mut();
@@ -319,7 +394,9 @@ impl Area for Controls {
                 }
             }
             Event::Status { live } => self.note_drops(app, Some(&live.files), None),
-            Event::Stream { stream } => {
+            // The main canvas's stream only: the vertical canvas's has
+            // its own status (#86).
+            Event::Stream { stream } if stream.canvas.is_main() => {
                 let on = matches!(
                     stream.state,
                     StreamState::Live | StreamState::Connecting | StreamState::Reconnecting
@@ -329,7 +406,25 @@ impl Area for Controls {
                 }
                 self.stream_on.set(on);
             }
-            Event::Stopped { .. } => self.drops_stopped(app),
+            Event::Stopped {
+                report: Some(report),
+                timeline,
+                ..
+            } => {
+                self.drops_stopped(app);
+                self.apply_pending_fix(app);
+                saved_toast(app, report, timeline.as_ref());
+            }
+            Event::Stopped { .. } => {
+                self.drops_stopped(app);
+                self.apply_pending_fix(app);
+            }
+            Event::RecordTarget { target } => {
+                if let Some(status) = app.session.borrow_mut().status.as_mut() {
+                    status.record_target = Some(target.clone());
+                }
+                app.changed(Changed::STATUS);
+            }
             _ => {}
         }
     }
@@ -386,17 +481,125 @@ impl Area for Controls {
             // The web app's snapshots set a stream's status the same way
             // (there is no server to stream to).
             "stream" => {
-                let stream = match sample_stream(arg) {
-                    Ok(stream) => stream,
+                let streams = match sample_streams(arg) {
+                    Ok(streams) => streams,
                     Err(error) => return Some(Err(error)),
                 };
-                self.stream_on.set(true);
-                app.session.borrow_mut().stream = Some(stream);
+                let mut s = app.session.borrow_mut();
+                s.set_streams(None, streams);
+                self.stream_on
+                    .set(s.stream.as_ref().is_some_and(|x| x.is_active()));
+                drop(s);
                 app.changed(Changed::STREAM | Changed::STATUS);
+            }
+            // The vertical canvas's stream (#96), as a status shows it.
+            "vertical-stream" => {
+                let streams = match arg {
+                    "off" => Vec::new(),
+                    which => {
+                        let sample = if which == "failed" {
+                            "connecting"
+                        } else {
+                            which
+                        };
+                        let mut status = match sample_stream(sample) {
+                            Ok(status) => status,
+                            Err(error) => return Some(Err(error)),
+                        };
+                        status.canvas = isocast_protocol::CanvasId::Vertical;
+                        status.service = StreamService::Custom;
+                        status.server = "rtmp://127.0.0.1/vertical".into();
+                        if which == "failed" {
+                            status.state = StreamState::Failed;
+                            status.last_error = Some("the server refused the stream key".into());
+                        }
+                        vec![status]
+                    }
+                };
+                app.session.borrow_mut().vertical_streams = streams;
+                app.changed(Changed::STREAM | Changed::STATUS);
+            }
+            // A failure contained to the vertical canvas (#96), as a
+            // status reports it (a real one: developer mode's
+            // ISOCAST_COMPOSITOR_FAIL_AFTER=vertical=SECONDS).
+            "vertical-stopped" => {
+                let why = if arg.is_empty() {
+                    "vertical compositor panicked: injected compositor failure"
+                } else {
+                    arg
+                };
+                {
+                    let mut s = app.session.borrow_mut();
+                    let Some(vertical) = s
+                        .status
+                        .as_mut()
+                        .and_then(|x| x.engine.as_mut())
+                        .and_then(|e| e.vertical.as_mut())
+                    else {
+                        return Some(Err(anyhow::anyhow!(
+                            "vertical-stopped needs a running engine with a vertical canvas \
+                             (vertical-canvas first, then wait)"
+                        )));
+                    };
+                    vertical.stopped = Some(why.to_string());
+                    vertical.fps = 0.0;
+                }
+                app.changed(Changed::STATUS);
             }
             "details" => {
                 app.flush();
                 open_details(app, arg);
+            }
+            // Where the next recording goes, as the menu next to Start
+            // Recording chooses it (it changes the engine's choice).
+            "record-target" => {
+                let id = match arg {
+                    "" => "new".to_string(),
+                    // The newest timeline (a recording's own, made just
+                    // before).
+                    "last" => match app
+                        .create
+                        .timelines()
+                        .into_iter()
+                        .max_by(|a, b| a.created_at.cmp(&b.created_at))
+                    {
+                        Some(t) => t.id,
+                        None => {
+                            return Some(Err(anyhow::anyhow!("no timelines yet (record first)")));
+                        }
+                    },
+                    id => id.to_string(),
+                };
+                choose_target(app, &id);
+            }
+            "record-target-menu" => {
+                app.flush();
+                if let Some(window) = app.window() {
+                    let area = window.global::<ControlsArea>();
+                    area.set_target_menu_serial(area.get_target_menu_serial() + 1);
+                }
+            }
+            "toast-saved" => {
+                let into = RecordingInto {
+                    timeline: "my-video".into(),
+                    name: match arg {
+                        "new" => "2026-10-17 19-27-03 Untitled".into(),
+                        _ => "My Video".into(),
+                    },
+                    new_project: arg == "new",
+                    takes: if arg == "takes" { 3 } else { 1 },
+                    clips: if arg == "new" { 1 } else { 4 },
+                };
+                let report: isocast_protocol::api::Report = match serde_json::from_value(json!({
+                    "folder": "/Users/you/Movies/Isocast/2026-10-17 19-27-03 Untitled",
+                    "manifest": "/Users/you/Movies/Isocast/2026-10-17 19-27-03 Untitled/2026-10-17 19-27-03.session.json",
+                    "duration_seconds": 12.0,
+                    "files": [],
+                })) {
+                    Ok(report) => report,
+                    Err(error) => return Some(Err(error.into())),
+                };
+                saved_toast(app, &report, Some(&into));
             }
             // Pause or resume the recording through the Controls dock.
             "pause" | "resume" => {
@@ -428,6 +631,57 @@ impl Area for Controls {
                     area.set_vcam_details_serial(area.get_vcam_details_serial() + 1);
                 }
             }
+            // The camera's Shows choice, as its popover's menu makes it.
+            "vcam-target" => {
+                set_vcam(app, "target", arg);
+                app.flush();
+            }
+            // Start the replay buffer through the Controls dock; with an
+            // argument, as the daemon reports that state.
+            "replay" => match arg {
+                "" => {
+                    let on = app
+                        .session
+                        .borrow()
+                        .replay
+                        .as_ref()
+                        .is_some_and(|r| r.state == ReplayState::Running);
+                    if !on {
+                        toggle_replay(app, isocast_protocol::CanvasId::Main);
+                    }
+                }
+                "running" | "failed" => {
+                    let mut status = app.session.borrow().replay.clone().unwrap_or_default();
+                    status.seconds = status.seconds.max(30);
+                    if arg == "running" {
+                        status.state = ReplayState::Running;
+                        status.buffered_seconds = 33.0;
+                        status.memory_bytes = 61_400_000;
+                        (status.width, status.height, status.fps) = (1920, 1080, 60);
+                    } else {
+                        status.state = ReplayState::Failed;
+                        status.last_error =
+                            Some("the live engine stopped, and the replay buffer with it".into());
+                    }
+                    app.session.borrow_mut().replay = Some(status);
+                    app.changed(Changed::REPLAY);
+                }
+                "saved" => replay_saved(
+                    app,
+                    &ReplaySaved {
+                        path: "~/Movies/Isocast/Replay 2026-10-15 14-32-18.mov".into(),
+                        seconds: 30.4,
+                        frames: 1824,
+                        bytes: 46_100_000,
+                        ..Default::default()
+                    },
+                ),
+                other => {
+                    return Some(Err(anyhow::anyhow!(
+                        "replay takes running, failed or saved, not {other:?}"
+                    )));
+                }
+            },
             "toasts" => {
                 // The web app's 42-toasts: four kinds; the oldest goes.
                 app.toast(
@@ -469,9 +723,96 @@ impl Area for Controls {
                     ]),
                 );
             }
+            // Audio sources that stopped while recording (#101), from a
+            // report `isocast stop --json` printed.
+            "toast-audio-stops" => {
+                match std::fs::read_to_string(arg)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|text| Ok(serde_json::from_str(&text)?))
+                {
+                    Ok(report) => app.audio_stops(&report),
+                    Err(error) => return Some(Err(error.context(format!("{arg}: not a report")))),
+                }
+            }
+            // The encoder overload notice (#66), as the soak's base M2
+            // sends it; "fits" when the chip table says it should fit; or
+            // an `encoder_overload` event saved by `isocast watch --json`.
+            "toast-overload" => {
+                let overload = if arg.ends_with(".json") {
+                    match std::fs::read_to_string(arg)
+                        .map_err(anyhow::Error::from)
+                        .and_then(|text| Ok(serde_json::from_str::<Event>(&text)?))
+                    {
+                        Ok(Event::EncoderOverload { overload }) => *overload,
+                        Ok(_) => {
+                            return Some(Err(anyhow::anyhow!(
+                                "{arg}: not an encoder_overload event"
+                            )));
+                        }
+                        Err(error) => return Some(Err(error)),
+                    }
+                } else {
+                    sample_overload(arg == "fits")
+                };
+                self.overload_came(app, &overload);
+            }
             _ => return None,
         }
         Some(Ok(()))
+    }
+}
+
+/// The overload a base M2 reports recording a 4K60 and a 1080p60 ISO and
+/// a 1080p60 program while streaming (the hardware soak), for snapshots.
+fn sample_overload(fits: bool) -> Overload {
+    use isocast_protocol::api::{CapacityEstimate, CapacitySuggestion, OverloadedFile};
+    let fix = CapacitySuggestion {
+        description: "capture screen at 2560×1440".into(),
+        change: Some(json!({ "sources": [{ "id": "screen", "width": 2560, "height": 1440 }] })),
+        method: None,
+        load: 0.74,
+        capacity: Capacity::Fits,
+        after_take: true,
+    };
+    Overload {
+        take: 1,
+        elapsed_seconds: 3.0,
+        dropping: vec![
+            OverloadedFile {
+                output: "screen".into(),
+                dropped_frames: 74,
+                percent: 41.0,
+            },
+            OverloadedFile {
+                output: "facecam".into(),
+                dropped_frames: 73,
+                percent: 40.5,
+            },
+        ],
+        protected_dropping: false,
+        reason: String::new(),
+        estimate: Some(CapacityEstimate {
+            chip: "Apple M2".into(),
+            encode_engines: 1,
+            engine_pixels_per_second: 8e8,
+            basis: "measured".into(),
+            outputs: Vec::new(),
+            resources: Vec::new(),
+            load: if fits { 0.6 } else { 1.09 },
+            capacity: if fits {
+                Capacity::Fits
+            } else {
+                Capacity::CannotKeepUp
+            },
+            streaming: true,
+            iso_drop_percent: 13.0,
+            summary: String::new(),
+            suggestions: if fits { Vec::new() } else { vec![fix] },
+            admission: None,
+            measured: None,
+            workload_key: "sample".into(),
+        }),
+        workload_key: "sample".into(),
     }
 }
 
@@ -658,6 +999,7 @@ impl Controls {
     /// REC, CPU and FPS in the status bar, the REC details' files, and the
     /// Controls dock's recording state.
     fn show_recording(&self, app: &Rc<App>, area: &ControlsArea) {
+        show_target(app, area);
         let s = app.session.borrow();
         let state = s.status.as_ref().map(|x| x.state);
         let recording = state == Some(EngineState::Recording);
@@ -827,20 +1169,34 @@ impl Controls {
         area.set_stream_dropped(format!("{} ({percent:.1}%)", count(stream.dropped_frames)).into());
         area.set_stream_dropped_bad(stream.dropped_frames > 0);
         area.set_stream_kbps(kbps(stream.total_kbps).into());
-        let level = health(stream);
+        let level = streams_health(&s.streams, stream);
         area.set_stream_health(level.into());
+        let reconnecting = s
+            .streams
+            .iter()
+            .filter(|x| x.state == StreamState::Reconnecting)
+            .count();
         let word = match level {
-            "ok" | "off" => "",
+            "ok" | "off" => String::new(),
+            // One of several destinations reconnecting: the others are live.
+            _ if s.streams.len() > 1 && reconnecting > 0 && stream.state == StreamState::Live => {
+                format!("{reconnecting} reconnecting")
+            }
             _ => match stream.state {
                 StreamState::Reconnecting => "Reconnecting",
                 StreamState::Connecting => "Connecting",
                 StreamState::Failed => "Failed",
                 _ if level == "bad" => "Poor connection",
                 _ => "Unstable",
-            },
+            }
+            .to_string(),
         };
         area.set_stream_health_word(word.into());
-        area.set_stream_rows(model(stream_rows(stream)));
+        area.set_stream_rows(model(if s.streams.len() > 1 {
+            destination_rows(&s.streams)
+        } else {
+            stream_rows(stream)
+        }));
     }
 
     /// The REC and LIVE timers (the LCD's, the details'), and the status
@@ -915,7 +1271,7 @@ impl Controls {
             1 => " · 1 ISO file".to_string(),
             n => format!(" · {n} ISO files"),
         };
-        let health = stream.map_or("off", health);
+        let health = stream.map_or("off", |x| streams_health(&s.streams, x));
         let connection = match (stream.map(|x| x.state), health) {
             (Some(StreamState::Reconnecting), _) => "reconnecting",
             (_, "bad") => "poor connection",
@@ -923,7 +1279,8 @@ impl Controls {
             _ => "connection stable",
         };
         let link = s.link_error.as_str();
-        let line = if !link.is_empty() && s.status.is_none() {
+        let load_warning = s.status.as_ref().and_then(|s| s.load_warning.as_ref());
+        let mut line = if !link.is_empty() && s.status.is_none() {
             link.to_string()
         } else if recording && live.is_some_and(|l| l.paused) {
             format!(
@@ -937,13 +1294,31 @@ impl Controls {
             )
         } else if recording && streaming {
             format!(
-                "Recording to {folder}{isos} · streaming for {}",
+                "Recording {}{isos} · streaming for {}",
+                into_words(s.status.as_ref().and_then(|x| x.recording_into.as_ref())),
                 clock(self.streaming.seconds())
             )
         } else if recording {
-            format!("Recording to {folder}{isos}")
+            format!(
+                "Recording {}{isos}",
+                into_words(s.status.as_ref().and_then(|x| x.recording_into.as_ref()))
+            )
         } else if state == Some(EngineState::Starting) {
             "Starting the recording…".to_string()
+        } else if streaming && s.streams.len() > 1 {
+            let live = s
+                .streams
+                .iter()
+                .filter(|x| x.state == StreamState::Live)
+                .count();
+            format!(
+                "Streaming to {live} of {} destinations for {} · {connection} · not recording",
+                s.streams
+                    .iter()
+                    .filter(|x| x.enabled || x.is_active())
+                    .count(),
+                clock(self.streaming.seconds())
+            )
         } else if streaming {
             format!(
                 "Streaming for {} · {connection} · not recording",
@@ -952,15 +1327,48 @@ impl Controls {
         } else if stream.is_some_and(|x| x.state == StreamState::Connecting) {
             "Connecting the stream…".to_string()
         } else if setup.is_some() {
-            format!("Records to {folder}{isos}")
+            let target = s.status.as_ref().and_then(|x| x.record_target.as_ref());
+            format!(
+                "Next recording: {} · records to {folder}{isos}",
+                next_words(target)
+            )
         } else if s.status.is_some() {
             // Paper's Welcome board, beside the IDLE badge.
             "No setup loaded".to_string()
         } else {
             String::new()
         };
+        // Keep the recording/pause and connection state ahead of a load
+        // warning, including when a narrow status bar has to elide its tail.
+        if recording && streaming && health != "ok" {
+            line = format!("{connection} · {line}");
+        }
+        // The vertical canvas's own state (#96): its streams, or that it
+        // stopped.
+        let (vertical, vertical_bad) = vertical_words(&s);
+        let mut line = match (vertical, line.is_empty()) {
+            (Some(words), false) => format!("{line} · {words}"),
+            (Some(words), true) => words,
+            (None, _) => line,
+        };
+        if let Some(warning) = load_warning {
+            line.push_str(" · ");
+            line.push_str(&warning.message);
+        }
+        // Automatic quality (T.2), after the states and #90's warning, only
+        // while it lowers something or is held back.
+        let governor = s.status.as_ref().and_then(|s| s.governor.as_ref());
+        if let Some(words) = governor.and_then(governor_words) {
+            if !line.is_empty() {
+                line.push_str(" · ");
+            }
+            line.push_str(&words);
+        }
+        let held = governor.is_some_and(|g| g.error.is_some() || g.enabled && g.limited_by_pins);
         area.set_status_line(line.into());
-        area.set_status_warn(streaming && health != "ok");
+        area.set_status_warn(
+            load_warning.is_some() || (streaming && health != "ok") || vertical_bad || held,
+        );
 
         // The readouts: the take's drops, else the stream's (with its
         // share); the stream's rate, else the disk's while recording.
@@ -991,6 +1399,35 @@ impl Controls {
             free.map_or(String::new(), crate::model::gigabytes_free)
                 .into(),
         );
+    }
+
+    /// Tell once when the vertical canvas stopped after a contained failure
+    /// (#96), with what brings it back (poison needs an engine restart).
+    fn vertical_came_or_went(&self, app: &Rc<App>) {
+        let stopped = {
+            let s = app.session.borrow();
+            s.status
+                .as_ref()
+                .and_then(|x| x.engine.as_ref())
+                .and_then(|e| e.vertical.as_ref())
+                .and_then(|v| v.stopped.clone())
+        };
+        if *self.vertical_stopped.borrow() == stopped {
+            return;
+        }
+        self.vertical_stopped.replace(stopped.clone());
+        let Some(why) = stopped else { return };
+        let toast = Toast::new(
+            ToastKind::Error,
+            "The vertical canvas stopped",
+            format!(
+                "{why}. The main canvas, its recording and its streams keep going. {}",
+                crate::model::vertical_recovery(&why)
+            ),
+        )
+        .key("vertical-stopped")
+        .action("Restart Engine", restart_engine);
+        app.show_toast(toast);
     }
 
     /// Tick just after each whole second of whichever timer runs.
@@ -1056,6 +1493,7 @@ impl Controls {
                 return;
             }
             let setup = app.session.borrow().setup.clone();
+            let quiet = self.overload.borrow().is_some();
             let mut rows = Vec::new();
             let mut frames = drops.stream;
             for (source, dropped, audio) in &drops.files {
@@ -1076,6 +1514,14 @@ impl Controls {
                 rows.push(("Stream".into(), format!("{} dropped", drops.stream), "bad"));
             }
             drops.rows = Some(rows.clone());
+            if quiet {
+                drop(drops);
+                // The overload notice says why; it updates while it shows.
+                if app.toasts.has_key("drops") {
+                    self.show_overload(app);
+                }
+                return;
+            }
             (frames, rows)
         };
         let (frames, rows) = rows;
@@ -1109,6 +1555,13 @@ impl Controls {
 
     /// The recording stopped: a drops toast still up says so.
     fn drops_stopped(&self, app: &Rc<App>) {
+        if self.overload.borrow().is_some() {
+            // Its fix can apply now.
+            if app.toasts.has_key("drops") {
+                self.show_overload(app);
+            }
+            return;
+        }
         let rows = self.drops.borrow().rows.clone();
         if let Some(rows) = rows
             && app.toasts.has_key("drops")
@@ -1123,6 +1576,163 @@ impl Controls {
                 .rows(rows),
             );
         }
+    }
+}
+
+impl Controls {
+    /// The engine says the encoders can't keep up (once per take): show
+    /// the notice, unless it was hidden for this setup.
+    fn overload_came(&self, app: &Rc<App>, overload: &Overload) {
+        let hidden =
+            !overload.workload_key.is_empty() && hidden_notice(app, &overload.workload_key);
+        self.overload.replace(Some(overload.clone()));
+        if !hidden {
+            self.show_overload(app);
+        }
+    }
+
+    /// The overload notice: what's dropping, why, and one fix.
+    fn show_overload(&self, app: &Rc<App>) {
+        let Some(overload) = self.overload.borrow().clone() else {
+            return;
+        };
+        let recording = app
+            .session
+            .borrow()
+            .status
+            .as_ref()
+            .is_some_and(|s| s.state == EngineState::Recording);
+        let setup = app.session.borrow().setup.clone();
+        // The take's counts so far, else what the engine reported.
+        let mut rows = self.drops.borrow().rows.clone().unwrap_or_default();
+        rows.retain(|r| r.2 == "bad");
+        if rows.is_empty() {
+            rows = overload
+                .dropping
+                .iter()
+                .map(|f| {
+                    let label = if f.output == "stream" {
+                        "Stream".to_string()
+                    } else {
+                        file_label(setup.as_deref(), &f.output)
+                    };
+                    (label, format!("{} dropped", f.dropped_frames), "bad")
+                })
+                .collect();
+        }
+        let estimate = overload.estimate.as_ref();
+        let at_capacity = estimate.is_none_or(|e| e.capacity != Capacity::Fits);
+        let fix = estimate.and_then(|e| e.suggestions.first()).cloned();
+        let (title, mut message) = if at_capacity {
+            (
+                "This Mac can’t keep up with every file",
+                if overload.protected_dropping {
+                    "Its video encoders are full, so files are dropping frames.".to_string()
+                } else {
+                    "Its video encoders are full, so ISO files drop frames to keep the program \
+                     and stream whole."
+                        .to_string()
+                },
+            )
+        } else {
+            (
+                "The encoders fell behind",
+                "ISO files are dropping frames to keep the program and stream whole, though \
+                 this setup should fit. Another app using the encoders can do this."
+                    .to_string(),
+            )
+        };
+        if let Some(fix) = &fix {
+            message.push_str(&format!(" To fit, {}.", fix.description));
+        }
+        let mut toast = Toast::new(ToastKind::Warning, title, message)
+            .key("drops")
+            .rows(rows);
+        toast = match fix {
+            Some(fix) if fix.method.as_deref() == Some("stream_stop") => {
+                toast.action("Stop Stream", |app| {
+                    // Only ever stops: it may have stopped meanwhile.
+                    let live = app
+                        .session
+                        .borrow()
+                        .stream
+                        .as_ref()
+                        .is_some_and(StreamStatus::is_active);
+                    if live {
+                        toggle_stream(app);
+                    }
+                })
+            }
+            Some(fix) if fix.change.is_some() => {
+                let change = fix.change.clone().unwrap_or_default();
+                let description = fix.description.clone();
+                if recording {
+                    toast.action("Fix After This Take", move |app| {
+                        app.controls
+                            .set_pending_fix(app, description.clone(), change.clone());
+                    })
+                } else {
+                    toast.action("Apply Fix", move |app| {
+                        apply_fix(app, &description, change.clone());
+                    })
+                }
+            }
+            _ => toast.action("Details", move |app| {
+                open_details(app, if recording { "rec" } else { "live" });
+            }),
+        };
+        // Without a key (the estimate failed) there's no setup to name, and
+        // hiding "" would hide every other key-less notice.
+        let key = overload.workload_key.clone();
+        if !key.is_empty() {
+            toast = toast.action2("Don’t Show Again for This Setup", move |app| {
+                hide_notice(app, &key);
+            });
+        }
+        app.show_toast(toast);
+    }
+
+    /// Keep `change` to apply when the recording stops.
+    pub fn set_pending_fix(&self, app: &Rc<App>, description: String, change: Value) {
+        app.toast(
+            ToastKind::Info,
+            "The fix applies when this take ends",
+            crate::app::sentence(&description),
+        );
+        self.pending_fix.replace(Some((description, change)));
+    }
+
+    fn apply_pending_fix(&self, app: &Rc<App>) {
+        if let Some((description, change)) = self.pending_fix.take() {
+            apply_fix(app, &description, change);
+        }
+    }
+}
+
+/// Apply a capacity fix to the live setup (undoable), and say so.
+fn apply_fix(app: &Rc<App>, description: &str, change: Value) {
+    let description = description.to_string();
+    app.edit_then(change, EditOptions::default(), move |app, applied| {
+        if applied {
+            app.toast(
+                ToastKind::Success,
+                "Fixed for the next take",
+                crate::app::sentence(&description),
+            );
+        }
+    });
+}
+
+/// Whether the viewer hid the overload notice for this workload.
+fn hidden_notice(app: &Rc<App>, key: &str) -> bool {
+    app.controls.hidden.borrow().iter().any(|k| k == key)
+        || (!app.mode.offscreen && crate::prefs::notice_hidden(key))
+}
+
+fn hide_notice(app: &Rc<App>, key: &str) {
+    app.controls.hidden.borrow_mut().push(key.to_string());
+    if !app.mode.offscreen {
+        crate::prefs::hide_notice(key);
     }
 }
 
@@ -1313,6 +1923,78 @@ fn service_name(service: StreamService) -> &'static str {
         StreamService::Facebook => "Facebook",
         StreamService::Custom => "Custom server",
     }
+}
+
+/// The worst health of the destinations streaming (or trying to): one
+/// reconnecting while the others are live makes the stream as one
+/// unstable, not fine.
+fn streams_health(streams: &[StreamStatus], summary: &StreamStatus) -> &'static str {
+    if streams.len() <= 1 {
+        return health(summary);
+    }
+    let rank = |level: &str| match level {
+        "bad" => 3,
+        "warn" => 2,
+        "ok" => 1,
+        _ => 0,
+    };
+    streams
+        .iter()
+        .filter(|x| x.is_active())
+        .map(health)
+        .max_by_key(|level| rank(level))
+        .unwrap_or_else(|| health(summary))
+}
+
+/// What the LIVE details call a destination: its service, or its id when
+/// that says more (two on one service, a custom server).
+fn destination_label(stream: &StreamStatus, all: &[StreamStatus]) -> String {
+    let shared = all.iter().filter(|x| x.service == stream.service).count() > 1;
+    let plain = (stream.id == isocast_protocol::stream::MAIN_DESTINATION
+        && stream.service != StreamService::Custom)
+        || stream.id == stream.service.id();
+    if plain && !shared {
+        service_name(stream.service).into()
+    } else {
+        stream.id.clone()
+    }
+}
+
+/// The LIVE details with several destinations: one row each, its state,
+/// rate and drops.
+fn destination_rows(streams: &[StreamStatus]) -> Vec<ToastRow> {
+    streams
+        .iter()
+        .filter(|x| x.enabled || x.state != StreamState::Offline)
+        .map(|x| {
+            let dropped = if x.dropped_frames > 0 {
+                format!(" · {} dropped", count(x.dropped_frames))
+            } else {
+                String::new()
+            };
+            let (value, tone) = match x.state {
+                StreamState::Live => (
+                    format!("Live · {}{dropped}", kbps(x.total_kbps)),
+                    if health(x) == "ok" { "" } else { "warn" },
+                ),
+                StreamState::Reconnecting => (format!("Reconnecting{dropped}"), "warn"),
+                StreamState::Connecting => ("Connecting…".to_string(), "warn"),
+                StreamState::Failed => (
+                    format!(
+                        "Failed: {}",
+                        x.last_error.as_deref().unwrap_or("it couldn’t connect")
+                    ),
+                    "bad",
+                ),
+                StreamState::Offline => ("Not streaming".to_string(), ""),
+            };
+            ToastRow {
+                label: destination_label(x, streams).into(),
+                value: value.into(),
+                tone: tone.into(),
+            }
+        })
+        .collect()
 }
 
 /// The LIVE details: where to, and how it is keeping up.
@@ -1522,25 +2204,9 @@ fn toggle_recording(app: &Rc<App>) {
     if recording {
         app.call(Method::Stop, move |app, result| {
             match result {
-                Ok(report) => {
-                    let files = report["files"].as_array().map_or(0, Vec::len);
-                    let folder = report["folder"].as_str().unwrap_or_default().to_string();
-                    let shown = report["manifest"]
-                        .as_str()
-                        .map(str::to_string)
-                        .unwrap_or_else(|| folder.clone());
-                    app.show_toast(
-                        Toast::new(
-                            ToastKind::Success,
-                            "Recording saved",
-                            format!(
-                                "{files} file{} in {folder}",
-                                if files == 1 { "" } else { "s" }
-                            ),
-                        )
-                        .action("Show in Finder", move |_| reveal(&shown)),
-                    );
-                }
+                // The `stopped` event's toast says where it went (#114),
+                // for this window's stop and any other alike.
+                Ok(_) => {}
                 Err(error) => app.failed("Couldn’t stop recording", &error),
             }
             done(app);
@@ -1551,6 +2217,7 @@ fn toggle_recording(app: &Rc<App>) {
                 setup: None,
                 folder: None,
                 seconds: None,
+                ..Default::default()
             })),
             move |app, result| {
                 if let Err(error) = result {
@@ -1614,6 +2281,13 @@ fn vcam_missing(error: &str) -> bool {
     error.contains("not installed")
 }
 
+/// A release build's first start asked macOS to activate the camera
+/// extension, and macOS waits for the user's approval (isocast-daemon
+/// virtual_camera.rs); the engine starts the camera when it comes.
+fn vcam_approval(error: &str) -> bool {
+    error.contains("Login Items & Extensions")
+}
+
 /// The virtual camera's button and popover: its state, its output (the
 /// setup's `virtual_camera`) and size, and why it couldn't start.
 fn show_vcam(app: &Rc<App>, area: &ControlsArea) {
@@ -1630,27 +2304,66 @@ fn show_vcam(app: &Rc<App>, area: &ControlsArea) {
         .into(),
     );
     area.set_busy_vcam(s.busy_vcam);
+    area.set_vcam_removable(status.is_some_and(|x| x.removable));
+    area.set_vcam_removing(s.removing_vcam);
     let error = status
         .and_then(|x| x.last_error.clone())
         .unwrap_or_default();
     let missing = vcam_missing(&error);
+    let approval = vcam_approval(&error);
     area.set_vcam_missing(missing);
-    area.set_vcam_error(if missing { String::new() } else { error }.into());
+    area.set_vcam_approval(approval);
+    area.set_vcam_error(
+        if missing || approval {
+            String::new()
+        } else {
+            error
+        }
+        .into(),
+    );
     let setup = s.setup.as_deref();
     let settings = setup.map(|x| x.virtual_camera.clone()).unwrap_or_default();
-    area.set_vcam_targets(model(vec![
+    let mut targets = vec![
         kit::option("program", "Program", ""),
         kit::option("preview", "Preview", "Studio Mode"),
         kit::option("scene", "A scene", ""),
         kit::option("source", "A source", ""),
-    ]));
+    ];
+    // Offered with a vertical canvas (and kept while chosen, so the
+    // engine's validation says what's missing).
+    if setup.is_some_and(|x| x.vertical.is_some()) || settings.target == VcamTarget::Vertical {
+        targets.push(kit::option("vertical", "Vertical program", ""));
+    }
+    // Every other extra canvas's program (#120): `canvas:ID`.
+    let chosen_canvas = (settings.target == VcamTarget::Canvas)
+        .then(|| settings.canvas.clone().unwrap_or_default());
+    let mut offered = false;
+    for canvas in s.extra_canvases().into_iter().filter(|c| !c.is_vertical()) {
+        offered |= chosen_canvas.as_deref() == Some(canvas.as_str());
+        targets.push(kit::option(
+            &format!("canvas:{canvas}"),
+            &format!("{} program", s.canvas_label(canvas)),
+            "",
+        ));
+    }
+    if let Some(id) = chosen_canvas.as_deref().filter(|_| !offered) {
+        targets.push(kit::option(
+            &format!("canvas:{id}"),
+            &format!("{id} program"),
+            "",
+        ));
+    }
+    area.set_vcam_targets(model(targets));
     area.set_vcam_target(
         match settings.target {
-            VcamTarget::Program => "program",
-            VcamTarget::Preview => "preview",
-            VcamTarget::Scene => "scene",
-            VcamTarget::Source => "source",
+            VcamTarget::Program => "program".to_string(),
+            VcamTarget::Preview => "preview".into(),
+            VcamTarget::Scene => "scene".into(),
+            VcamTarget::Source => "source".into(),
+            VcamTarget::Vertical => "vertical".into(),
+            VcamTarget::Canvas => format!("canvas:{}", settings.canvas.as_deref().unwrap_or("")),
         }
+        .as_str()
         .into(),
     );
     area.set_vcam_scenes(model(setup.map_or(Vec::new(), |x| {
@@ -1668,7 +2381,12 @@ fn show_vcam(app: &Rc<App>, area: &ControlsArea) {
             .collect()
     })));
     area.set_vcam_source(settings.source.clone().unwrap_or_default().into());
-    let canvas = setup.map(|x| (x.canvas.width, x.canvas.height));
+    // The size with none set: the canvas the camera shows.
+    let canvas = setup.map(|x| {
+        let mut canvas = settings.clone();
+        (canvas.width, canvas.height) = (None, None);
+        canvas.size(x)
+    });
     let mut sizes = vec![kit::option(
         "",
         "Canvas",
@@ -1687,12 +2405,21 @@ fn show_vcam(app: &Rc<App>, area: &ControlsArea) {
         }
         .into(),
     );
-    // What it sends (running), or would send (the next start's).
+    // What it sends (running), or would send (the next start's: a
+    // stopped camera's status still has the last start's size).
     let (w, h, fps) = match status {
-        Some(x) if x.width > 0 => (x.width, x.height, x.fps),
+        Some(x)
+            if x.width > 0
+                && matches!(
+                    x.state,
+                    VirtualCameraState::Running | VirtualCameraState::Starting
+                ) =>
+        {
+            (x.width, x.height, x.fps)
+        }
         _ => {
             let (w, h) = setup.map_or((0, 0), |x| settings.size(x));
-            (w, h, setup.map_or(0, |x| x.canvas.fps))
+            (w, h, setup.map_or(0, |x| settings.fps(x)))
         }
     };
     area.set_vcam_format(format!("{w}×{h} at {fps} fps").into());
@@ -1709,9 +2436,10 @@ fn show_vcam(app: &Rc<App>, area: &ControlsArea) {
     );
 }
 
-/// Start or stop the virtual camera. Starting never installs anything:
-/// without its extension the start fails, and the popover says how to
-/// install it.
+/// Start or stop the virtual camera. A development engine never installs
+/// anything: without its extension the start fails, and the popover says how
+/// to install it. A release engine asks macOS to activate the extension it
+/// carries; the popover then says how to allow it.
 fn toggle_vcam(app: &Rc<App>) {
     let on = {
         let mut s = app.session.borrow_mut();
@@ -1744,7 +2472,7 @@ fn toggle_vcam(app: &Rc<App>) {
         match result {
             Ok(status) => app.session.borrow_mut().vcam = Some(status),
             Err(error) => {
-                let missing = vcam_missing(&error.message);
+                let missing = vcam_missing(&error.message) || vcam_approval(&error.message);
                 {
                     let mut s = app.session.borrow_mut();
                     let status = s.vcam.get_or_insert_with(VirtualCameraStatus::default);
@@ -1778,6 +2506,65 @@ fn toggle_vcam(app: &Rc<App>) {
     });
 }
 
+/// Remove the camera extension from macOS (#69). The engine waits for
+/// macOS's password prompt (minutes, perhaps), so the call goes on its own
+/// connection and thread: the app's other calls don't queue behind it.
+fn remove_vcam(app: &Rc<App>) {
+    {
+        let mut s = app.session.borrow_mut();
+        if s.busy_vcam {
+            return;
+        }
+        s.busy_vcam = true;
+        s.removing_vcam = true;
+    }
+    app.changed(Changed::BUSY | Changed::VCAM);
+    std::thread::spawn(|| {
+        let result = crate::daemon::connect()
+            .and_then(|mut client| {
+                client.call::<isocast_protocol::virtual_camera::VirtualCameraRemoval>(
+                    Method::VirtualCameraRemove,
+                )
+            })
+            .map_err(|error| {
+                error
+                    .downcast_ref::<isocast_client::DaemonError>()
+                    .map_or_else(|| format!("{error:#}"), |e| e.0.message.clone())
+            });
+        let _ = slint::invoke_from_event_loop(move || {
+            crate::window::with_app(|app| {
+                {
+                    let mut s = app.session.borrow_mut();
+                    s.busy_vcam = false;
+                    s.removing_vcam = false;
+                }
+                match result {
+                    Ok(removal) => {
+                        app.toast(
+                            ToastKind::Info,
+                            if removal.restart_needed {
+                                "Restart to finish removing the virtual camera"
+                            } else {
+                                "Virtual camera removed"
+                            },
+                            removal.message,
+                        );
+                    }
+                    Err(message) => {
+                        app.toast(
+                            ToastKind::Error,
+                            "Couldn’t remove the virtual camera",
+                            message,
+                        );
+                    }
+                }
+                app.refresh_status(true);
+                app.changed(Changed::BUSY | Changed::VCAM);
+            })
+        });
+    });
+}
+
 /// Change the camera's output in the live setup (`virtual_camera`): the
 /// engine takes it while the camera is off.
 fn set_vcam(app: &Rc<App>, field: &str, value: &str) {
@@ -1788,15 +2575,45 @@ fn set_vcam(app: &Rc<App>, field: &str, value: &str) {
             return;
         };
         let current = &setup.virtual_camera;
+        // Leaving a canvas target: its size (picked for that canvas's
+        // shape, #120) goes too, so the new picture isn't letterboxed into
+        // it.
+        let unsize = |mut patch: Value| {
+            if current.target == VcamTarget::Canvas {
+                patch["width"] = Value::Null;
+                patch["height"] = Value::Null;
+            }
+            patch
+        };
         match field {
             "target" => match value {
                 // A scene or source is needed with them: the one chosen
                 // before, else the first.
-                "scene" => json!({ "target": "scene", "source": null,
-                    "scene": current.scene.clone().or_else(|| first(setup.scenes.iter().map(|x| x.id.clone()).collect())) }),
-                "source" => json!({ "target": "source", "scene": null,
-                    "source": current.source.clone().or_else(|| first(setup.sources.iter().filter(|x| x.kind.has_video()).map(|x| x.id.clone()).collect())) }),
-                other => json!({ "target": other, "scene": null, "source": null }),
+                "scene" => unsize(json!({ "target": "scene", "source": null, "canvas": null,
+                    "scene": current.scene.clone().or_else(|| first(setup.scenes.iter().map(|x| x.id.clone()).collect())) })),
+                "source" => unsize(json!({ "target": "source", "scene": null, "canvas": null,
+                    "source": current.source.clone().or_else(|| first(setup.sources.iter().filter(|x| x.kind.has_video()).map(|x| x.id.clone()).collect())) })),
+                other => match other.strip_prefix("canvas:") {
+                    // An extra canvas (#120): its size if the camera
+                    // offers it, else the offered size of its shape.
+                    Some(id) => {
+                        let size = isocast_protocol::CanvasId::parse(id)
+                            .ok()
+                            .and_then(|c| setup.extra_canvas(c))
+                            .map(|c| c.canvas(&setup.canvas))
+                            .map(|c| (c.width, c.height));
+                        let (width, height) = match size {
+                            Some(size) if VCAM_SIZES.contains(&size) => (json!(null), json!(null)),
+                            Some((w, h)) if h > w => (json!(1080), json!(1920)),
+                            _ => (json!(1920), json!(1080)),
+                        };
+                        json!({ "target": "canvas", "canvas": id, "scene": null, "source": null,
+                            "width": width, "height": height })
+                    }
+                    None => unsize(
+                        json!({ "target": other, "scene": null, "source": null, "canvas": null }),
+                    ),
+                },
             },
             "scene" => json!({ "scene": value }),
             "source" => json!({ "source": value }),
@@ -1814,14 +2631,19 @@ fn set_vcam(app: &Rc<App>, field: &str, value: &str) {
 }
 
 /// The camera's status for snapshots: `missing` (a start found no
-/// extension), `running` (an hour of frames), `failed` (another reason).
+/// extension), `running` (an hour of frames), `failed` (another reason),
+/// `removable` (a release engine's, with Remove Virtual Camera).
 fn sample_vcam(app: &Rc<App>, which: &str) -> anyhow::Result<VirtualCameraStatus> {
     let s = app.session.borrow();
     let mut status = s.vcam.clone().unwrap_or_default();
     match which {
         "missing" => {
             status.state = VirtualCameraState::Failed;
-            status.last_error = Some("virtual_camera: Isocast Virtual Camera is not installed/approved; run scripts/vcam-install.sh (Start never installs it)".into());
+            status.last_error = Some("virtual_camera: Isocast Virtual Camera is not installed/approved; run scripts/vcam-install.sh (a development engine never installs it)".into());
+        }
+        "approval" => {
+            status.state = VirtualCameraState::Failed;
+            status.last_error = Some("virtual_camera: allow Isocast Virtual Camera in System Settings › General › Login Items & Extensions › Camera Extensions (macOS asks once); it starts as soon as you do".into());
         }
         "running" => {
             status.state = VirtualCameraState::Running;
@@ -1833,12 +2655,306 @@ fn sample_vcam(app: &Rc<App>, which: &str) -> anyhow::Result<VirtualCameraStatus
             status.state = VirtualCameraState::Failed;
             status.last_error = Some("virtual_camera.width: give an advertised size: 1920x1080, 1280x720, 2560x1440, 3840x2160, 1080x1920, 720x1280".into());
         }
-        other => anyhow::bail!("vcam takes missing, running or failed, not {other:?}"),
+        // A release engine (it carries the extension): Remove is offered.
+        "removable" => {
+            status.state = VirtualCameraState::Stopped;
+            status.last_error = None;
+            status.removable = true;
+        }
+        other => anyhow::bail!(
+            "vcam takes missing, approval, running, failed or removable, not {other:?}"
+        ),
     }
     Ok(status)
 }
 
+/// The replay buffer's button and Save Replay: its state, its length and
+/// what it holds.
+fn show_replay(app: &Rc<App>, area: &ControlsArea) {
+    let s = app.session.borrow();
+    let status = s.replay.as_ref();
+    area.set_replay_state(
+        match status.map(|x| x.state) {
+            _ if s.busy_replay => {
+                if status.is_some_and(|x| x.state == ReplayState::Running) {
+                    "stopping"
+                } else {
+                    "starting"
+                }
+            }
+            Some(ReplayState::Running) => "running",
+            Some(ReplayState::Failed) => "failed",
+            _ => "off",
+        }
+        .into(),
+    );
+    area.set_busy_replay(s.busy_replay);
+    area.set_saving_replay(s.saving_replay);
+    let seconds = status
+        .filter(|x| x.state == ReplayState::Running)
+        .map(|x| x.seconds)
+        .or_else(|| s.setup.as_ref().map(|x| x.recording.replay.seconds))
+        .unwrap_or(30);
+    area.set_replay_length(format!("the last {}", duration_words(seconds)).into());
+    area.set_replay_counts(
+        status
+            .filter(|x| x.state == ReplayState::Running)
+            .map(|x| {
+                format!(
+                    "{:.0} s held · {}",
+                    x.buffered_seconds.min(f64::from(x.seconds)),
+                    megabytes(x.memory_bytes)
+                )
+            })
+            .unwrap_or_default()
+            .into(),
+    );
+}
+
+/// "30 s", "2 min", "1 min 30 s".
+fn duration_words(seconds: u32) -> String {
+    match (seconds / 60, seconds % 60) {
+        (0, s) => format!("{s} s"),
+        (m, 0) => format!("{m} min"),
+        (m, s) => format!("{m} min {s} s"),
+    }
+}
+
+/// "61 MB", "1.2 GB".
+fn megabytes(bytes: u64) -> String {
+    if bytes >= 1_000_000_000 {
+        format!("{:.1} GB", bytes as f64 / 1e9)
+    } else {
+        format!("{:.0} MB", bytes as f64 / 1e6)
+    }
+}
+
+/// Canvas `canvas`'s replay buffer, as last told (#120: each canvas has
+/// its own).
+pub(crate) fn replay_of(
+    s: &crate::session::Session,
+    canvas: isocast_protocol::CanvasId,
+) -> Option<&ReplayStatus> {
+    if canvas.is_main() {
+        s.replay.as_ref()
+    } else {
+        s.canvases
+            .iter()
+            .find(|c| c.id == canvas)
+            .and_then(|c| c.replay.as_ref())
+    }
+}
+
+/// Start or stop canvas `canvas`'s replay buffer (the Controls dock's is
+/// the main canvas's; the canvas monitor's menu has the others', #120).
+pub(crate) fn toggle_replay(app: &Rc<App>, canvas: isocast_protocol::CanvasId) {
+    let on = {
+        let mut s = app.session.borrow_mut();
+        if s.busy_replay {
+            return;
+        }
+        s.busy_replay = true;
+        replay_of(&s, canvas).is_some_and(|x| x.state == ReplayState::Running)
+    };
+    app.changed(Changed::BUSY | Changed::REPLAY);
+    let params = isocast_protocol::replay::ReplayParams::of(canvas);
+    let method = if on {
+        Method::ReplayStop(params)
+    } else {
+        Method::ReplayStart(params)
+    };
+    app.call_as::<ReplayStatus>(method, move |app, result| {
+        app.session.borrow_mut().busy_replay = false;
+        match result {
+            Ok(status) => app.session.borrow_mut().set_replay(status),
+            Err(error) => {
+                app.failed(
+                    if on {
+                        "Couldn’t stop the replay buffer"
+                    } else {
+                        "Couldn’t start the replay buffer"
+                    },
+                    &error,
+                );
+                app.refresh_status(true);
+            }
+        }
+        app.changed(Changed::BUSY | Changed::REPLAY);
+    });
+}
+
+/// Save Replay: canvas `canvas`'s buffer's last seconds to a file; a
+/// toast says where.
+pub(crate) fn save_replay(app: &Rc<App>, canvas: isocast_protocol::CanvasId) {
+    {
+        let mut s = app.session.borrow_mut();
+        if s.saving_replay {
+            return;
+        }
+        s.saving_replay = true;
+    }
+    app.changed(Changed::REPLAY);
+    let params = isocast_protocol::replay::ReplayParams::of(canvas);
+    app.call_as::<ReplaySaved>(Method::ReplaySave(params), |app, result| {
+        app.session.borrow_mut().saving_replay = false;
+        match result {
+            Ok(saved) => replay_saved(app, &saved),
+            Err(error) => app.failed("Couldn’t save the replay", &error),
+        }
+        app.changed(Changed::REPLAY);
+    });
+}
+
+/// The toast for a saved replay (this window's, a hotkey's or another
+/// client's).
+pub fn replay_saved(app: &Rc<App>, saved: &ReplaySaved) {
+    let name = std::path::Path::new(&saved.path)
+        .file_name()
+        .map_or(saved.path.clone(), |n| n.to_string_lossy().into_owned());
+    let mut message = format!(
+        "{name}: {:.1} s, {}.",
+        saved.seconds,
+        megabytes(saved.bytes)
+    );
+    if saved.short {
+        message.push_str(" Shorter than asked: the buffer hadn’t filled yet.");
+    }
+    if saved.dropped_frames > 0 {
+        message.push_str(&format!(
+            " {} frame(s) missed show the picture before.",
+            saved.dropped_frames
+        ));
+    }
+    let shown = saved.path.clone();
+    app.show_toast(
+        Toast::new(ToastKind::Success, "Replay saved", message)
+            .action("Show in Finder", move |_| reveal(&shown)),
+    );
+}
+
+/// The vertical canvas's streams (#96): whether one streams (or tries
+/// to), whether it is set up with a key for its main destination, and why
+/// its key can't be used.
+fn vertical_stream_state(s: &crate::session::Session) -> (bool, bool, Option<&'static str>) {
+    let active = s.vertical_streams.iter().any(StreamStatus::is_active);
+    let configured = s
+        .setup
+        .as_ref()
+        .and_then(|x| x.vertical.as_ref())
+        .is_some_and(|v| v.stream.is_some());
+    let enabled: Vec<&StreamStatus> = s.vertical_streams.iter().filter(|x| x.enabled).collect();
+    // Every destination turned off on purpose: the vertical canvas simply
+    // doesn't go live, without a warning.
+    let all_off = enabled.is_empty() && !s.vertical_streams.is_empty();
+    let problem = if !configured || all_off {
+        None
+    } else if enabled.is_empty() || enabled.iter().any(|x| !x.key_set) {
+        Some(
+            "Add the vertical canvas’s stream key. It’s kept in the Keychain, apart from the main canvas’s.",
+        )
+    } else if enabled.iter().any(|x| x.key_problem.is_some()) {
+        Some(
+            "The vertical canvas’s saved stream key can’t be read. Settings › Stream says how to fix it.",
+        )
+    } else {
+        None
+    };
+    (active, configured && !all_off && problem.is_none(), problem)
+}
+
+/// Start or stop the vertical canvas's streams alongside the main one's
+/// (Start Streaming starts both once both are set up, #96).
+fn toggle_vertical_alongside(app: &Rc<App>, start: bool) {
+    let params = isocast_protocol::api::StreamStartParams {
+        canvas: isocast_protocol::CanvasId::Vertical,
+        ..Default::default()
+    };
+    app.session.borrow_mut().busy_canvas_stream = true;
+    app.changed(Changed::BUSY);
+    let method = if start {
+        Method::StreamStart(Some(params))
+    } else {
+        Method::StreamStop(Some(params))
+    };
+    app.call_as::<isocast_protocol::api::Streaming>(method, move |app, result| {
+        match result {
+            Ok(status) => {
+                app.session.borrow_mut().vertical_streams = if status.destinations.is_empty() {
+                    vec![status.stream]
+                } else {
+                    status.destinations
+                };
+            }
+            Err(error) => {
+                app.failed(
+                    if start {
+                        "The vertical canvas didn’t go live"
+                    } else {
+                        "Couldn’t stop the vertical stream"
+                    },
+                    &error,
+                );
+                app.refresh_status(true);
+            }
+        }
+        app.session.borrow_mut().busy_canvas_stream = false;
+        app.changed(Changed::BUSY | Changed::STREAM);
+    });
+}
+
+/// Start or stop the `[[canvases]]`' streams alongside the main one's
+/// (#84): on start, each canvas whose enabled destinations all have keys
+/// and none streams; on stop, each that streams. The vertical canvas has
+/// its own path (`toggle_vertical_alongside`).
+fn toggle_canvases_alongside(app: &Rc<App>, start: bool) {
+    let canvases: Vec<isocast_protocol::CanvasId> = app
+        .session
+        .borrow()
+        .canvases
+        .iter()
+        .filter(|c| !c.id.is_vertical())
+        .filter(|c| {
+            let active = c.streams.iter().any(StreamStatus::is_active);
+            let enabled: Vec<&StreamStatus> = c.streams.iter().filter(|x| x.enabled).collect();
+            if start {
+                !active
+                    && !enabled.is_empty()
+                    && enabled.iter().all(|x| x.key_set && x.key_problem.is_none())
+            } else {
+                active
+            }
+        })
+        .map(|c| c.id)
+        .collect();
+    for canvas in canvases {
+        let params = isocast_protocol::api::StreamStartParams {
+            canvas,
+            ..Default::default()
+        };
+        let method = if start {
+            Method::StreamStart(Some(params))
+        } else {
+            Method::StreamStop(Some(params))
+        };
+        app.call_as::<isocast_protocol::api::Streaming>(method, move |app, result| {
+            if let Err(error) = result {
+                app.failed(
+                    &if start {
+                        format!("Canvas {canvas} didn’t go live")
+                    } else {
+                        format!("Couldn’t stop canvas {canvas}’s stream")
+                    },
+                    &error,
+                );
+            }
+            app.refresh_status(true);
+        });
+    }
+}
+
 fn toggle_stream(app: &Rc<App>) {
+    let (vertical_on, vertical_ready, vertical_problem) =
+        vertical_stream_state(&app.session.borrow());
     let (on, missing) = {
         let s = app.session.borrow();
         if s.busy_stream {
@@ -1855,9 +2971,7 @@ fn toggle_stream(app: &Rc<App>) {
         } else if s.stream.as_ref().is_some_and(|x| !x.key_set) {
             Some("Add your stream key first. It’s kept in the Keychain, never in the setup.")
         } else if s.stream.as_ref().is_some_and(|x| x.key_problem.is_some()) {
-            Some(
-                "Enter your stream key again: the saved one was stored by another build of Isocast.",
-            )
+            Some("The saved stream key can’t be read. Settings › Stream says how to fix it.")
         } else {
             None
         };
@@ -1868,6 +2982,27 @@ fn toggle_stream(app: &Rc<App>) {
         app.open_dialog("settings", &format!("stream:{missing}"));
         return;
     }
+    // The other canvases' streams go with the main one's (#84).
+    toggle_canvases_alongside(app, !on);
+    // The vertical canvas's streams go with the main one's: started when
+    // they are set up (else why not, with a way there), stopped with it.
+    if on && vertical_on {
+        toggle_vertical_alongside(app, false);
+    } else if !on && !vertical_on {
+        if vertical_ready {
+            toggle_vertical_alongside(app, true);
+        } else if let Some(problem) = vertical_problem {
+            let toast = Toast::new(
+                ToastKind::Warning,
+                "Only the main canvas is going live",
+                problem,
+            )
+            .action("Open Settings", |app| {
+                app.open_dialog("settings", "stream-vertical");
+            });
+            app.show_toast(toast);
+        }
+    }
     {
         let mut s = app.session.borrow_mut();
         s.busy_stream = true;
@@ -1877,13 +3012,16 @@ fn toggle_stream(app: &Rc<App>) {
     }
     app.changed(Changed::BUSY | Changed::STREAM);
     let method = if on {
-        Method::StreamStop
+        Method::StreamStop(None)
     } else {
-        Method::StreamStart
+        Method::StreamStart(None)
     };
-    app.call_as::<StreamStatus>(method, move |app, result| {
+    app.call_as::<isocast_protocol::api::Streaming>(method, move |app, result| {
         match result {
-            Ok(status) => app.session.borrow_mut().stream = Some(status),
+            Ok(status) => app
+                .session
+                .borrow_mut()
+                .set_streams(Some(status.stream), status.destinations),
             Err(error) => {
                 if error.is_unknown_method() {
                     app.toast(
@@ -1907,6 +3045,133 @@ fn toggle_stream(app: &Rc<App>) {
         app.session.borrow_mut().busy_stream = false;
         app.changed(Changed::BUSY | Changed::STREAM);
     });
+}
+
+/// Restart the live engine (the vertical canvas's Restart Engine, #96):
+/// isocastd refuses, atomically, while anything records, streams or
+/// exports; the window's link starts it again.
+fn restart_engine(app: &Rc<App>) {
+    app.call(Method::ShutdownIfIdle, |app, result| match result {
+        Ok(_) => {
+            app.toast(
+                ToastKind::Info,
+                "Restarting the engine",
+                "The vertical canvas comes back with it.",
+            );
+        }
+        Err(error) => app.failed(
+            "The engine can’t restart yet: stop recording and streaming first",
+            &error,
+        ),
+    });
+}
+
+/// Automatic quality's words (T.2) for the status bar and Settings, while
+/// it is doing something: lowering a rate, finding a bottleneck, or held
+/// back by what the user keeps (pins). None while everything runs as set
+/// (or it is off). The engine's own reason, else what is lowered.
+pub(crate) fn governor_words(
+    governor: &isocast_protocol::governor::GovernorStatus,
+) -> Option<String> {
+    if let Some(error) = &governor.error {
+        return Some(format!("Automatic quality: {error}"));
+    }
+    let lowered = |percent: u32| percent < 100;
+    let active = governor.bottleneck.is_some()
+        || governor.limited_by_pins
+        || governor.preview_fps.is_some()
+        || lowered(governor.iso_percent)
+        || lowered(governor.vertical_percent)
+        || lowered(governor.stream_bitrate_percent);
+    if !governor.enabled || !active {
+        return None;
+    }
+    let reason = governor.reason.trim();
+    if !reason.is_empty() {
+        return Some(reason.to_string());
+    }
+    let mut parts = Vec::new();
+    if let Some(fps) = governor.preview_fps {
+        parts.push(format!("preview at {fps} fps"));
+    }
+    for (what, percent) in [
+        ("ISO video", governor.iso_percent),
+        ("vertical video", governor.vertical_percent),
+        ("stream bitrate", governor.stream_bitrate_percent),
+    ] {
+        if lowered(percent) {
+            parts.push(format!("{what} at {percent}%"));
+        }
+    }
+    if governor.limited_by_pins {
+        parts.push("kept settings stop it lowering more".to_string());
+    }
+    Some(if parts.is_empty() {
+        "Automatic quality is watching this Mac’s load".to_string()
+    } else {
+        format!("Automatic quality: {}", parts.join(", "))
+    })
+}
+
+/// The status bar's words for the vertical canvas (#96), and whether they
+/// warn: that it stopped, or how its streams are doing while they run.
+fn vertical_words(s: &crate::session::Session) -> (Option<String>, bool) {
+    let stopped = s
+        .status
+        .as_ref()
+        .and_then(|x| x.engine.as_ref())
+        .and_then(|e| e.vertical.as_ref())
+        .and_then(|v| v.stopped.as_deref());
+    if let Some(why) = stopped
+        && s.setup.as_ref().is_some_and(|x| x.vertical.is_some())
+    {
+        return (
+            Some(format!(
+                "vertical canvas stopped. {}",
+                crate::model::vertical_recovery(why)
+            )),
+            true,
+        );
+    }
+    // A failed one is news while the broadcast runs, not after.
+    let broadcasting = s.streams.iter().any(StreamStatus::is_active)
+        || s.vertical_streams.iter().any(StreamStatus::is_active);
+    let shown: Vec<&StreamStatus> = s
+        .vertical_streams
+        .iter()
+        .filter(|x| x.is_active() || (broadcasting && x.state == StreamState::Failed))
+        .collect();
+    if shown.is_empty() {
+        return (None, false);
+    }
+    let live = shown
+        .iter()
+        .filter(|x| x.state == StreamState::Live)
+        .count();
+    let any = |state: StreamState| shown.iter().any(|x| x.state == state);
+    if live == shown.len() {
+        let elapsed = shown
+            .iter()
+            .map(|x| x.elapsed_seconds)
+            .fold(0.0f64, f64::max);
+        let words = if live > 1 {
+            format!("vertical live to {live} for {}", clock(elapsed as u64))
+        } else {
+            format!("vertical live for {}", clock(elapsed as u64))
+        };
+        (Some(words), false)
+    } else if live > 0 {
+        (
+            Some(format!("vertical live to {live} of {}", shown.len())),
+            true,
+        )
+    } else if any(StreamState::Reconnecting) {
+        (Some("vertical reconnecting".into()), true)
+    } else if any(StreamState::Connecting) {
+        (Some("connecting the vertical stream…".into()), false)
+    } else {
+        (Some("vertical stream failed".into()), true)
+    }
 }
 
 /// A stream's status for snapshots, as the web app's snapshots set it:
@@ -1936,11 +3201,331 @@ fn sample_stream(which: &str) -> anyhow::Result<StreamStatus> {
             "key_set": true, "elapsed_seconds": 61, "total_kbps": 6100,
             "frames_sent": 1800, "dropped_frames": 0, "congestion": 0.02, "reconnects": 0
         }),
+        // Offline, with a saved key this build may not read (#63).
+        "key-problem" => json!({
+            "state": "offline", "service": "twitch", "server": "live.twitch.tv",
+            "key_set": true,
+            "key_problem": "The saved key was stored by a differently signed copy of this \
+                Isocast, and macOS lets only that copy use or replace it. Open Keychain Access, \
+                delete the “dev.isocast.release.stream” item, then paste the key and press Save Key."
+        }),
         other => anyhow::bail!(
-            "no sample stream {other:?}; one of live, reconnecting, connecting, short"
+            "no sample stream {other:?}; one of live, reconnecting, connecting, short, \
+             key-problem, multi"
         ),
     };
     Ok(serde_json::from_value(value)?)
+}
+
+/// Every destination's status for a snapshot: one for the samples above,
+/// three for `multi` (YouTube and a backup server live, Twitch
+/// reconnecting).
+fn sample_streams(which: &str) -> anyhow::Result<Vec<StreamStatus>> {
+    if which != "multi" {
+        return Ok(vec![sample_stream(which)?]);
+    }
+    let values = [
+        json!({
+            "id": "main", "state": "live", "service": "youtube",
+            "server": "rtmps://a.rtmps.youtube.com/live2", "key_set": true,
+            "elapsed_seconds": 754, "width": 1920, "height": 1080, "fps": 30,
+            "video_kbps": 5980, "target_video_kbps": 6000, "audio_kbps": 160,
+            "total_kbps": 6140, "frames_sent": 22620, "dropped_frames": 0,
+            "congestion": 0.04, "reconnects": 0
+        }),
+        json!({
+            "id": "twitch", "state": "reconnecting", "service": "twitch",
+            "server": "rtmps://ingest.global-contribute.live-video.net/app", "key_set": true,
+            "elapsed_seconds": 754, "width": 1920, "height": 1080, "fps": 30,
+            "target_video_kbps": 6000, "frames_sent": 21900, "dropped_frames": 720,
+            "congestion": 0.0, "reconnects": 1,
+            "last_error": "the connection dropped: Connection reset by peer"
+        }),
+        json!({
+            "id": "backup", "state": "live", "service": "custom",
+            "server": "rtmp://relay.local/live", "key_set": true,
+            "elapsed_seconds": 754, "width": 1280, "height": 720, "fps": 30,
+            "video_kbps": 2990, "target_video_kbps": 3000, "audio_kbps": 160,
+            "total_kbps": 3150, "frames_sent": 22620, "dropped_frames": 0,
+            "congestion": 0.02, "reconnects": 0
+        }),
+    ];
+    values
+        .into_iter()
+        .map(|value| Ok(serde_json::from_value(value)?))
+        .collect()
+}
+
+/// The owner of the menu next to Start Recording (#114).
+const TARGET_MENU: &str = "controls:record-target";
+
+/// A timeline's name as the app shows it (#114). A new project's timeline
+/// is named like its folder, "2026-10-17 19-27-03 Untitled": that shows as
+/// "Untitled · Oct 17 19:27".
+pub fn timeline_label(name: &str) -> String {
+    match stamped(name) {
+        Some((rest, when)) => format!("{rest} · {when}"),
+        None => name.to_string(),
+    }
+}
+
+/// A timeline's name without a new project's date and time
+/// ("Untitled"), for the Controls dock's narrow row.
+fn timeline_short(name: &str) -> &str {
+    stamped(name).map_or(name, |(rest, _)| rest)
+}
+
+/// A name that begins with a project folder's date and time: the rest,
+/// and when ("Oct 17 19:27").
+fn stamped(name: &str) -> Option<(&str, String)> {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let b = name.as_bytes();
+    let digits = |r: std::ops::Range<usize>| {
+        b.get(r.clone())
+            .is_some_and(|d| d.iter().all(u8::is_ascii_digit))
+    };
+    let stamped = b.len() > 20
+        && digits(0..4)
+        && b[4] == b'-'
+        && digits(5..7)
+        && b[7] == b'-'
+        && digits(8..10)
+        && b[10] == b' '
+        && digits(11..13)
+        && b[13] == b'-'
+        && digits(14..16)
+        && b[16] == b'-'
+        && digits(17..19)
+        && b[19] == b' ';
+    let month = name.get(5..7).and_then(|m| m.parse::<usize>().ok());
+    match (stamped, month) {
+        (true, Some(m @ 1..=12)) => Some((
+            &name[20..],
+            format!(
+                "{} {} {}:{}",
+                MONTHS[m - 1],
+                name[8..10].trim_start_matches('0'),
+                &name[11..13],
+                &name[14..16]
+            ),
+        )),
+        _ => None,
+    }
+}
+
+/// "New project" or "Take 4 · My Video": where the next recording goes.
+pub fn target_label(target: Option<&RecordTarget>) -> String {
+    match target.and_then(|t| Some((t.take.unwrap_or(1), t.name.as_deref()?))) {
+        Some((take, name)) => format!("Take {take} · {}", timeline_short(name)),
+        None => "New project".into(),
+    }
+}
+
+/// The status bar's words for the next recording: "a new project" or
+/// "take 4 of My Video".
+fn next_words(target: Option<&RecordTarget>) -> String {
+    match target.and_then(|t| Some((t.take.unwrap_or(1), t.name.as_deref()?))) {
+        Some((take, name)) => format!("take {take} of {}", timeline_label(name)),
+        None => "a new project".into(),
+    }
+}
+
+/// The status bar's words for the recording running: "a new project
+/// (Untitled · Oct 17 19:27)" or "take 4 of My Video".
+fn into_words(into: Option<&RecordingInto>) -> String {
+    match into {
+        Some(into) if into.new_project => {
+            format!("a new project ({})", timeline_label(&into.name))
+        }
+        Some(into) => format!("take {} of {}", into.clips + 1, timeline_label(&into.name)),
+        None => "a new project".into(),
+    }
+}
+
+/// The record target control next to Start Recording.
+fn show_target(app: &Rc<App>, area: &ControlsArea) {
+    let s = app.session.borrow();
+    let target = s.status.as_ref().and_then(|x| x.record_target.as_ref());
+    let chosen = target.is_some_and(|t| t.timeline.is_some());
+    area.set_target_new(!chosen);
+    area.set_target_label(target_label(target).into());
+    let mut tooltip = match target.filter(|_| chosen) {
+        Some(t) => format!(
+            "Next recording: take {} of {}{}. Choose where it goes.",
+            t.take.unwrap_or(1),
+            timeline_label(t.name.as_deref().unwrap_or_default()),
+            t.folder
+                .as_ref()
+                .map(|f| format!(
+                    ", in “{}”",
+                    f.file_name().unwrap_or_default().to_string_lossy()
+                ))
+                .unwrap_or_default()
+        ),
+        None => "Next recording: a new project, with its own timeline. Choose to add it to a \
+                 project instead."
+            .into(),
+    };
+    if let Some(note) = target.and_then(|t| t.notes.first()) {
+        tooltip.push('\n');
+        tooltip.push_str(&sentence_case(note));
+    }
+    area.set_target_tooltip(tooltip.into());
+    area.set_target_notice(target.is_some_and(|t| !t.notes.is_empty()));
+}
+
+fn sentence_case(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => {
+            let mut out: String = first.to_uppercase().collect();
+            out.push_str(chars.as_str());
+            if !out.ends_with('.') {
+                out.push('.');
+            }
+            out
+        }
+        None => String::new(),
+    }
+}
+
+/// The menu next to Start Recording: New Project, the timeline open in the
+/// editor, and the newest timelines, the chosen one checked.
+fn target_menu(app: &Rc<App>) -> MenuBuilder {
+    let (target, migrated) = {
+        let s = app.session.borrow();
+        let target = s.status.as_ref().and_then(|x| x.record_target.as_ref());
+        (
+            target.and_then(|t| t.timeline.clone()),
+            target.and_then(|t| t.migrated.clone()),
+        )
+    };
+    let mut menu = MenuBuilder::new()
+        .heading("Next Recording")
+        .item("new", "New Project")
+        .hint("its own timeline")
+        .checked(target.is_none())
+        .separator()
+        .heading("Add a Take To");
+    let list = app.create.timelines();
+    let editor = app
+        .create
+        .editor_open()
+        .then(|| list.iter().find(|t| t.current).cloned())
+        .flatten();
+    let mut newest: Vec<_> = list
+        .iter()
+        .filter(|t| editor.as_ref().is_none_or(|e| e.id != t.id))
+        .collect();
+    newest.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    let mut shown = 0;
+    if let Some(t) = &editor {
+        menu = menu
+            .item(&format!("timeline:{}", t.id), &timeline_label(&t.name))
+            .hint(&format!("in the editor · take {}", t.clips + 1))
+            .checked(target.as_deref() == Some(t.id.as_str()));
+        shown += 1;
+    }
+    // The chosen one and a migrated one are always listed.
+    let keep = |id: &str| target.as_deref() == Some(id) || migrated.as_deref() == Some(id);
+    for t in newest
+        .iter()
+        .enumerate()
+        .filter(|(i, t)| *i < 6 || keep(&t.id))
+        .map(|(_, t)| t)
+    {
+        menu = menu
+            .item(&format!("timeline:{}", t.id), &timeline_label(&t.name))
+            .hint(&format!("take {}", t.clips + 1))
+            .checked(target.as_deref() == Some(t.id.as_str()));
+        shown += 1;
+    }
+    if shown == 0 {
+        menu = menu.item("none", "No projects yet").disabled(true);
+    }
+    menu
+}
+
+/// Choose where the next recording goes: "new" or a timeline's id.
+pub fn choose_target(app: &Rc<App>, target: &str) {
+    app.call_as::<RecordTarget>(
+        Method::RecordTarget(Some(RecordTargetParams {
+            target: Some(target.to_string()),
+        })),
+        |app, result| match result {
+            Ok(target) => {
+                if let Some(status) = app.session.borrow_mut().status.as_mut() {
+                    status.record_target = Some(target);
+                }
+                app.changed(Changed::STATUS);
+            }
+            Err(error) => app.failed("Couldn’t choose where the next recording goes", &error),
+        },
+    );
+}
+
+/// The toast a stopped recording shows: where its takes went (#114), with
+/// its files.
+fn saved_toast(
+    app: &Rc<App>,
+    report: &isocast_protocol::api::Report,
+    into: Option<&RecordingInto>,
+) {
+    let files = report.files.len();
+    let folder = home_short(&report.folder.display().to_string());
+    let files = format!(
+        "{files} file{} in {folder}",
+        if files == 1 { "" } else { "s" }
+    );
+    let Some(into) = into.filter(|into| into.takes > 0) else {
+        let shown = report.manifest.display().to_string();
+        app.show_toast(
+            Toast::new(ToastKind::Success, "Recording saved", files)
+                .key("recording-saved")
+                .action("Show in Finder", move |_| reveal(&shown)),
+        );
+        return;
+    };
+    let name = timeline_label(&into.name);
+    let first = into.clips + 1 - into.takes.min(into.clips);
+    let title = match (into.new_project, into.takes) {
+        (true, _) => "Saved as a new project".to_string(),
+        (false, 1) => format!("Saved as take {} of {name}", into.clips),
+        (false, _) => format!("Saved as takes {first}–{} of {name}", into.clips),
+    };
+    let message = match (into.new_project, into.takes) {
+        (true, 1) => format!("{name}, with its own timeline · {files}"),
+        (true, n) => format!("{name}: {n} takes on its own timeline · {files}"),
+        (false, _) => files,
+    };
+    let id = into.timeline.clone();
+    app.show_toast(
+        Toast::new(ToastKind::Success, title, message)
+            .key("recording-saved")
+            .action("Open in Editor", move |app| open_in_editor(app, &id)),
+    );
+}
+
+/// Make `timeline` current and show the editor on it.
+fn open_in_editor(app: &Rc<App>, timeline: &str) {
+    app.call(
+        Method::TimelineOpen(isocast_protocol::timeline::TimelineOpenParams {
+            timeline: timeline.to_string(),
+        }),
+        |app, result| match result {
+            Ok(_) => {
+                if let Err(error) = app
+                    .create
+                    .open_editor_as(app, super::projects::Raise::Focus)
+                {
+                    isocast_diagnostics::diagnostic!("editor: {error:#}");
+                }
+            }
+            Err(error) => app.failed("Couldn’t open the timeline", &error),
+        },
+    );
 }
 
 #[cfg(test)]
@@ -1960,6 +3545,21 @@ mod tests {
             Some(40)
         );
         assert_eq!(stream_drops("the stream reconnected"), None);
+    }
+
+    #[test]
+    fn new_project_timelines_read_by_name_and_time() {
+        assert_eq!(
+            timeline_label("2026-10-07 09-05-03 Untitled"),
+            "Untitled · Oct 7 09:05"
+        );
+        assert_eq!(timeline_short("2026-10-07 09-05-03 My Talk"), "My Talk");
+        assert_eq!(timeline_label("My Video"), "My Video");
+        assert_eq!(
+            timeline_label("2026-13-07 09-05-03 X"),
+            "2026-13-07 09-05-03 X"
+        );
+        assert_eq!(target_label(None), "New project");
     }
 
     #[test]

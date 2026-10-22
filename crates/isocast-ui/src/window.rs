@@ -43,7 +43,7 @@ pub enum DragMode {
     Rows,
 }
 
-fn with_app(f: impl FnOnce(&Rc<App>)) {
+pub(crate) fn with_app(f: impl FnOnce(&Rc<App>)) {
     APP.with(|app| {
         if let Some(app) = app.borrow().as_ref() {
             f(app);
@@ -67,6 +67,8 @@ pub fn run(options: &Options) -> Result<()> {
         .context("Slint could not open a window with Skia on the GPU")?;
 
     let app = AppWindow::new()?;
+    // Project files opened from the Finder (#88), the launch's too.
+    crate::documents::listen();
     // Decided before the window exists: Slint makes the window
     // see-through for the layers under it when it is created.
     app.global::<crate::CanvasArea>()
@@ -79,6 +81,9 @@ pub fn run(options: &Options) -> Result<()> {
     let shell = App::new(&app, commands, Mode { offscreen: false }, canvas);
     shell
         .sources
+        .set_device(gpu.device.clone(), gpu.queue.clone());
+    shell
+        .projectors
         .set_device(gpu.device.clone(), gpu.queue.clone());
     APP.with(|s| *s.borrow_mut() = Some(shell.clone()));
 
@@ -254,8 +259,8 @@ pub fn run(options: &Options) -> Result<()> {
 #[derive(Clone)]
 struct Setup {
     device: slint::wgpu_30::wgpu::Device,
-    /// Fills the frames' pictures into the device's textures (the frames'
-    /// shared surfaces are memory first).
+    /// Fills the frames' pictures into the device's textures (on Linux the
+    /// frames' shared surfaces are memory first).
     queue: slint::wgpu_30::wgpu::Queue,
     mode: crate::preview::Mode,
     fps: u32,
@@ -301,10 +306,10 @@ fn setup_when_ready(weak: slint::Weak<AppWindow>, shell: Rc<App>, setup: Setup) 
                 shell.canvas.set_max_fps(setup.fps);
                 shell
                     .canvas
-                    .start_pictures(&shell, output, setup.check, |program, incoming| {
+                    .start_pictures(&shell, output, setup.check, |role, incoming| {
                         let _ = slint::invoke_from_event_loop(move || {
-                            with_app(|app| app.canvas.incoming(program, incoming));
-                            if !program {
+                            with_app(|app| app.canvas.incoming(role, incoming));
+                            if role == crate::preview::Role::Editor {
                                 DRAG_STEP.with(|step| {
                                     if let Some(step) = step.borrow_mut().as_mut() {
                                         step();

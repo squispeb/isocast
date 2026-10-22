@@ -10,6 +10,7 @@ default-members = [
     "crates/isocast-client",
     "crates/isocast-daemon",
     "crates/isocast-engine",
+    "crates/isocast-obsws",
     "crates/isocast-platform-macos",
     "crates/isocast-protocol",
     "crates/isocast-surfaces",
@@ -17,7 +18,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.0.3"
+version = "0.0.8"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/R44VC0RP/isocast"
@@ -46,3 +47,12 @@ opt-level = 3
 inherits = "release"
 lto = "fat"
 codegen-units = 1
+
+# The app's development loop (`cargo build --profile ui-dev -p isocast-ui
+# --features live-slint`, see docs/handoff/agent-rules.md): `release`, but
+# incremental, so a Rust edit in isocast-ui rebuilds in seconds (measured
+# 2.7-3.8 s against 17 s without, and ~345 s for a compiled-interface
+# release build). Its own folder, so release builds and their caches are untouched.
+[profile.ui-dev]
+inherits = "release"
+incremental = true

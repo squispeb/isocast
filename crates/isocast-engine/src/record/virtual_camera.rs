@@ -1,13 +1,16 @@
 //! A camera is an independent, bounded output. Its worker never blocks a
 //! compositor, recording or stream. There is no work while it is off.
+use parking_lot::Mutex;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use super::program::{Compositor, Feed};
 use super::scenes::ProgramScenes;
-use crate::gpu::{FrameImporter, Gpu};
+use crate::gpu::{FrameImporter, Gpu, InFlight, PendingFrame};
+use crate::pacing::Wake;
 use crate::render::{Layer, Renderer};
 use crate::{FramePool, Platform, Time};
 use anyhow::Result;
@@ -42,12 +45,11 @@ pub struct VirtualCamera {
 
 impl VirtualCamera {
     pub fn status(&self) -> VirtualCameraStatus {
-        self.status.lock().unwrap().clone()
+        self.status.lock().clone()
     }
     pub fn finished(&self) -> bool {
         self.thread
             .lock()
-            .unwrap()
             .as_ref()
             .is_none_or(JoinHandle::is_finished)
     }
@@ -67,7 +69,7 @@ impl VirtualCamera {
 
     fn fail_timeout(&self, message: &str) {
         self.timed_out.store(true, Ordering::Release);
-        let mut status = self.status.lock().unwrap();
+        let mut status = self.status.lock();
         status.state = VirtualCameraState::Failed;
         status.last_error = Some(message.into());
     }
@@ -77,7 +79,7 @@ impl VirtualCamera {
     pub fn stop(&self) -> VirtualCameraStatus {
         self.stop.store(true, Ordering::Release);
         {
-            let mut status = self.status.lock().unwrap();
+            let mut status = self.status.lock();
             if matches!(
                 status.state,
                 VirtualCameraState::Starting | VirtualCameraState::Running
@@ -94,7 +96,7 @@ impl VirtualCamera {
             std::thread::sleep(Duration::from_millis(2));
         }
         let finished = if self.finished() {
-            self.thread.lock().unwrap().take()
+            self.thread.lock().take()
         } else {
             None
         };
@@ -131,16 +133,16 @@ pub(super) fn start<P: Platform>(
             let stop = stop.clone();
             move || {
                 platform.real_time_thread();
-                on_change(status.lock().unwrap().clone());
+                on_change(status.lock().clone());
                 let result =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
-                        let initial = status.lock().unwrap().clone();
+                        let initial = status.lock().clone();
                         let sink = platform.virtual_camera_sink(
                             initial.width,
                             initial.height,
                             initial.fps,
                         )?;
-                        let gpu = Gpu::new()?;
+                        let gpu = Gpu::for_platform(&platform)?;
                         let renderer = Renderer::new(&gpu, wgpu::TextureFormat::Bgra8Unorm);
                         let importer = platform.frame_importer(&gpu)?;
                         let pool = platform.frame_pool(initial.width, initial.height)?;
@@ -148,17 +150,24 @@ pub(super) fn start<P: Platform>(
                             return Ok(());
                         }
                         {
-                            let mut status = status.lock().unwrap();
+                            let mut status = status.lock();
                             status.transport = sink.transport().into();
                             status.state = VirtualCameraState::Running;
                         }
-                        on_change(status.lock().unwrap().clone());
+                        on_change(status.lock().clone());
+                        // At most three scene draws and three camera draws
+                        // in flight. Both wake this worker as soon as ready.
+                        let (completed, ready) = sync_channel(6);
                         let mut output = Output {
                             gpu,
                             renderer,
                             importer,
                             pool,
                             sink,
+                            completed,
+                            ready,
+                            size: (initial.width, initial.height),
+                            in_flight: InFlight::default(),
                         };
                         let result = run(&platform, &clocks, &status, &stop, &input, &mut output);
                         let closed = output.sink.close();
@@ -169,7 +178,7 @@ pub(super) fn start<P: Platform>(
                         Err(anyhow::anyhow!("virtual_camera: output worker panicked"))
                     });
                 let final_status = {
-                    let mut status = status.lock().unwrap();
+                    let mut status = status.lock();
                     match result {
                         _ if status.state == VirtualCameraState::Failed => {}
                         Ok(()) => status.state = VirtualCameraState::Stopped,
@@ -197,18 +206,26 @@ struct Output<P: Platform> {
     importer: P::Importer,
     pool: P::FramePool,
     sink: Box<dyn CameraSink<P::Frame>>,
+    completed: SyncSender<Ready<P::Frame>>,
+    ready: Receiver<Ready<P::Frame>>,
+    size: (u32, u32),
+    in_flight: InFlight,
+}
+
+enum Ready<F> {
+    Scene(F, Time),
+    Camera(F, Time),
 }
 
 fn run<P: Platform>(
     platform: &P,
     clocks: &crate::pacing::Clocks,
-    status: &Mutex<VirtualCameraStatus>,
+    status: &Arc<Mutex<VirtualCameraStatus>>,
     stop: &AtomicBool,
     input: &impl Fn(Time) -> Result<Option<Input<P::Frame>>>,
     output: &mut Output<P>,
 ) -> Result<()> {
-    let initial = status.lock().unwrap().clone();
-    let size = (initial.width, initial.height);
+    let initial = status.lock().clone();
     let fps = initial.fps;
     let period = Duration::from_secs(1) / fps;
     let mut clock = clocks.start("virtual_camera".into(), period);
@@ -229,12 +246,23 @@ fn run<P: Platform>(
     let mut latencies = Vec::with_capacity(600);
     loop {
         let tick = epoch.add_ticks(next, fps);
-        while platform.now() < tick && !stop.load(Ordering::Acquire) {
-            clock.sleep_until(
-                platform,
-                tick.min(platform.now() + Duration::from_millis(10)),
-            );
+        while let Ok(ready) = output.ready.try_recv() {
+            receive(platform, status, output, ready, &mut latencies, fps)?;
         }
+        // GPU completions hand frames over while this waits for the tick;
+        // the clock still records one truthful wake per tick.
+        clock.wait_until(platform, tick, |limit| -> Result<Wake> {
+            if stop.load(Ordering::Acquire) {
+                return Ok(Wake::Stop);
+            }
+            match output.ready.recv_timeout(limit) {
+                Ok(ready) => {
+                    receive(platform, status, output, ready, &mut latencies, fps)?;
+                    Ok(Wake::HandOff)
+                }
+                Err(_) => Ok(Wake::Timeout),
+            }
+        })?;
         if stop.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -242,13 +270,13 @@ fn run<P: Platform>(
         let now = platform.now();
         if now > tick + period * 2 {
             let current = now.ticks_since(epoch, fps).max(0) as u64;
-            status.lock().unwrap().frames_dropped += current.saturating_sub(next);
+            status.lock().frames_dropped += current.saturating_sub(next);
             next = current;
             continue;
         }
         next += 1;
         let Some(input) = input(after)? else {
-            status.lock().unwrap().frames_dropped += 1;
+            status.lock().frames_dropped += 1;
             continue;
         };
         let (frame, pts) = match input {
@@ -274,46 +302,115 @@ fn run<P: Platform>(
                     scene: id.into(),
                     from: None,
                 };
-                let Some((frame, _)) = compositor.draw(Feed::Preview, Some(&selected), now, now)?
+                let Some((frame, _)) =
+                    compositor.draw(Feed::Preview, Some(&selected), now, now, true)?
                 else {
-                    status.lock().unwrap().frames_dropped += 1;
+                    status.lock().frames_dropped += 1;
                     continue;
                 };
-                (frame, tick)
+                let ready = output.completed.clone();
+                let status = status.clone();
+                frame.then(move |(rgb, _), _| {
+                    if ready.try_send(Ready::Scene(rgb, tick)).is_err() {
+                        status.lock().frames_dropped += 1;
+                    }
+                });
+                after = tick;
+                continue;
             }
         };
         after = pts;
-        let Some(buffer) = output.pool.take()? else {
-            status.lock().unwrap().frames_dropped += 1;
-            continue;
-        };
-        let picture = output.importer.import(&frame)?;
-        let target = output.importer.target(&buffer)?;
-        let mut layer = Layer::full(&picture, size.0, size.1);
-        layer.fit = isocast_protocol::Fit::Contain;
-        layer.background = Some([0.0, 0.0, 0.0, 1.0]);
-        let submitted = output.renderer.render(&output.gpu, &target, &[layer], size);
-        output.gpu.device.poll(wgpu::PollType::Wait {
-            submission_index: Some(submitted),
-            timeout: Some(Duration::from_secs(1)),
-        })?;
-        let sent = output.sink.send(&buffer, pts)?;
-        let mut status = status.lock().unwrap();
-        if sent {
-            status.frames_sent += 1;
-            latencies.push(platform.now().saturating_since(pts).as_secs_f64() * 1e6);
-            if latencies.len() >= 600 || latencies.len() % fps as usize == 0 {
-                let mut sorted = latencies.clone();
-                sorted.sort_by(f64::total_cmp);
-                status.enqueue_latency_us.p50 = sorted[sorted.len() / 2];
-                status.enqueue_latency_us.p99 =
-                    sorted[(sorted.len() * 99 / 100).min(sorted.len() - 1)];
-                if latencies.len() >= 600 {
-                    latencies.clear();
-                }
-            }
-        } else {
-            status.frames_dropped += 1;
-        }
+        draw(status, output, frame, pts)?;
     }
+}
+
+fn draw<P: Platform>(
+    status: &Arc<Mutex<VirtualCameraStatus>>,
+    output: &mut Output<P>,
+    frame: P::Frame,
+    pts: Time,
+) -> Result<()> {
+    let size = output.size;
+    let Some(frame) = P::retain_frame(&frame, crate::FrameUse::Auxiliary) else {
+        status.lock().frames_dropped += 1;
+        return Ok(());
+    };
+    if !output.in_flight.available()? {
+        status.lock().frames_dropped += 1;
+        return Ok(());
+    }
+    let Some(buffer) = output.pool.take()? else {
+        status.lock().frames_dropped += 1;
+        return Ok(());
+    };
+    let picture = output.importer.import(&frame)?;
+    let target = output.importer.target(&buffer)?;
+    let mut layer = Layer::full(&picture, size.0, size.1);
+    layer.fit = isocast_protocol::Fit::Contain;
+    layer.background = Some([0.0, 0.0, 0.0, 1.0]);
+    let mut encoder = output
+        .gpu
+        .device
+        .create_command_encoder(&Default::default());
+    output.renderer.encode(
+        &output.gpu,
+        &mut encoder,
+        &target,
+        &[layer],
+        size,
+        wgpu::Color::BLACK,
+    );
+    let done = output.in_flight.submit(&output.gpu, encoder.finish());
+    let completed = output.completed.clone();
+    let status = status.clone();
+    PendingFrame::new(buffer, done.clone()).then(move |buffer, _| {
+        let _held = (frame, picture);
+        if completed.try_send(Ready::Camera(buffer, pts)).is_err() {
+            status.lock().frames_dropped += 1;
+        }
+    });
+    Ok(())
+}
+
+fn receive<P: Platform>(
+    platform: &P,
+    status: &Arc<Mutex<VirtualCameraStatus>>,
+    output: &mut Output<P>,
+    ready: Ready<P::Frame>,
+    latencies: &mut Vec<f64>,
+    fps: u32,
+) -> Result<()> {
+    match ready {
+        Ready::Scene(frame, pts) => draw(status, output, frame, pts),
+        Ready::Camera(frame, pts) => send(platform, status, output, frame, pts, latencies, fps),
+    }
+}
+
+fn send<P: Platform>(
+    platform: &P,
+    status: &Mutex<VirtualCameraStatus>,
+    output: &mut Output<P>,
+    buffer: P::Frame,
+    pts: Time,
+    latencies: &mut Vec<f64>,
+    fps: u32,
+) -> Result<()> {
+    let sent = output.sink.send(&buffer, pts)?;
+    let mut status = status.lock();
+    if sent {
+        status.frames_sent += 1;
+        latencies.push(platform.now().saturating_since(pts).as_secs_f64() * 1e6);
+        if latencies.len() >= 600 || latencies.len().is_multiple_of(fps as usize) {
+            let mut sorted = latencies.clone();
+            sorted.sort_by(f64::total_cmp);
+            status.enqueue_latency_us.p50 = sorted[sorted.len() / 2];
+            status.enqueue_latency_us.p99 = sorted[(sorted.len() * 99 / 100).min(sorted.len() - 1)];
+            if latencies.len() >= 600 {
+                latencies.clear();
+            }
+        }
+    } else {
+        status.frames_dropped += 1;
+    }
+    Ok(())
 }

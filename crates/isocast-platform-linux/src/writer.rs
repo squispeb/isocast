@@ -44,7 +44,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use isocast_engine::{FileWriter, SAMPLE_RATE, Time, WriterSpec};
+use isocast_engine::{FileWriter, Finished, SAMPLE_RATE, Time, WriterSpec};
 use isocast_protocol::{Codec, Container, Encoder};
 
 use crate::frames::{FrameKind, LinuxFrame};
@@ -811,7 +811,7 @@ impl FileWriter for FfmpegFileWriter {
         Ok(pipe.send_samples(samples))
     }
 
-    fn finish(mut self, end: Time) -> Result<u64> {
+    fn finish(mut self, end: Time) -> Result<Finished> {
         // Cover the tail: the last picture that arrived may be frames
         // short of `end`, and the file should play up to its end. The
         // padding waits for room rather than being skipped — a file
@@ -903,7 +903,13 @@ impl FileWriter for FfmpegFileWriter {
                     self.start
                         .map_or(0.0, |at| end.saturating_since(at).as_secs_f64())
                 );
-                Ok(self.repeats)
+                // ffmpeg's encoders don't report pictures or audio
+                // they discard on their own, so those counts stay 0.
+                Ok(Finished {
+                    repeated: self.repeats,
+                    lost_frames: 0,
+                    lost_audio_tracks: 0,
+                })
             }
             Some(_) if failed.is_some() => Err(anyhow!(
                 "a stream stopped early writing {}: {}; its last words: {tail}",

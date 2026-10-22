@@ -27,7 +27,8 @@ use objc2_core_audio::{
     AudioObjectPropertyAddress, kAudioDevicePropertyDeviceUID,
     kAudioDevicePropertyNominalSampleRate, kAudioDevicePropertyStreamConfiguration,
     kAudioHardwarePropertyDefaultOutputDevice, kAudioHardwarePropertyDevices,
-    kAudioObjectPropertyElementMain, kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal,
+    kAudioObjectPropertyElementMain, kAudioObjectPropertyElementName, kAudioObjectPropertyName,
+    kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeInput,
     kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject,
 };
 use objc2_core_audio_types::{
@@ -76,11 +77,12 @@ fn output_devices() -> Result<Vec<(AudioObjectID, u32)>> {
 
 /// The output channels of `device` (0 for an input-only device).
 fn output_channels(device: AudioObjectID) -> u32 {
-    let Some(bytes) = property_bytes(
-        device,
-        kAudioDevicePropertyStreamConfiguration,
-        kAudioObjectPropertyScopeOutput,
-    ) else {
+    scope_channels(device, kAudioObjectPropertyScopeOutput)
+}
+
+/// The channels of `device` in `scope` (input or output).
+fn scope_channels(device: AudioObjectID, scope: u32) -> u32 {
+    let Some(bytes) = property_bytes(device, kAudioDevicePropertyStreamConfiguration, scope) else {
         return 0;
     };
     if bytes.len() < size_of::<AudioBufferList>() {
@@ -100,7 +102,77 @@ fn output_channels(device: AudioObjectID) -> u32 {
     }
 }
 
-fn default_output() -> Option<AudioObjectID> {
+/// The Core Audio device with UID `uid` (an AVCaptureDevice's uniqueID).
+pub(crate) fn device_with_uid(uid: &str) -> Option<AudioObjectID> {
+    let bytes = property_bytes(
+        kAudioObjectSystemObject as AudioObjectID,
+        kAudioHardwarePropertyDevices,
+        kAudioObjectPropertyScopeGlobal,
+    )?;
+    bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|id| AudioObjectID::from_ne_bytes(*id))
+        .find(|device| {
+            string_property(*device, kAudioDevicePropertyDeviceUID).as_deref() == Some(uid)
+        })
+}
+
+/// The input channels `device` has in its current (active) format.
+pub(crate) fn input_channels(device: AudioObjectID) -> u32 {
+    scope_channels(device, kAudioObjectPropertyScopeInput)
+}
+
+/// The names the device with Core Audio UID `uid` gives its input
+/// channels, one per channel from channel 1 ("" where it names none), or
+/// none when it names none (most single microphones).
+pub(crate) fn input_channel_names(uid: &str) -> Vec<String> {
+    let Some(device) = device_with_uid(uid) else {
+        return Vec::new();
+    };
+    let channels = input_channels(device);
+    let names: Vec<String> = (1..=channels)
+        .map(|channel| {
+            let address = AudioObjectPropertyAddress {
+                mSelector: kAudioObjectPropertyElementName,
+                mScope: kAudioObjectPropertyScopeInput,
+                mElement: channel,
+            };
+            element_string(device, &address).unwrap_or_default()
+        })
+        .collect();
+    if names.iter().all(|name| name.trim().is_empty()) {
+        return Vec::new();
+    }
+    names
+        .into_iter()
+        .map(|name| name.trim().to_string())
+        .collect()
+}
+
+/// A string property at `address` (a retained CFString), if it has one.
+fn element_string(object: AudioObjectID, address: &AudioObjectPropertyAddress) -> Option<String> {
+    let mut value: *const CFString = ptr::null();
+    let mut size = size_of::<*const CFString>() as u32;
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            object,
+            NonNull::from(address),
+            0,
+            ptr::null(),
+            NonNull::from(&mut size),
+            NonNull::from(&mut value).cast(),
+        )
+    };
+    if status != 0 || size as usize != size_of::<*const CFString>() {
+        return None;
+    }
+    let string = unsafe { CFRetained::from_raw(NonNull::new(value.cast_mut())?) };
+    Some(string.to_string())
+}
+
+pub(crate) fn default_output() -> Option<AudioObjectID> {
     property::<AudioObjectID>(
         kAudioObjectSystemObject as AudioObjectID,
         kAudioHardwarePropertyDefaultOutputDevice,
@@ -109,7 +181,7 @@ fn default_output() -> Option<AudioObjectID> {
     .filter(|device| *device != 0)
 }
 
-fn device_name(device: AudioObjectID) -> String {
+pub(crate) fn device_name(device: AudioObjectID) -> String {
     string_property(device, kAudioObjectPropertyName).unwrap_or_else(|| format!("Device {device}"))
 }
 
@@ -153,7 +225,7 @@ fn find_output(query: &str) -> Result<(AudioObjectID, String)> {
     }
 }
 
-fn address(selector: u32, scope: u32) -> AudioObjectPropertyAddress {
+pub(crate) fn address(selector: u32, scope: u32) -> AudioObjectPropertyAddress {
     AudioObjectPropertyAddress {
         mSelector: selector,
         mScope: scope,
@@ -162,7 +234,7 @@ fn address(selector: u32, scope: u32) -> AudioObjectPropertyAddress {
 }
 
 /// A fixed-size property of a Core Audio object.
-fn property<T: Copy>(object: AudioObjectID, selector: u32, scope: u32) -> Option<T> {
+pub(crate) fn property<T: Copy>(object: AudioObjectID, selector: u32, scope: u32) -> Option<T> {
     let address = address(selector, scope);
     let mut value = MaybeUninit::<T>::uninit();
     let mut size = size_of::<T>() as u32;
@@ -180,7 +252,7 @@ fn property<T: Copy>(object: AudioObjectID, selector: u32, scope: u32) -> Option
 }
 
 /// A variable-size property, as bytes aligned for any of its structs.
-fn property_bytes(object: AudioObjectID, selector: u32, scope: u32) -> Option<Vec<u8>> {
+pub(crate) fn property_bytes(object: AudioObjectID, selector: u32, scope: u32) -> Option<Vec<u8>> {
     let address = address(selector, scope);
     let mut size = 0u32;
     let status = unsafe {
@@ -215,7 +287,7 @@ fn property_bytes(object: AudioObjectID, selector: u32, scope: u32) -> Option<Ve
 }
 
 /// A string property (Core Audio hands over a retained CFString).
-fn string_property(object: AudioObjectID, selector: u32) -> Option<String> {
+pub(crate) fn string_property(object: AudioObjectID, selector: u32) -> Option<String> {
     let string = property::<*const CFString>(object, selector, kAudioObjectPropertyScopeGlobal)?;
     let string = unsafe { CFRetained::from_raw(NonNull::new(string.cast_mut())?) };
     Some(string.to_string())

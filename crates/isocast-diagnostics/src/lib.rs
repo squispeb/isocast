@@ -1,6 +1,7 @@
 //! Synchronous JSONL at control-plane rates: no queue can lose the last error.
 //! No capture/render/audio callback should emit per-frame logs.
 pub mod bundle;
+pub mod fds;
 pub mod native;
 pub mod output;
 pub mod poll;
@@ -33,6 +34,11 @@ static LOG_CPU_NS: AtomicU64 = AtomicU64::new(0);
 static PANICS: AtomicU64 = AtomicU64::new(0);
 static LAST_PANIC: Mutex<Option<Value>> = Mutex::new(None);
 static MAINTENANCE: OnceLock<std::sync::mpsc::SyncSender<()>> = OnceLock::new();
+/// A console process's start-up prune has finished (see `init`).
+static FIRST_PRUNE: (Mutex<bool>, std::sync::Condvar) =
+    (Mutex::new(false), std::sync::Condvar::new());
+/// This process got an answer from isocastd (see [`daemon_answered`]).
+static DAEMON_ANSWERED: AtomicBool = AtomicBool::new(false);
 static WORKER_WARNING: OnceLock<Box<dyn Fn(String) + Send + Sync>> = OnceLock::new();
 
 struct Logger {
@@ -69,9 +75,11 @@ pub fn logs_folder() -> PathBuf {
     if let Some(socket) = std::env::var_os("ISOCAST_SOCKET") {
         return PathBuf::from(socket).with_extension("logs");
     }
-    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    let home = isocast_protocol::api::home_folder();
     if cfg!(target_os = "macos") {
         home.join("Library/Logs/Isocast")
+    } else if cfg!(windows) {
+        isocast_protocol::api::support_folder().join("logs")
     } else {
         home.join(".isocast/logs")
     }
@@ -206,19 +214,43 @@ pub fn init(process: &str, console: bool) -> Guard {
     {
         let _ = native::start(&log.folder, &log.launch, &log.process);
     }
-    prune(&folder);
+    // A console process (the CLI above all) prunes on the maintenance
+    // thread while it does its work (see `clean_exit`): on the command's
+    // path it cost ~1 ms of every `isocast` run (GitHub #4).
+    if !console {
+        prune(&folder);
+    }
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     let _ = MAINTENANCE.set(tx);
-    let _ = std::thread::Builder::new()
+    let maintained = folder.clone();
+    let spawned = std::thread::Builder::new()
         .name("diagnostic maintenance".into())
         .spawn(move || {
+            let folder = maintained;
+            if console {
+                prune(&folder);
+                let (done, pruned) = &FIRST_PRUNE;
+                *done.lock().unwrap_or_else(|p| p.into_inner()) = true;
+                pruned.notify_all();
+            }
             loop {
                 let _ = rx.recv_timeout(Duration::from_secs(30));
                 poll::flush(false);
                 prune(&folder);
             }
         });
+    if console && spawned.is_err() {
+        prune(&folder);
+        *FIRST_PRUNE.0.lock().unwrap_or_else(|p| p.into_inner()) = true;
+    }
     Guard
+}
+
+/// isocastd answered this process (the client calls this): a console
+/// process then exits without waiting for its start-up prune, which the
+/// daemon's own pruning of the same folder covers (GitHub #4).
+pub fn daemon_answered() {
+    DAEMON_ANSWERED.store(true, Ordering::Relaxed);
 }
 
 pub fn private_file(path: &Path) -> std::io::Result<File> {
@@ -249,12 +281,23 @@ pub fn ready() {
     }
 }
 pub fn health() -> Value {
-    json!({"native_relay_pid":native::pid(),"native_relay":native::health(),"callback_records_dropped":output::dropped(),"credential_pinned_count":redact::pinned_count(),"credential_cache_evictions":redact::cache_evictions(),"write_errors":ERRORS.load(Ordering::Relaxed),"logging_cpu_ns":cfg!(unix).then(||LOG_CPU_NS.load(Ordering::Relaxed)),"launch":LOGGER.get().map(|l| &l.launch),"mode":if LOGGER.get().is_some_and(|l|l.init_error.is_none()) {"jsonl"} else {"stderr"},"init_error":LOGGER.get().and_then(|l|l.init_error.as_ref()),"previous_logging_failure":LOGGER.get().and_then(|l|l.previous_failure.as_ref()),"previous_abnormal":previous_abnormal(),"panics":PANICS.load(Ordering::Relaxed),"developer":developer(),"developer_write_errors":DEVELOPER_ERRORS.load(Ordering::Relaxed),"last_panic":LAST_PANIC.try_lock().ok().and_then(|v|v.clone())})
+    json!({"native_relay_pid":native::pid(),"native_relay":native::health(),"callback_records_dropped":output::dropped(),"credential_pinned_count":redact::pinned_count(),"credential_cache_evictions":redact::cache_evictions(),"write_errors":ERRORS.load(Ordering::Relaxed),"logging_cpu_ns":cfg!(unix).then(||LOG_CPU_NS.load(Ordering::Relaxed)),"launch":LOGGER.get().map(|l| &l.launch),"mode":if LOGGER.get().is_some_and(|l|l.init_error.is_none()) {"jsonl"} else {"stderr"},"init_error":LOGGER.get().and_then(|l|l.init_error.as_ref()),"previous_logging_failure":LOGGER.get().and_then(|l|l.previous_failure.as_ref()),"previous_abnormal":previous_abnormal(),"open_files":fds::health(),"panics":PANICS.load(Ordering::Relaxed),"developer":developer(),"developer_write_errors":DEVELOPER_ERRORS.load(Ordering::Relaxed),"last_panic":LAST_PANIC.try_lock().ok().and_then(|v|v.clone())})
 }
 
 pub fn clean_exit() {
     poll::flush(true);
     let Some(log) = LOGGER.get() else { return };
+    if log.console && !DAEMON_ANSWERED.load(Ordering::Relaxed) {
+        // The start-up prune runs beside the process's work; finish it, so
+        // every run still prunes. Bounded, so a stuck disk can't hold the
+        // exit. Not when isocastd answered: it prunes the same folder every
+        // 30 s, and a prune cut short leaves nothing half-done (it deletes
+        // whole files, a launch's `.run` marker last, and the next prune
+        // takes up the rest).
+        let (done, pruned) = &FIRST_PRUNE;
+        let done = done.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = pruned.wait_timeout_while(done, Duration::from_secs(5), |done| !*done);
+    }
     emit("info", "lifecycle", "clean exit", Value::Null);
     let failed = ERRORS.load(Ordering::Relaxed);
     if failed > 0 {
@@ -273,7 +316,26 @@ pub fn clean_exit() {
     let _ = writer.file.flush();
     // Append, rather than overwrite: an interrupted write cannot erase evidence.
     let _ = writeln!(writer.marker, "{{\"clean\":true}}");
-    let _ = writer.marker.sync_all();
+    sync_marker(&writer.marker, log.console);
+}
+
+/// Put the clean-exit mark on disk. The daemon flushes the drive's cache
+/// too (`sync_all` is F_FULLFSYNC on macOS); a console process (the CLI, the
+/// app) uses a plain fsync, which reaches the drive without waiting for its
+/// cache: F_FULLFSYNC took 3.6–14 ms on every `isocast` command, more than
+/// the rest of the command (GitHub #4). The line is in the kernel either
+/// way, so only a power loss in the next moment could cost the mark, and a
+/// missing mark only reports that one run as unclean.
+fn sync_marker(marker: &File, console: bool) {
+    #[cfg(unix)]
+    if console {
+        use std::os::fd::AsRawFd;
+        // SAFETY: fsync on a descriptor this File owns and keeps open.
+        unsafe { libc::fsync(marker.as_raw_fd()) };
+        return;
+    }
+    let _ = console;
+    let _ = marker.sync_all();
 }
 
 /// Contain a worker failure after its stack guards have unwound. The panic
@@ -475,6 +537,7 @@ pub fn emit(level: &str, component: &str, message: &str, fields: Value) {
             writer.bytes += 1;
             writer.partial_line = false;
         }
+        budget_write_delay(component, message);
         writer.file.write_all(&bytes)?;
         writer.bytes += bytes.len() as u64;
         // Unbuffered File: every complete line reaches the OS immediately.
@@ -569,6 +632,44 @@ pub fn diagnostic(level: &str, component: &str, message: String) {
             redact::Redactor::default().text(&message)
         );
     }
+}
+
+/// Isolated developer exercise of slow diagnostic storage, not slow media
+/// storage: AFTER_MS:DURATION_MS, once, while the real writer lock is held.
+fn budget_write_delay(component: &str, message: &str) {
+    static BEGAN: OnceLock<Instant> = OnceLock::new();
+    static FIRED: AtomicBool = AtomicBool::new(false);
+    if !developer()
+        || std::env::var_os("ISOCAST_SOCKET").is_none()
+        || component != "isocast_platform_macos::frames"
+        || !message.starts_with("frame budget")
+    {
+        return;
+    }
+    let Some((after, duration)) =
+        std::env::var("ISOCAST_BUDGET_LOG_STALL_MS")
+            .ok()
+            .and_then(|value| {
+                let (after, duration) = value.split_once(':')?;
+                Some((
+                    after.parse::<u64>().ok()?,
+                    duration.parse::<u64>().ok()?.min(10_000),
+                ))
+            })
+    else {
+        return;
+    };
+    if BEGAN.get_or_init(Instant::now).elapsed() < Duration::from_millis(after)
+        || FIRED.swap(true, Ordering::AcqRel)
+    {
+        return;
+    }
+    let _ = writeln!(
+        std::io::stderr(),
+        "injected diagnostic writer delay {duration} ms begins"
+    );
+    std::thread::sleep(Duration::from_millis(duration));
+    let _ = writeln!(std::io::stderr(), "injected diagnostic writer delay ends");
 }
 
 #[macro_export]

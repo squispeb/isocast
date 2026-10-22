@@ -10,8 +10,8 @@
 //! their records uploaded between frames; [`Renderer::render`] draws a
 //! one-off list of [`Layer`]s the same way.
 
+use parking_lot::Mutex;
 use std::num::NonZeroU64;
-use std::sync::Mutex;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -19,7 +19,7 @@ use anyhow::{Context, Result, bail};
 
 use isocast_protocol::{Align, Blend, Crop, Fit, ScaleFilter};
 
-use crate::gpu::{Gpu, GpuFrame, Matrix, YCbCr};
+use crate::gpu::{Gpu, GpuFrame, GpuPixels, Matrix, YCbCr};
 
 const SHADER: &str = r#"
 struct Draw {
@@ -134,7 +134,11 @@ fn coverage(d: f32) -> f32 {
 
 // How much of the target pixel at `p` the draw's clips leave (1 with
 // none): inside each clipping item's rounded rect, antialiased.
-fn clipped(p: vec2<f32>) -> f32 {
+fn clipped(local: vec2<f32>) -> f32 {
+    // Layout pixels, not framebuffer pixels: scene monitors may rasterize
+    // the same records into a smaller target.
+    let point = vec3<f32>(local, 1.0);
+    let p = vec2<f32>(dot(draw.row0.xyz, point), dot(draw.row1.xyz, point));
     var next = u32(draw.sampling.w + 0.5);
     var covered = 1.0;
     for (var depth = 0; depth < 16 && next > 0u; depth++) {
@@ -298,7 +302,7 @@ fn fs_picture(in: Varyings) -> @location(0) vec4<f32> {
     }
     var shaded = shade(color + premultiply(draw.background) * (1.0 - color.a), p);
     if (draw.sampling.w > 0.5) {
-        shaded *= clipped(in.position.xy);
+        shaded *= clipped(in.local);
     }
     return blended(shaded);
 }
@@ -308,7 +312,7 @@ fn fs_fill(in: Varyings) -> @location(0) vec4<f32> {
     draw = draws[in.record];
     var shaded = shade(premultiply(draw.background), in.local);
     if (draw.sampling.w > 0.5) {
-        shaded *= clipped(in.position.xy);
+        shaded *= clipped(in.local);
     }
     return blended(shaded);
 }
@@ -326,7 +330,7 @@ fn fs_shadow(in: Varyings) -> @location(0) vec4<f32> {
     let under = coverage(rounded_box(in.local - half, half, draw.radius));
     var a = draw.shadow_color.a * alpha * (1.0 - under) * draw.style.x;
     if (draw.sampling.w > 0.5) {
-        a *= clipped(in.position.xy);
+        a *= clipped(in.local);
     }
     return blended(vec4<f32>(draw.shadow_color.rgb * a, a));
 }
@@ -1004,6 +1008,19 @@ impl Renderer {
 
     /// The bind group (1) a draw of `frame`'s picture samples.
     pub(crate) fn frame_group(&self, gpu: &Gpu, frame: &GpuFrame) -> wgpu::BindGroup {
+        if let GpuPixels::YCbCrBiPlanar { texture, .. } = &frame.pixels {
+            let luma = texture.create_view(&wgpu::TextureViewDescriptor {
+                format: Some(wgpu::TextureFormat::R8Unorm),
+                aspect: wgpu::TextureAspect::Plane0,
+                ..Default::default()
+            });
+            let chroma = texture.create_view(&wgpu::TextureViewDescriptor {
+                format: Some(wgpu::TextureFormat::Rg8Unorm),
+                aspect: wgpu::TextureAspect::Plane1,
+                ..Default::default()
+            });
+            return views_group(gpu, &self.planes_layout, &luma, &chroma);
+        }
         let (plane0, plane1) = frame.planes();
         planes_group(gpu, &self.planes_layout, plane0, plane1)
     }
@@ -1068,7 +1085,7 @@ impl Renderer {
         size: (u32, u32),
         clear: wgpu::Color,
     ) {
-        let mut immediate = self.immediate.lock().unwrap();
+        let mut immediate = self.immediate.lock();
         let Immediate {
             records,
             clips,
@@ -1196,17 +1213,26 @@ fn planes_group(
 ) -> wgpu::BindGroup {
     let view0 = plane0.create_view(&Default::default());
     let view1 = plane1.create_view(&Default::default());
+    views_group(gpu, layout, &view0, &view1)
+}
+
+fn views_group(
+    gpu: &Gpu,
+    layout: &wgpu::BindGroupLayout,
+    view0: &wgpu::TextureView,
+    view1: &wgpu::TextureView,
+) -> wgpu::BindGroup {
     gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("draw planes"),
         layout,
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
-                resource: wgpu::BindingResource::TextureView(&view0),
+                resource: wgpu::BindingResource::TextureView(view0),
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: wgpu::BindingResource::TextureView(&view1),
+                resource: wgpu::BindingResource::TextureView(view1),
             },
         ],
     })

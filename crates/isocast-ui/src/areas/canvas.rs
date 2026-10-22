@@ -19,14 +19,21 @@
 //!   so the handle stays under the pointer;
 //! - Studio Mode: the edited monitor shows `preview`, a second picture the
 //!   program; the preview's rate follows Settings → General (30 fps saves
-//!   power except while working on the canvas).
+//!   power except while working on the canvas);
+//! - extra canvases (#86, #120): the chosen one's program in a monitor of
+//!   its own beside the others (View → Canvases → Show Canvas Monitor; its
+//!   line's menu switches canvases), and Edit <name> Canvas puts it in the
+//!   edited monitor (and Studio Mode's pair), where gestures change the
+//!   scene's arrangement for that canvas, never the main items.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use isocast_protocol::{SceneItem, Setup};
+use isocast_protocol::api::{EngineState, Method, StreamStartParams, Streaming};
+use isocast_protocol::stream::{StreamState, StreamStatus};
+use isocast_protocol::{CanvasId, SceneItem, Setup};
 use serde_json::{Value, json};
 use slint::{ComponentHandle, Model, VecModel};
 
@@ -39,7 +46,7 @@ use crate::model;
 use crate::picture::{Scene as TestScene, TestPicture};
 use crate::preview::{BoxShape, BoxStyle, LiveBox, Output, Preview, Role};
 use crate::session::EditOptions;
-use crate::{AppWindow, CanvasArea, CanvasBox, CanvasGuide, Menus, Ui};
+use crate::{AppWindow, CanvasArea, CanvasBox, CanvasGuide, Menus, ToastKind, Ui};
 
 /// Snapshot states (`--state NAME[:ARG]`).
 pub const STATES: &[&str] = &[
@@ -48,6 +55,12 @@ pub const STATES: &[&str] = &[
     "canvas-drag:X1,Y1,X2,Y2[,shift|alt|meta]",
     "canvas-hold:X1,Y1,X2,Y2[,shift|alt|meta]",
     "preview-scale:window|canvas",
+    "vertical-canvas[:on|off]",
+    "extra-canvases:ID[=WxH],…|off",
+    "vertical-preview:on|off",
+    "extra-canvas:ID",
+    "edit-canvas:main|vertical|ID",
+    "vertical-layout:wide|compact",
 ];
 
 /// Drag steps go to the daemon at most once per display frame.
@@ -242,8 +255,12 @@ pub struct Canvas {
     pub preview: RefCell<Option<Preview>>,
     /// Studio Mode's program picture (the window).
     pub program: RefCell<Option<Preview>>,
-    /// The test picture (offscreen runs), drawn before each frame.
+    /// The chosen extra canvas's program picture (the window, #86, #120).
+    pub extra: RefCell<Option<Preview>>,
+    /// The test picture (offscreen runs), drawn before each frame, and the
+    /// canvas monitor's.
     picture: Option<RefCell<TestPicture>>,
+    extra_picture: Option<RefCell<TestPicture>>,
     /// The test picture's clock, in seconds.
     clock: Box<dyn Fn() -> f32>,
     /// Frames the window has drawn.
@@ -253,8 +270,9 @@ pub struct Canvas {
     /// `--drag-test`: when each window frame started and finished drawing.
     pub render_log: RefCell<Option<Vec<(Instant, Instant)>>>,
     render_started: Cell<Option<Instant>>,
-    /// The newest confirmed layout handed to the preview (revision, scene).
-    shown_layout: RefCell<(u64, String)>,
+    /// The newest confirmed layout handed to the preview (revision, scene,
+    /// the canvas edited).
+    shown_layout: RefCell<(u64, String, CanvasId)>,
     gesture: RefCell<Option<Gesture>>,
     /// Until when the monitors keep the canvas's rate after a gesture.
     gesture_tail: Cell<Option<Instant>>,
@@ -272,7 +290,10 @@ impl Canvas {
         Self {
             preview: RefCell::new(None),
             program: RefCell::new(None),
+            extra: RefCell::new(None),
             picture: test_picture.then(|| RefCell::new(TestPicture::new(&gpu.device, &gpu.queue))),
+            extra_picture: test_picture
+                .then(|| RefCell::new(TestPicture::new(&gpu.device, &gpu.queue))),
             clock,
             frames: Cell::new(0),
             moves: Cell::new(0),
@@ -302,15 +323,15 @@ impl Canvas {
     }
 
     /// Start the monitors' pictures (the window, once it is shown): the
-    /// edited one and Studio Mode's program, each from a feed of its own.
-    /// `deliver` hands each feed's frames to the window's thread (true:
-    /// the program's).
+    /// edited one, Studio Mode's program and the chosen extra canvas's, each
+    /// from a feed of its own. `deliver` hands each feed's frames to the
+    /// window's thread, with the monitor they are for.
     pub fn start_pictures(
         &self,
         app: &Rc<App>,
         output: Output,
         check: bool,
-        deliver: impl Fn(bool, Incoming) + Send + Clone + 'static,
+        deliver: impl Fn(Role, Incoming) + Send + Clone + 'static,
     ) {
         let Some(window) = app.window() else { return };
         let fps = self.wanted_fps(app);
@@ -323,7 +344,7 @@ impl Canvas {
                 window.get_picture_pixel_height(),
             ),
             fps,
-            move |incoming| to_editor(false, incoming),
+            move |incoming| to_editor(Role::Editor, incoming),
         );
         *self.preview.borrow_mut() = Some(Preview::new(
             &window,
@@ -340,43 +361,58 @@ impl Canvas {
                 window.get_program_pixel_height(),
             ),
             fps,
-            move |incoming| deliver(true, incoming),
+            {
+                let deliver = deliver.clone();
+                move |incoming| deliver(Role::Program, incoming)
+            },
         );
         *self.program.borrow_mut() = Some(Preview::new(
             &window,
             Role::Program,
-            output,
+            output.clone(),
             feed,
             fps,
             false,
         ));
-        *self.shown_layout.borrow_mut() = (0, String::new());
+        let feed = Feed::start(
+            None,
+            size(
+                window.get_extra_pixel_width(),
+                window.get_extra_pixel_height(),
+            ),
+            fps,
+            move |incoming| deliver(Role::Extra, incoming),
+        );
+        *self.extra.borrow_mut() =
+            Some(Preview::new(&window, Role::Extra, output, feed, fps, false));
+        *self.shown_layout.borrow_mut() = (0, String::new(), CanvasId::Main);
         self.follow_scenes(app);
         self.push_layout(app);
         self.place_box(app, &window);
     }
 
-    /// A frame (or the loss of the stream) for the edited monitor or
-    /// (`program`) Studio Mode's program.
-    pub fn incoming(&self, program: bool, incoming: Incoming) {
-        let cell = if program {
-            &self.program
-        } else {
-            &self.preview
-        };
+    /// A frame (or the loss of the stream) for monitor `role`.
+    pub fn incoming(&self, role: Role, incoming: Incoming) {
+        let cell = self.cell(role);
         if let Some(preview) = cell.borrow_mut().as_mut() {
             match incoming {
                 Incoming::Frame(frame) => preview.frame(frame),
-                #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-                Incoming::Picture(picture) => preview.picture(picture),
                 Incoming::Lost(why) => preview.lost(why),
             }
         }
     }
 
+    fn cell(&self, role: Role) -> &RefCell<Option<Preview>> {
+        match role {
+            Role::Editor => &self.preview,
+            Role::Program => &self.program,
+            Role::Extra => &self.extra,
+        }
+    }
+
     /// The window was hidden or shown again.
     pub fn set_hidden(&self, hidden: bool) {
-        for cell in [&self.preview, &self.program] {
+        for cell in [&self.preview, &self.program, &self.extra] {
             if let Some(preview) = cell.borrow_mut().as_mut() {
                 preview.set_hidden(hidden);
             }
@@ -385,37 +421,56 @@ impl Canvas {
 
     /// What each monitor shows: the edited one `program`, or in Studio
     /// Mode `preview` (and the second one `program`); nothing while there
-    /// is nothing to show.
+    /// is nothing to show. Editing an extra canvas, the same of it
+    /// (`<id>-program`, `<id>-preview`); else the chosen one's monitor
+    /// beside them, while shown, `<id>-program`.
     fn follow_scenes(&self, app: &Rc<App>) {
+        let shown = app
+            .window()
+            .is_some_and(|w| w.global::<Ui>().get_show_extra());
+        let (extra, edited) = {
+            let s = app.session.borrow();
+            (s.extra.as_ref().and(s.extra_canvas()), s.edit_canvas())
+        };
         let (studio, has_preview, has_program) = {
             let s = app.session.borrow();
-            let exists = |id: &Option<String>| {
-                id.as_deref().is_some_and(|id| {
+            let exists = |id: Option<&String>| {
+                id.is_some_and(|id| {
                     s.setup
                         .as_ref()
                         .and_then(|x| model::find_scene(x, id))
                         .is_some()
                 })
             };
-            (s.studio, exists(&s.preview), exists(&s.scene))
+            // The canvas whose scenes are switched (#86).
+            (s.studio, exists(s.staged()), exists(s.on_air()))
         };
+        let (preview_target, program_target) = (edited.preview_target(), edited.program_target());
         let (editor, program) = if studio {
             (
-                has_preview.then_some("preview"),
-                has_program.then_some("program"),
+                has_preview.then_some(preview_target),
+                has_program.then_some(program_target),
             )
         } else {
-            (has_program.then_some("program"), None)
+            (has_program.then_some(program_target), None)
         };
+        let side = extra
+            .filter(|_| shown && edited.is_main() && has_program)
+            .map(CanvasId::program_target);
         if let Ok(mut preview) = self.preview.try_borrow_mut()
             && let Some(preview) = preview.as_mut()
         {
-            preview.set_target(editor);
+            preview.set_target(editor.as_deref());
         }
         if let Ok(mut preview) = self.program.try_borrow_mut()
             && let Some(preview) = preview.as_mut()
         {
-            preview.set_target(program);
+            preview.set_target(program.as_deref());
+        }
+        if let Ok(mut preview) = self.extra.try_borrow_mut()
+            && let Some(preview) = preview.as_mut()
+        {
+            preview.set_target(side.as_deref());
         }
     }
 
@@ -425,14 +480,16 @@ impl Canvas {
         let canvas = app
             .session
             .borrow()
-            .setup
-            .as_ref()
+            .edited_setup()
             .map_or(MAX_FPS, |s| s.canvas.fps.max(1));
         let saving = app
             .window()
             .is_some_and(|w| w.global::<Ui>().get_preview_rate() == "30");
         let working = self.gesture.borrow().is_some()
-            || self.gesture_tail.get().is_some_and(|t| Instant::now() < t);
+            || self
+                .gesture_tail
+                .get()
+                .is_some_and(|t| crate::clock::now() < t);
         let fps = if saving && !working {
             POWER_SAVING_FPS
         } else {
@@ -443,7 +500,7 @@ impl Canvas {
 
     fn update_fps(&self, app: &Rc<App>) {
         let fps = self.wanted_fps(app);
-        for cell in [&self.preview, &self.program] {
+        for cell in [&self.preview, &self.program, &self.extra] {
             if let Ok(mut preview) = cell.try_borrow_mut()
                 && let Some(preview) = preview.as_mut()
             {
@@ -455,7 +512,8 @@ impl Canvas {
     /// The user worked on the canvas (a drag ended, a nudge): keep the
     /// canvas's rate a moment longer.
     fn worked(&self, app: &Rc<App>) {
-        self.gesture_tail.set(Some(Instant::now() + GESTURE_TAIL));
+        self.gesture_tail
+            .set(Some(crate::clock::now() + GESTURE_TAIL));
         self.update_fps(app);
         let weak = Rc::downgrade(app);
         self.tail_timer.start(
@@ -473,10 +531,10 @@ impl Canvas {
     /// frames drawn from it.
     fn push_layout(&self, app: &Rc<App>) {
         let s = app.session.borrow();
-        let (Some(setup), Some(scene)) = (s.confirmed_setup(), s.editing_scene()) else {
+        let (Some(setup), Some(scene)) = (s.confirmed_edited(), s.editing_scene()) else {
             return;
         };
-        let key = (s.revision, scene.clone());
+        let key = (s.revision, scene.clone(), s.edit_canvas());
         if *self.shown_layout.borrow() == key {
             return;
         }
@@ -495,7 +553,7 @@ impl Canvas {
         let path = {
             let s = app.session.borrow();
             s.editing_scene()
-                .and_then(|id| s.setup.as_ref().and_then(|x| model::find_scene(x, &id)))
+                .and_then(|id| s.edited_setup().and_then(|x| model::find_scene(x, &id)))
                 .and_then(|scene| scene.items.first())
                 .map(|item| model::key(item).to_string())
         };
@@ -509,7 +567,9 @@ impl Canvas {
     pub fn select_first_item(&self, app: &Rc<App>) {
         let path = {
             let s = app.session.borrow();
-            let Some(setup) = s.setup.clone() else { return };
+            let Some(setup) = s.edited_setup().cloned() else {
+                return;
+            };
             let Some(scene) = s
                 .editing_scene()
                 .and_then(|id| model::find_scene(&setup, &id).cloned())
@@ -563,6 +623,21 @@ impl Canvas {
             }
             canvas.set_picture(image);
         }
+        // The canvas monitor's, without a box.
+        if let Some(extra) = &self.extra_picture
+            && window.get_extra_width() > 0.0
+        {
+            let width = window.get_extra_pixel_width().max(1) as u32;
+            let height = window.get_extra_pixel_height().max(1) as u32;
+            let scene = TestScene {
+                time: (self.clock)(),
+                rect: [0.0; 4],
+            };
+            if let Some(image) = extra.borrow_mut().draw(width, height, scene) {
+                canvas.set_extra_picture(image);
+            }
+            canvas.set_extra_waiting(false);
+        }
         // The test picture is drawn from the box itself.
         canvas.set_waiting(false);
         canvas.set_shown_box_visible(true);
@@ -607,7 +682,7 @@ impl Canvas {
         let mut boxes = Vec::new();
         let scene = s
             .editing_scene()
-            .and_then(|id| s.setup.as_ref().and_then(|x| model::find_scene(x, &id)));
+            .and_then(|id| s.edited_setup().and_then(|x| model::find_scene(x, &id)));
         let mut empty = false;
         if let Some(scene) = scene {
             empty = scene.items.is_empty();
@@ -640,6 +715,354 @@ impl Canvas {
         }
     }
 
+    // ---------- Extra canvases (#86, #120) ----------
+
+    /// Edit the chosen extra canvas (`on`) or the main one: the edited
+    /// monitor (and Studio Mode's pair) show it, its size is the
+    /// editor's, and gestures change its items.
+    fn set_edit_extra(&self, app: &Rc<App>, on: bool) {
+        {
+            let mut s = app.session.borrow_mut();
+            if s.extra_edit == on {
+                return;
+            }
+            s.extra_edit = on;
+            // Pinned, so the canvas edited never changes under the editor
+            // (see `Session::refresh_extra`).
+            if on && let Some(canvas) = s.extra_canvas() {
+                s.extra_choice = Some(canvas);
+            }
+            // Its items (and maybe its scenes) are another canvas's.
+            s.selection = None;
+        }
+        self.edit_changed(app);
+    }
+
+    /// The canvas edited changed: the other canvas's boxes are at other
+    /// places at the same revisions.
+    fn edit_changed(&self, app: &Rc<App>) {
+        *self.shown_layout.borrow_mut() = (0, String::new(), CanvasId::Main);
+        if let Ok(mut preview) = self.preview.try_borrow_mut()
+            && let Some(preview) = preview.as_mut()
+        {
+            preview.forget_layouts();
+        }
+        app.changed(Changed::SETUP | Changed::CONFIRMED | Changed::SCENES | Changed::SELECTION);
+        // Studio Mode on an extra canvas with scenes of its own: its own
+        // preview.
+        app.stage_extra_preview();
+    }
+
+    /// Show extra canvas `canvas` in the canvas monitor (and edit it
+    /// instead, while editing an extra canvas): the monitor's switcher
+    /// (#120). Kept with the window's layout.
+    pub fn choose_extra(&self, app: &Rc<App>, canvas: CanvasId, edit: bool) {
+        let changed = {
+            let mut s = app.session.borrow_mut();
+            let before = (s.extra_canvas(), s.editing_extra());
+            s.extra_choice = Some(canvas);
+            if edit {
+                s.extra_edit = true;
+            }
+            s.refresh_extra();
+            let after = (s.extra_canvas(), s.editing_extra());
+            if before != after && after.1 {
+                s.selection = None;
+            }
+            (before != after).then_some(after.1 || before.1)
+        };
+        if let Some(window) = app.window() {
+            window
+                .global::<Ui>()
+                .set_extra_choice(canvas.as_str().into());
+            if !app.mode.offscreen {
+                crate::prefs::save(&window);
+            }
+        }
+        match changed {
+            Some(true) => self.edit_changed(app),
+            Some(false) => app.changed(Changed::SETUP),
+            None => {}
+        }
+    }
+
+    /// The canvas monitor beside the others, shown or not (View →
+    /// Canvases; kept with the window's layout).
+    fn set_show_extra(&self, app: &Rc<App>, on: bool) {
+        let Some(window) = app.window() else { return };
+        window.global::<Ui>().set_show_extra(on);
+        if !app.mode.offscreen {
+            crate::prefs::save(&window);
+        }
+        self.follow_scenes(app);
+    }
+
+    /// Record the chosen extra canvas's program with the next recording
+    /// (or not): its `recording`, changed while not recording.
+    fn toggle_extra_record(&self, app: &Rc<App>) {
+        let (canvas, on, recording, label) = {
+            let s = app.session.borrow();
+            let Some(canvas) = s.extra_canvas() else {
+                return;
+            };
+            (
+                canvas,
+                records(&s, canvas),
+                recording(&s),
+                s.canvas_label(canvas),
+            )
+        };
+        if recording {
+            app.toast(
+                ToastKind::Info,
+                "Recording now",
+                format!("Whether {label} is recorded changes once this recording stops."),
+            );
+            return;
+        }
+        // Kept when off (`enabled: false`), so its file name and encoder
+        // come back with it.
+        app.edit(
+            model::canvas_patch(canvas, json!({ "recording": { "enabled": !on } })),
+            EditOptions::default(),
+        );
+    }
+
+    /// Start or stop streaming the chosen extra canvas (`stream_start` and
+    /// `stream_stop` with its `canvas`).
+    fn toggle_extra_stream(&self, app: &Rc<App>) {
+        let (canvas, on, configured, label) = {
+            let s = app.session.borrow();
+            let Some(canvas) = s.extra_canvas() else {
+                return;
+            };
+            (
+                canvas,
+                canvas_stream(&s, canvas).is_some_and(StreamStatus::is_active),
+                s.setup
+                    .as_ref()
+                    .and_then(|x| x.extra_canvas(canvas))
+                    .is_some_and(|v| v.stream.is_some()),
+                s.canvas_label(canvas),
+            )
+        };
+        if !on && !configured {
+            // Settings › Stream, showing the canvas's (#96).
+            let tab = if canvas.is_vertical() {
+                "stream-vertical:Choose where the vertical canvas streams first.".to_string()
+            } else {
+                format!("stream@{canvas}:Choose where {label} streams first.")
+            };
+            app.open_dialog("settings", &tab);
+            return;
+        }
+        let params = StreamStartParams {
+            canvas,
+            ..StreamStartParams::default()
+        };
+        app.session.borrow_mut().busy_canvas_stream = true;
+        app.changed(Changed::BUSY);
+        let method = if on {
+            Method::StreamStop(Some(params))
+        } else {
+            Method::StreamStart(Some(params))
+        };
+        app.call_as::<Streaming>(method, move |app, result| {
+            match result {
+                Ok(status) => {
+                    let streams = if status.destinations.is_empty() {
+                        vec![status.stream]
+                    } else {
+                        status.destinations
+                    };
+                    let mut s = app.session.borrow_mut();
+                    if canvas.is_vertical() {
+                        s.vertical_streams = streams.clone();
+                    }
+                    if let Some(entry) = s.canvases.iter_mut().find(|c| c.id == canvas) {
+                        entry.streams = streams;
+                    }
+                }
+                Err(error) => {
+                    app.failed(
+                        &if on {
+                            format!("Couldn’t stop the {} stream", label.to_lowercase())
+                        } else {
+                            format!("Couldn’t stream {label}")
+                        },
+                        &error,
+                    );
+                    app.refresh_status(true);
+                }
+            }
+            app.session.borrow_mut().busy_canvas_stream = false;
+            app.changed(Changed::BUSY | Changed::STREAM);
+        });
+    }
+
+    /// The canvas monitor's head and picture: its scene, whether it is
+    /// recorded and live.
+    fn show_extra(&self, app: &Rc<App>, window: &AppWindow) {
+        let canvas_area = window.global::<CanvasArea>();
+        let s = app.session.borrow();
+        let Some(canvas) = s.extra_canvas() else {
+            return;
+        };
+        let name = s
+            .scene_on(canvas)
+            .and_then(|id| model::find_scene(s.setup.as_ref()?, id))
+            .map(|scene| model::scene_name(scene).to_string())
+            .unwrap_or_default();
+        canvas_area.set_extra_name(name.as_str().into());
+        // Stopped after a failure of its own (#96): it says so, not a
+        // frozen picture.
+        let stopped = stopped(&s, canvas);
+        canvas_area.set_extra_empty_text(
+            if let Some(why) = stopped {
+                let label = s.canvas_label(canvas);
+                format!("{label} stopped. {}", model::canvas_recovery(why, &label))
+            } else if name.is_empty() {
+                "Nothing on air.".into()
+            } else {
+                String::new()
+            }
+            .into(),
+        );
+        canvas_area.set_extra_record(records(&s, canvas));
+        canvas_area.set_extra_live(
+            canvas_stream(&s, canvas)
+                .is_some_and(|x| matches!(x.state, StreamState::Live | StreamState::Reconnecting)),
+        );
+    }
+
+    /// The canvas monitor's menu (its head's ⌄, its picture's right-click,
+    /// View → Canvases): the canvases to show, with several, then what to
+    /// do with the one shown.
+    fn extra_menu(&self, app: &Rc<App>) -> MenuBuilder {
+        let s = app.session.borrow();
+        let chosen = s.extra_canvas();
+        let has = s.extra.is_some();
+        let editing = s.editing_extra();
+        let canvas = chosen.unwrap_or(CanvasId::Vertical);
+        let label = chosen.map_or("Extra".to_string(), |c| s.canvas_label(c));
+        let records = records(&s, canvas);
+        let busy = recording(&s);
+        let live = canvas_stream(&s, canvas).is_some_and(StreamStatus::is_active);
+        let configured = s
+            .setup
+            .as_ref()
+            .and_then(|x| x.extra_canvas(canvas))
+            .is_some_and(|v| v.stream.is_some());
+        let own_layout = own_layout(&s, canvas).is_some();
+        let replay = super::controls::replay_of(&s, canvas)
+            .is_some_and(|r| r.state == isocast_protocol::replay::ReplayState::Running);
+        let replay_busy = s.busy_replay || s.saving_replay;
+        let canvases: Vec<(CanvasId, String, String)> = s
+            .extra_canvases()
+            .into_iter()
+            .filter_map(|c| {
+                let size = s.setup.as_ref()?.extra_canvas(c)?;
+                Some((
+                    c,
+                    s.canvas_label(c),
+                    format!("{}×{}", size.width, size.height),
+                ))
+            })
+            .collect();
+        let shown = app
+            .window()
+            .is_some_and(|w| w.global::<Ui>().get_show_extra());
+        drop(s);
+        let mut menu = MenuBuilder::new();
+        if canvases.len() > 1 {
+            for (id, name, size) in &canvases {
+                menu = menu
+                    .item(&format!("extra_show:{id}"), name)
+                    .hint(size)
+                    .checked(Some(*id) == chosen);
+            }
+            menu = menu.separator();
+        }
+        menu.item("extra_preview", "Show Canvas Monitor")
+            .checked(shown && has)
+            .disabled(!has)
+            .item("edit_canvas_main", "Edit Main Canvas")
+            .checked(!editing)
+            .disabled(!has)
+            .item("edit_canvas_extra", &format!("Edit {label} Canvas"))
+            .checked(editing)
+            .disabled(!has)
+            .item("extra_main_layout", "Use Main Layout for This Scene")
+            .disabled(!has || !own_layout)
+            .separator()
+            .item("extra_record", &format!("Record {label} Canvas"))
+            .checked(records)
+            .disabled(!has || busy)
+            .item(
+                "extra_stream",
+                &if live {
+                    format!("Stop {label} Stream")
+                } else if configured {
+                    format!("Start {label} Stream")
+                } else {
+                    format!("Set Up {label} Stream…")
+                },
+            )
+            .disabled(!has)
+            .item(
+                "extra_replay",
+                &if replay {
+                    format!("Stop {label} Replay Buffer")
+                } else {
+                    format!("Start {label} Replay Buffer")
+                },
+            )
+            .disabled(!has || replay_busy)
+            .item("extra_replay_save", &format!("Save {label} Replay"))
+            .disabled(!has || !replay || replay_busy)
+            .separator()
+            .item("extra_settings", "Canvas Settings…")
+    }
+
+    /// Use Main Layout for This Scene: the scene being edited drops its
+    /// own arrangement for the chosen extra canvas, which shows the main
+    /// items again. Asked for by name; Undo (here, or Edit › Undo) brings
+    /// it back.
+    fn use_main_layout(&self, app: &Rc<App>) {
+        let (canvas, scene, before, label) = {
+            let s = app.session.borrow();
+            let Some(canvas) = s.extra_canvas() else {
+                return;
+            };
+            let Some(scene) = own_layout(&s, canvas) else {
+                return;
+            };
+            (
+                canvas,
+                scene,
+                s.setup_json().cloned(),
+                s.canvas_label(canvas),
+            )
+        };
+        app.select("");
+        app.edit(
+            model::drop_arrangement(&scene.0, canvas),
+            EditOptions::default(),
+        );
+        let toast = crate::toasts::Toast::new(
+            ToastKind::Info,
+            format!("“{}” uses the main layout on {label}", scene.1),
+            "",
+        );
+        let toast = match before {
+            Some(before) => toast.action("Undo", move |app| {
+                app.replace_setup(before.clone(), true);
+            }),
+            None => toast,
+        };
+        app.show_toast(toast);
+    }
+
     // ---------- The pointer ----------
 
     /// Points per canvas pixel.
@@ -654,7 +1077,7 @@ impl Canvas {
         let s = app.session.borrow();
         let Some(scene) = s
             .editing_scene()
-            .and_then(|id| s.setup.as_ref().and_then(|x| model::find_scene(x, &id)))
+            .and_then(|id| s.edited_setup().and_then(|x| model::find_scene(x, &id)))
         else {
             return;
         };
@@ -686,7 +1109,9 @@ impl Canvas {
         // A locked item, or a locked preview (Edit → Lock Preview), stays
         // put.
         let s = app.session.borrow();
-        let Some(setup) = s.setup.clone() else { return };
+        let Some(setup) = s.edited_setup().cloned() else {
+            return;
+        };
         let Some(scene) = model::find_scene(&setup, &scene_id) else {
             return;
         };
@@ -844,7 +1269,7 @@ impl Canvas {
         };
         let patch = {
             let s = app.session.borrow();
-            let Some(setup) = s.setup.as_ref() else {
+            let Some(setup) = s.edited_setup() else {
                 return;
             };
             let Some(chain) =
@@ -852,7 +1277,7 @@ impl Canvas {
             else {
                 return;
             };
-            model::item_patch(&scene, &chain, step.fields)
+            s.canvas_item_patch(&scene, &chain, step.fields)
         };
         self.moves.set(self.moves.get() + 1);
         app.edit(
@@ -904,7 +1329,7 @@ impl Canvas {
         let s = app.session.borrow();
         let Some(scene) = s
             .editing_scene()
-            .and_then(|id| s.setup.as_ref().and_then(|x| model::find_scene(x, &id)))
+            .and_then(|id| s.edited_setup().and_then(|x| model::find_scene(x, &id)))
         else {
             return;
         };
@@ -945,7 +1370,7 @@ impl Canvas {
         let hit = {
             let s = app.session.borrow();
             s.editing_scene()
-                .and_then(|id| s.setup.as_ref().and_then(|x| model::find_scene(x, &id)))
+                .and_then(|id| s.edited_setup().and_then(|x| model::find_scene(x, &id)))
                 .and_then(|scene| {
                     topmost(scene, s.selection.as_ref().map(|x| x.path.as_str()), x, y)
                 })
@@ -1312,7 +1737,7 @@ impl Area for Canvas {
                             app.canvas.draw_picture(&window);
                         }
                         // The window's layout may have moved the monitors.
-                        for cell in [&app.canvas.preview, &app.canvas.program] {
+                        for cell in [&app.canvas.preview, &app.canvas.program, &app.canvas.extra] {
                             if let Ok(mut preview) = cell.try_borrow_mut()
                                 && let Some(preview) = preview.as_mut()
                             {
@@ -1339,7 +1764,7 @@ impl Area for Canvas {
         if changed.any(Changed::LINK)
             && app.session.borrow().link != Some(crate::daemon::Link::Connected)
         {
-            *self.shown_layout.borrow_mut() = (0, String::new());
+            *self.shown_layout.borrow_mut() = (0, String::new(), CanvasId::Main);
             if let Ok(mut preview) = self.preview.try_borrow_mut()
                 && let Some(preview) = preview.as_mut()
             {
@@ -1358,29 +1783,35 @@ impl Area for Canvas {
         if changed.any(Changed::SETUP) {
             self.update_fps(app);
         }
+        if changed.any(
+            Changed::SETUP | Changed::SCENES | Changed::STATUS | Changed::STREAM | Changed::BUSY,
+        ) {
+            self.show_extra(app, window);
+        }
         if changed.any(Changed::SETUP | Changed::SCENES) {
             let canvas = window.global::<CanvasArea>();
             let s = app.session.borrow();
-            let name = |id: &Option<String>| {
-                id.as_deref()
-                    .and_then(|id| model::find_scene(s.setup.as_ref()?, id))
+            // The canvas whose scenes are switched (an extra one's own
+            // while editing it, #86).
+            let name = |id: Option<&String>| {
+                id.and_then(|id| model::find_scene(s.setup.as_ref()?, id))
                     .map(|scene| model::scene_name(scene).to_string())
                     .unwrap_or_default()
             };
             let no_scenes = s.setup.as_ref().is_none_or(|x| x.scenes.is_empty());
             let program_empty = if no_scenes {
                 "Add a scene with + under Scenes."
-            } else if name(&s.scene).is_empty() {
+            } else if name(s.on_air()).is_empty() {
                 "Nothing on air."
             } else {
                 ""
             };
-            canvas.set_program_name(name(&s.scene).into());
-            canvas.set_preview_name(name(&s.preview).into());
+            canvas.set_program_name(name(s.on_air()).into());
+            canvas.set_preview_name(name(s.staged()).into());
             canvas.set_program_empty_text(program_empty.into());
             canvas.set_empty_text(
                 if s.studio {
-                    if name(&s.preview).is_empty() {
+                    if name(s.staged()).is_empty() {
                         "Click a scene to put it in preview."
                     } else {
                         ""
@@ -1417,11 +1848,13 @@ impl Area for Canvas {
                         .checked(canvas),
                 )
             }
+            "viewer:extra" | super::projectors::EXTRA_MONITOR => Some(self.extra_menu(app)),
             "viewer:view" => Some(
                 MenuBuilder::new()
                     .item("studio_mode", "Studio Mode")
                     .hint("⇧⌘S")
                     .checked(ui.get_studio())
+                    .submenu("Canvases", self.extra_menu(app))
                     .separator()
                     .item("source_toolbar", "Source Toolbar")
                     .checked(ui.get_show_source_toolbar())
@@ -1453,7 +1886,44 @@ impl Area for Canvas {
         if id.starts_with("nudge:") {
             self.worked(app);
         }
-        false
+        match id {
+            "extra_preview" => {
+                let shown = app
+                    .window()
+                    .is_some_and(|w| w.global::<Ui>().get_show_extra());
+                self.set_show_extra(app, !shown);
+            }
+            "edit_canvas_main" => self.set_edit_extra(app, false),
+            "edit_canvas_extra" => self.set_edit_extra(app, true),
+            "extra_record" => self.toggle_extra_record(app),
+            "extra_main_layout" => self.use_main_layout(app),
+            "extra_stream" => self.toggle_extra_stream(app),
+            "extra_replay" | "extra_replay_save" => {
+                let canvas = app.session.borrow().extra_canvas();
+                if let Some(canvas) = canvas {
+                    if id == "extra_replay" {
+                        super::controls::toggle_replay(app, canvas);
+                    } else {
+                        super::controls::save_replay(app, canvas);
+                    }
+                }
+            }
+            "extra_settings" => {
+                let canvas = app.session.borrow().extra_canvas();
+                match canvas {
+                    Some(canvas) => app.open_dialog("settings", &format!("video@{canvas}")),
+                    None => app.open_dialog("settings", "video"),
+                }
+            }
+            other => match other
+                .strip_prefix("extra_show:")
+                .and_then(|id| CanvasId::parse(id).ok())
+            {
+                Some(canvas) => self.choose_extra(app, canvas, false),
+                None => return false,
+            },
+        }
+        true
     }
 
     fn state(
@@ -1531,6 +2001,94 @@ impl Area for Canvas {
                     )),
                 }
             }),
+            // Give the live (throwaway) engine's setup a vertical canvas
+            // (on, the default) or take it away.
+            "vertical-canvas" => Some(match arg {
+                "" | "on" => {
+                    app.edit(
+                        json!({ "vertical": { "width": 1080, "height": 1920, "follow_main": true } }),
+                        EditOptions::default(),
+                    );
+                    Ok(())
+                }
+                "off" => {
+                    app.edit(json!({ "vertical": null }), EditOptions::default());
+                    Ok(())
+                }
+                _ => Err(anyhow::anyhow!(
+                    "vertical-canvas takes on or off, not {arg:?}"
+                )),
+            }),
+            // Give the live engine's setup these `[[canvases]]` (ID or
+            // ID=WxH, 1080×1920 by default), or none.
+            "extra-canvases" => Some(if arg == "off" {
+                app.edit(json!({ "canvases": [] }), EditOptions::default());
+                Ok(())
+            } else {
+                let mut list = Vec::new();
+                for entry in arg.split(',').filter(|e| !e.is_empty()) {
+                    let (id, size) = entry.split_once('=').unwrap_or((entry, "1080x1920"));
+                    let size = size
+                        .split_once('x')
+                        .and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?)));
+                    let (Some((width, height)), Ok(_)) = (size, CanvasId::parse(id)) else {
+                        return Some(Err(anyhow::anyhow!(
+                            "extra-canvases takes ID[=WxH],… or off, not {arg:?}"
+                        )));
+                    };
+                    let mut name: Vec<char> = id.replace('-', " ").chars().collect();
+                    if let Some(first) = name.first_mut() {
+                        *first = first.to_ascii_uppercase();
+                    }
+                    let name: String = name.into_iter().collect();
+                    list.push(json!({
+                        "id": id, "name": name, "width": width, "height": height,
+                        "follow_main": true,
+                    }));
+                }
+                app.edit(json!({ "canvases": list }), EditOptions::default());
+                Ok(())
+            }),
+            "extra-canvas" => Some(match CanvasId::parse(arg) {
+                Ok(canvas) if !canvas.is_main() => {
+                    self.choose_extra(app, canvas, false);
+                    Ok(())
+                }
+                _ => Err(anyhow::anyhow!(
+                    "extra-canvas takes an extra canvas's id, not {arg:?}"
+                )),
+            }),
+            "vertical-preview" => Some(match arg {
+                "on" | "off" => {
+                    self.set_show_extra(app, arg == "on");
+                    Ok(())
+                }
+                _ => Err(anyhow::anyhow!(
+                    "vertical-preview takes on or off, not {arg:?}"
+                )),
+            }),
+            "vertical-layout" => Some(match arg {
+                "wide" | "compact" => {
+                    window.global::<Ui>().set_extra_layout(arg.into());
+                    Ok(())
+                }
+                _ => Err(anyhow::anyhow!(
+                    "vertical-layout takes wide or compact, not {arg:?}"
+                )),
+            }),
+            "edit-canvas" => Some(match CanvasId::parse(arg) {
+                Ok(CanvasId::Main) => {
+                    self.set_edit_extra(app, false);
+                    Ok(())
+                }
+                Ok(canvas) => {
+                    self.choose_extra(app, canvas, true);
+                    Ok(())
+                }
+                _ => Err(anyhow::anyhow!(
+                    "edit-canvas takes main, vertical or an extra canvas's id, not {arg:?}"
+                )),
+            }),
             "preview-scale" => Some(match arg {
                 "window" | "canvas" => {
                     window.global::<Ui>().set_preview_scale(arg.into());
@@ -1543,6 +2101,58 @@ impl Area for Canvas {
             _ => None,
         }
     }
+}
+
+/// The scene being edited, if it has an arrangement of its own for extra
+/// canvas `canvas`: its id and name.
+fn own_layout(s: &crate::session::Session, canvas: CanvasId) -> Option<(String, String)> {
+    let id = s.editing_scene()?;
+    let scene = model::find_scene(s.setup.as_ref()?, &id)?;
+    scene
+        .arrangement(canvas)
+        .is_some()
+        .then(|| (id.clone(), model::scene_name(scene).to_string()))
+}
+
+/// Whether the next recording writes extra canvas `canvas`'s program too.
+fn records(s: &crate::session::Session, canvas: CanvasId) -> bool {
+    s.setup
+        .as_ref()
+        .and_then(|x| x.extra_canvas(canvas))
+        .and_then(|v| v.recording.as_ref())
+        .is_some_and(|r| r.enabled)
+}
+
+/// Why extra canvas `canvas`'s program stopped, after a failure contained
+/// to it (#96).
+pub(crate) fn stopped(s: &crate::session::Session, canvas: CanvasId) -> Option<&str> {
+    s.status
+        .as_ref()
+        .and_then(|x| x.engine.as_ref())
+        .and_then(|e| e.canvases.iter().find(|c| c.id == canvas))
+        .and_then(|v| v.stopped.as_deref())
+}
+
+/// Recording, or starting or stopping it.
+fn recording(s: &crate::session::Session) -> bool {
+    s.busy_record
+        || s.status
+            .as_ref()
+            .is_some_and(|x| x.state == EngineState::Recording)
+}
+
+/// Extra canvas `canvas`'s stream: its destination streaming (or trying
+/// to), else its first.
+fn canvas_stream(s: &crate::session::Session, canvas: CanvasId) -> Option<&StreamStatus> {
+    let streams = if canvas.is_vertical() {
+        &s.vertical_streams
+    } else {
+        s.canvases
+            .iter()
+            .find(|c| c.id == canvas)
+            .map(|c| &c.streams)?
+    };
+    streams.iter().find(|x| x.is_active()).or(streams.first())
 }
 
 /// Every item's box in scene `scene`, by path.

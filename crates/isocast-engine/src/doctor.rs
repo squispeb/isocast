@@ -37,16 +37,30 @@ pub fn doctor<P: Platform>(
     let uses = |f: fn(&SourceKind) -> bool| kinds.iter().any(|kind| f(kind));
     match platform.permissions() {
         Ok(report) => {
+            // System and app audio use system audio recording where it's
+            // granted, else screen recording; neither alone is required.
             let screen = uses(|k| {
                 matches!(
                     k,
-                    SourceKind::Display(_)
-                        | SourceKind::Window(_)
-                        | SourceKind::Application(_)
-                        | SourceKind::ApplicationAudio(_)
-                        | SourceKind::SystemAudio(_)
+                    SourceKind::Display(_) | SourceKind::Window(_) | SourceKind::Application(_)
                 )
             });
+            let played = uses(|k| {
+                matches!(
+                    k,
+                    SourceKind::ApplicationAudio(_) | SourceKind::SystemAudio(_)
+                )
+            });
+            // Unknown counts: recording tries it rather than being blocked.
+            let either = |kind| {
+                matches!(
+                    report.permissions.get(kind),
+                    Permission::Granted | Permission::Unknown
+                )
+            };
+            let played_missing = played
+                && !either(PermissionKind::ScreenRecording)
+                && !either(PermissionKind::SystemAudio);
             let camera = uses(|k| matches!(k, SourceKind::Camera(_)));
             let microphone = uses(|k| matches!(k, SourceKind::Microphone(_)));
             for detail in &report.details {
@@ -54,6 +68,7 @@ pub fn doctor<P: Platform>(
                     PermissionKind::ScreenRecording => screen,
                     PermissionKind::Camera => camera,
                     PermissionKind::Microphone => microphone,
+                    PermissionKind::SystemAudio => played_missing,
                 };
                 let name = format!("permission: {}", detail.permission.label());
                 let fix = detail.next_step.as_deref();
@@ -74,6 +89,14 @@ pub fn doctor<P: Platform>(
                                 "not asked yet; the system asks the first time it is needed".into()
                             }
                         },
+                        fix,
+                    ),
+                    // Never a problem: recording still tries it.
+                    (Permission::Unknown, _) => check(
+                        &name,
+                        CheckStatus::Warning,
+                        "unknown; it can't be checked without using it, so recording tries it"
+                            .into(),
                         fix,
                     ),
                     (other, true) => check(
@@ -97,6 +120,20 @@ pub fn doctor<P: Platform>(
             format!("could not check permissions: {err:#}"),
             None,
         )),
+    }
+
+    if let Some(budget) = platform.frame_budget() {
+        let invariant = budget["invariant"].as_bool() == Some(true);
+        let refused = budget["refused"]
+            .as_array()
+            .is_some_and(|counts| counts.iter().any(|n| n.as_u64().unwrap_or(0) != 0));
+        checks.push(check(
+            "frame budget",
+            if !invariant { CheckStatus::Problem } else if refused { CheckStatus::Warning } else { CheckStatus::Ok },
+            format!("distinct-buffer invariant {}; base reserves: production {}, recording {}, auxiliary {}, composition {}; refusals {} (since daemon start)",
+                if invariant { "holds" } else { "FAILED" }, budget["production_reserve"], budget["recording_reserve"], budget["auxiliary_limit"], budget["composition_reserve"], budget["refused"]),
+            refused.then_some("reduce auxiliary viewers/outputs; status.diagnostics.frame_budget identifies the exhausted domain"),
+        ));
     }
 
     // Hardware encoders. The names are the platform's own — macOS lists
@@ -181,6 +218,8 @@ pub fn doctor<P: Platform>(
             Some("pick a codec listed under hardware encoders"),
         ));
     }
+    // The daemon adds encoder capacity from the same profile-aware method
+    // as `capacity` and `setup check` (the profile belongs to the daemon).
 
     // Every source the recording uses, resolved to a device: ISO files
     // and their audio, and the program's audio (a recording won't start
@@ -194,7 +233,7 @@ pub fn doctor<P: Platform>(
         needed.extend(
             iso.sources
                 .iter()
-                .chain(iso.audio.iter().flatten())
+                .chain(iso.listed_audio())
                 .map(String::as_str),
         );
     }
@@ -298,6 +337,7 @@ pub fn doctor<P: Platform>(
                 encoder: encoder.clone(),
             },
             audio,
+            created: std::time::SystemTime::now(),
         })
     };
     let mut rate = 0.0;

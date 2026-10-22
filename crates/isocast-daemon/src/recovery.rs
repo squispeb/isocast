@@ -1,13 +1,12 @@
-//! Failure boundaries and orderly shutdown after poisoned shared state.
+//! Failure boundaries and orderly shutdown after broken shared state.
 use crate::Daemon;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-use crate::HostPlatform;
 use isocast_protocol::api::{Event, socket_path};
 use std::path::PathBuf;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+
 use std::time::{Duration, Instant};
 
 impl Daemon {
@@ -24,7 +23,10 @@ impl Daemon {
             "worker panic contained",
             serde_json::json!({"error":message}),
         );
-        if self.state.is_poisoned() {
+        // Only a panic that cut a change to the control state short leaves
+        // it possibly inconsistent; one that only read it (housekeeping)
+        // leaves recordings and the stream running.
+        if self.state.is_broken() {
             self.emergency_stop(message);
         } else {
             self.publish(Event::Warning { message });
@@ -32,7 +34,7 @@ impl Daemon {
     }
 
     /// Never unwind through the recorder's ownership. Extract only stop
-    /// handles from poisoned state, finalize outside it, and then terminate.
+    /// handles from broken state, finalize outside it, and then terminate.
     pub(crate) fn emergency_stop(self: &Arc<Self>, why: String) {
         if self.emergency.swap(true, Ordering::SeqCst) {
             return;
@@ -50,7 +52,7 @@ impl Daemon {
                         "emergency finalization timed out; durable fragments retained",
                         serde_json::Value::Null,
                     );
-                    // Do not run possibly poisoned destructors or manufacture
+                    // Do not run destructors of broken state or manufacture
                     // SIGABRT. No clean marker: startup will repair manifests.
                     std::process::exit(70);
                 }
@@ -62,20 +64,22 @@ impl Daemon {
                 serde_json::json!({"reason":why}),
             );
             let (id, stream, engine) = {
-                let mut state = daemon.state.lock().unwrap_or_else(|p| p.into_inner());
+                let mut state = daemon.state.lock();
                 let id = state.session.as_ref().map(|s| {
                     s.stop.store(true, Ordering::SeqCst);
                     s.id
                 });
-                (id, state.stream.take(), state.engine.clone())
+                (id, std::mem::take(&mut state.streams), state.engine.clone())
             };
-            // Stop the stream as well, while its sources still run.
-            if let Some(stream) = stream {
-                let _ = isocast_diagnostics::contain("emergency stream stop", || stream.stop());
+            // Stop the streams as well, while their sources still run.
+            for (_, output) in stream {
+                if let crate::streams::Output::Running(stream) = output {
+                    let _ = isocast_diagnostics::contain("emergency stream stop", || stream.stop());
+                }
             }
             let deadline = Instant::now() + Duration::from_secs(9);
             let report = loop {
-                let state = daemon.state.lock().unwrap_or_else(|p| p.into_inner());
+                let state = daemon.state.read();
                 if id.is_none_or(|id| state.ended_session >= id) {
                     break state.last.clone();
                 }
@@ -113,25 +117,18 @@ impl Daemon {
     /// The recordings folders recordings were made in lately (newest
     /// last), as `remember_recording_folder` keeps them.
     pub(crate) fn remembered_recording_folders(&self) -> Vec<PathBuf> {
-        let path = isocast_protocol::api::setup_path().with_extension("recording-folders.json");
-        std::fs::read(path)
-            .ok()
-            .and_then(|s| serde_json::from_slice::<Vec<PathBuf>>(&s).ok())
-            .unwrap_or_default()
+        isocast_protocol::project::remembered_roots()
     }
 
+    /// Remember a recordings folder (a failure is logged: the folder's
+    /// projects are then listed only while it is the setup's).
     pub(crate) fn remember_recording_folder(&self, folder: &std::path::Path) {
-        let path = isocast_protocol::api::setup_path().with_extension("recording-folders.json");
-        let mut folders = std::fs::read(&path)
-            .ok()
-            .and_then(|s| serde_json::from_slice::<Vec<PathBuf>>(&s).ok())
-            .unwrap_or_default();
-        folders.retain(|p| p != folder);
-        folders.push(folder.to_owned());
-        if folders.len() > 20 {
-            folders.drain(..folders.len() - 20);
+        if let Err(err) = isocast_protocol::project::remember_root(folder) {
+            isocast_diagnostics::diagnostic!("warn";
+                "isocastd: could not remember the recordings folder {}: {err}",
+                folder.display()
+            );
         }
-        let _ = std::fs::write(path, serde_json::to_vec(&folders).unwrap_or_default());
     }
 
     pub(crate) fn recover_recordings(&self) {
@@ -143,28 +140,48 @@ impl Daemon {
             .collect();
         folders.sort();
         folders.dedup();
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        let mut recovered: Vec<isocast_protocol::manifest::InterruptedRecording> = folders
+        let mut recovered = folders
             .iter()
-            .flat_map(|p| isocast_engine::record::recover_interrupted(&HostPlatform, p))
+            .flat_map(|p| isocast_engine::record::recover_interrupted(crate::platform::native(), p))
             .collect::<Vec<_>>();
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        let mut recovered: Vec<isocast_protocol::manifest::InterruptedRecording> = Vec::new();
         recovered.sort_by(|a, b| b.recording.started_at.cmp(&a.recording.started_at));
         recovered.truncate(20);
         for take in recovered.iter().filter(|r| r.newly_detected) {
+            #[cfg(windows)]
             self.publish(Event::Warning {
                 message: format!(
-                    "recording interrupted: {}; recoverable duration unknown; inspect status.interrupted or bug_report",
+                    "recording recovery inspected {}; see the manifest and status.interrupted for each file's verified media, unknown counts and any persistence errors",
                     take.manifest.display(),
                 ),
             });
+            #[cfg(not(windows))]
+            {
+                // Files a crash-safe writer left were finished from their
+                // fragments just now; the manifest's errors say what each holds.
+                let finished = take.recording.errors.iter().any(|e| {
+                    e.contains("crash-safe fragments that reached the disk")
+                        || e.contains("completed at launch")
+                });
+                self.publish(Event::Warning {
+                message: if finished {
+                    format!(
+                        "recording interrupted: {}; its files were finished from what reached the disk (see the manifest's errors and status.interrupted)",
+                        take.manifest.display(),
+                    )
+                } else {
+                    format!(
+                        "recording interrupted: {}; recoverable duration unknown; inspect status.interrupted or bug_report",
+                        take.manifest.display(),
+                    )
+                },
+            });
+            }
         }
-        *self.interrupted_unnoted.lock().unwrap() = recovered
+        *self.interrupted_unnoted.lock() = recovered
             .iter()
             .filter(|r| r.newly_detected)
             .map(|take| take.manifest.clone())
             .collect();
-        *self.interrupted.lock().unwrap() = recovered;
+        *self.interrupted.lock() = recovered;
     }
 }

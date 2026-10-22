@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use isocast_protocol::api::{Candidate, Capacity, TunedStream, Tuning, Variant};
 use isocast_protocol::change::merge_patch;
-use isocast_protocol::{Codec, Encoder, EncoderQuality, PROGRAM, QualityPreset, Setup, SourceKind};
+use isocast_protocol::{
+    CanvasId, Codec, Encoder, EncoderQuality, PROGRAM, QualityPreset, Setup, SourceKind,
+};
 use serde_json::{Value, json};
 
 use crate::capacity::{self, Fix, Measurement, Memory, VideoLoad, Workload};
@@ -43,8 +45,10 @@ const MAX_VARIANTS: usize = 8;
 const HOPELESS: f64 = 0.9;
 /// How far frames' windows into the texture shift.
 const TEXTURE_MARGIN: usize = 64;
-/// Distinct frames each stream cycles through.
-const CYCLE: usize = 16;
+/// Distinct frames each stream cycles through. Each one holds a
+/// production permit for the whole benchmark, so this stays under the frame
+/// budget's production reserve (8 per pool), with room for the encoder.
+const CYCLE: usize = 6;
 /// The program file sizes tried, by their short side, when the setup
 /// doesn't fit.
 const PROGRAM_SIDES: [u32; 3] = [1440, 1080, 720];
@@ -100,6 +104,9 @@ pub fn tune<P: Platform>(
     std::fs::create_dir_all(&folder)
         .with_context(|| format!("could not create {}", folder.display()))?;
     let scratch = folder.join(".isocast-tune");
+    // Files an earlier run left behind (it was killed or panicked) would
+    // fail every benchmark that writes to the same name.
+    let _ = std::fs::remove_dir_all(&scratch);
     std::fs::create_dir_all(&scratch)?;
     let tuner = Tuner {
         platform,
@@ -176,6 +183,7 @@ impl Load {
                 encoder: self.encoder.clone(),
             },
             audio: Vec::new(),
+            created: std::time::SystemTime::now(),
         }
     }
 
@@ -221,7 +229,8 @@ fn estimate(loads: &[Load]) -> f64 {
 type Formats = HashMap<(String, u32), (u32, u32, u32)>;
 
 /// The files' video: each ISO source at its device's format, then the
-/// program at its file's size.
+/// program at its file's size, then the vertical program (if a vertical
+/// canvas records) at its own.
 fn setup_loads<P: Platform>(
     platform: &P,
     setup: &Setup,
@@ -265,6 +274,27 @@ fn setup_loads<P: Platform>(
             input: (setup.canvas.width, setup.canvas.height),
             encoder: program.encoder.clone(),
         });
+    }
+    // The vertical program too, drawn at the vertical canvas's size and
+    // rate.
+    for canvas in setup.extra_canvas_ids() {
+        let Some(vertical) = setup.for_canvas(canvas) else {
+            continue;
+        };
+        let program = &vertical.recording.program;
+        if program.enabled {
+            let (width, height) = program.size(&vertical.canvas);
+            loads.push(Load {
+                stream: TunedStream {
+                    source: canvas.program().to_string(),
+                    width,
+                    height,
+                    fps: vertical.canvas.fps,
+                },
+                input: (vertical.canvas.width, vertical.canvas.height),
+                encoder: program.encoder.clone(),
+            });
+        }
     }
     Ok(loads)
 }
@@ -556,7 +586,13 @@ impl<P: Platform> Tuner<'_, P> {
         let disk_before = space::write_speed(folder)?;
         self.free = self.platform.volume(folder)?.free_bytes;
         let current = setup.recording.iso.encoder.clone();
-        let has_iso = loads.iter().any(|l| l.stream.source != PROGRAM);
+        let programs: Vec<String> = setup
+            .canvas_ids()
+            .into_iter()
+            .map(CanvasId::program)
+            .collect();
+        let program = |source: &str| programs.iter().any(|p| p == source);
+        let has_iso = loads.iter().any(|l| !program(&l.stream.source));
         let encoders = if has_iso {
             iso_encoders(&current)
         } else {
@@ -567,7 +603,7 @@ impl<P: Platform> Tuner<'_, P> {
             loads
                 .iter()
                 .map(|load| match load.stream.source.as_str() {
-                    PROGRAM => load.clone(),
+                    source if program(source) => load.clone(),
                     _ => Load {
                         encoder: encoder.clone(),
                         ..load.clone()
@@ -956,8 +992,23 @@ fn benchmark<P: Platform>(platform: &P, loads: &[Load], scratch: &Path) -> Resul
 /// Encode one stream of moving, hard-to-compress frames of `input` size
 /// (scaled to the file's, if it differs). Returns how long the timed part
 /// took (after the warm-up, until the encoder took its last frame; frames
-/// in flight cancel out at both ends), and the file's size.
+/// in flight cancel out at both ends), and the file's size. A failed stream
+/// removes its file, which would otherwise make the next candidate's fail
+/// with "File exists".
 fn encode_stream<P: Platform>(
+    platform: &P,
+    spec: &WriterSpec,
+    input: (u32, u32),
+    barrier: &Barrier,
+) -> Result<(Duration, u64)> {
+    let result = encode_stream_to(platform, spec, input, barrier);
+    if result.is_err() {
+        let _ = std::fs::remove_file(&spec.path);
+    }
+    result
+}
+
+fn encode_stream_to<P: Platform>(
     platform: &P,
     spec: &WriterSpec,
     input: (u32, u32),
@@ -1015,13 +1066,13 @@ const NOISE: u32 = 8;
 
 /// Busy, camera-like content: coloured blocks with fine noise, cut into
 /// shifted windows so every frame moves.
-struct Texture {
+pub(crate) struct Texture {
     width: usize,
     pixels: Vec<u8>,
 }
 
 impl Texture {
-    fn new(width: usize, height: usize) -> Self {
+    pub(crate) fn new(width: usize, height: usize) -> Self {
         let mut pixels = vec![0u8; width * height * 4];
         let mut x: u32 = 0x9E37_79B9;
         let mut next = move || {
@@ -1049,7 +1100,7 @@ impl Texture {
     }
 
     /// Copy the `width`×`height` window at (`dx`, `dy`) into a BGRA frame.
-    fn copy(
+    pub(crate) fn copy(
         &self,
         dx: usize,
         dy: usize,

@@ -142,7 +142,12 @@ impl Platform for LinuxPlatform {
     /// answers its picker now and keeps the restore token: a take's own
     /// open is bounded to 8 s, which is not long enough to choose a
     /// screen in.
-    fn request_permissions(&self) -> Result<PermissionsReport> {
+    fn request_permissions(&self, only: Option<PermissionKind>) -> Result<PermissionsReport> {
+        // Only the screen has a prompt (the portal's picker); asking for
+        // anything else has nothing to show.
+        if only.is_some_and(|kind| kind != PermissionKind::ScreenRecording) {
+            return system::permissions_report();
+        }
         portal::prepare(true).context(
             "asking the desktop to share a screen (its picker chooses the monitor once; later \
              captures need no prompt)",
@@ -191,6 +196,21 @@ impl Platform for LinuxPlatform {
 
     fn volume(&self, path: &Path) -> Result<Volume> {
         system::volume(path)
+    }
+
+    /// Same device number, same file system: what `volume`'s free space
+    /// is counted on.
+    fn same_volume(&self, left: &Path, right: &Path) -> Result<bool> {
+        use std::os::unix::fs::MetadataExt;
+        Ok(std::fs::metadata(left)?.dev() == std::fs::metadata(right)?.dev())
+    }
+
+    fn process_cpu_seconds(&self) -> Option<f64> {
+        system::process_cpu_seconds()
+    }
+
+    fn system_cpu_seconds(&self) -> Option<f64> {
+        system::system_cpu_seconds()
     }
 
     fn write_latency(&self, probe: &Path) -> Option<std::time::Duration> {
@@ -358,15 +378,26 @@ impl Platform for LinuxPlatform {
         ))
     }
 
-    /// L.3: a microphone through PipeWire (see audio.rs). The stream
-    /// asks for the device's own channel count, which is what the samples
-    /// are interleaved in.
-    fn capture_microphone(&self, device: &str, sink: AudioSink) -> Result<(Self::Capture, u32)> {
+    /// L.3: a microphone through PipeWire (see audio.rs). A one- or
+    /// two-channel device is captured as it is; a larger one, or one
+    /// whose `channels` are picked, is captured whole and only the picked
+    /// inputs (by default 1 + 2) go on, as on macOS.
+    fn capture_microphone(
+        &self,
+        device: &str,
+        channels: Option<&[u32]>,
+        sink: AudioSink,
+    ) -> Result<(Self::Capture, u32)> {
         let microphone = system::find_microphone(device)?;
-        let (audio, channels) = audio::capture(
+        let (request, pick) = system::microphone_channels(&microphone, channels)?;
+        let sink = match &pick {
+            Some(pick) => audio::picking(sink, request as usize, pick.clone()),
+            None => sink,
+        };
+        let (audio, delivered) = audio::capture(
             *self,
             audio::Target::Microphone(microphone.id.clone()),
-            microphone.channels,
+            request,
             sink,
         )
         .with_context(|| {
@@ -375,6 +406,16 @@ impl Platform for LinuxPlatform {
                 microphone.name, microphone.id
             )
         })?;
+        let channels = match &pick {
+            Some(_) if delivered != request => bail!(
+                "microphone {} (id {}) delivered {delivered} channel(s), not the {request} its \
+                 picked inputs are counted in",
+                microphone.name,
+                microphone.id
+            ),
+            Some(pick) => pick.len() as u32,
+            None => delivered,
+        };
         isocast_diagnostics::debug!(
             "microphone: {} ({}): {channels} channel(s)",
             microphone.name,
@@ -392,9 +433,21 @@ impl Platform for LinuxPlatform {
     /// ports (audio.rs), as stereo.
     fn capture_system_audio(
         &self,
+        exclude: &[String],
         sink: AudioSink,
         exclude_own: bool,
     ) -> Result<(Self::Capture, u32)> {
+        // The default output's monitor carries every app's sound mixed,
+        // so leaving apps out needs per-stream links (the per-app step's
+        // way); recording what the setup said to leave out would be worse
+        // than not recording.
+        if !exclude.is_empty() {
+            bail!(
+                "exclude: leaving apps out of system audio is not available on Linux yet (the \
+                 output's monitor carries every app mixed); remove {exclude:?} from the source's \
+                 exclude, or record the apps you want as application audio sources"
+            );
+        }
         let output = system::default_output()?;
         if exclude_own {
             // What this process plays (monitoring) goes through the same

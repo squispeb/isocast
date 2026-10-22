@@ -1,12 +1,13 @@
 //! Live streaming of the program over RTMP or RTMPS.
 //!
-//! A stream taps the live engine's program (one frame per canvas tick, and
-//! the program mix as track 0) and runs on two threads of its own, apart
-//! from any recording:
+//! A stream takes the live engine's program (one frame per canvas tick, and
+//! the program mix as track 0) on two threads, apart from any recording:
 //!
 //! - **encode**: H.264 and AAC through the platform's encoders, interleaved
 //!   by time into the send queue. It never waits on the network, so the
-//!   program and any recording never wait on the stream.
+//!   program and any recording never wait on the stream. The encoder is
+//!   shared with the replay buffer when both ask for the same format (see
+//!   [`encoder`]).
 //! - **send**: connects (Isocast's own RTMP client), sends the queue, and
 //!   reconnects after a drop, resuming with sequence headers and a fresh
 //!   keyframe. When the connection can't keep up, the queue drops video
@@ -16,34 +17,38 @@
 //! replaced (see [`redact`]).
 
 mod amf;
+pub mod encoder;
 pub(crate) mod flv;
-mod queue;
+pub(crate) mod queue;
 mod rtmp;
+pub mod speed;
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::RecvTimeoutError;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use chrono::{Local, SecondsFormat};
+use isocast_protocol::CanvasId;
 use isocast_protocol::stream::ServerUrl;
+use parking_lot::{Condvar, Mutex};
 
 pub use isocast_protocol::stream::{StreamSettings, StreamState, StreamStatus};
 
-use crate::record::{Engine, Packet, ProgramTap};
-use crate::{
-    AudioEncoder, LiveAudioSpec, LiveVideoSpec, Platform, SAMPLE_RATE, Time, VideoEncoder,
-};
+use crate::record::Engine;
+use crate::{AudioEncoder, LiveAudioSpec, LiveVideoSpec, Platform, SAMPLE_RATE, Time};
+use encoder::{EncoderSpec, Sink, Subscription};
 use queue::{Kind, Media, SendQueue};
 
 pub use rtmp::CA_FILE_ENV;
 
-/// The Keychain service stream keys are kept under; the account is
-/// [`StreamSettings::key_account`].
-pub const KEY_SERVICE: &str = "dev.isocast.stream";
+/// The Keychain service every build kept stream keys under up to 0.0.3
+/// (the account is [`StreamSettings::key_account`]). Builds now keep them
+/// under `<app bundle id>.stream` and move a key from here once, when they
+/// may read it (#63).
+pub const LEGACY_KEY_SERVICE: &str = "dev.isocast.stream";
 /// For local testing: a stream key the daemon takes from its environment
 /// instead of the Keychain.
 pub const KEY_ENV: &str = "ISOCAST_STREAM_KEY";
@@ -61,12 +66,10 @@ const STOP_GRACE: Duration = Duration::from_millis(500);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// How often bitrates and counters are worked out.
 const RATE_INTERVAL: Duration = Duration::from_secs(1);
-/// A bounded stall reserve, not a playout delay. At 60 fps the tap carries
-/// 60 pictures plus 100 mix blocks per second: 16 packets covered only
-/// 100 ms, dropping audio as well as video while VideoToolbox stalled.
-/// Consumed immediately when the encoder runs; the frame pool separately
-/// bounds retained pictures, so capture and the compositor never wait.
-const TAP_DEPTH: usize = 96;
+/// Audio's bounded stall reserve, not a playout delay. Video has a separate
+/// eight-picture budget and evicts stale pictures without dropping audio
+/// or pinning the compositor's entire frame pool.
+pub(crate) const TAP_DEPTH: usize = 96;
 /// How long one stream (audio or video) waits for the other before going
 /// out alone.
 const INTERLEAVE_WAIT: Duration = Duration::from_secs(1);
@@ -87,6 +90,152 @@ pub struct StreamSpec {
     pub fps: u32,
 }
 
+impl StreamSpec {
+    /// What the stream's encoder makes.
+    pub fn encoder(&self) -> EncoderSpec {
+        let settings = &self.settings;
+        EncoderSpec {
+            video: LiveVideoSpec {
+                width: self.width,
+                height: self.height,
+                fps: self.fps,
+                bitrate_kbps: settings.video_bitrate_kbps,
+                constant_bitrate: settings.rate_control()
+                    == isocast_protocol::stream::RateControl::Constant,
+                // The engine asks for every keyframe on its grid (see
+                // `encoder`); VideoToolbox's own limit is only a backstop,
+                // at twice the interval. At the interval itself it added
+                // keyframes of its own, a frame or two before the grid's,
+                // whenever frames reached it late.
+                keyframe_interval: 2 * self.fps * settings.keyframe_interval_seconds,
+                low_latency: false,
+            },
+            audio: LiveAudioSpec {
+                channels: CHANNELS,
+                bitrate_kbps: settings.audio_bitrate_kbps,
+            },
+            keyframe_seconds: settings.keyframe_interval_seconds,
+        }
+    }
+
+    /// What a stream of `settings` from `engine`'s canvas sends.
+    pub fn of<P: Platform>(engine: &Engine<P>, settings: StreamSettings) -> Self {
+        let canvas = engine.setup().canvas.clone();
+        let (width, height) = settings.output_size((canvas.width, canvas.height));
+        Self {
+            settings,
+            width,
+            height,
+            fps: canvas.fps,
+        }
+    }
+
+    pub fn of_canvas<P: Platform>(
+        engine: &Engine<P>,
+        canvas: CanvasId,
+        settings: StreamSettings,
+    ) -> Result<Self> {
+        if canvas == CanvasId::Main {
+            return Ok(Self::of(engine, settings));
+        }
+        let setup = engine.setup();
+        let canvas = setup
+            .canvas_of(canvas)
+            .ok_or_else(|| anyhow::anyhow!("{}", crate::record::canvas_off(canvas)))?;
+        let (width, height) = settings.output_size((canvas.width, canvas.height));
+        Ok(Self {
+            settings,
+            width,
+            height,
+            fps: canvas.fps,
+        })
+    }
+}
+
+/// Place the encoders of `setup`'s enabled stream destinations that don't
+/// share the main destination's (their own bitrate or size), before a
+/// recording's writers start: one starting mid-recording then joins a
+/// placed hardware session instead of stalling the program (#68, #73).
+/// The main destination's is placed by the recording itself. A failure
+/// warns; the recording goes on.
+pub(crate) fn warm_destinations<P: Platform>(
+    engine: &Engine<P>,
+    setup: &isocast_protocol::Setup,
+    stop: &AtomicBool,
+    warnings: &mut Vec<String>,
+) -> Vec<Subscription> {
+    let Some(stream) = &setup.stream else {
+        return Vec::new();
+    };
+    let main = StreamSpec::of(engine, stream.clone()).encoder();
+    let mut placed: Vec<EncoderSpec> = vec![main];
+    let mut out = Vec::new();
+    for destination in stream.resolve().into_iter().filter(|d| d.enabled) {
+        let spec = StreamSpec::of(engine, destination.settings).encoder();
+        if placed.contains(&spec) {
+            continue;
+        }
+        placed.push(spec);
+        match engine.encoders().warm(engine, &spec, stop) {
+            Ok(subscription) => out.push(subscription),
+            Err(error) => warnings.push(format!(
+                "could not prepare stream destination {}'s encoder before recording: {error:#}",
+                destination.id
+            )),
+        }
+    }
+    out
+}
+
+/// Other canvases' destinations (`[vertical]`'s, `[[canvases]]`') cannot
+/// share a main-canvas encode even at equal dimensions: they contain
+/// different pictures. Place each canvas's own format groups before any
+/// program writer, with the same parking policy as main.
+pub(crate) fn warm_vertical<P: Platform>(
+    engine: &Engine<P>,
+    setup: &isocast_protocol::Setup,
+    stop: &AtomicBool,
+    warnings: &mut Vec<String>,
+) -> Vec<Subscription> {
+    let mut out = Vec::new();
+    for canvas in setup.extra_canvas_ids() {
+        let Some(stream) = setup.stream_of(canvas) else {
+            continue;
+        };
+        let mut placed = Vec::new();
+        for destination in stream.resolve().into_iter().filter(|d| d.enabled) {
+            let result = (|| {
+                let spec = StreamSpec::of_canvas(engine, canvas, destination.settings)?.encoder();
+                if placed.contains(&spec) {
+                    return Ok(None);
+                }
+                placed.push(spec);
+                engine
+                    .canvas_encoders(canvas)?
+                    .warm_canvas(engine, canvas, &spec, stop)
+                    .map(Some)
+            })();
+            match result {
+                Ok(Some(subscription)) => out.push(subscription),
+                Ok(None) => {}
+                Err(error) => warnings.push(match canvas {
+                    CanvasId::Vertical => format!(
+                        "could not prepare vertical stream destination {} before recording: \
+                         {error:#}",
+                        destination.id
+                    ),
+                    other => format!(
+                        "could not prepare canvas {other:?}'s stream destination {} before \
+                         recording: {error:#}",
+                        destination.id
+                    ),
+                }),
+            }
+        }
+    }
+    out
+}
+
 /// Called on the stream's threads whenever its state or bitrate warning changes.
 pub type OnChange = Box<dyn Fn(&StreamStatus) + Send + Sync>;
 
@@ -100,12 +249,14 @@ struct Shared {
     stop: AtomicBool,
     queue: Mutex<SendQueue>,
     queued: Condvar,
-    /// The sender asks the encoder for a keyframe (after connecting and
-    /// restarting the queue, which then starts at that keyframe).
-    want_keyframe: AtomicBool,
+    /// Its place on the program's encoder, until sending ends.
+    subscription: Mutex<Option<Subscription>>,
+    /// Mix chunks the tap lost, once the stream has left the encoder.
+    tap_audio_dropped: AtomicU64,
+    /// The encoder's acknowledged video bitrate, once the stream has left it.
+    video_kbps: AtomicU32,
     /// Frames the video encoder dropped.
     encoder_dropped: AtomicU64,
-    tap_audio_dropped: Arc<AtomicU64>,
     /// Video frames and bytes (protocol included) sent, over every
     /// connection.
     frames_sent: AtomicU64,
@@ -123,25 +274,11 @@ impl Shared {
     fn fail(&self, message: String) {
         self.stop.store(true, Ordering::SeqCst);
         // Only stream-private state is discarded; recording routes are separate.
-        if self.queue.is_poisoned() {
-            *self.queue.lock().unwrap_or_else(|p| p.into_inner()) = SendQueue::default();
-            self.queue.clear_poison();
-        }
-        if self.status.is_poisoned() {
-            self.status.clear_poison();
-        }
-        *self.ended.lock().unwrap_or_else(|p| p.into_inner()) =
-            Some(Ended::Failed(message.clone()));
-        self.ended.clear_poison();
-        if let Some(socket) = self
-            .socket
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .as_ref()
-        {
+        *self.queue.lock() = SendQueue::default();
+        *self.ended.lock() = Some(Ended::Failed(message.clone()));
+        if let Some(socket) = self.socket.lock().as_ref() {
             let _ = socket.shutdown(std::net::Shutdown::Both);
         }
-        self.socket.clear_poison();
         self.queued.notify_all();
         self.set_state(StreamState::Failed, Some(message));
     }
@@ -149,10 +286,47 @@ impl Shared {
         self.stop.load(Ordering::SeqCst)
     }
 
+    /// Ask the encoder for a keyframe; the queue starts at it.
+    fn request_keyframe(&self) {
+        if let Some(subscription) = self.subscription.lock().as_ref() {
+            subscription.request_keyframe();
+        }
+    }
+
+    /// Leave the program's encoder (it stops if nothing else uses it).
+    fn leave_encoder(&self) {
+        let subscription = self.subscription.lock().take();
+        if let Some(subscription) = subscription {
+            self.tap_audio_dropped
+                .store(subscription.tap_audio_dropped(), Ordering::Relaxed);
+            self.video_kbps
+                .store(subscription.video_kbps(), Ordering::Relaxed);
+            // Dropped outside the lock: the last output waits for the
+            // encoder's thread, which may be handing this stream media.
+            drop(subscription);
+        }
+    }
+
+    fn tap_audio_dropped(&self) -> u64 {
+        match self.subscription.lock().as_ref() {
+            Some(subscription) => subscription.tap_audio_dropped(),
+            None => self.tap_audio_dropped.load(Ordering::Relaxed),
+        }
+    }
+
+    /// The video bitrate the shared encoder acknowledged: the settings'
+    /// until the governor retunes it.
+    fn video_kbps(&self) -> u32 {
+        match self.subscription.lock().as_ref() {
+            Some(subscription) => subscription.video_kbps(),
+            None => self.video_kbps.load(Ordering::Relaxed),
+        }
+    }
+
     /// Move to `state`, telling `on_change`.
     fn set_state(&self, state: StreamState, error: Option<String>) {
         let status = {
-            let mut status = self.status.lock().unwrap();
+            let mut status = self.status.lock();
             if status.state == StreamState::Failed
                 && state == StreamState::Offline
                 && error.is_none()
@@ -182,17 +356,18 @@ impl Shared {
 
     /// Bring the counters in `status` up to date.
     fn snapshot(&self, status: &mut StreamStatus) {
-        let queue = self.queue.lock().unwrap();
+        let queue = self.queue.lock();
         let dropped = queue.dropped_frames;
-        status.audio_dropouts =
-            queue.audio_dropouts + self.tap_audio_dropped.load(Ordering::Relaxed);
+        let queue_audio = queue.audio_dropouts;
         drop(queue);
+        status.audio_dropouts = queue_audio + self.tap_audio_dropped();
         // Frames that never reached the encoder (its queue from the program
         // was full, or the program missed them) are counted from the gaps
         // between the frames it got, in `dropped`.
         status.dropped_frames = dropped + self.encoder_dropped.load(Ordering::Relaxed);
         status.frames_sent = self.frames_sent.load(Ordering::Relaxed);
         status.bytes_sent = self.bytes_sent.load(Ordering::Relaxed);
+        status.target_video_kbps = self.video_kbps();
         if status.is_active() {
             status.elapsed_seconds = self.started.elapsed().as_secs_f64();
         }
@@ -201,7 +376,7 @@ impl Shared {
 
 /// Why the encoder stopped.
 #[derive(Debug, Clone)]
-enum Ended {
+pub(crate) enum Ended {
     /// The stream was stopped.
     Stopped,
     /// The program stopped coming (the live engine stopped).
@@ -228,9 +403,21 @@ impl Stream {
     }
     /// Its state and counters now.
     pub fn status(&self) -> StreamStatus {
-        let mut status = self.shared.status.lock().unwrap().clone();
+        let mut status = self.shared.status.lock().clone();
         self.shared.snapshot(&mut status);
         status
+    }
+
+    /// How backed up sending is now, 0 to 1, for the governor: read fresh
+    /// from the queue without taking the peak `status` reports, so the
+    /// status's congestion is unchanged.
+    pub fn governor_congestion(&self) -> f64 {
+        self.shared.queue.lock().congestion()
+    }
+
+    /// Lifecycle probe without cloning strings or gathering full statistics.
+    pub fn governor_state(&self) -> StreamState {
+        self.shared.status.lock().state
     }
 
     /// Stop sending, close the connection and return the final status.
@@ -244,6 +431,7 @@ impl Stream {
         self.shared.queued.notify_all();
         let threads = std::mem::take(&mut self.threads);
         if threads.is_empty() {
+            self.shared.leave_encoder();
             return;
         }
         let (finished, joined) = std::sync::mpsc::channel();
@@ -259,11 +447,12 @@ impl Stream {
             move |why| failed.fail(why),
         );
         if joined.recv_timeout(STOP_GRACE).is_err() {
-            if let Some(socket) = self.shared.socket.lock().unwrap().as_ref() {
+            if let Some(socket) = self.shared.socket.lock().as_ref() {
                 let _ = socket.shutdown(std::net::Shutdown::Both);
             }
             let _ = joined.recv();
         }
+        self.shared.leave_encoder();
     }
 }
 
@@ -273,69 +462,37 @@ impl Drop for Stream {
     }
 }
 
-/// Stream `engine`'s program with `settings`, to the server under `key`.
-/// The engine keeps its canvas while the stream taps it.
+/// Stream `engine`'s program with `settings`, to the server under `key`:
+/// video at the canvas rate, and the mix as audio track 0. The engine
+/// keeps its canvas while the stream taps it. `id` names the destination
+/// in its status (`main` for the `[stream]` section's own).
 pub fn start<P: Platform>(
     engine: &Engine<P>,
+    id: &str,
     settings: StreamSettings,
     key: String,
     on_change: OnChange,
 ) -> Result<Stream> {
-    let canvas = engine.setup().canvas.clone();
-    let (width, height) = settings.output_size((canvas.width, canvas.height));
-    let spec = StreamSpec {
-        settings,
-        width,
-        height,
-        fps: canvas.fps,
-    };
-    run(
-        engine.platform(),
-        spec,
-        key,
-        engine.tap_program(TAP_DEPTH),
-        on_change,
-    )
+    start_canvas(engine, CanvasId::Main, id, settings, key, on_change)
 }
 
-/// Stream the program from `tap`: video at the canvas rate, and the mix
-/// as audio track 0.
-pub(crate) fn run<P: Platform>(
-    platform: &P,
-    spec: StreamSpec,
+pub fn start_canvas<P: Platform>(
+    engine: &Engine<P>,
+    canvas: CanvasId,
+    id: &str,
+    settings: StreamSettings,
     key: String,
-    tap: ProgramTap<P::Frame>,
     on_change: OnChange,
 ) -> Result<Stream> {
+    let spec = StreamSpec::of_canvas(engine, canvas, settings)?;
     let server = spec
         .settings
         .server()
         .map_err(|err| anyhow::anyhow!("{err}"))?;
     let settings = &spec.settings;
-    // The engine asks for every keyframe on its grid (see `encode`);
-    // VideoToolbox's own limit is only a backstop, at twice the interval.
-    // At the interval itself it added keyframes of its own, a frame or two
-    // before the grid's, whenever frames reached it late.
-    let keyframe_interval = 2 * spec.fps * settings.keyframe_interval_seconds;
-    let video = platform
-        .create_video_encoder(&LiveVideoSpec {
-            width: spec.width,
-            height: spec.height,
-            fps: spec.fps,
-            bitrate_kbps: settings.video_bitrate_kbps,
-            constant_bitrate: settings.rate_control()
-                == isocast_protocol::stream::RateControl::Constant,
-            keyframe_interval,
-            low_latency: false,
-        })
-        .context("could not start the stream's H.264 encoder")?;
-    let audio = platform
-        .create_audio_encoder(&LiveAudioSpec {
-            channels: CHANNELS,
-            bitrate_kbps: settings.audio_bitrate_kbps,
-        })
-        .context("could not start the stream's AAC encoder")?;
     let mut status = StreamStatus::offline(settings, true);
+    status.canvas = canvas;
+    status.id = id.to_string();
     status.state = StreamState::Connecting;
     (status.width, status.height, status.fps) = (spec.width, spec.height, spec.fps);
     status.since = Some(now());
@@ -343,9 +500,10 @@ pub(crate) fn run<P: Platform>(
         stop: AtomicBool::new(false),
         queue: Mutex::new(SendQueue::default()),
         queued: Condvar::new(),
-        want_keyframe: AtomicBool::new(false),
+        subscription: Mutex::new(None),
+        tap_audio_dropped: AtomicU64::new(0),
+        video_kbps: AtomicU32::new(settings.video_bitrate_kbps),
         encoder_dropped: AtomicU64::new(0),
-        tap_audio_dropped: tap.missed_audio_chunks.clone(),
         frames_sent: AtomicU64::new(0),
         bytes_sent: AtomicU64::new(0),
         ended: Mutex::new(None),
@@ -354,35 +512,19 @@ pub(crate) fn run<P: Platform>(
         started: Instant::now(),
         on_change,
     });
+    let subscription = engine.canvas_encoders(canvas)?.subscribe_canvas(
+        engine,
+        canvas,
+        &spec.encoder(),
+        "the stream",
+        shared.clone(),
+    )?;
+    *shared.subscription.lock() = Some(subscription);
     (shared.on_change)(&status);
-    // Both threads keep pace with the program, ahead of background work.
-    let encoding = {
-        let shared = shared.clone();
-        let spec = spec.clone();
-        let platform = platform.clone();
-        thread::Builder::new()
-            .name("stream encode".into())
-            .spawn(move || {
-                platform.real_time_thread();
-                let encoded = isocast_diagnostics::contain("stream encoder", || {
-                    encode::<P>(video, audio, tap, &shared, &spec)
-                });
-                let ended = match encoded {
-                    Ok(result) => result.unwrap_or_else(|err| {
-                        Ended::Failed(format!("the stream's encoder failed: {err:#}"))
-                    }),
-                    Err(message) => {
-                        shared.fail(message);
-                        return;
-                    }
-                };
-                *shared.ended.lock().unwrap() = Some(ended);
-                shared.queued.notify_all();
-            })?
-    };
+    // The sender keeps pace with the program, ahead of background work.
     let sending = {
         let shared = shared.clone();
-        let platform = platform.clone();
+        let platform = engine.platform().clone();
         thread::Builder::new()
             .name("stream send".into())
             .spawn(move || {
@@ -392,118 +534,58 @@ pub(crate) fn run<P: Platform>(
                 }) {
                     shared.fail(message);
                 }
-            })?
+                // The encoder stops with the stream, unless another output
+                // uses it.
+                shared.leave_encoder();
+            })
+    };
+    let sending = match sending {
+        Ok(sending) => sending,
+        Err(err) => {
+            shared.leave_encoder();
+            return Err(err.into());
+        }
     };
     Ok(Stream {
         shared,
-        threads: vec![encoding, sending],
+        threads: vec![sending],
     })
 }
 
-/// Encode the program until the stream stops or the program does. Returns
-/// why it ended.
-fn encode<P: Platform>(
-    mut video: P::VideoEncoder,
-    mut audio: P::AudioEncoder,
-    tap: ProgramTap<P::Frame>,
-    shared: &Shared,
-    spec: &StreamSpec,
-) -> Result<Ended> {
-    let frame_ns = 1_000_000_000 / i64::from(spec.fps.max(1));
-    // Keyframes are due on a grid of the frames' times, not every so many
-    // frames, so frames that never reached the stream don't stretch the
-    // interval past what services allow (or leave VideoToolbox to put in
-    // keyframes of its own). Half a frame early allows for rounding.
-    let keyframe_ns = i64::from(spec.settings.keyframe_interval_seconds.max(1)) * 1_000_000_000;
-    let mut last_frame: Option<Time> = None;
-    let mut next_keyframe: Option<i64> = None;
-    // A keyframe the encoder dropped (too many frames in flight) is asked
-    // of the next frame instead.
-    let mut keyframe_missed = false;
-    let mut config: Option<Arc<Vec<u8>>> = None;
-    let mut track = AudioTrack::new(audio.delay());
-    let mut order = Interleaver::default();
-    loop {
-        if shared.stopping() {
-            return Ok(Ended::Stopped);
+impl Sink for Shared {
+    fn missed(&self, frames: u64) {
+        self.queue.lock().dropped(frames);
+    }
+
+    fn encoder_dropped(&self, frames: u64) {
+        self.encoder_dropped.fetch_add(frames, Ordering::Relaxed);
+    }
+
+    fn keyframe_requested(&self, at: Time) {
+        self.queue.lock().start_at(at);
+    }
+
+    fn push(&self, ready: &[Media]) {
+        if self.stopping() {
+            return;
         }
-        match tap.packets.recv_timeout(Duration::from_millis(5)) {
-            Ok(Packet::Video { frame, pts }) => {
-                // Frames come one per canvas tick; any between this and the
-                // last never reached the stream (the tap was full, or the
-                // program missed them), so they count as dropped.
-                if let Some(last) = last_frame.replace(pts) {
-                    let ticks = (pts.as_nanos() - last.as_nanos() + frame_ns / 2) / frame_ns;
-                    if ticks > 1 {
-                        shared.queue.lock().unwrap().dropped(ticks as u64 - 1);
-                    }
-                }
-                let forced = shared.want_keyframe.swap(false, Ordering::SeqCst);
-                if forced {
-                    // A new connection starts with this frame, and so
-                    // does the grid (below): its first interval is whole.
-                    shared.queue.lock().unwrap().start_at(pts);
-                }
-                let t = pts.as_nanos();
-                let due = next_keyframe.is_none_or(|at| t >= at - frame_ns / 2);
-                if forced || due {
-                    // The grid restarts at a forced keyframe (a new
-                    // connection); a late one keeps it.
-                    let mut at = match next_keyframe {
-                        Some(at) if !forced => at,
-                        _ => t,
-                    } + keyframe_ns;
-                    while at - frame_ns / 2 <= t {
-                        at += keyframe_ns;
-                    }
-                    next_keyframe = Some(at);
-                }
-                let keyframe = forced || due || keyframe_missed;
-                let dropped = video.dropped();
-                video.encode(&frame, pts, keyframe)?;
-                keyframe_missed = keyframe && video.dropped() > dropped;
-            }
-            Ok(Packet::Audio { samples, pts, .. }) => {
-                track.add(&samples, pts, &mut audio, &mut order)?;
-            }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => return Ok(Ended::Program),
+        let mut queue = self.queue.lock();
+        for media in ready {
+            queue.push(media.clone());
         }
-        while let Some(frame) = video.receive()? {
-            if let Some(record) = frame
-                .parameter_sets
-                .as_ref()
-                .and_then(flv::avc_decoder_configuration)
-                && config.as_deref() != Some(&record)
-            {
-                config = Some(Arc::new(record));
-            }
-            order.push(Media {
-                ts: frame.dts,
-                kind: Kind::Video {
-                    keyframe: frame.keyframe,
-                },
-                data: frame.data,
-                config: frame.keyframe.then(|| config.clone()).flatten(),
-            });
-        }
-        shared
-            .encoder_dropped
-            .store(video.dropped(), Ordering::Relaxed);
-        let ready = order.release();
-        if !ready.is_empty() {
-            let mut queue = shared.queue.lock().unwrap();
-            for media in ready {
-                queue.push(media);
-            }
-            shared.queued.notify_all();
-        }
+        drop(queue);
+        self.queued.notify_all();
+    }
+
+    fn ended(&self, ended: &Ended) {
+        *self.ended.lock() = Some(ended.clone());
+        self.queued.notify_all();
     }
 }
 
 /// The audio fed to the AAC encoder, kept continuous, and the times of the
 /// frames it makes.
-struct AudioTrack {
+pub(crate) struct AudioTrack {
     /// The time of the first sample.
     start: Option<Time>,
     /// Samples per channel fed so far.
@@ -515,7 +597,7 @@ struct AudioTrack {
 }
 
 impl AudioTrack {
-    fn new(delay: u32) -> Self {
+    pub(crate) fn new(delay: u32) -> Self {
         Self {
             start: None,
             fed: 0,
@@ -526,7 +608,7 @@ impl AudioTrack {
 
     /// Add stereo samples captured at `pts`: small jitter is ignored, gaps
     /// become silence and overlaps are trimmed, like file tracks.
-    fn add<E: AudioEncoder>(
+    pub(crate) fn add<E: AudioEncoder>(
         &mut self,
         samples: &[f32],
         pts: Time,
@@ -582,7 +664,7 @@ impl AudioTrack {
 /// picture, so video waits for audio of the same time (up to
 /// [`INTERLEAVE_WAIT`]).
 #[derive(Default)]
-struct Interleaver {
+pub(crate) struct Interleaver {
     video: VecDeque<Media>,
     audio: VecDeque<Media>,
     /// The newest time seen.
@@ -590,7 +672,7 @@ struct Interleaver {
 }
 
 impl Interleaver {
-    fn push(&mut self, media: Media) {
+    pub(crate) fn push(&mut self, media: Media) {
         self.latest = Some(self.latest.map_or(media.ts, |t| t.max(media.ts)));
         match media.kind {
             Kind::Audio => self.audio.push_back(media),
@@ -599,7 +681,7 @@ impl Interleaver {
     }
 
     /// Everything that can go out now, oldest first.
-    fn release(&mut self) -> Vec<Media> {
+    pub(crate) fn release(&mut self) -> Vec<Media> {
         let mut out = Vec::new();
         let Some(latest) = self.latest else {
             return out;
@@ -649,14 +731,14 @@ fn send(shared: &Shared, spec: &StreamSpec, server: &ServerUrl, key: &str) {
         let error = match result {
             Ok(mut connection) => {
                 if was_live {
-                    shared.status.lock().unwrap().reconnects += 1;
+                    shared.status.lock().reconnects += 1;
                 }
                 was_live = true;
-                shared.queue.lock().unwrap().restart();
-                shared.want_keyframe.store(true, Ordering::SeqCst);
+                shared.queue.lock().restart();
+                shared.request_keyframe();
                 shared.set_state(StreamState::Live, None);
                 let connected = Instant::now();
-                *shared.socket.lock().unwrap() = connection.socket().ok();
+                *shared.socket.lock() = connection.socket().ok();
                 attempts = 0;
                 let result = publish(&mut connection, shared, spec);
                 if connected.elapsed() >= STABLE {
@@ -668,7 +750,7 @@ fn send(shared: &Shared, spec: &StreamSpec, server: &ServerUrl, key: &str) {
                 if result.is_ok() {
                     connection.close(key);
                 }
-                *shared.socket.lock().unwrap() = None;
+                *shared.socket.lock() = None;
                 match result {
                     Ok(()) => break Ok(()),
                     Err(err) if !was_stable && !unreachable && short_lived >= 2 => format!(
@@ -719,7 +801,7 @@ fn send(shared: &Shared, spec: &StreamSpec, server: &ServerUrl, key: &str) {
         let resume = Instant::now() + Duration::from_secs(reconnect.delay_seconds.into());
         while Instant::now() < resume && !shared.stopping() && !program_ended(shared) {
             // Keep the queue from holding stale media meanwhile.
-            shared.queue.lock().unwrap().restart();
+            shared.queue.lock().restart();
             thread::sleep(Duration::from_millis(50));
         }
         if program_ended(shared) {
@@ -728,7 +810,7 @@ fn send(shared: &Shared, spec: &StreamSpec, server: &ServerUrl, key: &str) {
     };
     // The encoder stops with the stream.
     shared.stop.store(true, Ordering::SeqCst);
-    let ended = shared.ended.lock().unwrap().clone();
+    let ended = shared.ended.lock().clone();
     match (outcome, ended) {
         (Err(error), _) => shared.set_state(StreamState::Failed, Some(error)),
         (Ok(()), Some(Ended::Failed(error))) => {
@@ -743,7 +825,7 @@ fn send(shared: &Shared, spec: &StreamSpec, server: &ServerUrl, key: &str) {
 }
 
 fn program_ended(shared: &Shared) -> bool {
-    shared.ended.lock().unwrap().is_some()
+    shared.ended.lock().is_some()
 }
 
 /// Send the queue over `connection` until the stream stops (`Ok`) or the
@@ -754,7 +836,8 @@ fn publish(connection: &mut rtmp::Connection, shared: &Shared, spec: &StreamSpec
         width: spec.width,
         height: spec.height,
         fps: spec.fps,
-        video_kbps: settings.video_bitrate_kbps,
+        // What the encoder makes now; a later retune isn't re-announced.
+        video_kbps: shared.video_kbps(),
         audio_kbps: settings.audio_bitrate_kbps,
         sample_rate: SAMPLE_RATE,
         channels: CHANNELS,
@@ -771,7 +854,7 @@ fn publish(connection: &mut rtmp::Connection, shared: &Shared, spec: &StreamSpec
     let mut counted = connection.bytes_sent;
     loop {
         let media = {
-            let mut queue = shared.queue.lock().unwrap();
+            let mut queue = shared.queue.lock();
             loop {
                 if shared.stopping() {
                     return Ok(());
@@ -782,8 +865,7 @@ fn publish(connection: &mut rtmp::Connection, shared: &Shared, spec: &StreamSpec
                 if queue.is_empty() && program_ended(shared) {
                     return Ok(());
                 }
-                let (next, timeout) = shared.queued.wait_timeout(queue, POLL_INTERVAL).unwrap();
-                queue = next;
+                let timeout = shared.queued.wait_for(&mut queue, POLL_INTERVAL);
                 if timeout.timed_out() {
                     break None;
                 }
@@ -864,8 +946,11 @@ impl Rate {
         let seconds = self.since.elapsed().as_secs_f64();
         let kbps = |bytes: u64| bytes as f64 * 8.0 / seconds / 1000.0;
         let total = shared.bytes_sent.load(Ordering::Relaxed);
-        let congestion = shared.queue.lock().unwrap().take_peak();
-        let mut status = shared.status.lock().unwrap();
+        let congestion = shared.queue.lock().take_peak();
+        let target = shared.video_kbps();
+        let mut status = shared.status.lock();
+        // Overshoot is measured against what the encoder was told.
+        status.target_video_kbps = target;
         status.video_kbps = kbps(self.video);
         status.audio_kbps = kbps(self.audio);
         if let Some(before) = self.total {

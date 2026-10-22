@@ -12,30 +12,28 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
-use std::time::Duration;
 
 use isocast_protocol::api::{
     ApplyParams, ImportObsParams, InitParams, Method, StreamKeyParams, StreamKeyTarget,
 };
 use isocast_protocol::change::{Change, merge_patch};
-use isocast_protocol::devices::{
-    CameraKind, Devices, Permission, PermissionAction, PermissionKind, PermissionsReport,
-};
+use isocast_protocol::devices::{CameraKind, Devices, Permission};
+use isocast_protocol::governor::GovernorSettings;
 use isocast_protocol::init::{InitOptions, Layout};
-use isocast_protocol::stream::{StreamService, StreamState};
-use isocast_protocol::{EncoderQuality, QualityPreset, Setup};
+use isocast_protocol::stream::{MAIN_DESTINATION, StreamService, StreamState, StreamStatus};
+use isocast_protocol::{CanvasId, EncoderQuality, QualityPreset, Setup};
 use serde_json::{Map, Value, json};
 use slint::{ComponentHandle, SharedString};
 
 use super::{Area, Changed};
-use crate::app::{App, sentence};
+use crate::app::App;
 use crate::daemon::{Link, Update};
 use crate::kit::{self, model};
 use crate::platform::{self, Choose};
 use crate::session::EditOptions;
 use crate::{
-    AppWindow, DeviceChoice, DropdownOption, HotkeyGroup, HotkeyRow, IsoChoice, MicRow, NavTab,
-    PermissionRow, ServiceChoice, SettingsArea, ToastKind, Ui,
+    AppWindow, DestinationRow, DeviceChoice, DropdownOption, HotkeyGroup, HotkeyRow, IsoChoice,
+    IsoTrack, MicRow, NavTab, ServiceChoice, SettingsArea, ToastKind, Ui,
 };
 
 /// Snapshot states (`--state NAME[:ARG]`).
@@ -47,6 +45,8 @@ pub const STATES: &[&str] = &[
     "set-number:FIELD=VALUE",
     "set-flag:FIELD=VALUE",
     "choose-service:ID",
+    "destination:ID",
+    "add-destination",
     "iso-source:ID",
     "advanced-quality",
     "connecting",
@@ -103,7 +103,7 @@ const TABS: &[(&str, &str, &str, &str, &str)] = &[
         "General",
         "sun",
         "System",
-        "This setup's name, snapping in the preview, how often the preview draws, and app updates.",
+        "This setup's name, snapping in the preview, how often the preview draws, app updates and permissions.",
     ),
     (
         "hotkeys",
@@ -117,7 +117,7 @@ const TABS: &[(&str, &str, &str, &str, &str)] = &[
         "Advanced",
         "sheet-sliders",
         "System",
-        "What a stream does when its connection drops, and developer mode.",
+        "Automatic quality, what a stream does when its connection drops, and developer mode.",
     ),
 ];
 
@@ -323,6 +323,19 @@ struct Draft {
     notice: String,
     /// Custom and Kick ask for a server before streaming is set up.
     needs_server: String,
+    /// The stream destination open in Stream (`main` or an id in
+    /// `stream.destinations`), and whether one is being added (#73).
+    destination: String,
+    adding: bool,
+    /// Which canvas's streams Stream shows (#96): `[stream]`, or the
+    /// vertical canvas's `[vertical.stream]` (its own destinations and
+    /// Keychain keys).
+    canvas: CanvasId,
+    /// The canvas besides the main one Video › Canvases edits (#84), if
+    /// one was picked; else the first.
+    edit_canvas: Option<CanvasId>,
+    /// Every canvas row is closed (its open one was clicked).
+    canvas_closed: bool,
     applying: bool,
     /// Why the daemon refused the last Apply/OK ("" if it didn't).
     refused: String,
@@ -344,8 +357,6 @@ struct FirstRun {
     folder: String,
     name: String,
     creating: bool,
-    report: Option<PermissionsReport>,
-    asking: bool,
 }
 
 impl Default for FirstRun {
@@ -362,8 +373,6 @@ impl Default for FirstRun {
             folder: "~/Movies/Isocast".into(),
             name: "My setup".into(),
             creating: false,
-            report: None,
-            asking: false,
         }
     }
 }
@@ -371,14 +380,14 @@ impl Default for FirstRun {
 #[derive(Default)]
 pub struct Settings {
     draft: RefCell<Option<Draft>>,
+    /// The draft kept while the permissions step stands in for Settings
+    /// (its Review…), for Settings to open with again.
+    parked: RefCell<Option<Draft>>,
     first_run: RefCell<FirstRun>,
     /// Looking for devices again (Audio, the first run).
     looking: std::cell::Cell<bool>,
     /// Welcome's choice that is working ("obs", "file").
     welcome_busy: RefCell<String>,
-    /// Checks the permissions every few seconds while the first run's
-    /// first step shows (granted in System Settings meanwhile).
-    permissions_timer: slint::Timer,
     /// The Hotkeys page (src/areas/hotkeys.rs).
     pub hotkeys: super::hotkeys::HotkeysPage,
     /// Help › Report a Bug… (src/areas/report.rs).
@@ -473,6 +482,9 @@ impl Area for Settings {
         on!(on_set_iso_source, |app, id, on| app
             .settings
             .set_iso_source(&app, &id, on));
+        on!(on_set_iso_audio, |app, id, audio| app
+            .settings
+            .set_iso_audio(&app, &id, &audio));
         on!(on_set_mic, |app, id, device| {
             if let Some(d) = app.settings.draft.borrow_mut().as_mut() {
                 d.mics.insert(id.into(), device.into());
@@ -492,19 +504,51 @@ impl Area for Settings {
                     .as_mut()
                     .map(|d| std::mem::take(&mut d.needs_server));
                 if let Some(service) = service {
-                    app.settings.change(
-                        &app,
-                        json!({"stream": {"service": service, "server": server}}),
-                    );
+                    let adding = app
+                        .settings
+                        .draft
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|d| d.adding);
+                    if adding {
+                        app.settings.add_destination(&app, &service, Some(&server));
+                    } else {
+                        let patch = app
+                            .settings
+                            .stream_patch(json!({"service": service, "server": server}));
+                        app.settings.change(&app, patch);
+                    }
                 }
             }
         });
         on!(on_server_back, |app| {
             if let Some(d) = app.settings.draft.borrow_mut().as_mut() {
+                if d.needs_server.is_empty() {
+                    d.adding = false;
+                }
                 d.needs_server.clear();
             }
             app.settings.show(&app);
         });
+        on!(on_select_destination, |app, id| {
+            if let Some(d) = app.settings.draft.borrow_mut().as_mut() {
+                d.destination = id.into();
+            }
+            app.settings.show(&app);
+        });
+        on!(on_add_destination, |app| {
+            if let Some(d) = app.settings.draft.borrow_mut().as_mut() {
+                d.adding = true;
+                d.needs_server.clear();
+            }
+            app.settings.show(&app);
+        });
+        on!(on_remove_destination, |app| app
+            .settings
+            .remove_destination(&app));
+        on!(on_set_destination_enabled, |app, id, on| app
+            .settings
+            .set_destination_enabled(&app, &id, on));
         on!(on_save_key, |app, key| app.settings.save_key(&app, &key));
         on!(on_clear_key, |app| app.settings.clear_key(&app));
         on!(on_browse_folder, |app| {
@@ -545,26 +589,6 @@ impl Area for Settings {
             app.settings.show_first_run(&app);
         });
         on!(on_ob_create, |app| app.settings.create_setup(&app));
-        on!(on_ob_check, |app| app.settings.check_permissions(&app));
-        on!(on_ob_ask, |app| app.settings.ask_permissions(&app));
-        on!(on_ob_restart_engine, |app| app
-            .settings
-            .restart_engine(&app));
-        on!(on_ob_open_settings, |app, permission| {
-            let kind = match permission.as_str() {
-                "screen_recording" => PermissionKind::ScreenRecording,
-                "camera" => PermissionKind::Camera,
-                _ => PermissionKind::Microphone,
-            };
-            app.call(
-                Method::OpenPermissionSettings { permission: kind },
-                |app, result| {
-                    if let Err(error) = result {
-                        app.failed("Couldn’t open System Settings", &error);
-                    }
-                },
-            );
-        });
         on!(on_ob_set, |app, field, value| app
             .settings
             .first_run_set(&app, &field, &value));
@@ -600,6 +624,18 @@ impl Area for Settings {
             "hotkeys" => app.open_dialog("settings", "hotkeys"),
             "report_bug" => app.open_dialog("bug-report", ""),
             "check_updates" => crate::update::check_now(),
+            "machine_calibrate" | "machine_cancel" => {
+                let method = if id == "machine_calibrate" {
+                    Method::MachineCalibrate
+                } else {
+                    Method::MachineCancel
+                };
+                app.call(method, |app, result| {
+                    if let Err(error) = result {
+                        app.toast(ToastKind::Error, "Machine calibration", &error.message);
+                    }
+                });
+            }
             "show_recordings" => {
                 let folder = app
                     .session
@@ -632,6 +668,14 @@ impl Area for Settings {
         // "stream:Add your stream key first." opens Stream saying why (or
         // the notice set just before, as Start Streaming does).
         let (tab, notice) = arg.split_once(':').unwrap_or((arg, ""));
+        // "stream-vertical:…": Stream showing the vertical canvas's (#96);
+        // "stream@ID", "video@ID": Stream showing extra canvas ID's, Video
+        // with its row open (#120).
+        let (tab, canvas) = match tab.split_once('@') {
+            Some((tab, id)) => (tab, CanvasId::parse(id).unwrap_or(CanvasId::Main)),
+            None if tab == "stream-vertical" => ("stream", CanvasId::Vertical),
+            None => (tab, CanvasId::Main),
+        };
         let notice = match (notice, tab) {
             ("", "stream") => area.get_notice().to_string(),
             (notice, _) => notice.to_string(),
@@ -641,16 +685,33 @@ impl Area for Settings {
         } else {
             TABS[0].0
         };
-        let prefs = Prefs::read(&window.global::<Ui>());
-        let base = app.session.borrow().setup_json().map(pick);
-        *self.draft.borrow_mut() = base.map(|base| Draft {
-            draft: base.clone(),
-            base,
-            prefs_base: prefs.clone(),
-            prefs,
-            notice,
-            ..Draft::default()
-        });
+        let parked = self.parked.borrow_mut().take();
+        if let Some(parked) = parked {
+            // Back from the permissions step: its edits as they were.
+            *self.draft.borrow_mut() = Some(parked);
+        } else {
+            let prefs = Prefs::read(&window.global::<Ui>());
+            let base = app.session.borrow().setup_json().map(pick);
+            *self.draft.borrow_mut() = base.map(|base| Draft {
+                draft: base.clone(),
+                base,
+                prefs_base: prefs.clone(),
+                prefs,
+                notice,
+                canvas,
+                ..Draft::default()
+            });
+        }
+        if !canvas.is_main()
+            && let Some(d) = self.draft.borrow_mut().as_mut()
+        {
+            if tab == "video" {
+                d.edit_canvas = Some(canvas);
+                d.canvas_closed = false;
+            } else {
+                d.canvas = canvas;
+            }
+        }
         area.set_tab(tab.into());
         area.set_quality_advanced(false);
         self.tab_shown(app, tab);
@@ -698,6 +759,17 @@ impl Area for Settings {
                 }
             }
             "choose-service" => self.choose_service(app, arg),
+            // Stream's destination `arg` open, or the services to add one.
+            "destination" | "add-destination" => {
+                if let Some(d) = self.draft.borrow_mut().as_mut() {
+                    if name == "destination" {
+                        d.destination = arg.to_string();
+                    } else {
+                        d.adding = true;
+                    }
+                }
+                self.show(app);
+            }
             // Settings → Hotkeys with sample bindings (no profile changes),
             // and a row waiting for its keys.
             "hotkeys-sample" => {
@@ -758,6 +830,12 @@ impl Area for Settings {
 impl Settings {
     // ---------- The Settings dialog ----------
 
+    /// Keep the open draft, unsaved edits and all, for the next time
+    /// Settings opens (the permissions step stands in for it a while).
+    pub fn park(&self) {
+        *self.parked.borrow_mut() = self.draft.borrow_mut().take();
+    }
+
     /// Close Settings, dropping its draft and why it opened.
     fn close(&self, app: &Rc<App>) {
         *self.draft.borrow_mut() = None;
@@ -814,16 +892,14 @@ impl Settings {
                 return self.set_prefs(app, |p| p.preview_rate = rate);
             }
             "service" => {
-                let same = self
-                    .draft_value(&["stream", "service"])
-                    .is_some_and(|s| s == value);
+                let open = self.open_destination();
+                let same = open.get("service").is_some_and(|s| s == value);
                 let server = if same {
-                    self.draft_value(&["stream", "server"])
-                        .unwrap_or(Value::Null)
+                    open.get("server").cloned().unwrap_or(Value::Null)
                 } else {
                     Value::Null
                 };
-                json!({"stream": {"service": value, "server": server}})
+                return self.change_destination(app, json!({"service": value, "server": server}));
             }
             "server" => {
                 let server = if trimmed.is_empty() {
@@ -831,17 +907,118 @@ impl Settings {
                 } else {
                     json!(trimmed)
                 };
-                json!({"stream": {"server": server}})
+                return self.change_destination(app, json!({"server": server}));
             }
-            "rate_control" => json!({"stream": {"rate_control": value}}),
+            "destination_bitrate" => {
+                let kbps = if value == "own" {
+                    json!(
+                        self.stream_value(&["video_bitrate_kbps"])
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(6000)
+                    )
+                } else {
+                    Value::Null
+                };
+                return self.change_destination(app, json!({"video_bitrate_kbps": kbps}));
+            }
+            "destination_size" if value == "custom" => {
+                return self.change_destination(app, json!({"width": 1280, "height": 720}));
+            }
+            "destination_size" => {
+                return self.change_destination(app, json!({"width": null, "height": null}));
+            }
+            "canvas_pick" => {
+                if let Some(d) = self.draft.borrow_mut().as_mut() {
+                    // "" closes the open one.
+                    d.edit_canvas = CanvasId::parse(value).ok();
+                    d.canvas_closed = d.edit_canvas.is_none();
+                }
+                return self.show(app);
+            }
+            "canvas_add" => {
+                let Some((patch, canvas)) = self.add_canvas(value) else {
+                    return;
+                };
+                if let Some(d) = self.draft.borrow_mut().as_mut() {
+                    d.edit_canvas = Some(canvas);
+                    d.canvas_closed = false;
+                }
+                patch
+            }
+            "canvas_remove" => {
+                let Ok(canvas) = CanvasId::parse(value) else {
+                    return;
+                };
+                if canvas.is_vertical() {
+                    return self.set_flag(app, "vertical", false);
+                }
+                // Never drops scenes' own layouts for it (the setup would
+                // refuse that): say which.
+                let own: Vec<String> = app
+                    .session
+                    .borrow()
+                    .setup
+                    .as_ref()
+                    .map(|setup| {
+                        setup
+                            .scenes
+                            .iter()
+                            .filter(|scene| scene.arrangement(canvas).is_some())
+                            .map(|scene| format!("“{}”", crate::model::scene_name(scene)))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !own.is_empty() {
+                    if let Some(d) = self.draft.borrow_mut().as_mut() {
+                        d.refused = format!(
+                            "The canvas stays: {} {} a layout of {} own for it. Remove it with \
+                             `isocast canvas remove {canvas}`, which removes those too.",
+                            own.join(", "),
+                            if own.len() == 1 { "has" } else { "have" },
+                            if own.len() == 1 { "its" } else { "their" },
+                        );
+                    }
+                    return self.show(app);
+                }
+                if let Some(d) = self.draft.borrow_mut().as_mut() {
+                    d.refused.clear();
+                    d.edit_canvas = None;
+                }
+                json!({"canvases": [{"id": canvas.as_str(), "remove": true}]})
+            }
+            "canvas_fps" => {
+                let fps = value.parse::<u32>().ok().map_or(Value::Null, Value::from);
+                self.edit_patch(json!({"fps": fps}))
+            }
+            "stream_canvas" => {
+                let canvas = CanvasId::parse(value).unwrap_or(CanvasId::Main);
+                if let Some(d) = self.draft.borrow_mut().as_mut()
+                    && d.canvas != canvas
+                {
+                    d.canvas = canvas;
+                    d.destination = MAIN_DESTINATION.into();
+                    d.adding = false;
+                    d.needs_server.clear();
+                }
+                return self.show(app);
+            }
+            "rate_control" => self.stream_patch(json!({"rate_control": value})),
             "audio_bitrate" => match value.parse::<u32>() {
-                Ok(kbps) => json!({"stream": {"audio_bitrate_kbps": kbps}}),
+                Ok(kbps) => self.stream_patch(json!({"audio_bitrate_kbps": kbps})),
                 Err(_) => return,
             },
             "stream_size" if value == "canvas" => {
-                json!({"stream": {"width": null, "height": null}})
+                self.stream_patch(json!({"width": null, "height": null}))
             }
-            "stream_size" => json!({"stream": {"width": 1280, "height": 720}}),
+            "stream_size" => {
+                // The vertical canvas's own shape, smaller.
+                let (width, height) = if self.stream_canvas() == CanvasId::Vertical {
+                    (720, 1280)
+                } else {
+                    (1280, 720)
+                };
+                self.stream_patch(json!({"width": width, "height": height}))
+            }
             "folder" if !trimmed.is_empty() => json!({"recording": {"folder": trimmed}}),
             "program_codec" | "iso_codec" => {
                 let which = field.trim_end_matches("_codec");
@@ -897,15 +1074,31 @@ impl Settings {
             "snap_distance" => {
                 return self.set_prefs(app, |p| p.distance = whole.clamp(1, 40) as i32);
             }
-            "video_bitrate" => json!({"stream": {"video_bitrate_kbps": whole}}),
-            "keyframe_interval" => json!({"stream": {"keyframe_interval_seconds": whole}}),
-            "stream_width" => json!({"stream": {"width": whole}}),
-            "stream_height" => json!({"stream": {"height": whole}}),
+            "video_bitrate" => self.stream_patch(json!({"video_bitrate_kbps": whole})),
+            "keyframe_interval" => self.stream_patch(json!({"keyframe_interval_seconds": whole})),
+            "destination_bitrate" => {
+                return self.change_destination(app, json!({"video_bitrate_kbps": whole}));
+            }
+            "destination_width" => return self.change_destination(app, json!({"width": whole})),
+            "destination_height" => {
+                return self.change_destination(app, json!({"height": whole}));
+            }
+            "stream_width" => self.stream_patch(json!({"width": whole})),
+            "stream_height" => self.stream_patch(json!({"height": whole})),
             "program_quality" => json!({"recording": {"program": {"encoder": {"quality": whole}}}}),
             "iso_quality" => json!({"recording": {"iso": {"encoder": {"quality": whole}}}}),
             "keep_free" => json!({"recording": {"keep_free_gb": value as f64}}),
+            "replay_seconds" => json!({"recording": {"replay": {"seconds": whole.clamp(
+                i64::from(isocast_protocol::replay::MIN_SECONDS),
+                i64::from(isocast_protocol::replay::MAX_SECONDS),
+            )}}}),
+            "replay_memory" => {
+                json!({"recording": {"replay": {"max_memory_mb": whole.clamp(16, 8192)}}})
+            }
             "canvas_width" => json!({"canvas": {"width": whole}}),
             "canvas_height" => json!({"canvas": {"height": whole}}),
+            "vertical_width" => self.edit_patch(json!({"width": whole})),
+            "vertical_height" => self.edit_patch(json!({"height": whole})),
             "reconnect_delay" => json!({"stream": {"reconnect": {"delay_seconds": whole}}}),
             "reconnect_retries" => json!({"stream": {"reconnect": {"max_retries": whole}}}),
             _ => return,
@@ -917,21 +1110,159 @@ impl Settings {
         let patch = match field {
             "snapping" => return self.set_prefs(app, |p| p.snapping = on),
             "auto_updates" => return self.set_prefs(app, |p| p.auto_updates = on),
-            // Turn off streaming.
-            "stream" if !on => json!({"stream": null}),
+            // Turn off streaming (the shown canvas's).
+            "stream" if !on => self.stream_patch(Value::Null),
             "program" => json!({"recording": {"program": {"enabled": on}}}),
             "iso" => json!({"recording": {"iso": {"enabled": on}}}),
             "iso_filtered" => json!({"recording": {"iso": {"filtered": on}}}),
+            "open_editor" => json!({"recording": {"open_editor": on}}),
             "reconnect" => json!({"stream": {"reconnect": {"enabled": on}}}),
             "developer" => json!({"developer": {"enabled": on}}),
+            // Automatic quality (T.2), and what it must keep ("pin:PATH").
+            "governor" => return self.change_governor(app, |g| g.enabled = on),
+            // The user's own choice to let it skip ISO pictures (off by default).
+            "iso_thinning" => return self.change_governor(app, |g| g.allow_iso_thinning = on),
+            _ if field.starts_with("pin:") => {
+                let pin = field["pin:".len()..].to_string();
+                return self.change_governor(app, |g| {
+                    let pins = &mut g.pins;
+                    pins.retain(|p| *p != pin);
+                    if on {
+                        pins.push(pin);
+                    }
+                });
+            }
+            // The vertical canvas (#86): back as saved, else 1080×1920
+            // following the main canvas's scenes; or none.
+            "vertical" if on => {
+                let saved = self
+                    .draft
+                    .borrow()
+                    .as_ref()
+                    .map(|d| d.base["vertical"].clone())
+                    .filter(Value::is_object);
+                json!({"vertical": saved.unwrap_or_else(|| json!({
+                    "width": 1080, "height": 1920, "follow_main": true,
+                }))})
+            }
+            // Never drops scenes' own vertical layouts with it (the engine
+            // refuses that too): say which, and how to put them back on
+            // the main layout first.
+            "vertical" => {
+                let own: Vec<String> = app
+                    .session
+                    .borrow()
+                    .setup
+                    .as_ref()
+                    .map(|setup| {
+                        setup
+                            .scenes
+                            .iter()
+                            .filter(|scene| scene.vertical.is_some())
+                            .map(|scene| format!("“{}”", crate::model::scene_name(scene)))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !own.is_empty() {
+                    if let Some(d) = self.draft.borrow_mut().as_mut() {
+                        d.refused = format!(
+                            "The vertical canvas stays on: {} {} a vertical layout of {} own. \
+                             To keep nothing you’d lose, put each back on the main layout \
+                             first (View › Canvases › Use Main Layout for This Scene, \
+                             while editing the vertical canvas).",
+                            own.join(", "),
+                            if own.len() == 1 { "has" } else { "have" },
+                            if own.len() == 1 { "its" } else { "their" },
+                        );
+                    }
+                    return self.show(app);
+                }
+                if let Some(d) = self.draft.borrow_mut().as_mut() {
+                    d.refused.clear();
+                }
+                json!({"vertical": null})
+            }
+            "vertical_follow" => self.edit_patch(json!({"follow_main": on})),
+            // Kept when off, with its file name and encoder.
+            "vertical_record" => {
+                let canvas = self.edit_canvas();
+                let filename = isocast_protocol::canvas_filename(canvas);
+                let has = self
+                    .draft
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|d| draft_canvas(&d.draft, canvas)["recording"].is_object());
+                if has || canvas.is_vertical() {
+                    self.edit_patch(json!({"recording": {"enabled": on}}))
+                } else {
+                    self.edit_patch(json!({"recording": {"enabled": on, "filename": filename}}))
+                }
+            }
+            // Back on: the hours it had (a custom `auto_off_hours` too).
             "developer_auto_off" => json!({"developer": {"auto_off_hours": if on {
-                isocast_protocol::developer::DEFAULT_AUTO_OFF_HOURS
+                self.auto_off_hours()
             } else {
                 0
             }}}),
             _ => return,
         };
         self.change(app, patch);
+    }
+
+    /// Change the draft's automatic quality (`governor`, T.2): whether it
+    /// is on, whether the user allows ISO frame thinning, and the field
+    /// paths it must never change (its pins). Back at its default (on, no
+    /// ISO thinning, nothing kept) while the setup has none, it is left
+    /// out again, as the setup omits it, so Apply has nothing to send.
+    fn change_governor(&self, app: &Rc<App>, change: impl FnOnce(&mut GovernorSettings)) {
+        if let Some(d) = self.draft.borrow_mut().as_mut() {
+            let mut governor = governor_settings(&d.draft);
+            change(&mut governor);
+            let default = governor.is_default() && d.base["governor"].is_null();
+            if let Some(map) = d.draft.as_object_mut() {
+                if default {
+                    map.remove("governor");
+                } else {
+                    // As the setup serializes it, so an untouched draft
+                    // matches its base.
+                    let value = serde_json::to_value(&governor).unwrap_or_default();
+                    map.insert("governor".into(), value);
+                }
+            }
+        }
+        self.show(app);
+    }
+
+    /// Developer mode's hours until it turns itself off when the switch is
+    /// on: the draft's, else the applied setting's, else the default (#55).
+    fn auto_off_hours(&self) -> u64 {
+        let guard = self.draft.borrow();
+        let d = guard.as_ref();
+        [d.map(|d| &d.draft), d.map(|d| &d.base)]
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v["developer"]["auto_off_hours"].as_u64())
+            .find(|&hours| hours > 0)
+            .unwrap_or(isocast_protocol::developer::DEFAULT_AUTO_OFF_HOURS.into())
+    }
+
+    /// The live setup with the draft's ISO settings, for the ISO audio
+    /// menus.
+    fn drafted(&self, app: &Rc<App>) -> Option<Setup> {
+        let iso = self.draft_value(&["recording", "iso"])?;
+        draft_setup(app.session.borrow().setup.as_deref(), &iso)
+    }
+
+    /// Video source `source`'s ISO file: back to the other files' audio
+    /// (`default`), or with audio source `audio` added or taken out.
+    fn set_iso_audio(&self, app: &Rc<App>, source: &str, audio: &str) {
+        if let Some(setup) = self.drafted(app) {
+            let list = super::sources::items::toggled_iso_audio(&setup, source, audio);
+            self.change(
+                app,
+                json!({"recording": {"iso": {"source_audio": {source: list}}}}),
+            );
+        }
     }
 
     fn set_iso_source(&self, app: &Rc<App>, id: &str, on: bool) {
@@ -947,13 +1278,260 @@ impl Settings {
     }
 
     fn choose_service(&self, app: &Rc<App>, id: &str) {
+        let adding = self.draft.borrow().as_ref().is_some_and(|d| d.adding);
         if id == "custom" || id == "kick" {
             if let Some(d) = self.draft.borrow_mut().as_mut() {
                 d.needs_server = id.to_string();
             }
             self.show(app);
+        } else if adding {
+            self.add_destination(app, id, None);
         } else {
-            self.change(app, json!({"stream": {"service": id}}));
+            let patch = self.stream_patch(json!({"service": id}));
+            self.change(app, patch);
+        }
+    }
+
+    /// The canvas whose streams Stream shows: the vertical one only while
+    /// the draft has a vertical canvas.
+    /// The canvas Video › Canvases edits: the one picked, if the draft has
+    /// it, else the first extra canvas (main if there is none).
+    fn edit_canvas(&self) -> CanvasId {
+        let guard = self.draft.borrow();
+        let Some(d) = guard.as_ref() else {
+            return CanvasId::Main;
+        };
+        d.edit_canvas
+            .filter(|c| draft_canvas(&d.draft, *c).is_object())
+            .or_else(|| {
+                draft_canvases(&d.draft)
+                    .first()
+                    .and_then(|(id, _)| CanvasId::parse(id).ok())
+            })
+            .unwrap_or(CanvasId::Main)
+    }
+
+    /// A patch making `change` to the edited canvas.
+    fn edit_patch(&self, change: Value) -> Value {
+        let canvas = self.edit_canvas();
+        if canvas.is_main() {
+            return json!({});
+        }
+        canvas_patch(&Value::Null, canvas, change)
+    }
+
+    /// The patch adding a canvas of preset `preset` (`WxH`), and its id:
+    /// the vertical canvas for the first upright one, else a
+    /// `[[canvases]]` entry named after its shape.
+    fn add_canvas(&self, preset: &str) -> Option<(Value, CanvasId)> {
+        let (w, h) = preset.split_once('x')?;
+        let (width, height): (u32, u32) = (w.parse().ok()?, h.parse().ok()?);
+        let guard = self.draft.borrow();
+        let draft = &guard.as_ref()?.draft;
+        if height > width && !draft["vertical"].is_object() {
+            let saved = guard.as_ref()?.base["vertical"].clone();
+            let mut vertical = if saved.is_object() {
+                saved
+            } else {
+                json!({"follow_main": true})
+            };
+            vertical["width"] = width.into();
+            vertical["height"] = height.into();
+            return Some((json!({"vertical": vertical}), CanvasId::Vertical));
+        }
+        let (base, name) = match (width, height) {
+            (w, h) if w == h => ("square", "Square"),
+            (w, h) if h > w && h * 4 == w * 5 => ("portrait", "Portrait 4:5"),
+            (w, h) if h > w => ("shorts", "Vertical"),
+            _ => ("landscape", "Landscape"),
+        };
+        let taken: Vec<String> = draft_canvases(draft)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        let id = (1..)
+            .map(|n| {
+                if n == 1 {
+                    base.to_string()
+                } else {
+                    format!("{base}-{n}")
+                }
+            })
+            .find(|id| !taken.contains(id))?;
+        let canvas = CanvasId::parse(&id).ok()?;
+        Some((
+            json!({"canvases": [{"id": id, "name": name, "width": width, "height": height}]}),
+            canvas,
+        ))
+    }
+
+    fn stream_canvas(&self) -> CanvasId {
+        let guard = self.draft.borrow();
+        match guard.as_ref() {
+            Some(d) if draft_canvas(&d.draft, d.canvas).is_object() => d.canvas,
+            _ => CanvasId::Main,
+        }
+    }
+
+    /// A merge patch setting `fields` in the shown canvas's stream
+    /// settings: `[stream]` or `[vertical.stream]`.
+    fn stream_patch(&self, fields: Value) -> Value {
+        let canvas = self.stream_canvas();
+        if canvas.is_main() {
+            return json!({ "stream": fields });
+        }
+        let guard = self.draft.borrow();
+        let draft = guard.as_ref().map_or(&Value::Null, |d| &d.draft);
+        canvas_patch(draft, canvas, json!({ "stream": fields }))
+    }
+
+    /// The shown canvas's stream settings in the draft, at `path`.
+    fn stream_value(&self, path: &[&str]) -> Option<Value> {
+        let canvas = self.stream_canvas();
+        let guard = self.draft.borrow();
+        let draft = &guard.as_ref()?.draft;
+        let mut at = if canvas.is_main() {
+            &draft["stream"]
+        } else {
+            &draft_canvas(draft, canvas)["stream"]
+        };
+        for key in path {
+            at = at.get(key)?;
+        }
+        (!at.is_null()).then(|| at.clone())
+    }
+
+    /// The open destination, as the draft has it: `[stream]` itself for
+    /// the main one, else its entry in `stream.destinations`.
+    fn open_destination(&self) -> Map<String, Value> {
+        let id = self.open_id();
+        let value = if id == MAIN_DESTINATION {
+            self.stream_value(&[])
+        } else {
+            self.stream_value(&["destinations"]).and_then(|list| {
+                list.as_array()?
+                    .iter()
+                    .find(|d| d["id"] == id.as_str())
+                    .cloned()
+            })
+        };
+        value
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default()
+    }
+
+    /// The open destination's id, if the draft still has it (else main).
+    fn open_id(&self) -> String {
+        let destinations = self.stream_value(&["destinations"]);
+        let guard = self.draft.borrow();
+        let Some(d) = guard.as_ref() else {
+            return MAIN_DESTINATION.into();
+        };
+        let known = destinations
+            .as_ref()
+            .and_then(Value::as_array)
+            .is_some_and(|list| list.iter().any(|x| x["id"] == d.destination.as_str()));
+        if known {
+            d.destination.clone()
+        } else {
+            MAIN_DESTINATION.into()
+        }
+    }
+
+    /// Change the open destination's `fields` (a null removes one).
+    fn change_destination(&self, app: &Rc<App>, fields: Value) {
+        let id = self.open_id();
+        if id == MAIN_DESTINATION {
+            let patch = self.stream_patch(fields);
+            return self.change(app, patch);
+        }
+        self.change_extra(app, &id, fields);
+    }
+
+    /// Change destination `id` (not main) in `stream.destinations`: the
+    /// list goes whole, as a merge patch replaces arrays.
+    fn change_extra(&self, app: &Rc<App>, id: &str, fields: Value) {
+        let mut list = self
+            .stream_value(&["destinations"])
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default();
+        if let Some(entry) = list
+            .iter_mut()
+            .find(|d| d["id"] == id)
+            .and_then(Value::as_object_mut)
+            && let Some(fields) = fields.as_object()
+        {
+            for (key, value) in fields {
+                if value.is_null() {
+                    entry.remove(key);
+                } else {
+                    entry.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        let patch = self.stream_patch(json!({ "destinations": list }));
+        self.change(app, patch);
+    }
+
+    /// Add a destination of `service` to the draft and open it.
+    fn add_destination(&self, app: &Rc<App>, service: &str, server: Option<&str>) {
+        let mut list = self
+            .stream_value(&["destinations"])
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default();
+        let taken = |id: &str| id == MAIN_DESTINATION || list.iter().any(|d| d["id"] == id);
+        let id = (1..)
+            .map(|n| {
+                if n == 1 {
+                    service.to_string()
+                } else {
+                    format!("{service}-{n}")
+                }
+            })
+            .find(|id| !taken(id))
+            .expect("a free id");
+        let mut entry = json!({"id": id, "service": service});
+        if let Some(server) = server {
+            entry["server"] = json!(server);
+        }
+        list.push(entry);
+        if let Some(d) = self.draft.borrow_mut().as_mut() {
+            d.adding = false;
+            d.needs_server.clear();
+            d.destination = id;
+        }
+        let patch = self.stream_patch(json!({ "destinations": list }));
+        self.change(app, patch);
+    }
+
+    fn remove_destination(&self, app: &Rc<App>) {
+        let id = self.open_id();
+        if id == MAIN_DESTINATION {
+            return;
+        }
+        let mut list = self
+            .stream_value(&["destinations"])
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default();
+        list.retain(|d| d["id"] != id.as_str());
+        if let Some(d) = self.draft.borrow_mut().as_mut() {
+            d.destination = MAIN_DESTINATION.into();
+        }
+        let patch = self.stream_patch(json!({ "destinations": list }));
+        self.change(app, patch);
+    }
+
+    fn set_destination_enabled(&self, app: &Rc<App>, id: &str, on: bool) {
+        if id == MAIN_DESTINATION {
+            let patch = self.stream_patch(json!({ "enabled": on }));
+            self.change(app, patch);
+        } else {
+            // On is the default: left out of the setup.
+            self.change_extra(
+                app,
+                id,
+                json!({"enabled": if on { Value::Null } else { json!(false) }}),
+            );
         }
     }
 
@@ -1004,23 +1582,31 @@ impl Settings {
         );
     }
 
-    /// Which key: the draft's service, and its server for a custom one.
+    /// Which key: the open destination's service, and its server for a
+    /// custom one; an added destination's own (its id with them).
     fn key_target(&self) -> Option<StreamKeyTarget> {
-        let service: StreamService =
-            serde_json::from_value(self.draft_value(&["stream", "service"])?).ok()?;
+        let id = self.open_id();
+        let open = self.open_destination();
+        let service: StreamService = serde_json::from_value(open.get("service")?.clone()).ok()?;
         let server = (service == StreamService::Custom)
-            .then(|| self.draft_value(&["stream", "server"]))
+            .then(|| open.get("server").cloned())
             .flatten()
             .and_then(|v| v.as_str().map(str::to_string))
             .filter(|s| !s.is_empty());
         Some(StreamKeyTarget {
+            destination: (id != MAIN_DESTINATION).then_some(id),
             service: Some(service),
             server,
+            canvas: self.stream_canvas(),
         })
     }
 
     fn set_key_busy(&self, app: &Rc<App>, busy: bool) {
+        // Parked meanwhile (Review…): the parked draft's, so its buttons
+        // aren't left disabled on return (#58).
         if let Some(d) = self.draft.borrow_mut().as_mut() {
+            d.key_busy = busy;
+        } else if let Some(d) = self.parked.borrow_mut().as_mut() {
             d.key_busy = busy;
         }
         self.show(app);
@@ -1094,7 +1680,12 @@ impl Settings {
         app.edit_then(patch, EditOptions::default(), move |app, ok| {
             let settings = &app.settings;
             let refusal = app.session.borrow_mut().last_refusal.take();
-            if let Some(d) = settings.draft.borrow_mut().as_mut() {
+            // Parked meanwhile (Review… opened the permissions step): the
+            // parked draft takes the answer, and that step stays open.
+            let parked = settings.draft.borrow().is_none() && settings.parked.borrow().is_some();
+            let mut draft = settings.draft.borrow_mut();
+            let mut parked_draft = settings.parked.borrow_mut();
+            if let Some(d) = draft.as_mut().or(parked_draft.as_mut()) {
                 d.applying = false;
                 if ok {
                     d.base = d.draft.clone();
@@ -1106,12 +1697,16 @@ impl Settings {
                     });
                 }
             }
+            drop((draft, parked_draft));
             if ok {
                 app.refresh_status(true);
-                if close {
-                    settings.close(app);
-                    return;
-                }
+            }
+            if parked {
+                return;
+            }
+            if ok && close {
+                settings.close(app);
+                return;
             }
             settings.show(app);
         });
@@ -1173,6 +1768,18 @@ impl Settings {
         area.set_applying(d.applying);
 
         // General
+        let machine = s
+            .status
+            .as_ref()
+            .and_then(|status| status.machine_profile.as_ref());
+        area.set_machine_summary(
+            machine
+                .map_or("Not calibrated; using the per-chip capacity table", |m| {
+                    m.summary.as_str()
+                })
+                .into(),
+        );
+        area.set_machine_calibrating(machine.is_some_and(|m| m.running));
         area.set_name(text(&draft["name"]).into());
         area.set_setup_file(
             s.status
@@ -1188,29 +1795,156 @@ impl Settings {
         area.set_updates_available(crate::update::available());
         area.set_auto_updates(d.prefs.auto_updates);
 
-        // Stream
-        let stream = &draft["stream"];
+        // Stream: the destinations, and the open one's service, server
+        // and key (#73), of the canvas chosen (#96).
+        let has_vertical = draft["vertical"].is_object();
+        let canvas = if draft_canvas(draft, d.canvas).is_object() {
+            d.canvas
+        } else {
+            CanvasId::Main
+        };
+        // Every canvas besides the main one (#84), for the Streams of
+        // choice.
+        let extras = draft_canvases(draft);
+        area.set_stream_canvas_choice(has_vertical || !extras.is_empty());
+        area.set_stream_canvas(canvas.as_str().into());
+        area.set_stream_canvas_options(slint::ModelRc::new(slint::VecModel::from(
+            std::iter::once(("main".to_string(), "Main Canvas".to_string()))
+                .chain(extras.iter().cloned())
+                .map(|(id, label)| crate::Segment {
+                    value: id.into(),
+                    label: label.into(),
+                    disabled: false,
+                })
+                .collect::<Vec<_>>(),
+        )));
+        let stream = if canvas.is_main() {
+            &draft["stream"]
+        } else {
+            &draft_canvas(draft, canvas)["stream"]
+        };
         let has_stream = stream.is_object();
-        let status = s.stream.as_ref();
-        let service = text(&stream["service"]);
+        let canvas_streams: Vec<StreamStatus> = s
+            .canvases
+            .iter()
+            .find(|c| c.id == canvas)
+            .map(|c| c.streams.clone())
+            .unwrap_or_default();
+        let statuses = match canvas {
+            CanvasId::Main => &s.streams,
+            CanvasId::Vertical => &s.vertical_streams,
+            _ => &canvas_streams,
+        };
+        // The canvas's stream as one: its main destination's status.
+        let summary = match canvas {
+            CanvasId::Main => s.stream.as_ref(),
+            _ => statuses
+                .iter()
+                .find(|x| x.id == MAIN_DESTINATION)
+                .or(statuses.first()),
+        };
+        let open_id = {
+            let known = stream["destinations"]
+                .as_array()
+                .is_some_and(|list| list.iter().any(|x| x["id"] == d.destination.as_str()));
+            if known {
+                d.destination.clone()
+            } else {
+                MAIN_DESTINATION.to_string()
+            }
+        };
+        let status_of = |id: &str| -> Option<&StreamStatus> {
+            statuses
+                .iter()
+                .find(|x| x.id == id)
+                .or_else(|| summary.filter(|x| x.id == id))
+        };
+        let mut rows = Vec::new();
+        if has_stream {
+            let mut entries = vec![(MAIN_DESTINATION.to_string(), stream.clone())];
+            for extra in stream["destinations"].as_array().into_iter().flatten() {
+                entries.push((text(&extra["id"]), extra.clone()));
+            }
+            let main_size = (stream["width"].clone(), stream["height"].clone());
+            let main_kbps = stream["video_bitrate_kbps"].clone();
+            for (id, entry) in &entries {
+                let status = status_of(id);
+                let service = text(&entry["service"]);
+                let label = match (id.as_str(), service_label(&service)) {
+                    (MAIN_DESTINATION, name) => name.to_string(),
+                    (id, name) if id == service => name.to_string(),
+                    (id, name) => format!("{id} · {name}"),
+                };
+                let own = id != MAIN_DESTINATION
+                    && ((!entry["video_bitrate_kbps"].is_null()
+                        && entry["video_bitrate_kbps"] != main_kbps)
+                        || (!entry["width"].is_null()
+                            && (entry["width"].clone(), entry["height"].clone()) != main_size));
+                let same_service = status
+                    .and_then(|x| serde_json::to_value(x.service).ok())
+                    .is_some_and(|v| v == entry["service"]);
+                let words = match status.map(|x| x.state) {
+                    Some(StreamState::Live) => "Live",
+                    Some(StreamState::Connecting) => "Connecting",
+                    Some(StreamState::Reconnecting) => "Reconnecting",
+                    Some(StreamState::Failed) => "Failed",
+                    _ if !same_service => "Not saved yet",
+                    _ if !status.is_some_and(|x| x.key_set) => "No key yet",
+                    _ if own => "Own encoder",
+                    _ => "Key saved",
+                };
+                rows.push(DestinationRow {
+                    id: id.as_str().into(),
+                    label: label.into(),
+                    status: words.into(),
+                    enabled: entry["enabled"].as_bool().unwrap_or(true),
+                });
+            }
+        }
+        area.set_destinations(model(rows));
+        area.set_destination(open_id.as_str().into());
+        area.set_adding_destination(d.adding);
+        let open = if open_id == MAIN_DESTINATION {
+            stream.clone()
+        } else {
+            stream["destinations"]
+                .as_array()
+                .and_then(|list| list.iter().find(|x| x["id"] == open_id.as_str()))
+                .cloned()
+                .unwrap_or(Value::Null)
+        };
+        area.set_destination_live(status_of(&open_id).is_some_and(|x| x.is_active()));
+        area.set_destination_own_bitrate(!open["video_bitrate_kbps"].is_null());
+        area.set_destination_bitrate(number(
+            &open["video_bitrate_kbps"],
+            number(&stream["video_bitrate_kbps"], 6000.0).into(),
+        ));
+        area.set_destination_own_size(!open["width"].is_null());
+        area.set_destination_width(number(&open["width"], 1280.0));
+        area.set_destination_height(number(&open["height"], 720.0));
+        let status = status_of(&open_id);
+        let service = text(&open["service"]);
         let status_service = status
             .and_then(|x| serde_json::to_value(x.service).ok())
             .and_then(|v| v.as_str().map(str::to_string));
         let key_set = status.is_some_and(|x| x.key_set);
-        let ready = has_stream && key_set;
+        let ready = has_stream && summary.is_some_and(|x| x.key_set);
         area.set_notice(if ready { "" } else { d.notice.as_str() }.into());
         area.set_refused(d.refused.as_str().into());
         area.set_has_stream(has_stream);
         area.set_needs_server(d.needs_server.as_str().into());
-        area.set_stream_live(status.is_some_and(|x| {
-            matches!(
-                x.state,
-                StreamState::Live | StreamState::Connecting | StreamState::Reconnecting
-            )
-        }));
+        area.set_stream_live(match canvas {
+            CanvasId::Main => s.stream.as_ref().is_some_and(|x| {
+                matches!(
+                    x.state,
+                    StreamState::Live | StreamState::Connecting | StreamState::Reconnecting
+                )
+            }),
+            _ => statuses.iter().any(StreamStatus::is_active),
+        });
         let preset = preset_server(&service);
         area.set_service(service.as_str().into());
-        area.set_server(text(&stream["server"]).into());
+        area.set_server(text(&open["server"]).into());
         area.set_server_placeholder(preset.unwrap_or("rtmps://…").into());
         area.set_server_hint(
             if preset.is_some() {
@@ -1253,6 +1987,9 @@ impl Settings {
         area.set_folder(text(&rec["folder"]).into());
         area.set_folder_short(middle_short(&text(&rec["folder"])).into());
         area.set_keep_free(number(&rec["keep_free_gb"], 1.0));
+        area.set_open_editor(rec["open_editor"] == json!(true));
+        area.set_replay_seconds(number(&rec["replay"]["seconds"], 30.0));
+        area.set_replay_memory(number(&rec["replay"]["max_memory_mb"], 1024.0));
         let program_on = program["enabled"] != json!(false);
         let iso_on = iso["enabled"] == json!(true);
         let codec = |encoder: &Value| encoder["codec"].as_str().unwrap_or("hevc").to_string();
@@ -1309,8 +2046,9 @@ impl Settings {
             .as_array()
             .map(|list| list.iter().filter_map(Value::as_str).collect())
             .unwrap_or_default();
+        let drafted = draft_setup(s.setup.as_deref(), &draft["recording"]["iso"]);
         area.set_iso_sources(model(
-            s.setup
+            drafted
                 .iter()
                 .flat_map(|setup| setup.sources.iter())
                 .filter(|source| source.kind.has_video())
@@ -1318,6 +2056,25 @@ impl Settings {
                     id: source.id.as_str().into(),
                     name: crate::model::source_name(source).into(),
                     on: chosen.contains(&source.id.as_str()),
+                    shared_audio: drafted.as_ref().is_some_and(|setup| {
+                        !setup.recording.iso.source_audio.contains_key(&source.id)
+                    }),
+                    tracks: model(drafted.iter().flat_map(|setup| {
+                        let tracks = setup
+                            .recording
+                            .iso
+                            .audio_for(source, source.kind.has_audio());
+                        setup
+                            .sources
+                            .iter()
+                            .filter(|a| a.kind.has_audio())
+                            .map(move |a| IsoTrack {
+                                id: a.id.as_str().into(),
+                                name: crate::model::source_name(a).into(),
+                                on: tracks.contains(&a.id),
+                            })
+                            .collect::<Vec<_>>()
+                    })),
                 }),
         ));
 
@@ -1387,15 +2144,135 @@ impl Settings {
             kit::option(&f, &f, "")
         })));
         area.set_fps(fps.to_string().into());
+        // Canvases (#84): every one besides main, the edited one's
+        // settings in the vertical-* fields.
+        let extras = draft_canvases(draft);
+        let edit = d
+            .edit_canvas
+            .filter(|c| draft_canvas(draft, *c).is_object())
+            .or_else(|| extras.first().and_then(|(id, _)| CanvasId::parse(id).ok()))
+            .filter(|_| !d.canvas_closed);
+        let main_fps = draft["canvas"]["fps"].as_u64().unwrap_or(30);
+        area.set_canvas_rows(model(extras.iter().map(|(id, label)| {
+            let c = CanvasId::parse(id)
+                .map(|c| draft_canvas(draft, c).clone())
+                .unwrap_or_default();
+            let fps = c["fps"].as_u64().unwrap_or(main_fps);
+            let mut detail = format!(
+                "{}×{} · {fps} fps · {}",
+                c["width"].as_u64().unwrap_or(1080),
+                c["height"].as_u64().unwrap_or(1920),
+                if c["follow_main"].as_bool() == Some(false) {
+                    "own scenes"
+                } else {
+                    "main scenes"
+                }
+            );
+            if c["recording"].is_object() && c["recording"]["enabled"].as_bool() != Some(false) {
+                detail.push_str(" · recorded");
+            }
+            let streams = c["stream"]["destinations"].as_array().map_or(0, Vec::len)
+                + usize::from(c["stream"].is_object());
+            if streams > 0 {
+                detail.push_str(&format!(
+                    " · {streams} stream{}",
+                    if streams == 1 { "" } else { "s" }
+                ));
+            }
+            kit::option(id, label, &detail)
+        })));
+        area.set_edit_canvas(edit.map_or("".into(), |c| c.as_str().into()));
+        let vertical = edit.map_or(&Value::Null, |c| draft_canvas(draft, c));
+        area.set_canvas_fps(
+            vertical["fps"]
+                .as_u64()
+                .map_or("main".to_string(), |f| f.to_string())
+                .into(),
+        );
+        area.set_canvas_fps_options(model(
+            std::iter::once(kit::option("main", &format!("Main ({main_fps})"), "")).chain(
+                [24u32, 25, 30, 50, 60].iter().map(|f| {
+                    let f = f.to_string();
+                    kit::option(&f, &f, "")
+                }),
+            ),
+        ));
+        area.set_canvas_presets(model(
+            [
+                (
+                    "1080x1920",
+                    "9:16 Vertical",
+                    "1080×1920 · Shorts, Reels, TikTok",
+                ),
+                ("1080x1080", "1:1 Square", "1080×1080"),
+                ("1080x1350", "4:5 Portrait", "1080×1350 · feeds"),
+                ("1280x720", "16:9 Landscape", "1280×720"),
+            ]
+            .iter()
+            .map(|(v, l, d)| kit::option(v, l, d)),
+        ));
+        area.set_vertical_on(vertical.is_object());
+        area.set_vertical_width(vertical["width"].as_u64().unwrap_or(1080) as f32);
+        area.set_vertical_height(vertical["height"].as_u64().unwrap_or(1920) as f32);
+        area.set_vertical_follow(vertical["follow_main"].as_bool() != Some(false));
+        area.set_vertical_record(
+            vertical["recording"].is_object()
+                && vertical["recording"]["enabled"].as_bool() != Some(false),
+        );
+        area.set_recording(s.status.as_ref().is_some_and(|x| {
+            matches!(
+                x.state,
+                isocast_protocol::api::EngineState::Recording
+                    | isocast_protocol::api::EngineState::Starting
+            )
+        }));
 
-        // Advanced
-        let reconnect = &stream["reconnect"];
+        // Advanced (the main canvas's stream)
+        let reconnect = &draft["stream"]["reconnect"];
         area.set_reconnect_on(reconnect["enabled"] != json!(false));
         area.set_reconnect_delay(number(&reconnect["delay_seconds"], 2.0));
         area.set_reconnect_retries(number(&reconnect["max_retries"], 25.0));
         let developer = &draft["developer"];
         area.set_developer_on(developer["enabled"] == json!(true));
         area.set_developer_auto_off(developer["auto_off_hours"] != json!(0));
+        // Automatic quality (T.2): on unless turned off, its pins, and
+        // the ISO files recorded now, each of which can be kept.
+        let governor = governor_settings(draft);
+        let pinned = |pin: &str| governor.pinned(pin);
+        area.set_governor_on(governor.enabled);
+        area.set_iso_thinning(governor.allow_iso_thinning);
+        area.set_pin_preview(pinned(PIN_PREVIEW));
+        area.set_pin_iso(pinned(PIN_ISO));
+        area.set_pin_vertical(pinned(PIN_VERTICAL));
+        area.set_pin_stream(pinned(PIN_STREAM));
+        area.set_pin_iso_sources(model(
+            drafted
+                .iter()
+                .filter(|setup| setup.recording.iso.enabled)
+                .flat_map(|setup| setup.sources.iter())
+                .filter(|source| source.kind.has_video() && chosen.contains(&source.id.as_str()))
+                .map(|source| IsoTrack {
+                    id: source.id.as_str().into(),
+                    name: crate::model::source_name(source).into(),
+                    on: pinned(&iso_pin(source.id.as_str())),
+                }),
+        ));
+        area.set_governor_now(
+            s.status
+                .as_ref()
+                .and_then(|x| x.governor.as_ref())
+                .and_then(super::controls::governor_words)
+                .unwrap_or_default()
+                .into(),
+        );
+        let hours = self.auto_off_hours();
+        area.set_developer_auto_off_label(
+            format!(
+                "Turn Off After {hours} Hour{}",
+                if hours == 1 { "" } else { "s" }
+            )
+            .into(),
+        );
 
         // The summary: what the draft makes, how fast its program file
         // fills the disk (the estimate the engine's free-space check uses,
@@ -1465,6 +2342,7 @@ impl Settings {
             ],
             "program" => &[&["recording", "program"]],
             "iso" => &[&["recording", "iso"]],
+            "replay" => &[&["recording", "replay"]],
             _ => return,
         };
         if let Some(d) = self.draft.borrow_mut().as_mut() {
@@ -1522,8 +2400,13 @@ impl Settings {
         }
     }
 
-    /// Ask for an OBS scene collection and make it the live setup.
+    /// Ask for an OBS scene collection and make it the live setup (or,
+    /// when OBS's own were found, offer those: area I).
     fn import_obs(&self, app: &Rc<App>) {
+        if app.wizard.has_found() {
+            app.wizard.open_obs(app);
+            return;
+        }
         if let Some(path) = choose_file(app, &["json"], "Import") {
             self.import_obs_path(app, &path);
         }
@@ -1626,95 +2509,16 @@ impl Settings {
         }
         // Ask for the devices now, so they're there by the second step.
         app.load_devices(true);
-        self.check_permissions(app);
-        if !app.mode.offscreen {
-            let weak = Rc::downgrade(app);
-            self.permissions_timer.start(
-                slint::TimerMode::Repeated,
-                Duration::from_secs(4),
-                move || {
-                    if let Some(app) = weak.upgrade() {
-                        let checking = app.settings.first_run.borrow().step == 0;
-                        if checking {
-                            app.settings.check_permissions(&app);
-                        }
-                    }
-                },
-            );
-        }
+        // The Permissions step draws the permissions step's rows (area H),
+        // which read the permissions every second while it shows.
+        app.permissions.check(app);
         self.show_first_run(app);
     }
 
     fn close_first_run(&self, app: &Rc<App>) {
-        self.permissions_timer.stop();
         if let Some(window) = app.window() {
             window.global::<Ui>().set_onboarding(false);
         }
-    }
-
-    fn check_permissions(&self, app: &Rc<App>) {
-        app.call_as::<PermissionsReport>(Method::Permissions, |app, result| match result {
-            Ok(next) => {
-                let granted = |r: &PermissionsReport| {
-                    r.details
-                        .iter()
-                        .filter(|d| d.state == Permission::Granted)
-                        .count()
-                };
-                let more = {
-                    let mut run = app.settings.first_run.borrow_mut();
-                    let more = run
-                        .report
-                        .as_ref()
-                        .is_some_and(|before| granted(&next) > granted(before));
-                    run.report = Some(next);
-                    more
-                };
-                // Newly allowed: what can be listed changed.
-                if more {
-                    app.load_devices(true);
-                }
-                app.settings.show_first_run(app);
-            }
-            Err(error) => app.failed("Couldn’t check permissions", &error),
-        });
-    }
-
-    fn ask_permissions(&self, app: &Rc<App>) {
-        self.first_run.borrow_mut().asking = true;
-        self.show_first_run(app);
-        app.call_as::<PermissionsReport>(Method::RequestPermissions, |app, result| {
-            {
-                let mut run = app.settings.first_run.borrow_mut();
-                run.asking = false;
-                if let Ok(report) = &result {
-                    run.report = Some(report.clone());
-                }
-            }
-            if let Err(error) = result {
-                app.failed("Couldn’t ask for permissions", &error);
-            }
-            app.settings.show_first_run(app);
-        });
-    }
-
-    /// Restart isocastd so it picks up a permission granted while it ran;
-    /// the link reconnects (and launches it) by itself.
-    fn restart_engine(&self, app: &Rc<App>) {
-        app.call(Method::Shutdown, |app, _| {
-            app.reload();
-            app.toast(
-                ToastKind::Info,
-                "Restarting the engine",
-                "It picks up the new permission when it starts again.",
-            );
-            let weak = Rc::downgrade(app);
-            slint::Timer::single_shot(Duration::from_secs(3), move || {
-                if let Some(app) = weak.upgrade() {
-                    app.settings.check_permissions(&app);
-                }
-            });
-        });
     }
 
     fn first_run_set(&self, app: &Rc<App>, field: &str, value: &str) {
@@ -1777,6 +2581,8 @@ impl Settings {
                     app.reload();
                     app.refresh_status(false);
                     app.settings.close_first_run(app);
+                    // Then optimize it (area I).
+                    app.wizard.open_goal(app);
                     let scenes = made["setup"]["scenes"].as_array().map_or(0, Vec::len);
                     app.toast(
                         ToastKind::Success,
@@ -1805,85 +2611,6 @@ impl Settings {
         area.set_step(run.step);
         area.set_can_close(s.setup.is_some());
         area.set_creating(run.creating);
-        area.set_asking(run.asking);
-
-        // Permissions
-        area.set_checked(run.report.is_some());
-        let report = run.report.as_ref();
-        let details = report.map(|r| r.details.as_slice()).unwrap_or_default();
-        area.set_any_to_ask(
-            details
-                .iter()
-                .any(|d| d.action == PermissionAction::Request),
-        );
-        let app_name = report.map_or("Isocast", |r| r.app.as_str());
-        area.set_permissions(model(details.iter().map(|d| {
-            let (icon, title, why, pane) = match d.permission {
-                PermissionKind::ScreenRecording => (
-                    "display",
-                    "Screen recording",
-                    "Displays, windows and system audio",
-                    "Screen & System Audio Recording",
-                ),
-                PermissionKind::Camera => (
-                    "camera",
-                    "Camera",
-                    "Cameras, capture cards and iPhones",
-                    "Camera",
-                ),
-                PermissionKind::Microphone => (
-                    "mic",
-                    "Microphone",
-                    "Microphones and audio interfaces",
-                    "Microphone",
-                ),
-            };
-            let granted = d.state == Permission::Granted;
-            let todo = match d.action {
-                PermissionAction::OpenSettings => format!(
-                    "Turn on “{app_name}” in System Settings → Privacy & Security → {pane}.{}",
-                    if d.restart_after_granting {
-                        " Then"
-                    } else {
-                        ""
-                    }
-                ),
-                PermissionAction::AskAdministrator => {
-                    "A policy on this Mac blocks it; ask its administrator.".to_string()
-                }
-                _ => String::new(),
-            };
-            let state = match d.state {
-                Permission::Granted => "Allowed",
-                Permission::Denied => "Turned off",
-                Permission::NotDetermined => "Not asked yet",
-                Permission::Restricted => "Blocked by a policy",
-                _ => "Not allowed",
-            };
-            let hint = if d.needed_for.is_empty() {
-                why.to_string()
-            } else {
-                sentence(&d.needed_for)
-            };
-            PermissionRow {
-                id: PermissionKind::NAMES[PermissionKind::ALL
-                    .iter()
-                    .position(|k| *k == d.permission)
-                    .unwrap_or(0)]
-                .into(),
-                icon: icon.into(),
-                title: title.into(),
-                hint: hint.into(),
-                todo: if granted { String::new() } else { todo }.into(),
-                restart: !granted
-                    && d.action == PermissionAction::OpenSettings
-                    && d.restart_after_granting,
-                state: state.into(),
-                granted,
-                denied: d.state == Permission::Denied,
-                open_settings: d.action == PermissionAction::OpenSettings,
-            }
-        })));
 
         // Devices
         let devices = s.devices.as_ref();
@@ -1911,7 +2638,10 @@ impl Settings {
                 if devices.displays.is_empty() {
                     format!(
                         "No displays found{}.",
-                        if devices.permissions.screen_recording != Permission::Granted {
+                        if !matches!(
+                            devices.permissions.screen_recording,
+                            Permission::Granted | Permission::Unknown
+                        ) {
                             " (screen recording isn’t allowed yet)"
                         } else {
                             ""
@@ -2032,6 +2762,13 @@ impl Settings {
 }
 
 /// The parts of a setup Settings changes.
+/// `setup` with ISO settings `iso` (the draft's), if they read as such.
+fn draft_setup(setup: Option<&Setup>, iso: &Value) -> Option<Setup> {
+    let mut setup = setup?.clone();
+    setup.recording.iso = serde_json::from_value(iso.clone()).ok()?;
+    Some(setup)
+}
+
 fn pick(setup: &Value) -> Value {
     let mut out = json!({
         "name": setup["name"],
@@ -2042,11 +2779,57 @@ fn pick(setup: &Value) -> Value {
     if setup["stream"].is_object() {
         out["stream"] = setup["stream"].clone();
     }
+    // The vertical canvas (#86); absent without one.
+    if setup["vertical"].is_object() {
+        out["vertical"] = setup["vertical"].clone();
+    }
+    // More canvases (#84), as a list (empty without any).
+    out["canvases"] = if setup["canvases"].is_array() {
+        setup["canvases"].clone()
+    } else {
+        json!([])
+    };
+    // Automatic quality (Advanced, T.2); absent at its default.
+    if setup["governor"].is_object() {
+        out["governor"] = setup["governor"].clone();
+    }
     // Developer mode (Advanced), the profile's; absent while it is off.
     if setup["developer"].is_object() {
         out["developer"] = setup["developer"].clone();
     }
     out
+}
+
+/// Automatic quality's pins (`governor.pins`): the field paths it must
+/// never change.
+const PIN_PREVIEW: &str = "preview.fps";
+const PIN_ISO: &str = "recording.iso.fps";
+const PIN_VERTICAL: &str = "vertical.fps";
+const PIN_STREAM: &str = "stream.video_bitrate_kbps";
+
+/// The pin keeping one source's ISO file at its frame rate.
+fn iso_pin(source: &str) -> String {
+    format!("recording.iso.sources.{source}.fps")
+}
+
+/// A setup's (or draft's) `governor`: on unless turned off, ISO frame
+/// thinning only when the user allowed it, and its pins.
+fn governor_settings(setup: &Value) -> GovernorSettings {
+    let governor = &setup["governor"];
+    let pins = governor["pins"]
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    GovernorSettings {
+        enabled: governor["enabled"].as_bool() != Some(false),
+        allow_iso_thinning: governor["allow_iso_thinning"].as_bool() == Some(true),
+        pins,
+    }
 }
 
 /// A patch turning object `from` into `to`: changed fields set, missing
@@ -2063,6 +2846,15 @@ fn object_patch(from: &Value, to: &Value) -> Map<String, Value> {
         }
     }
     for (key, value) in to {
+        // `[[canvases]]` (#84): the daemon merges it by id, so each entry
+        // changed, added or removed (`{"id": …, "remove": true}`).
+        if key == "canvases" {
+            let list = canvases_patch(from.get(key).unwrap_or(&Value::Null), value);
+            if !list.is_empty() {
+                out.insert(key.clone(), Value::Array(list));
+            }
+            continue;
+        }
         match from.get(key) {
             Some(old) if old.is_object() && value.is_object() => {
                 let inner = object_patch(old, value);
@@ -2074,6 +2866,32 @@ fn object_patch(from: &Value, to: &Value) -> Map<String, Value> {
                 out.insert(key.clone(), value.clone());
             }
             _ => {}
+        }
+    }
+    out
+}
+
+/// The `canvases` list patch turning `from` into `to`, entry by id.
+fn canvases_patch(from: &Value, to: &Value) -> Vec<Value> {
+    let empty = Vec::new();
+    let from = from.as_array().unwrap_or(&empty);
+    let to = to.as_array().unwrap_or(&empty);
+    let mut out = Vec::new();
+    for old in from {
+        if !to.iter().any(|new| new["id"] == old["id"]) {
+            out.push(json!({ "id": old["id"], "remove": true }));
+        }
+    }
+    for new in to {
+        match from.iter().find(|old| old["id"] == new["id"]) {
+            Some(old) => {
+                let mut inner = object_patch(old, new);
+                if !inner.is_empty() {
+                    inner.insert("id".into(), new["id"].clone());
+                    out.push(Value::Object(inner));
+                }
+            }
+            None => out.push(new.clone()),
         }
     }
     out
@@ -2100,7 +2918,7 @@ fn quality_stop(quality: &Value) -> i32 {
 
 /// A path with its middle left out when it has more than three parts,
 /// so the folder's own name shows: "/Volumes/…/scratch/rec".
-fn middle_short(path: &str) -> String {
+pub(crate) fn middle_short(path: &str) -> String {
     let parts: Vec<&str> = path.split('/').collect();
     if parts.len() <= 4 {
         return path.to_string();
@@ -2262,4 +3080,58 @@ fn mp4_ok(codec: &str) -> bool {
     serde_json::from_value::<isocast_protocol::Codec>(json!(codec))
         .map(|c| c.containers().contains(&isocast_protocol::Container::Mp4))
         .unwrap_or(true)
+}
+
+/// A service's name as Settings shows it.
+fn service_label(service: &str) -> &'static str {
+    match service {
+        "twitch" => "Twitch",
+        "youtube" => "YouTube",
+        "kick" => "Kick",
+        "facebook" => "Facebook",
+        "custom" => "Custom server",
+        _ => "Stream",
+    }
+}
+
+/// Extra canvas `canvas`'s settings in a setup draft: `vertical`, or its
+/// `canvases` entry (#84); null if the draft hasn't it (or it is main).
+fn draft_canvas(draft: &Value, canvas: CanvasId) -> &Value {
+    match canvas {
+        CanvasId::Main => &Value::Null,
+        CanvasId::Vertical => &draft["vertical"],
+        other => draft["canvases"]
+            .as_array()
+            .and_then(|list| list.iter().find(|c| c["id"] == other.as_str()))
+            .unwrap_or(&Value::Null),
+    }
+}
+
+/// Every extra canvas in a draft, `(id, label)`: the vertical one first.
+fn draft_canvases(draft: &Value) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if draft["vertical"].is_object() {
+        out.push(("vertical".to_string(), "Vertical Canvas".to_string()));
+    }
+    for canvas in draft["canvases"].as_array().into_iter().flatten() {
+        if let Some(id) = canvas["id"].as_str() {
+            let label = canvas["name"].as_str().unwrap_or(id).to_string();
+            out.push((id.to_string(), label));
+        }
+    }
+    out
+}
+
+/// A merge patch making `change` to extra canvas `canvas`'s settings:
+/// under `vertical`, or its `canvases` entry (the daemon merges that list
+/// by id).
+fn canvas_patch(_draft: &Value, canvas: CanvasId, change: Value) -> Value {
+    if canvas.is_vertical() {
+        return json!({ "vertical": change });
+    }
+    let mut entry = change;
+    if let Some(object) = entry.as_object_mut() {
+        object.insert("id".into(), canvas.as_str().into());
+    }
+    json!({ "canvases": [entry] })
 }

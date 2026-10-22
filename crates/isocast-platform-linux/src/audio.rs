@@ -516,6 +516,22 @@ impl Drop for AudioCapture {
     }
 }
 
+/// `sink`, taking samples interleaved in `channels` channels and passing
+/// on only the ones `pick` names (from 0), in its order.
+pub(crate) fn picking(sink: AudioSink, channels: usize, pick: Vec<usize>) -> AudioSink {
+    let samples = sink.samples;
+    AudioSink {
+        samples: Box::new(move |interleaved: &[f32], at: Time| {
+            let mut out = Vec::with_capacity(interleaved.len() / channels.max(1) * pick.len());
+            for frame in interleaved.chunks_exact(channels.max(1)) {
+                out.extend(pick.iter().map(|&c| frame[c]));
+            }
+            samples(&out, at)
+        }),
+        stopped: sink.stopped,
+    }
+}
+
 /// Start capturing `target` in `channels` (the device's own for a
 /// microphone, 2 for what the machine plays), returning the channel
 /// count the stream settled on: the samples are interleaved in that, and

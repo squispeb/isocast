@@ -1,0 +1,49 @@
+{
+  "about": "How much video each Apple chip's H.264/HEVC encode engines take in real time, for `estimate_capacity` (crates/isocast-engine/src/estimate.rs). A file's encoder runs on one engine for its whole life. Rates are 8-bit HEVC pixels a second per engine at Isocast's settings (real-time mode, no B-frames, constant quality), on synthetic content. Add a chip by measuring it (docs/notes.md, #66): record files of known sizes on it and find where ISO files start dropping.",
+  "fits_below": 0.85,
+  "codec_cost": {
+    "hevc": 1.0,
+    "h264": 1.9,
+    "basis": "measured with `isocast tune` on isocast-m2-b (hard content, HEVC program): the same ISO files ran 1.28x real time as HEVC and 0.72x as H.264 (4K60 ISO), 1.04x and 0.60x (4K60 + 1080p60 ISOs), so an H.264 picture costs 1.90-1.96x an HEVC one; live H.264 uses a chip's stream_h264_cost when measured, otherwise this file cost remains an assumption"
+  },
+  "chips": [
+    {
+      "chip": "Apple M2",
+      "encode_engines": 1,
+      "engine_pixels_per_second": 800000000,
+      "frame_overhead_pixels": 250000,
+      "overload_iso_efficiency": 0.5,
+      "stream_h264_cost": 2.4,
+      "basis": "measured on base M2s (isocast-m2-a/b), recalibrated 2026-10-16 (#79): 4K60 + 1080p60 ISOs and a 1080p60 program fit, but five 1080p60 ISOs plus program (the same 747 Mpx/s in six rather than three sessions) do not. A 250k HEVC-equivalent-pixel overhead per submitted picture puts these at 792 and 837 Mpx/s against the 800 Mpx/s engine. Four HD ISOs plus program stay loss-free. Under overload, budget half the theoretical spare ISO throughput for native pressure pauses and slow admission recovery: 20 s takes with five/six/eight HD ISOs lost 38-55/57-62/57-67%, and eight plus a 6 Mb/s HD stream lost 73-87% (program, stream and all audio clean). This is a cautious short-take estimate, not an exact loss forecast; content, startup and recovery change the realized share. H.264 files cost 1.9x HEVC from tune. Live H.264 costs 2.4x on M2 (#96): two 6 Mb/s HD60 streams plus two HD30 HEVC ISOs fit, but HD45 ISOs shed (238 frames each in 15 s); with the measured overhead this bounds stream cost between 2.25x and 2.53x. HD60 ISOs shed 45-54% where the old 1.9x predicted no_margin. ProRes uses separate engines."
+    },
+    {
+      "chip": "Apple M4 Max",
+      "encode_engines": 2,
+      "engine_pixels_per_second": 1250000000,
+      "basis": "measured on an M4 Max (exonbook): two 4K and two 1080p HEVC sessions at 120 fps each (2488 Mpx/s) all hold real time when started apart (#41)"
+    },
+    {
+      "chip": "Apple M5 Max",
+      "encode_engines": 2,
+      "engine_pixels_per_second": 1050000000,
+      "basis": "measured on an M5 Max: sixteen 1080p60 HEVC ISO files (1990 Mpx/s) record with no drops; adding the program drops frames"
+    }
+  ],
+  "generations": [
+    { "generation": "M1", "engine_pixels_per_second": 800000000 },
+    { "generation": "M2", "engine_pixels_per_second": 800000000 },
+    { "generation": "M3", "engine_pixels_per_second": 800000000 },
+    { "generation": "M4", "engine_pixels_per_second": 1250000000 },
+    { "generation": "M5", "engine_pixels_per_second": 1050000000 }
+  ],
+  "tiers": [
+    { "tier": "", "encode_engines": 1 },
+    { "tier": "Pro", "encode_engines": 1 },
+    { "tier": "Max", "encode_engines": 2 },
+    { "tier": "Ultra", "encode_engines": 4 }
+  ],
+  "unknown": {
+    "encode_engines": 1,
+    "engine_pixels_per_second": 500000000
+  }
+}

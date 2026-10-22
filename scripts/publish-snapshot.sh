@@ -4,6 +4,7 @@
 #   scripts/publish-snapshot.sh "message"           # commit locally, don't push
 #   scripts/publish-snapshot.sh --push "message"    # commit and push
 #   scripts/publish-snapshot.sh --create --push "message"  # first run: make the GitHub repo (private)
+#   scripts/publish-snapshot.sh --scan-only DIR     # scan an exported tree, no commit or push
 #
 # The public repo has its own history: this checkout's history is never
 # pushed. Each run copies `git archive <ref>` into the public checkout
@@ -17,20 +18,33 @@ repo="${ISOCAST_PUBLIC_REPO:-R44VC0RP/isocast}"
 ref="${ISOCAST_PUBLIC_REF:-main}"
 push=0
 create=0
+scan_only=
 while [ $# -gt 0 ]; do
     case "$1" in
         --push) push=1; shift ;;
         --create) create=1; shift ;;
-        -h|--help) sed -n 2,13p "$0"; exit 0 ;;
+        --scan-only)
+            [ $# -ge 2 ] || { echo "publish: --scan-only needs a directory" >&2; exit 2; }
+            [ -n "$2" ] || { echo "publish: --scan-only needs a nonempty directory" >&2; exit 2; }
+            scan_only="$2"; shift 2 ;;
+        -h|--help) sed -n 2,12p "$0"; exit 0 ;;
         *) break ;;
     esac
 done
-message="${1:-Update from $(git -C "$here" rev-parse --short "$ref") ($(date +%Y-%m-%d))}"
-
 # 1. A fresh copy of the tracked files at $ref.
-staging="$(mktemp -d "${TMPDIR:-/tmp}/isocast-publish.XXXXXX")"
-trap 'rm -rf "${staging:?}"' EXIT
-git -C "$here" archive "$ref" | tar -x -C "$staging"
+work="$(mktemp -d "${TMPDIR:-/tmp}/isocast-publish.XXXXXX")"
+trap 'rm -rf "${work:?}"' EXIT
+if [ -n "$scan_only" ]; then
+    [ "$push" = 0 ] && [ "$create" = 0 ] && [ $# = 0 ] || {
+        echo "publish: --scan-only cannot be combined with publishing options" >&2; exit 2;
+    }
+    staging="$(cd "$scan_only" && pwd)"
+else
+    message="${1:-Update from $(git -C "$here" rev-parse --short "$ref") ($(date +%Y-%m-%d))}"
+    staging="$work/tree"
+    mkdir "$staging"
+    git -C "$here" archive "$ref" | tar -x -C "$staging"
+fi
 
 # 2. Refuse secrets and AI attribution.
 patterns=(
@@ -50,20 +64,24 @@ for p in "${patterns[@]}"; do
     # grep exits 0 on a match, 1 on none and 2 on an error: anything but
     # "none" refuses, so a broken scan can never pass for a clean one.
     rc=0
-    grep -R -I -n -E --exclude=Cargo.lock --exclude=publish-snapshot.sh \
-        -e "$p" "$staging" >"$staging.hit" 2>&1 || rc=$?
+    # Report filenames, never the matching credential itself.
+    grep -R -I -l -E --exclude=Cargo.lock --exclude=publish-snapshot.sh \
+        -e "$p" "$staging" >"$work/hits" 2>&1 || rc=$?
     if [ "$rc" = 0 ]; then
         echo "publish: refused, a file matches /$p/:" >&2
-        sed -E 's/(.{160}).*/\1…/' "$staging.hit" | head -5 >&2
+        head -5 "$work/hits" >&2
         hits=1
     elif [ "$rc" != 1 ]; then
         echo "publish: refused, the scan for /$p/ failed:" >&2
-        head -3 "$staging.hit" >&2
+        head -3 "$work/hits" >&2
         hits=1
     fi
 done
-rm -f "$staging.hit"
 [ "$hits" = 0 ] || exit 1
+if [ -n "$scan_only" ]; then
+    echo "publish: snapshot scan passed"
+    exit 0
+fi
 
 # 3. The public checkout.
 if [ ! -d "$public/.git" ]; then
@@ -76,10 +94,27 @@ git -C "$public" add -A
 if git -C "$public" diff --cached --quiet; then
     echo "publish: nothing changed since the last snapshot"
 else
+    # Credit outside contributors: their commits since the last snapshot
+    # become Co-authored-by trailers, so GitHub shows them on the public
+    # commit (the public history is one snapshot commit per publish).
+    me="$(git -C "$here" config user.email)"
+    last="$(cat "$public/.git/isocast-published" 2>/dev/null || true)"
+    range="$ref"
+    if [ -n "$last" ] && git -C "$here" cat-file -e "$last^{commit}" 2>/dev/null; then
+        range="$last..$ref"
+    else
+        range="$ref~50..$ref"
+    fi
+    trailers="$(git -C "$here" log --no-merges --format='%an <%ae>' "$range" 2>/dev/null |
+        { grep -v -F "<$me>" || true; } | sort -u | sed 's/^/Co-authored-by: /')"
+    if [ -n "$trailers" ]; then
+        message="$(printf '%s\n\n%s' "$message" "$trailers")"
+    fi
     git -C "$public" -c user.name="$(git -C "$here" config user.name)" \
-        -c user.email="$(git -C "$here" config user.email)" commit -q -m "$message"
+        -c user.email="$me" commit -q -m "$message"
     echo "publish: committed $(git -C "$public" log --oneline -1)"
 fi
+git -C "$here" rev-parse "$ref" > "$public/.git/isocast-published"
 
 # 4. GitHub.
 if [ "$create" = 1 ] && ! gh repo view "$repo" >/dev/null 2>&1; then

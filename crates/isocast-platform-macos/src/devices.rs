@@ -108,6 +108,7 @@ pub(crate) fn permissions() -> Result<Permissions> {
         },
         camera: authorization(unsafe { AVMediaTypeVideo })?,
         microphone: authorization(unsafe { AVMediaTypeAudio })?,
+        system_audio: crate::tap::permission(),
     })
 }
 
@@ -145,12 +146,18 @@ pub fn devices() -> Result<Devices> {
         Vec::new()
     });
 
+    let audio_apps = match crate::tap::backend() {
+        crate::tap::Backend::ProcessTap => crate::tap::audio_apps(),
+        crate::tap::Backend::ScreenCaptureKit => Vec::new(),
+    };
+
     Ok(Devices {
         displays: displays()?.into_iter().map(|(_, d)| d).collect(),
         windows,
         cameras: cameras()?,
         microphones: microphones()?,
         audio_outputs,
+        audio_apps,
         permissions,
         notes,
     })
@@ -165,34 +172,62 @@ pub(crate) fn inventory() -> Result<Devices> {
         cameras: cameras()?,
         microphones: microphones()?,
         audio_outputs: crate::output::audio_outputs()?,
+        // Like window titles, which apps run is private.
+        audio_apps: Vec::new(),
         permissions: permissions()?,
         notes: vec!["Window titles deliberately not collected by diagnostics".into()],
     })
 }
 
 /// Ask macOS for screen recording, camera and microphone access where it
-/// hasn't been decided, showing its prompts, and wait up to `timeout` for
-/// the answers. Returns the permissions afterwards.
-pub(crate) fn request_permissions(timeout: Duration) -> Result<Permissions> {
+/// hasn't been decided (only `only`, if given), showing its prompts, and
+/// wait up to `timeout` for the answers. Returns the permissions afterwards.
+pub(crate) fn request_permissions(
+    timeout: Duration,
+    only: Option<PermissionKind>,
+) -> Result<Permissions> {
+    let wanted = |kind| only.is_none_or(|only| only == kind);
     // Opens the prompt (or System Settings) the first time; no answer to
     // wait for, since macOS applies it to the next launch.
-    if !CGPreflightScreenCaptureAccess() {
+    if wanted(PermissionKind::ScreenRecording) && !CGPreflightScreenCaptureAccess() {
         CGRequestScreenCaptureAccess();
     }
     let (tx, rx) = mpsc::channel();
     let mut asked = 0;
-    for media_type in [unsafe { AVMediaTypeVideo }, unsafe { AVMediaTypeAudio }] {
-        if authorization(media_type)? != Permission::NotDetermined {
+    let media = [
+        (PermissionKind::Camera, unsafe { AVMediaTypeVideo }),
+        (PermissionKind::Microphone, unsafe { AVMediaTypeAudio }),
+    ];
+    for (kind, media_type) in media {
+        if !wanted(kind) || authorization(media_type)? != Permission::NotDetermined {
             continue;
         }
         let tx = tx.clone();
-        let handler = RcBlock::new(move |_granted: Bool| {
+        let asked_at = Instant::now();
+        let handler = RcBlock::new(move |granted: Bool| {
+            // Refused before a prompt could even be read: macOS showed none.
+            crate::permissions::answered(kind, granted.as_bool(), asked_at.elapsed());
             let _ = tx.send(());
         });
         let media_type = media_type.context("AVFoundation media type constant is missing")?;
         unsafe {
             AVCaptureDevice::requestAccessForMediaType_completionHandler(media_type, &handler)
         };
+        asked += 1;
+    }
+    if wanted(PermissionKind::SystemAudio) && crate::tap::permission() == Permission::NotDetermined
+    {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let asked_at = Instant::now();
+            let state = crate::tap::request_permission(timeout);
+            crate::permissions::answered(
+                PermissionKind::SystemAudio,
+                state == Permission::Granted,
+                asked_at.elapsed(),
+            );
+            let _ = tx.send(());
+        });
         asked += 1;
     }
     let deadline = Instant::now() + timeout;
@@ -558,10 +593,15 @@ fn video_formats(device: &AVCaptureDevice) -> Vec<VideoFormat> {
     formats
 }
 
-fn microphone_devices() -> Retained<NSArray<AVCaptureDevice>> {
+fn microphone_devices() -> Vec<Retained<AVCaptureDevice>> {
     discover(&[unsafe { AVCaptureDeviceTypeMicrophone }], unsafe {
         AVMediaTypeAudio
     })
+    .iter()
+    // A running system or app audio capture's own device (tap.rs) isn't a
+    // microphone to offer or to announce as connected.
+    .filter(|d| !crate::tap::is_ours(&unsafe { d.uniqueID() }.to_string()))
+    .collect()
 }
 
 /// Find a microphone by "default", id, name, or part of a name.
@@ -571,7 +611,7 @@ pub(crate) fn find_microphone(query: &str) -> Result<Retained<AVCaptureDevice>> 
         return unsafe { AVCaptureDevice::defaultDeviceWithMediaType(audio) }
             .context("this Mac has no default microphone");
     }
-    let devices: Vec<_> = microphone_devices().iter().collect();
+    let devices = microphone_devices();
     match_device(&devices, query).ok_or_else(|| {
         let names: Vec<String> = devices
             .iter()
@@ -610,7 +650,17 @@ fn microphones() -> Result<Vec<Microphone>> {
                 }
             }
             sample_rates.sort_by(f64::total_cmp);
-            let (id, name, model, manufacturer) = identity(&device);
+            let (id, name, model, manufacturer) = identity(device);
+            let channel_names = crate::output::input_channel_names(&id);
+            // The inputs it has now (what `channels` is checked against),
+            // not the most any of its formats has: an ADAT interface at
+            // 96 kHz has fewer, and AVFoundation's formats can be stale.
+            if let Some(now) = crate::output::device_with_uid(&id)
+                .map(crate::output::input_channels)
+                .filter(|now| *now > 0)
+            {
+                channels = now;
+            }
             Microphone {
                 default: default_id.as_deref() == Some(id.as_str()),
                 id,
@@ -619,6 +669,7 @@ fn microphones() -> Result<Vec<Microphone>> {
                 manufacturer,
                 sample_rates,
                 channels,
+                channel_names,
             }
         })
         .collect())

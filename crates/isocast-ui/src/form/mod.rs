@@ -194,7 +194,10 @@ pub fn build(ctx: &Context, fields: &[Field], value: &Map<String, Value>) -> Vec
             continue;
         }
         let mut row = control(ctx, f, &current, value, "");
-        row.lane = lane && !trailing(f, &current);
+        // A microphone's channels end where its device's dropdown does,
+        // before the refresh button.
+        row.lane =
+            (lane && !trailing(f, &current)) || (ctx.kind == "microphone" && f.name == "channels");
         groups.push(Group {
             row,
             children: Vec::new(),
@@ -321,10 +324,12 @@ fn control(
 fn empty_note(devices: Option<&Devices>, what: &str) -> Option<&'static str> {
     use isocast_protocol::devices::Permission;
     let devices = devices?;
-    if what == "windows" && devices.permissions.screen_recording != Permission::Granted {
+    // Unknown isn't a refusal, so it gets no note.
+    let refused = |p: Permission| !matches!(p, Permission::Granted | Permission::Unknown);
+    if what == "windows" && refused(devices.permissions.screen_recording) {
         return Some("Screen recording isn’t allowed, so no windows are listed.");
     }
-    if what == "cameras" && devices.permissions.camera != Permission::Granted {
+    if what == "cameras" && refused(devices.permissions.camera) {
         return Some("Camera access isn’t allowed, so no cameras are listed.");
     }
     None
@@ -365,12 +370,58 @@ fn choice_control(
             row.value = v;
             row.refresh = true;
         }
+        ("microphone", "channels") => {
+            let device = all.get("device").map(text_of);
+            let device = device.as_deref().unwrap_or("default");
+            let v = dev::channels_value(value);
+            row.options = dev::channel_options(devices, device, &v);
+            row.value = v;
+        }
         ("display" | "application", "display") => {
             row.options = dev::display_options(devices, &v);
             row.value = v;
             row.refresh = true;
         }
-        ("window" | "application" | "application_audio", "app") => {
+        ("application_audio", "app") => {
+            let none = devices.is_none_or(|d| d.windows.is_empty() && d.audio_apps.is_empty());
+            row.options = if none && v.is_empty() {
+                let note = if devices.is_none() {
+                    "Looking…"
+                } else {
+                    "No apps with sound found."
+                };
+                vec![(String::new(), note.into(), String::new())]
+            } else {
+                dev::audio_app_options(devices, &v)
+            };
+            row.value = v;
+            row.refresh = true;
+        }
+        ("system_audio", "exclude") => {
+            // The apps left out, each removable, and a menu to add one.
+            let excluded: Vec<String> = value
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default();
+            row.kind = "files";
+            row.files = excluded.iter().map(|e| dev::app_name(devices, e)).collect();
+            row.dirs = excluded
+                .iter()
+                .map(|e| {
+                    let name = dev::app_name(devices, e);
+                    if name == *e { String::new() } else { e.clone() }
+                })
+                .collect();
+            row.options = dev::exclude_options(devices, &excluded);
+            row.value = String::new();
+            row.refresh = true;
+        }
+        ("window" | "application", "app") => {
             let none = devices.is_none_or(|d| d.windows.is_empty());
             row.options = if none && v.is_empty() {
                 let note = if devices.is_none() {
@@ -728,6 +779,39 @@ pub fn enum_value(f: &Field, chosen: &str) -> Value {
 
 /// The change choosing camera `device` makes: its resolution and frame
 /// rate stay only if the new camera offers them, else back to Auto.
+/// A microphone's `channels` dropdown value ("", "1", "3,4") as the
+/// setting.
+fn channels_json(chosen: &str) -> Value {
+    if chosen.is_empty() {
+        return Value::Null;
+    }
+    let channels: Vec<u32> = chosen
+        .split(',')
+        .filter_map(|c| c.trim().parse().ok())
+        .collect();
+    json!(channels)
+}
+
+/// Choosing a microphone: its channels go back to the default when the
+/// new device doesn't have them.
+fn microphone_change(
+    devices: Option<&Devices>,
+    all: &Map<String, Value>,
+    device: &str,
+) -> Map<String, Value> {
+    let mut out = one("device", json!(device));
+    let highest = all
+        .get("channels")
+        .and_then(Value::as_array)
+        .and_then(|list| list.iter().filter_map(Value::as_u64).max());
+    if let (Some(highest), Some(mic)) = (highest, dev::find_microphone(devices, device))
+        && highest > u64::from(mic.channels)
+    {
+        out.insert("channels".into(), Value::Null);
+    }
+    out
+}
+
 pub fn camera_change(
     devices: Option<&Devices>,
     all: &Map<String, Value>,
@@ -816,6 +900,11 @@ fn field(row: &Row) -> FormField {
         label: row.label.as_str().into(),
         kind: row.kind.into(),
         text: row.text.as_str().into(),
+        rest_text: if row.kind == "path" {
+            crate::areas::settings::middle_short(&row.text).into()
+        } else {
+            SharedString::new()
+        },
         number: row.number as f32,
         empty: row.empty,
         on: row.on,
@@ -984,6 +1073,8 @@ pub fn change(app: &Rc<App>, t: &Target, key: &str, event: FormEvent) -> Outcome
                 };
                 match (kind, f.name.as_str()) {
                     ("camera", "device") => camera_change(devices, value, &chosen),
+                    ("microphone", "device") => microphone_change(devices, value, &chosen),
+                    ("microphone", "channels") => one("channels", channels_json(&chosen)),
                     ("window", "title") => {
                         if chosen == dev::TITLE_PART {
                             t.typing.set(true);
@@ -1016,6 +1107,18 @@ pub fn change(app: &Rc<App>, t: &Target, key: &str, event: FormEvent) -> Outcome
                             out.insert("title".into(), Value::Null);
                         }
                         out
+                    }
+                    ("system_audio", "exclude") => {
+                        let mut list = value
+                            .get(key)
+                            .and_then(Value::as_array)
+                            .cloned()
+                            .unwrap_or_default();
+                        if chosen.is_empty() || list.iter().any(|v| v == &json!(chosen)) {
+                            return Outcome::Nothing;
+                        }
+                        list.push(json!(chosen));
+                        one(key, Value::Array(list))
                     }
                     ("filter", "sidechain_source") => one(
                         "sidechain_source",

@@ -55,6 +55,7 @@ pub fn load(window: &AppWindow) {
     flag("docks_locked", &|v| ui.set_docks_locked(v));
     flag("preview_locked", &|v| ui.set_preview_locked(v));
     flag("studio", &|v| ui.set_studio(v));
+    flag("vertical_preview", &|v| ui.set_show_extra(v));
     // The Create view (area G).
     flag("create", &|v| {
         window.global::<crate::CreateArea>().set_active(v)
@@ -64,6 +65,9 @@ pub fn load(window: &AppWindow) {
     length("sources_width", &|v| ui.set_sources_width(v));
     length("transitions_width", &|v| ui.set_transitions_width(v));
     length("controls_width", &|v| ui.set_controls_width(v));
+    if let Some(v) = saved.get("canvas_monitor").and_then(Value::as_str) {
+        ui.set_extra_choice(v.into());
+    }
     if let Some(v) = saved.get("preview_scale").and_then(Value::as_str) {
         ui.set_preview_scale(v.into());
     }
@@ -105,6 +109,8 @@ pub fn save(window: &AppWindow) {
         "docks_locked": ui.get_docks_locked(),
         "preview_locked": ui.get_preview_locked(),
         "studio": ui.get_studio(),
+        "vertical_preview": ui.get_show_extra(),
+        "canvas_monitor": ui.get_extra_choice().as_str(),
         "create": window.global::<crate::CreateArea>().get_active(),
         "docks_height": ui.get_docks_height(),
         "scenes_width": ui.get_scenes_width(),
@@ -150,5 +156,47 @@ pub fn reset(window: &AppWindow, docks_only: bool) {
         ui.set_show_status_bar(true);
         ui.set_preview_locked(false);
         ui.set_preview_scale("window".into());
+        ui.set_show_extra(true);
+        // The canvas monitor shows the first extra canvas again.
+        ui.set_extra_choice("".into());
     }
+}
+
+/// Notices the viewer chose not to see again (the encoder overload notice
+/// for one setup's workload, #66), kept beside the layout in their own
+/// file so saving the layout leaves them alone.
+fn notices_path() -> PathBuf {
+    path().with_file_name("isocast-ui-notices.json")
+}
+
+/// Whether notice `key` was hidden for good.
+pub fn notice_hidden(key: &str) -> bool {
+    std::fs::read_to_string(notices_path())
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|saved| saved.get("hidden").cloned())
+        .and_then(|hidden| hidden.as_array().cloned())
+        .is_some_and(|hidden| hidden.iter().any(|k| k.as_str() == Some(key)))
+}
+
+/// Hide notice `key` for good.
+pub fn hide_notice(key: &str) {
+    let path = notices_path();
+    let mut saved = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    let hidden = saved["hidden"].as_array().cloned().unwrap_or_default();
+    if hidden.iter().any(|k| k.as_str() == Some(key)) {
+        return;
+    }
+    let mut hidden = hidden;
+    hidden.push(json!(key));
+    saved["hidden"] = Value::Array(hidden);
+    if let Some(folder) = path.parent() {
+        let _ = std::fs::create_dir_all(folder);
+    }
+    // Not kept is fine: the notice shows again, once per take.
+    let _ = std::fs::write(&path, format!("{saved:#}\n"));
 }

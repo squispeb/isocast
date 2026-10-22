@@ -10,6 +10,8 @@
 //! | E the canvas | `canvas.rs` (+ preview.rs, layers.rs, frames.rs, picture.rs) | `canvas/` | `CanvasArea` |
 //! | F scene collections and profiles | `library.rs` | `library/` | `LibraryArea` |
 //! | G the Create view (clip bar) | `create.rs` (+ thumbs.rs) | `create/` | `CreateArea` |
+//! | H the permissions step | `permissions.rs` (+ helper.rs) | `permissions/` | `PermissionsArea` |
+//! | I the setup wizard (OBS, optimize) | `wizard.rs` | `wizard/` | `WizardArea` |
 //!
 //! What is shared lives outside the areas and changes rarely: the widget
 //! kit (ui/kit.slint, ui/widgets/), the tokens (ui/theme.slint), icons
@@ -38,7 +40,8 @@
 //!
 //! # Snapshot states
 //!
-//! `isocast-ui --snapshot OUT.png --state NAME[:ARG]…` runs each state in
+//! `scripts/snapshot.sh --snapshot OUT.png --state NAME[:ARG]…` (a throwaway
+//! engine; isocast-ui refuses offscreen runs on the user's own) runs each state in
 //! order, offscreen, against the daemon (see offscreen.rs for the
 //! window-wide ones). To add one for your area, answer it in `state`:
 //! return `Some(Ok(()))` when you handled `name`, `Some(Err(…))` when it
@@ -46,6 +49,17 @@
 //! and the error for an unknown state name it. Prefer states that drive
 //! the real interface (open the dialog through `app.open_dialog`, select
 //! through `app.select`) over ones that set properties directly.
+//!
+//! # The layout loop
+//!
+//! `cargo build --profile ui-dev -p isocast-ui --features live-slint`
+//! builds an app that reads ui/*.slint at run time (Slint's interpreter;
+//! never shipped). `isocast-ui --snapshot-watch DIR [--state …] [--crop
+//! controls]` then redraws DIR/snapshot.png about a second after each
+//! .slint save. What the Rust side set carries over (dialogs, menus,
+//! record, stream, hide:) with the daemon's state; what lives in the
+//! interface (hover, typed text, focus, dragged splitters) does not.
+//! `--snapshot` may be repeated: one picture after each one's states.
 //!
 //! # Testing
 //!
@@ -62,9 +76,13 @@ pub mod developer;
 pub mod hotkeys;
 pub mod library;
 pub mod mixer;
+pub mod permissions;
+pub mod projectors;
+pub mod projects;
 pub mod report;
 pub mod settings;
 pub mod sources;
+pub mod wizard;
 
 use std::rc::Rc;
 
@@ -85,6 +103,10 @@ pub const STATES: &[&[&str]] = &[
     library::STATES,
     create::STATES,
     developer::STATES,
+    permissions::STATES,
+    wizard::STATES,
+    projectors::STATES,
+    projects::STATES,
 ];
 
 /// What `App` asks of an area. Everything but `connect` and `update` has

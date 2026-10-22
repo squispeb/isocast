@@ -111,6 +111,29 @@ sais-lite (MIT, Yuta Mori) and orlp/ed25519 (zlib, Orson Peters). The full
 texts ship in the app as Contents/Resources/LICENSE-Sparkle and are at
 https://github.com/sparkle-project/Sparkle/blob/2.10.0/LICENSE.""")
 
+section("VP8 decoder")
+vpx = root / "crates/isocast-vp8/libvpx"
+print("""VP8 video in WebM and Matroska files is decoded with libvpx's VP8 decoder
+(libvpx 1.17.0, https://chromium.googlesource.com/webm/libvpx), whose sources
+are vendored in crates/isocast-vp8/libvpx and built into the engine. libvpx
+is under the BSD 3-clause licence below, with the WebM Project's patent
+grant after it.
+""")
+print((vpx / "LICENSE").read_text().rstrip())
+print()
+print((vpx / "PATENTS").read_text().rstrip())
+
+section("NVIDIA encoder interface")
+print("""The Windows encoder uses NVIDIA's public NVENC API header, vendored from
+nv-codec-headers n13.0.19.0 (API 13.0):
+https://github.com/FFmpeg/nv-codec-headers/blob/n13.0.19.0/include/ffnvcodec/nvEncodeAPI.h
+Only the interface header is bundled. NVIDIA's driver is loaded from the
+Windows system directory, not redistributed with Isocast.
+""")
+header = root / "crates/isocast-platform-windows/native/nvEncodeAPI.h"
+notice = header.read_text().split("*/", 1)[0].splitlines()[1:]
+print("\n".join(line.removeprefix(" *").removeprefix(" ") for line in notice).strip())
+
 section(f"Rust crates ({len(rows)})")
 print("Crate, version, licence, link.")
 print()

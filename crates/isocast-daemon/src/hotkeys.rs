@@ -2,9 +2,10 @@
 //! native callbacks only send edges to one worker. Holds overlay the setup in
 //! memory, so a crash/restart never saves a momentary unmute into the profile.
 
+use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{
-    Arc, Mutex, OnceLock,
+    Arc, OnceLock,
     atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc,
 };
@@ -16,7 +17,7 @@ use isocast_engine::hotkeys::GlobalHotkeys;
 use isocast_engine::hotkeys::{Edge, Key};
 use isocast_protocol::Setup;
 use isocast_protocol::api::{
-    ApplyParams, Event, Method, Request, RpcError, SnapshotParams, StartParams,
+    ApplyParams, Event, Method, Request, RpcError, SnapshotParams, StartParams, StreamStartParams,
 };
 use isocast_protocol::change::Change;
 use isocast_protocol::hotkeys::{
@@ -49,7 +50,10 @@ pub(crate) struct HotkeyRuntime {
 }
 
 enum Input {
-    Key(Edge, InputSource, u64, Instant),
+    /// A key edge, its source, owner, time, and the plugin whose request
+    /// sent it (`hotkeys_input`), if one did: its action is then checked as
+    /// that plugin's request (#103).
+    Key(Edge, InputSource, u64, Instant, Option<String>),
     Disconnect(u64),
 }
 
@@ -224,11 +228,13 @@ impl Daemon {
                     daemon.publish(Event::Warning { message: "hotkey input queue overflowed; pending actions cancelled and push keys released".into() });
                     continue;
                 }
-                let (edge, source, owner, at) = match input {
-                    Input::Key(edge, source, owner, at) => (edge, source, owner, at),
+                let (edge, source, owner, at, plugin) = match input {
+                    Input::Key(edge, source, owner, at, plugin) => {
+                        (edge, source, owner, at, plugin)
+                    }
                     Input::Disconnect(owner) => {
                         let released = pressed.disconnect(owner);
-                        let mut state = daemon.state.lock().unwrap();
+                        let mut state = daemon.state.lock();
                         let count = state.hotkey_holds.len();
                         for id in released {
                             state.hotkey_holds.remove(&format!("press:{id}"));
@@ -244,7 +250,7 @@ impl Daemon {
                     }
                 };
                 let binding = {
-                    let registered = daemon.hotkeys.registered.lock().unwrap();
+                    let registered = daemon.hotkeys.registered.lock();
                     if registered.generation != edge.generation {
                         continue;
                     }
@@ -262,7 +268,10 @@ impl Daemon {
                     continue;
                 };
                 let hold_id = format!("press:{stroke}");
-                let result = daemon.fire_hotkey(&hold_id, &binding, edge.phase);
+                let result = {
+                    let _caller = plugin.as_deref().map(crate::PluginCaller::set);
+                    daemon.fire_hotkey(&hold_id, &binding, edge.phase)
+                };
                 let error = result.err().map(|e| {
                     let field = if e.message.starts_with("args") || e.message.starts_with("action:")
                     {
@@ -298,10 +307,10 @@ impl Daemon {
         if self.hotkeys.sender.get().is_none() {
             return;
         }
-        let _refresh = self.hotkeys.refresh.lock().unwrap();
-        let mut registered = self.hotkeys.registered.lock().unwrap();
+        let _refresh = self.hotkeys.refresh.lock();
+        let mut registered = self.hotkeys.registered.lock();
         let (identity, config) = {
-            let state = self.state.lock().unwrap();
+            let state = self.state.read();
             let current = state.file.current();
             (
                 (
@@ -353,15 +362,33 @@ impl Daemon {
             // The queue fits a whole profile's edges. A full queue is handled
             // below by the same enqueue path for focused input.
             if sender
-                .try_send(Input::Key(edge, InputSource::Global, 0, Instant::now()))
+                .try_send(Input::Key(
+                    edge,
+                    InputSource::Global,
+                    0,
+                    Instant::now(),
+                    None,
+                ))
                 .is_err()
             {
                 overflow.store(true, Ordering::Release);
             }
         });
         #[cfg(target_os = "macos")]
-        let registrations =
-            isocast_platform_macos::hotkeys::MacHotkeys.replace(keys, generation, on_key);
+        let registrations = if crate::PARENT_OWNED.load(Ordering::SeqCst) {
+            // Foreground record previously opened no global shortcuts. A
+            // private engine must not steal the app's chords or fire actions
+            // from an otherwise inactive profile. Focused API input still works.
+            keys.into_iter()
+                .map(|key| Registration {
+                    binding: key.binding,
+                    global: false,
+                    warning: None,
+                })
+                .collect()
+        } else {
+            isocast_platform_macos::hotkeys::MacHotkeys.replace(keys, generation, on_key)
+        };
         #[cfg(not(target_os = "macos"))]
         let registrations: Vec<Registration> = {
             let _ = on_key;
@@ -378,7 +405,7 @@ impl Daemon {
                 })
                 .collect::<Vec<_>>(),
         );
-        let mut registered = self.hotkeys.registered.lock().unwrap();
+        let mut registered = self.hotkeys.registered.lock();
         *registered = Registered {
             identity,
             bindings,
@@ -396,8 +423,8 @@ impl Daemon {
     }
 
     pub(crate) fn hotkeys_get(&self) -> Hotkeys {
-        let registered = self.hotkeys.registered.lock().unwrap();
-        let state = self.state.lock().unwrap();
+        let registered = self.hotkeys.registered.lock();
+        let state = self.state.read();
         Hotkeys {
             profile: state.file.current().map(|c| c.profile.clone()),
             revision: state.revision,
@@ -421,7 +448,7 @@ impl Daemon {
 
     pub(crate) fn hotkeys_set(&self, params: SetParams) -> Result<Hotkeys, RpcError> {
         let (revision, mut setup) = {
-            let state = self.state.lock().unwrap();
+            let state = self.state.read();
             let setup = state
                 .setup
                 .as_ref()
@@ -486,7 +513,7 @@ impl Daemon {
 
     pub(crate) fn hotkeys_input(&self, params: InputParams, owner: u64) -> Result<Value, RpcError> {
         let chord = Chord::parse(&params.keys).map_err(|e| invalid(format!("keys: {e}")))?;
-        let registered = self.hotkeys.registered.lock().unwrap();
+        let registered = self.hotkeys.registered.lock();
         if registered.pending {
             return Err(invalid(
                 "hotkeys: registration update in progress; retry after it completes",
@@ -514,6 +541,7 @@ impl Daemon {
                 InputSource::Focused,
                 owner,
                 Instant::now(),
+                crate::PluginCaller::current(),
             ))
             .is_err()
         {
@@ -526,7 +554,7 @@ impl Daemon {
     }
 
     fn clear_hotkey_holds(&self) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         if state.hotkey_holds.is_empty() {
             return;
         }
@@ -545,7 +573,7 @@ impl Daemon {
         mute: bool,
         phase: Phase,
     ) -> Result<(), RpcError> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         let setup = state
             .setup
             .as_ref()
@@ -576,7 +604,7 @@ impl Daemon {
     }
 
     fn hotkey_patch(&self, patch: Value) -> Result<(), RpcError> {
-        let revision = self.state.lock().unwrap().revision;
+        let revision = self.state.lock().revision;
         self.apply(ApplyParams {
             revision,
             change: Change::Patch(patch),
@@ -607,12 +635,13 @@ impl Daemon {
                     setup: None,
                     folder: None,
                     seconds: None,
+                    ..Default::default()
                 })),
                 "recording.stop" => Method::Stop,
                 "recording.pause" => Method::Pause,
                 "recording.resume" => Method::Resume,
                 "recording.pause_toggle" => {
-                    let control = self.state.lock().unwrap().control();
+                    let control = self.state.lock().control();
                     if control
                         .and_then(|control| control.pause_status(crate::now()))
                         .is_some_and(|recording| recording.paused)
@@ -623,30 +652,21 @@ impl Daemon {
                     }
                 }
                 "recording.toggle" => {
-                    if self.state.lock().unwrap().session.is_some() {
+                    if self.state.lock().session.is_some() {
                         Method::Stop
                     } else {
                         Method::Start(Box::new(StartParams {
                             setup: None,
                             folder: None,
                             seconds: None,
+                            ..Default::default()
                         }))
                     }
                 }
                 "recording.split" => Method::Split,
-                "streaming.start" => Method::StreamStart,
-                "streaming.stop" => Method::StreamStop,
-                "streaming.toggle" => {
-                    if self.state.lock().unwrap().streaming() {
-                        Method::StreamStop
-                    } else {
-                        Method::StreamStart
-                    }
-                }
-                "transition.take" => Method::Take { transition: None },
                 "timeline.close" => Method::TimelineClose,
                 "studio.toggle" => {
-                    let mut state = self.state.lock().unwrap();
+                    let mut state = self.state.lock();
                     if state.preview.is_some() {
                         state.preview = None;
                         if let Some(engine) = &state.engine {
@@ -661,16 +681,57 @@ impl Daemon {
                             .clone()
                             .ok_or_else(|| invalid("studio.toggle: no program scene"))?;
                         drop(state);
-                        self.preview(scene)?;
+                        self.preview(scene, isocast_protocol::CanvasId::Main)?;
                     }
                     return Ok(());
                 }
                 _ => return Err(invalid(format!("action: {action} is not available"))),
             },
+            // A canvas's streams; the main one's unless args say vertical
+            // (as before canvases, with no args).
+            Arguments::Stream(args) => {
+                let canvas = args.canvas;
+                let params = |canvas: isocast_protocol::CanvasId| {
+                    (!canvas.is_main()).then(|| StreamStartParams {
+                        canvas,
+                        ..Default::default()
+                    })
+                };
+                let stop = match action {
+                    "streaming.start" => false,
+                    "streaming.stop" => true,
+                    "streaming.toggle" => self.state.read().streaming_on(canvas),
+                    _ => return Err(invalid(format!("action: {action} is not available"))),
+                };
+                if stop {
+                    Method::StreamStop(params(canvas))
+                } else {
+                    Method::StreamStart(params(canvas))
+                }
+            }
+            // A canvas's replay buffer; the main one's unless args say
+            // vertical.
+            Arguments::Replay(args) => {
+                let canvas = args.canvas;
+                let params = isocast_protocol::replay::ReplayParams::of(canvas);
+                match action {
+                    "replay.start" => Method::ReplayStart(params),
+                    "replay.stop" => Method::ReplayStop(params),
+                    "replay.save" => Method::ReplaySave(params),
+                    "replay.toggle" => {
+                        if self.state.read().replay.active_on(canvas) {
+                            Method::ReplayStop(params)
+                        } else {
+                            Method::ReplayStart(params)
+                        }
+                    }
+                    _ => return Err(invalid(format!("action: {action} is not available"))),
+                }
+            }
             Arguments::Marker(args) => Method::Marker { label: args.label },
-            Arguments::Scene(args) => self.hotkey_scene(action, args.scene),
+            Arguments::Scene(args) => self.hotkey_scene(action, args.scene, args.canvas),
             Arguments::Index(args) => {
-                let state = self.state.lock().unwrap();
+                let state = self.state.read();
                 let ids = state.scene_ids();
                 let scene = ids
                     .get(args.index as usize - 1)
@@ -684,7 +745,7 @@ impl Daemon {
                     })?
                     .clone();
                 drop(state);
-                self.hotkey_scene(action, scene)
+                self.hotkey_scene(action, scene, isocast_protocol::CanvasId::Main)
             }
             Arguments::Source(args) => {
                 if binding.hold() {
@@ -695,7 +756,7 @@ impl Daemon {
                         phase,
                     );
                 }
-                let state = self.state.lock().unwrap();
+                let state = self.state.read();
                 let setup = state
                     .setup
                     .as_ref()
@@ -712,7 +773,7 @@ impl Daemon {
                     .hotkey_patch(json!({"sources":[{"id":args.source,"audio":{"muted":mute}}]}));
             }
             Arguments::Item(args) => {
-                let state = self.state.lock().unwrap();
+                let state = self.state.read();
                 let setup = state
                     .setup
                     .as_ref()
@@ -742,13 +803,18 @@ impl Daemon {
                 return self.hotkey_patch(json!({"scenes":[{"id":args.scene,"items":items}]}));
             }
             Arguments::Transition(args) => {
-                if action == "transition.set" {
-                    return self.hotkey_patch(json!({"transition":args.transition}));
-                }
-                Method::Take {
-                    transition: Some(args.transition),
-                }
+                return self.hotkey_patch(json!({"transition":args.transition}));
             }
+            // A canvas's preview on air; the main one's unless args say
+            // vertical (as before canvases, with no canvas).
+            Arguments::Take(args) => Method::Take {
+                transition: None,
+                canvas: args.canvas,
+            },
+            Arguments::TakeWith(args) => Method::Take {
+                transition: Some(args.transition),
+                canvas: args.canvas,
+            },
             Arguments::Id(args) => Method::LibrarySwitch(LibrarySwitchParams {
                 profile: (action == "profile.switch").then_some(args.id.clone()),
                 collection: (action == "collection.switch").then_some(args.id),
@@ -791,6 +857,7 @@ impl Daemon {
                 Method::TimelineExport(Some(TimelineExportParams {
                     timeline: params.timeline,
                     folder: params.folder,
+                    vertical: params.vertical,
                 }))
             }
         };
@@ -806,6 +873,11 @@ impl Daemon {
                 error.message = format!("args.{}", hotkeys::bounded(&error.message, 2048));
                 return Err(error);
             }
+            // A canvas that can't do it (none, or following the main one).
+            if error.message.starts_with("canvas: ") {
+                error.message = format!("args.{}", hotkeys::bounded(&error.message, 2048));
+                return Err(error);
+            }
             let field = match action {
                 "scene.switch" | "scene.preview" => "args.scene",
                 "scene.switch_index" | "scene.preview_index" => "args.index",
@@ -818,13 +890,29 @@ impl Daemon {
         })
     }
 
-    fn hotkey_scene(&self, action: &str, scene: String) -> Method {
-        if action.starts_with("scene.preview") || self.state.lock().unwrap().preview.is_some() {
-            Method::Preview { scene }
+    /// Select `scene` on `canvas`: into its preview for `scene.preview`, or
+    /// while it has one staged (Studio Mode), else on air.
+    fn hotkey_scene(
+        &self,
+        action: &str,
+        scene: String,
+        canvas: isocast_protocol::CanvasId,
+    ) -> Method {
+        let staged = {
+            let state = self.state.read();
+            if canvas.is_main() {
+                state.preview.is_some()
+            } else {
+                state.canvas_previews.contains_key(&canvas)
+            }
+        };
+        if action.starts_with("scene.preview") || staged {
+            Method::Preview { scene, canvas }
         } else {
             Method::SwitchScene {
                 scene,
                 transition: None,
+                canvas,
             }
         }
     }

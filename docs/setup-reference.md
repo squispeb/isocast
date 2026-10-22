@@ -16,7 +16,9 @@ A complete session description.
 |---|---|---|
 | `audio` | [AudioSetup](#audiosetup) | How sources' balance pans them, and where monitored sources play. |
 | `canvas` (required) | [Canvas](#canvas) | The composited output canvas. |
+| `canvases` | list of [VerticalCanvas](#verticalcanvas) | More canvases, each with its own id, size, frame rate, scene (or the main one's, laid out its own way), recording and streams, for streaming one show to several platforms in their own shapes (#84): `[[canvases]]` with an `id`, otherwise as `[vertical]`. |
 | `developer` | [DeveloperSettings](#developersettings) | Developer mode: verbose logs and timing traces (the profile's). |
+| `governor` | [GovernorSettings](#governorsettings) | |
 | `hotkeys` | [Config](#config) | Profile hotkeys. Absent/empty keeps legacy profiles unchanged. |
 | `keyframes` | list of [Keyframes](#keyframes) | Keyframe sets, by id, that scene items' `animations` play (CSS's `@keyframes`). |
 | `name` (required) | string | Human-readable name of this setup. |
@@ -26,6 +28,7 @@ A complete session description.
 | `stream` | [StreamSettings](#streamsettings) (optional) | Live streaming of the program, if set up. The stream key is never part of a setup: `isocast stream key set` keeps it in the Keychain. |
 | `transition` | [Transition](#transition) | How the program changes scenes unless a switch says otherwise. |
 | `version` (required) | integer | Setup format version. Must be 1. |
+| `vertical` | [VerticalCanvas](#verticalcanvas) (optional) | A second, vertical canvas (for Shorts, Reels, TikTok) showing the same scenes, with its own recording and stream. Absent: none. |
 | `virtual_camera` | [VirtualCameraSettings](#virtualcamerasettings) | |
 
 ## AudioSetup
@@ -55,6 +58,128 @@ One of:
 | `height` (required) | integer | An even number of pixels from 16 to 8192. |
 | `width` (required) | integer | An even number of pixels from 16 to 8192. |
 
+## VerticalCanvas
+
+Another canvas, upright by default, that shows the setup's scenes: the `[vertical]` canvas or one of `[[canvases]]`. A scene is laid out on it by its arrangement for it (`vertical`, or `canvases.<id>`) if it has one, else it shows the main picture fitted inside this canvas and centred (letterboxed; items placed by `layout` are laid out again on this canvas's size). Its program has the same audio mix as the main one (`recording.program.audio`).
+
+| Field | Type | Description |
+|---|---|---|
+| `follow_main` | boolean | Show the scene the main canvas has on air, switching with it. False lets the vertical canvas put its own scene on air. |
+| `fps` | integer (optional) | Frames per second, from 1 to 240; the main canvas's if absent. |
+| `height` | integer | An even number of pixels from 16 to 8192. Default `1920`. |
+| `id` | string (optional) | Its id in `[[canvases]]` (lowercase letters, digits and dashes, at most 32; not `main` or `vertical`), as requests' `canvas` names it. Absent on `[vertical]`, whose id is `vertical`. |
+| `name` | string (optional) | Display label, like "YouTube Shorts". Defaults to the id. |
+| `recording` | [VerticalRecording](#verticalrecording) (optional) | The vertical program recording. Absent: not recorded. |
+| `stream` | [StreamSettings](#streamsettings) (optional) | Live streaming of the vertical program, if set up (its own service; the key stays in the Keychain). |
+| `width` | integer | An even number of pixels from 16 to 8192. Default `1080`. |
+
+## VerticalRecording
+
+How the vertical program is recorded, in `recording.folder` alongside the main program. Its sound is the main program's mix (`recording.program.audio`): both canvases share one audio mix.
+
+| Field | Type | Description |
+|---|---|---|
+| `audio` | list of string | Must be empty: the vertical program has the main program's audio mix (`recording.program.audio`). |
+| `enabled` | boolean |  Default `true`. |
+| `encoder` | [Encoder](#encoder) |  Default `{"bit_depth": 8, "codec": "hevc", "container": "mov", "quality": "high"}`. |
+| `filename` | string | File name without extension. Tokens: {date}, {time}. Must differ from `recording.program.filename`. Default `"{date} {time} vertical"`. |
+| `height` | integer (optional) | |
+| `width` | integer (optional) | The file's size, if not the vertical canvas's (each side even, from 16 up to the vertical canvas's). |
+
+## Encoder
+
+| Field | Type | Description |
+|---|---|---|
+| `bit_depth` | integer | 8 or 10. 10-bit HEVC uses the Main 10 profile and captures displays in 10 bits, which avoids banding in gradients. ProRes is always 10-bit; H.264 can only be 8-bit. The incredible HEVC preset promotes 8 to 10, including the display capture format. Default `8`. Max 255. |
+| `codec` (required) | [Codec](#codec) | |
+| `container` | [Container](#container) |  Default `"mov"`. |
+| `quality` | [EncoderQuality](#encoderquality) | A named quality preset, or the original 1–100 constant quality. Ignored by ProRes, which is constant quality. Default `"high"`. |
+
+## Codec
+
+One of: `"h264"`, `"hevc"`, `"prores422_proxy"`, `"prores422_lt"`, `"prores422"`, `"prores422_hq"`, `"prores4444"`.
+
+## Container
+
+One of: `"mov"`, `"mp4"`.
+
+## EncoderQuality
+
+Numbers stay numbers and preset names stay names in setup files and API replies. See docs/recording.md for the measured preset ladder.
+
+One of:
+
+- [QualityPreset](#qualitypreset)
+- integer
+
+## QualityPreset
+
+One of: `"low"`, `"medium"`, `"high"`, `"very_high"`, `"incredible"`.
+
+## StreamSettings
+
+Streaming the program (the canvas and the program mix) to a service over RTMP or RTMPS, as H.264 and AAC.
+
+| Field | Type | Description |
+|---|---|---|
+| `audio_bitrate_kbps` | integer | AAC audio bitrate in kb/s, held constant (silence too, as services expect): 64, 96, 128, 160, 192, 256 or 320. Default `160`. |
+| `destinations` | list of [StreamDestination](#streamdestination) | More places to stream the same program to at once, each with its own key, state and reconnects. A destination with the same encode settings as another shares its encoder; one with its own `video_bitrate_kbps` or size gets an encoder of its own if this Mac's encoders have room. |
+| `enabled` | boolean | Whether `stream start` (without `only`) streams to this section's own service, the main destination (id `main`). Its encode settings stay the other destinations' defaults while it is off. |
+| `height` | integer (optional) | |
+| `keyframe_interval_seconds` | integer | Seconds between keyframes. Twitch and YouTube ask for 2. Default `2`. |
+| `rate_control` | [RateControl](#ratecontrol) (optional) | How the encoder keeps to `video_bitrate_kbps`: `constant` (the default: the full rate every second, padding still scenes, as YouTube's and Twitch's guidelines ask) or `average` (fewer bits when the picture is still, overshooting very busy scenes a little less). |
+| `reconnect` | [Reconnect](#reconnect) | Connect again after the connection drops. |
+| `server` | string (optional) | The ingest server without the stream key: `rtmp://host[:port]/app` or `rtmps://host[:port]/app`. Required for `custom` and `kick` (each Kick channel has its own); for the other services it replaces their default server (for example a nearer Twitch ingest). |
+| `service` (required) | [StreamService](#streamservice) | Where to stream. A service fills in its ingest server; `custom` needs `server`. |
+| `video_bitrate_kbps` | integer | Video bitrate in kb/s, held near constant as services ask. Default `6000`. |
+| `width` | integer (optional) | The size sent, if not the canvas's: the encoder scales the program to it. Without it, a canvas larger than 1920×1080 (1080×1920 upright) is scaled down to fit, as most services take 1080p at most. Each side is an even number from 16 to 4096. |
+
+## StreamDestination
+
+Another place to stream the program to (see [`StreamSettings::destinations`]). What it doesn't set comes from the `[stream]` section; reconnecting always does.
+
+| Field | Type | Description |
+|---|---|---|
+| `audio_bitrate_kbps` | integer (optional) | Its own AAC bitrate; `[stream]`'s if absent. |
+| `enabled` | boolean | Whether `stream start` (without `only`) streams here. |
+| `height` | integer (optional) | |
+| `id` (required) | string | Its id (lowercase letters, digits and dashes; not `main`), as `isocast stream start --only` and the key commands name it. |
+| `keyframe_interval_seconds` | integer (optional) | Its own seconds between keyframes; `[stream]`'s if absent. |
+| `rate_control` | [RateControl](#ratecontrol) (optional) | Its own rate control; `[stream]`'s if absent. |
+| `server` | string (optional) | The ingest server without the stream key, as for `[stream]`. |
+| `service` (required) | [StreamService](#streamservice) | |
+| `video_bitrate_kbps` | integer (optional) | Its own video bitrate; `[stream]`'s if absent. |
+| `width` | integer (optional) | Its own size sent; `[stream]`'s if absent. Give both or neither. |
+
+## RateControl
+
+How a stream's encoder keeps to its bitrate.
+
+One of:
+
+- `"average"`: About the bitrate on average: fewer bits for still pictures.
+- `"constant"`: The bitrate every second, still pictures padded.
+
+## StreamService
+
+A streaming service. Presets use the service's documented RTMPS ingest (see `docs/streaming.md`).
+
+One of:
+
+- `"twitch"` \| `"youtube"` \| `"facebook"`
+- `"custom"`: Any RTMP or RTMPS server, given as `server`.
+- `"kick"`: Kick: give your channel's Stream URL (Creator Dashboard → Channel → Stream URL and Key) as `server`.
+
+## Reconnect
+
+Reconnecting after the connection to the server drops.
+
+| Field | Type | Description |
+|---|---|---|
+| `delay_seconds` | integer | Seconds to wait before each attempt. Default `2`. |
+| `enabled` | boolean |  Default `true`. |
+| `max_retries` | integer | Attempts before giving up (the stream then shows `failed`). Default `25`. |
+
 ## DeveloperSettings
 
 The profile's developer mode.
@@ -63,6 +188,14 @@ The profile's developer mode.
 |---|---|---|
 | `auto_off_hours` | integer | Turn it off by itself this many hours after it was turned on; 0 keeps it on until turned off. Default `24`. |
 | `enabled` | boolean | Log every API call and debug messages from capture, the compositor, encoders, writers, streaming and updates, and trace frame timing each second while recording, into their own log segments (200 MiB budget, separate from the ordinary logs). Default `false`. |
+
+## GovernorSettings
+
+| Field | Type | Description |
+|---|---|---|
+| `allow_iso_thinning` | boolean | The user's explicit choice to let the governor skip ISO pictures under pressure (off by default). Skipped pictures are lost from the file for good. Off, every ISO counts as pinned; the native encoder safety controller still sheds ISO frames on real overload. Default `false`. |
+| `enabled` | boolean |  Default `true`. |
+| `pins` | list of string | Settings the governor must not override. Native overload protection still applies; a pin cannot guarantee that hardware delivers frames. Default `[]`. |
 
 ## Config
 
@@ -198,7 +331,9 @@ One of:
 | `folder` (required) | string | Folder recordings are written to. `~` expands to the home folder. |
 | `iso` | [IsoRecording](#isorecording) | Separate recordings of individual sources. Default `{"enabled": false, "encoder": {"bit_depth": 8, "codec": "hevc", "container": "mov", "quality": "high"}, "filename": "{SOURCE}-{date} {time}", "sources": []}`. |
 | `keep_free_gb` | number | Free space, in GB, a recording never uses: it won't start without room for its estimated size plus this, and it stops cleanly, finishing every file, when free space falls below it (or below about 10 s of its files, at least 64 MB, if that is more). Default `1.0`. |
+| `open_editor` | boolean | The app opens the editor, in its own window, on the take's project and timeline when a recording stops (a split doesn't). Off unless set: a window after every stop gets in the way of a session of many takes and of recordings driven from the CLI or MCP. While a stream runs it opens behind the studio, never taking the keyboard. |
 | `program` (required) | [ProgramRecording](#programrecording) | The composited program recording. |
+| `replay` | [ReplaySettings](#replaysettings) | The replay buffer: how much of the program it keeps. |
 
 ## IsoRecording
 
@@ -206,42 +341,13 @@ ISO ("isolated") recording: each listed source is written to its own file at its
 
 | Field | Type | Description |
 |---|---|---|
-| `audio` | list of string (optional) | Audio sources written into every ISO file. Omitted: each ISO uses its own source's sound. An explicit list (including []) preserves the chosen shared routing. A source's audio.iso can override its own sound. |
+| `audio` | list of string (optional) | Audio sources written into every ISO file without a list of its own in `source_audio`. Omitted: each ISO uses its own source's sound. An explicit list (including []) preserves the chosen shared routing. A source's audio.iso can override its own sound. |
 | `enabled` | boolean |  Default `false`. |
 | `encoder` | [Encoder](#encoder) |  Default `{"bit_depth": 8, "codec": "hevc", "container": "mov", "quality": "high"}`. |
 | `filename` | string | File name without extension. Tokens: {SOURCE} (upper-case id), {source}, {date}, {time}. Default `"{SOURCE}-{date} {time}"`. |
 | `filtered` | boolean | Record sources with filters as filtered (as the program shows them) rather than as captured, and audio with its audio filters (all but sidechain ducking). Keyed-out areas come out black, since the files have no transparency. |
+| `source_audio` | map of list of string | Audio sources for one ISO file, by its video source's id, instead of `audio`: `{ camera = ["mic"], screen = ["desktop"] }`. An empty list records that file without audio. Sources not listed follow `audio`; a source's audio.iso still adds or drops its own sound. |
 | `sources` | list of string | Video sources to record separately. Default `[]`. |
-
-## Encoder
-
-| Field | Type | Description |
-|---|---|---|
-| `bit_depth` | integer | 8 or 10. 10-bit HEVC uses the Main 10 profile and captures displays in 10 bits, which avoids banding in gradients. ProRes is always 10-bit; H.264 can only be 8-bit. The incredible HEVC preset promotes 8 to 10, including the display capture format. Default `8`. Max 255. |
-| `codec` (required) | [Codec](#codec) | |
-| `container` | [Container](#container) |  Default `"mov"`. |
-| `quality` | [EncoderQuality](#encoderquality) | A named quality preset, or the original 1–100 constant quality. Ignored by ProRes, which is constant quality. Default `"high"`. |
-
-## Codec
-
-One of: `"h264"`, `"hevc"`, `"prores422_proxy"`, `"prores422_lt"`, `"prores422"`, `"prores422_hq"`, `"prores4444"`.
-
-## Container
-
-One of: `"mov"`, `"mp4"`.
-
-## EncoderQuality
-
-Numbers stay numbers and preset names stay names in setup files and API replies. See docs/recording.md for the measured preset ladder.
-
-One of:
-
-- [QualityPreset](#qualitypreset)
-- integer
-
-## QualityPreset
-
-One of: `"low"`, `"medium"`, `"high"`, `"very_high"`, `"incredible"`.
 
 ## ProgramRecording
 
@@ -254,15 +360,34 @@ One of: `"low"`, `"medium"`, `"high"`, `"very_high"`, `"incredible"`.
 | `height` | integer (optional) | |
 | `width` | integer (optional) | The program file's size, if not the canvas's: the encoder scales the canvas down to it (a different shape is letterboxed), like OBS's Output (Scaled) Resolution. ISO files keep their sources' sizes. Each side is an even number from 16 up to the canvas's. |
 
+## ReplaySettings
+
+| Field | Type | Description |
+|---|---|---|
+| `max_memory_mb` | integer | The most memory the buffer may use, in MB, from 16 to 8192. If `seconds` of the program need more (a high bitrate), the oldest seconds go and `replay_status` says the buffer is short. Default `1024`. |
+| `seconds` | integer | How many seconds of the program a save covers, from 5 to 300 (the saved file starts at the keyframe before them, so it can be up to a keyframe interval longer). Default `30`. |
+| `video_bitrate_kbps` | integer (optional) | The video bitrate, in kb/s, when the buffer encodes the program itself. Without it, about 0.1 bit per pixel (12 Mb/s at 1080p60), at most 40 Mb/s. While the setup has a `[stream]`, the buffer encodes as the stream does (its size, bitrate and keyframes), so a stream and the buffer share one encoder; this is then unused. |
+
 ## Scene
 
 | Field | Type | Description |
 |---|---|---|
+| `canvases` | map of [SceneLayout](#scenelayout) | Its arrangements on the setup's `[[canvases]]`, by canvas id, as `vertical` is on the vertical canvas. |
 | `id` (required) | string | |
 | `items` | list of [SceneItem](#sceneitem) | Items drawn back to front. Default `[]`. |
 | `layout` | [Layout](#layout) (optional) | How its items with a `layout` are laid out: the scene is their root container, the size of the canvas (CSS block layout if absent). Only the fields for children apply. |
 | `name` | string (optional) | |
 | `transition` | [Transition](#transition) (optional) | How the program changes to this scene, in place of the setup's transition, unless a switch names its own (OBS's transition override). |
+| `vertical` | [SceneLayout](#scenelayout) (optional) | Its arrangement on the setup's vertical canvas, in place of `layout` and `items`. Absent: the main picture fitted inside the vertical canvas and centred (letterboxed): items placed by `rect` are scaled and centred with it, items placed by `layout` are laid out again on the vertical canvas's size. |
+
+## SceneLayout
+
+How a scene is arranged on the vertical canvas, in place of its own `layout` and `items`.
+
+| Field | Type | Description |
+|---|---|---|
+| `items` | list of [SceneItem](#sceneitem) | Items drawn back to front, in vertical canvas pixels. Default `[]`. |
+| `layout` | [Layout](#layout) (optional) | How its items with a `layout` are laid out, as the scene's `layout`. |
 
 ## SceneItem
 
@@ -703,7 +828,7 @@ One of:
 
 ## Stinger
 
-A video played over the switch (OBS's Stinger). It lasts as long as the video. Transparent parts need a video with alpha that macOS decodes (ProRes 4444 or HEVC with alpha in a .mov), or a matte.
+A video played over the switch (OBS's Stinger). It lasts as long as the video. Transparent parts need a video with alpha (ProRes 4444 or HEVC with alpha in a .mov, or VP9 or VP8 with alpha in a .webm, as OBS uses), or a matte.
 
 | Field | Type | Description |
 |---|---|---|
@@ -929,6 +1054,9 @@ Plus one of these, chosen by its tag:
 - `kind = "image_mask"`: [ImageMask](#imagemask)
 - `kind = "lut"`: [ApplyLut](#applylut)
 - `kind = "render_delay"`: [RenderDelay](#renderdelay)
+- `kind = "shape_mask"`: [ShapeMask](#shapemask)
+- `kind = "gradient_mask"`: [GradientMask](#gradientmask)
+- `kind = "source_mask"`: [SourceMask](#sourcemask)
 
 ## ColorCorrection
 
@@ -1092,6 +1220,162 @@ Shows the picture later, to line it up with sound that arrives late (OBS's Rende
 |---|---|---|
 | `delay_ms` | integer | 0 to 500 milliseconds. Default `0`. |
 
+## ShapeMask
+
+Shows the picture inside a shape (OBS Advanced Masks' shape masks).
+
+| Field | Type | Description |
+|---|---|---|
+| `animations` | list of [MaskAnimation](#maskanimation) | Animations of its numbers (see [`MaskAnimation`]). |
+| `combine` | [MaskCombine](#maskcombine) |  Default `"intersect"`. |
+| `feather` | number | Softens the edge over this many pixels, centred on it. Default `0.0`. |
+| `height` | number | Its height as a fraction of the picture's. Default `0.800000011920929`. |
+| `inner_radius` | number | How far a star's notches reach out, as a fraction of its points' reach: 0.05 to 1. Default `0.5`. |
+| `invert` | boolean | Show the picture outside the shape instead. |
+| `points` | integer | A star's points: 3 to 32. Default `5`. |
+| `radius` | [Radius](#radius) | Rounds corners, in pixels: each of a rectangle's (top left, top right, bottom right, bottom left), or a polygon's and star's (the first value). |
+| `rotation` | number | Turns the shape about its centre, in degrees clockwise. Default `0.0`. |
+| `shape` | [MaskShape](#maskshape) |  Default `"rectangle"`. |
+| `sides` | integer | A polygon's sides: 3 to 32. Default `6`. |
+| `width` | number | The shape's box: its width as a fraction of the picture's. Default `0.800000011920929`. |
+| `x` | number | Where the shape's centre is across the picture: 0 (left edge) to 1 (right edge). Default `0.5`. |
+| `y` | number | And down: 0 (top) to 1 (bottom). Default `0.5`. |
+
+## MaskAnimation
+
+Animates a mask's numbers over time, as an item's `animations` do (CSS's `animation`), with its stops written in place: each stop sets some of the mask's numbers by their field names.
+
+| Field | Type | Description |
+|---|---|---|
+| `delay_ms` | integer | How long after its clock starts it starts, in milliseconds; less than 0 starts it part of the way through. |
+| `direction` | [PlayDirection](#playdirection) | |
+| `duration_ms` (required) | integer | How long one run takes, in milliseconds. |
+| `easing` | [Easing](#easing) | How each stretch between stops speeds up and slows down, unless a stop says otherwise: `ease_in_out` if absent. |
+| `fill` | [Fill](#fill) | |
+| `frames` (required) | list of [MaskKeyframe](#maskkeyframe) | The stops, in order of `at`. A number no stop at 0 (or 1) sets runs from (or to) the mask's own value. |
+| `iterations` | [Iterations](#iterations) | How many runs: a number (1 if absent) or `"infinite"`. |
+| `start` | [AnimationStart](#animationstart) | The clock it runs on: `clock` (the engine's: loops stay in step, in the program and in filtered ISO files and previews alike), or `on_air` and `shown` (both: from when the masked source's picture is first drawn). Snapshots show animations at their start. |
+
+## MaskKeyframe
+
+One stop of a mask animation: the mask's numbers at `at`. Each kind of mask animates its own: shape masks `x`, `y`, `width`, `height`, `rotation`, `radius`, `inner_radius` and `feather`; gradient masks `x`, `y`, `angle`, `length` and `feather`; source masks `x`, `y`, `scale`, `threshold` and `softness`.
+
+| Field | Type | Description |
+|---|---|---|
+| `angle` | number (optional) | |
+| `at` (required) | number | How far through a run it is, from 0 (the start) to 1 (the end). |
+| `easing` | [Easing](#easing) (optional) | How the stretch from this stop to the next speeds up and slows down, in place of the animation's `easing`. |
+| `feather` | number (optional) | |
+| `height` | number (optional) | |
+| `inner_radius` | number (optional) | |
+| `length` | number (optional) | |
+| `radius` | [Radius](#radius) (optional) | |
+| `rotation` | number (optional) | |
+| `scale` | number (optional) | |
+| `softness` | number (optional) | |
+| `threshold` | number (optional) | |
+| `width` | number (optional) | |
+| `x` | number (optional) | |
+| `y` | number (optional) | |
+
+## MaskCombine
+
+How a mask combines with the masks before it in the chain.
+
+One of:
+
+- `"intersect"`: Only what this mask and those before it both show stays (the first mask simply masks).
+- `"add"`: What this mask shows is added to what those before it show (of the picture before them).
+- `"subtract"`: What this mask shows is taken away from what those before it show.
+
+## MaskShape
+
+A shape mask's shape.
+
+One of:
+
+- `"rectangle"`: Fills its box, with each corner rounded by `radius`.
+- `"circle"`: The largest circle that fits its box.
+- `"ellipse"`: Fills its box.
+- `"polygon"`: A regular polygon with `sides`, the largest that fits its box, a corner at the top; corners rounded by `radius`.
+- `"star"`: A star with `points`, the largest that fits its box, a point at the top; `inner_radius` sets how deep its notches go.
+- `"heart"`: A heart, the largest that fits its box.
+
+## GradientMask
+
+Fades the picture in or out along a gradient (OBS Advanced Masks' gradient masks).
+
+| Field | Type | Description |
+|---|---|---|
+| `angle` | number | A linear gradient's direction, in degrees clockwise: 0 runs left to right, 90 top to bottom. Default `0.0`. |
+| `animations` | list of [MaskAnimation](#maskanimation) | Animations of its numbers (see [`MaskAnimation`]). |
+| `combine` | [MaskCombine](#maskcombine) |  Default `"intersect"`. |
+| `feather` | number | Softens the gradient over this many more pixels. Default `0.0`. |
+| `gradient` | [GradientShape](#gradientshape) |  Default `"linear"`. |
+| `invert` | boolean | Show where the gradient hides, and hide where it shows. |
+| `length` | number | How long it is: 1 spans the picture along its direction (linear), or reaches its corners from the middle (radial). Default `1.0`. |
+| `stops` | list of [GradientStop](#gradientstop) | How much shows along it, from its start to its end (2 to 8 stops, in order of `at`); between stops it changes evenly. Before the first and after the last, their opacity holds. Default `[{"at": 0.0, "opacity": 1.0}, {"at": 1.0, "opacity": 0.0}]`. |
+| `x` | number | The gradient's centre across the picture: 0 (left) to 1 (right). Default `0.5`. |
+| `y` | number | And down: 0 (top) to 1 (bottom). Default `0.5`. |
+
+## GradientShape
+
+A gradient mask's shape.
+
+One of:
+
+- `"linear"`: Changes along a line through its centre, in the direction `angle`.
+- `"radial"`: Changes outwards from its centre.
+
+## GradientStop
+
+One stop of a gradient mask.
+
+| Field | Type | Description |
+|---|---|---|
+| `at` (required) | number | Where along the gradient: 0 (its start) to 1 (its end). |
+| `opacity` (required) | number | How much of the picture shows there: 0 (none) to 1 (all). |
+
+## SourceMask
+
+Uses another source's or scene's live picture as the mask (OBS Advanced Masks' source masks), frame by frame in step with the program. Until the mask has a picture, nothing of the source shows, whatever `invert`, `threshold` or `combine` say. Previews of the source alone, and its ISO file, show it unmasked by other sources.
+
+| Field | Type | Description |
+|---|---|---|
+| `animations` | list of [MaskAnimation](#maskanimation) | Animations of its numbers (see [`MaskAnimation`]). |
+| `channel` | [MaskChannel](#maskchannel) |  Default `"luminance"`. |
+| `combine` | [MaskCombine](#maskcombine) |  Default `"intersect"`. |
+| `fit` | [MaskFit](#maskfit) |  Default `"stretch"`. |
+| `invert` | boolean | Show the picture where the mask would hide it, and hide it where it would show. |
+| `mask_scene` | string (optional) | Or the id of a scene, drawn on its own canvas, that masks. |
+| `mask_source` | string (optional) | The id of the video source whose picture masks (give it or `mask_scene`). It runs, and is on air (media play, pages load), while a source it masks does. |
+| `scale` | number | Scales the mask's picture about its centre, after `fit`. Default `1.0`. |
+| `softness` | number | How gradually it turns, 0 (at once: a hard edge) to 1 (evenly from 0 to 1, which with a threshold of 0.5 uses the value as it is). Default `1.0`. |
+| `threshold` | number | With `softness`, where the channel's value turns from hiding to showing the picture: 0 to 1. Default `0.5`. |
+| `x` | number | Where the mask's centre is across the masked picture: 0 (left) to 1 (right). Default `0.5`. |
+| `y` | number | And down: 0 (top) to 1 (bottom). Default `0.5`. |
+
+## MaskChannel
+
+What a source mask reads of the mask's picture.
+
+One of:
+
+- `"red"` \| `"green"` \| `"blue"`
+- `"luminance"`: Its brightness: white shows the picture, black (or transparent) hides it. Right for black-and-white mask videos.
+- `"alpha"`: Its opacity: opaque shows the picture, transparent hides it.
+
+## MaskFit
+
+How a source mask's picture is placed on the masked picture before `scale`, `x` and `y` move it.
+
+One of:
+
+- `"stretch"`: Stretched over the whole picture.
+- `"contain"`: As large as fits inside, keeping its shape; outside it nothing shows.
+- `"cover"`: Covers the picture, keeping its shape; its overflow is cut off.
+- `"none"`: Pixel for pixel, at its own size.
+
 ## DisplaySource
 
 A whole display (OBS's macOS Screen Capture, display mode).
@@ -1146,13 +1430,16 @@ A microphone or audio interface input.
 
 | Field | Type | Description |
 |---|---|---|
+| `channels` | list of integer (optional) | Which of the device's input channels to record, numbered from 1 as `isocast devices` lists them: one (`[1]`, a mic on input 1) is recorded as centred mono at full level; two (`[1, 2]`, `[3, 4]`) as left and right. Absent records inputs 1 and 2 as left and right (a 1-input device's input as one channel), on larger interfaces too; pick other inputs here. |
 | `device` | string | "default", or an id, name or part of a name from `isocast devices`. Default `"default"`. |
 
 ## SystemAudioSource
 
-Audio the computer is playing.
+Audio the computer is playing, optionally leaving some apps out.
 
-Type: object.
+| Field | Type | Description |
+|---|---|---|
+| `exclude` | list of string | Apps whose sound is left out: names or bundle ids, or parts of names, as for `application_audio`'s `app` (`isocast devices` lists the apps that have opened audio). |
 
 ## ColorSource
 
@@ -1223,61 +1510,21 @@ Synthetic stereo audio that needs no permissions: a 100 ms beep at every whole s
 |---|---|---|
 | `frequency` | integer | Beep pitch in Hz. Default `1000`. |
 
-## StreamSettings
-
-Streaming the program (the canvas and the program mix) to a service over RTMP or RTMPS, as H.264 and AAC.
-
-| Field | Type | Description |
-|---|---|---|
-| `audio_bitrate_kbps` | integer | AAC audio bitrate in kb/s, held constant (silence too, as services expect): 64, 96, 128, 160, 192, 256 or 320. Default `160`. |
-| `height` | integer (optional) | |
-| `keyframe_interval_seconds` | integer | Seconds between keyframes. Twitch and YouTube ask for 2. Default `2`. |
-| `rate_control` | [RateControl](#ratecontrol) (optional) | How the encoder keeps to `video_bitrate_kbps`: `constant` (the default: the full rate every second, padding still scenes, as YouTube's and Twitch's guidelines ask) or `average` (fewer bits when the picture is still, overshooting very busy scenes a little less). |
-| `reconnect` | [Reconnect](#reconnect) | Connect again after the connection drops. |
-| `server` | string (optional) | The ingest server without the stream key: `rtmp://host[:port]/app` or `rtmps://host[:port]/app`. Required for `custom` and `kick` (each Kick channel has its own); for the other services it replaces their default server (for example a nearer Twitch ingest). |
-| `service` (required) | [StreamService](#streamservice) | Where to stream. A service fills in its ingest server; `custom` needs `server`. |
-| `video_bitrate_kbps` | integer | Video bitrate in kb/s, held near constant as services ask. Default `6000`. |
-| `width` | integer (optional) | The size sent, if not the canvas's: the encoder scales the program to it. Without it, a canvas larger than 1920×1080 (1080×1920 upright) is scaled down to fit, as most services take 1080p at most. Each side is an even number from 16 to 4096. |
-
-## RateControl
-
-How a stream's encoder keeps to its bitrate.
-
-One of:
-
-- `"average"`: About the bitrate on average: fewer bits for still pictures.
-- `"constant"`: The bitrate every second, still pictures padded.
-
-## Reconnect
-
-Reconnecting after the connection to the server drops.
-
-| Field | Type | Description |
-|---|---|---|
-| `delay_seconds` | integer | Seconds to wait before each attempt. Default `2`. |
-| `enabled` | boolean |  Default `true`. |
-| `max_retries` | integer | Attempts before giving up (the stream then shows `failed`). Default `25`. |
-
-## StreamService
-
-A streaming service. Presets use the service's documented RTMPS ingest (see `docs/streaming.md`).
-
-One of:
-
-- `"twitch"` \| `"youtube"` \| `"facebook"`
-- `"custom"`: Any RTMP or RTMPS server, given as `server`.
-- `"kick"`: Kick: give your channel's Stream URL (Creator Dashboard → Channel → Stream URL and Key) as `server`.
-
 ## VirtualCameraSettings
 
 | Field | Type | Description |
 |---|---|---|
+| `canvas` | string (optional) | The extra canvas (a `[[canvases]]` id, or `vertical`), for target = canvas (#120). |
 | `height` | integer (optional) | |
 | `scene` | string (optional) | |
 | `source` | string (optional) | |
-| `target` | [Target](#target) | Program, studio preview, or an explicit scene/source id. Default `"program"`. |
-| `width` | integer (optional) | Output dimensions; both absent uses the canvas. Other aspect ratios are letterboxed. These are the camera extension's advertised modes. |
+| `target` | [Target](#target) | Program, studio preview, the vertical program, or an explicit scene/source id. Default `"program"`. |
+| `width` | integer (optional) | Output dimensions; both absent uses the canvas (the vertical canvas's for target = vertical, the extra canvas's for target = canvas). Other aspect ratios are letterboxed. These are the camera extension's advertised modes. |
 
 ## Target
 
-One of: `"program"`, `"preview"`, `"scene"`, `"source"`.
+One of:
+
+- `"program"` \| `"preview"` \| `"scene"` \| `"source"`
+- `"vertical"`: The vertical canvas's program (`[vertical]` must be on).
+- `"canvas"`: An extra canvas's program (`canvas`: a `[[canvases]]` id, #120).

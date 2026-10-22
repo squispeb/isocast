@@ -11,10 +11,11 @@
 //! engines), so the CPU only hands frames over and copies the compressed
 //! bytes, a few kilobytes each.
 
+use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
-use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -81,7 +82,7 @@ const DRAWN_KEPT: usize = 32;
 
 /// Note that the frame at `tick` was drawn from `stamp`.
 pub(crate) fn drawn(drawn: &Drawn, tick: Time, stamp: Stamp) {
-    let mut drawn = drawn.lock().unwrap();
+    let mut drawn = drawn.lock();
     if drawn.len() == DRAWN_KEPT {
         drawn.pop_front();
     }
@@ -90,7 +91,7 @@ pub(crate) fn drawn(drawn: &Drawn, tick: Time, stamp: Stamp) {
 
 /// What the frame at `tick` was drawn from, if known.
 pub(crate) fn stamp_at(drawn: &Drawn, tick: Time) -> Option<Stamp> {
-    let drawn = drawn.lock().unwrap();
+    let drawn = drawn.lock();
     drawn
         .iter()
         .rev()
@@ -147,14 +148,13 @@ impl FeedRate {
 
 /// The highest rate any running stream's viewer asks for.
 pub(crate) fn highest_rate(streams: &Streams) -> Option<u32> {
-    let running = streams.lock().unwrap();
+    let running = streams.lock();
     running
         .values()
         .flat_map(|shared| {
             shared
                 .viewers
                 .lock()
-                .unwrap()
                 .iter()
                 .map(|viewer| viewer.fps.load(Ordering::Relaxed))
                 .collect::<Vec<_>>()
@@ -167,7 +167,6 @@ impl Drop for FrameFeed {
         self.shared
             .viewers
             .lock()
-            .unwrap_or_else(|p| p.into_inner())
             .retain(|viewer| viewer.id != self.id);
     }
 }
@@ -186,7 +185,7 @@ pub(crate) fn watch<P: Platform>(
     let (tx, records) = sync_channel(VIEWER_QUEUE);
     // Held while the viewer is added, so a stream whose last viewer just
     // left can't remove itself in between.
-    let mut running = streams.lock().unwrap();
+    let mut running = streams.lock();
     let shared = match running.get(&key) {
         Some(shared) => shared.clone(),
         None => {
@@ -210,7 +209,7 @@ pub(crate) fn watch<P: Platform>(
     };
     let id = shared.next_viewer.fetch_add(1, Ordering::Relaxed);
     let fps = Arc::new(AtomicU32::new(fps.clamp(1, MAX_FPS)));
-    shared.viewers.lock().unwrap().push(Viewer {
+    shared.viewers.lock().push(Viewer {
         id,
         tx,
         fps: fps.clone(),
@@ -231,8 +230,12 @@ struct Encoding<E> {
     encoder: E,
     input: (u32, u32),
     output: (u32, u32),
-    /// The rate it was told to expect.
+    /// The rate it was told to expect: the last one it accepted.
     fps: u32,
+    /// Don't retry an unchanged refused request on every picture.
+    refused: Option<u32>,
+    /// This encoder's rate status, for the governor.
+    notice: crate::governor::PreviewRate,
     /// The current config record.
     config: Option<Record>,
     last_pts: Option<Time>,
@@ -256,18 +259,18 @@ fn run<P: Platform>(
         let fps = shared
             .viewers
             .lock()
-            .unwrap()
             .iter()
             .map(|viewer| viewer.fps.load(Ordering::Relaxed))
             .max();
         let Some(fps) = fps else {
-            let mut running = streams.lock().unwrap();
-            if shared.viewers.lock().unwrap().is_empty() {
+            let mut running = streams.lock();
+            if shared.viewers.lock().is_empty() {
                 remove(&mut running, key, shared);
                 return;
             }
             continue;
         };
+        let fps = crate::governor::monitor_fps(fps);
         let Source { slot, grid, drawn } = match source(fps) {
             Ok(source) => source,
             Err(why) => return end(streams, key, shared, &why),
@@ -289,13 +292,30 @@ fn run<P: Platform>(
         }
         let encoding = encoding.as_mut().expect("started above");
         // A new rate goes to the running encoder: no new session, no
-        // keyframe.
-        if encoding.fps != fps {
+        // keyframe. One it refuses isn't fatal: it keeps its last rate
+        // while frames are still picked at the new one, and that rate
+        // isn't asked again until the request changes.
+        let uncertain = encoding.encoder.rate_uncertain();
+        if encoding.fps == fps && !uncertain && encoding.refused.take().is_some() {
+            encoding.notice.result(None);
+        } else if (encoding.fps != fps || uncertain) && encoding.refused != Some(fps) {
             let bitrate = bitrate_kbps(encoding.output, fps);
-            if let Err(err) = encoding.encoder.set_rate(fps, bitrate) {
-                return end(streams, key, shared, &format!("{err:#}"));
+            match encoding.encoder.set_rate(fps, bitrate) {
+                Ok(()) => {
+                    encoding.fps = fps;
+                    encoding.refused = None;
+                    encoding.notice.result(None);
+                }
+                Err(err) => {
+                    let message = format!(
+                        "the {} monitor's last acknowledged encoder rate is {} fps; could not set {fps} fps: {err:#}",
+                        key.target, encoding.fps
+                    );
+                    isocast_diagnostics::diagnostic!("warn"; "{message}");
+                    encoding.refused = Some(fps);
+                    encoding.notice.result(Some(message));
+                }
             }
-            encoding.fps = fps;
         }
         // Frame times must increase, even for a frame sent again.
         let pts = match encoding.last_pts {
@@ -386,7 +406,7 @@ impl Pace {
         }
         self.last = Some(at);
         self.skipped = None;
-        Some((frame, at))
+        P::retain_frame(&frame, crate::FrameUse::Auxiliary).map(|frame| (frame, at))
     }
 }
 
@@ -413,6 +433,8 @@ fn start_encoder<P: Platform>(
         input,
         output,
         fps,
+        refused: None,
+        notice: crate::governor::PreviewRate::new(),
         config: None,
         last_pts: None,
         revisions: VecDeque::new(),
@@ -482,7 +504,7 @@ fn deliver<E>(shared: &Shared, encoding: &mut Encoding<E>, encoded: EncodedVideo
         frames::encode(frames::REVISION, seq, 0, 0, &payload).into()
     });
     let mut behind = false;
-    shared.viewers.lock().unwrap().retain_mut(|viewer| {
+    shared.viewers.lock().retain_mut(|viewer| {
         if encoded.keyframe && (!viewer.synced || config_changed) {
             viewer.synced = false;
             if let Some(config) = &encoding.config {
@@ -524,19 +546,9 @@ fn deliver<E>(shared: &Shared, encoding: &mut Encoding<E>, encoded: EncodedVideo
 
 /// Stop the stream: tell every viewer why, then close their channels.
 fn end(streams: &Streams, key: &Key, shared: &Arc<Shared>, why: &str) {
-    remove(
-        &mut streams.lock().unwrap_or_else(|p| p.into_inner()),
-        key,
-        shared,
-    );
-    streams.clear_poison();
+    remove(&mut streams.lock(), key, shared);
     let record: Record = frames::encode(frames::END, 0, 0, 0, why.as_bytes()).into();
-    for viewer in shared
-        .viewers
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .drain(..)
-    {
+    for viewer in shared.viewers.lock().drain(..) {
         let _ = viewer.tx.try_send(record.clone());
     }
 }

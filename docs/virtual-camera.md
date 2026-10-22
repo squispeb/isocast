@@ -3,9 +3,83 @@
 `isocast vcam start|stop|status [--json]` controls **Isocast Virtual Camera**.
 The method table and MCP use `virtual_camera_start`, `virtual_camera_stop`,
 and `virtual_camera_status`. `status.virtual_camera` and `virtual_camera`
-events report state, format, frame counts and failures. Start never installs
-anything. Installation/approval and real camera-client qualification remain
-**waiting on Ryan**; see `docs/notes.md`.
+events report state, format, frame counts and failures. The release app
+carries the camera extension and activates it on the first Start (below); a
+development engine never installs anything (use `scripts/vcam-install.sh`).
+Real activation and camera-client qualification wait on Ryan's Developer ID
+provisioning profiles; see `docs/notes.md`.
+
+## In the release app (#67)
+
+`Isocast.app/Contents/Helpers/Isocast Engine.app` (bundle id
+`dev.isocast.isocastd`) embeds `Contents/Library/SystemExtensions/
+dev.isocast.isocastd.camera.systemextension`. Both are signed with Developer
+ID and carry Developer ID provisioning profiles; the engine's grants
+`com.apple.developer.system-extension.install`. The app group is
+`9G68SMNHEU.dev.isocast.isocastd` (Team-ID prefixed: no registration for
+Developer ID) and the Mach service `9G68SMNHEU.dev.isocast.isocastd.camera`.
+`scripts/release.sh` builds, embeds, signs and checks them
+(docs/releasing.md step 4a).
+
+When a Start finds no Isocast camera and the engine carries the extension,
+the engine asks macOS to activate it (`<engine> --install-camera-extension
+--wait-for-approval`, a child with its own run loop):
+
+- **Already allowed** (for example after a reinstall): Start retries until
+  CoreMediaIO publishes the device, up to 5 s, and runs.
+- **First time:** macOS asks the user once. Start fails with "allow Isocast
+  Virtual Camera in System Settings › General › Login Items & Extensions ›
+  Camera Extensions"; the app's popover says the same, with an Open System
+  Settings button. The request stays alive for 15 minutes; when the user
+  allows it the engine starts the camera itself, unless Stop was pressed.
+  A later Start while it waits doesn't ask again. macOS's alert says
+  **"Isocast Engine" would like to use a new camera extension**: it names
+  the requesting process's executable, not its bundle (#69), so since #83
+  the engine's executable is `Contents/MacOS/Isocast Engine` (it was
+  `isocastd`, and the alert said "isocastd"; checked on isocast-m2-b,
+  2026-10-16). The password sheets that follow use the bundle name
+  ("Isocast Engine is trying to modify a System Extension").
+- **Not in /Applications** (run from the DMG): Start says to move Isocast
+  into Applications. **Refused** by macOS: Start reports macOS's reason.
+
+- **After an update** (#69): Sparkle replaces the app and the extension it
+  carries, but macOS keeps running the build it activated. The first Start
+  of each installed build asks macOS which build is active
+  (`<engine> --camera-extension-state`, one JSON line); when it's another
+  build, Start asks macOS to activate this one, which replaces it without
+  asking the user again, then starts. Engine logs say
+  `camera extension build check: Current` (or the replacement).
+
+### Remove Virtual Camera
+
+Moving Isocast.app to the Trash does **not** remove the camera (checked on
+isocast-m2-b: it stays activated and listed). **Remove Virtual Camera…** in
+the camera's popover (the gear beside Virtual Camera), `isocast vcam remove
+[--json]`, MCP `virtual_camera_remove` and the API's `virtual_camera_remove`
+stop the camera and ask macOS to deactivate the extension; macOS asks for an
+administrator password and the call waits for it (about 4 minutes at most;
+the app makes it on its own connection). It returns
+`{restart_needed, message}`; a later Start installs the camera again. A
+development engine refuses (use `scripts/vcam-uninstall.sh`). Removal stops
+Start until macOS answers.
+
+macOS only deactivates the build the requesting app carries ("not found"
+otherwise). When an older build is still active (an update without a Start
+since), removal first asks macOS to activate this app's build, which needs no
+approval, and then deactivates it. The engine's own maintenance entry point
+does the same from a terminal:
+
+```sh
+"/Applications/Isocast.app/Contents/Helpers/Isocast Engine.app/Contents/MacOS/Isocast Engine" --uninstall-camera-extension
+```
+
+To delete Isocast: Remove Virtual Camera, then move the app to the Trash
+(docs/install.md, "Delete Isocast").
+
+Checked on isocast-m2-b (macOS 26.7, notarized Developer ID build,
+2026-10-15): Finder's Move to Trash leaves the camera listed (showing the
+waiting card) until deactivated. Deactivation asks for an administrator
+password.
 
 ## Picture and lifecycle
 
@@ -13,7 +87,7 @@ The live setup accepts:
 
 ```toml
 [virtual_camera]
-target = "program" # program | preview | scene | source
+target = "program" # program | preview | scene | source | vertical
 # scene = "interview" # required only for target = "scene"
 # source = "facecam"  # required only for target = "source"
 # width = 1920       # give both dimensions, or neither for the canvas
@@ -22,6 +96,16 @@ target = "program" # program | preview | scene | source
 
 These settings belong to the **scene collection**, preserving the meaning
 of source/scene ids. The canvas supplies the frame rate (1–240 integer fps).
+`target = "vertical"` shows the vertical canvas's program (#96): with
+neither dimension set the output is the vertical canvas's size (1080×1920
+by default, an advertised mode) at its frame rate. It needs `[vertical]`;
+without it the setup reports `virtual_camera.target` and Start refuses.
+While the camera runs on it, the vertical canvas's size, rate and on/off are
+fixed like the main canvas's; removing the vertical canvas while stopped
+falls back to program, with a note. A contained vertical failure fails the
+camera with the reason; bring the vertical canvas back (off and on, or
+an engine restart), then start again.
+The default (program, main canvas) is unchanged.
 The extension advertises 1920×1080, 1280×720, 2560×1440, 3840×2160,
 1080×1920 and 720×1280. For other canvases, configure an advertised output
 size; mismatched aspect ratios are letterboxed. Invalid settings name the
@@ -39,11 +123,15 @@ Stopped status reports the next output's size and fps. MCP camera tools take
 
 The output worker samples the existing program/preview frames, or draws a
 named scene with the same compiled compositor. One GPU pass scales/converts
-to an IOSurface-backed BGRA pool (bounded at 32 outstanding buffers).
+to an IOSurface-backed BGRA pool governed by the frame-budget ledger.
+The native helper copies into its own bounded pool before acknowledging
+enqueue, so CMIO cannot keep the recorder's pooled pixels alive or see them
+recycled. Status exposes the helper's conservative native reservation.
 An authenticated private child owns all native CoreMediaIO sink calls. The
-worker transfers IOSurface references over Mach; CoreMediaIO's bounded sink
-queue (4 samples) transfers them onward without a CPU image copy. CoreVideo
-keeps surfaces out of the pool while downstream processes hold them. There
+worker transfers IOSurface references over Mach; the helper copies their
+pixels before CoreMediaIO's bounded sink queue (4 samples) transfers the
+private buffers onward. CoreVideo bounds that native pool's outstanding
+buffers independently of the recorder's pools. There
 is no raw shared file or globally discoverable IOSurface-id transport.
 
 Native open has a **2 s** deadline, frames **250 ms**, and close **500 ms**.
@@ -56,10 +144,37 @@ fails after a second; the per-frame DeviceIsAlive IPC has been removed.
 
 The control socket is created **0600** and Darwin peers must match the daemon's
 effective uid. The anonymous helper socket verifies its kernel peer audit
-token against the daemon's designated code requirement. The extension accepts
-only signing id **dev.isocast.isocastd** with Apple team **9G68SMNHEU**, checked
-against the live client's signature. Reservations are keyed by CMIO client id
-so a second authorization cannot overwrite the first.
+token against the daemon's designated code requirement. The extension refuses
+a producer whose CMIO signing id is another app's (CMIO reports the engine's
+as "unknown"). It checks the live client against Apple anchor + identifier
+**dev.isocast.isocastd** + team **9G68SMNHEU** when macOS allows the lookup;
+its sandbox denies that by pid on macOS 26.7, so it then requires the
+producer's executable to be at one of the engine's exact paths: the release
+app's `/Applications/<app>.app/Contents/Helpers/Isocast Engine.app/Contents/MacOS/Isocast Engine`
+or the development host's `/Applications/Isocast Camera Host.app/Contents/MacOS/isocastd`
+(weaker than the team check). The release engine's name before #83,
+`…/MacOS/isocastd` in the same helper, is also accepted, so an older
+engine works until its build replaces the extension. Refusals are logged:
+`log stream --predicate 'subsystem == "dev.isocast.isocastd.camera"'`.
+Reservations are keyed by CMIO client id so a second authorization cannot
+overwrite the first.
+
+**Why not a nonce (#69).** The suggested stronger check was a secret the
+engine writes into the Team-ID app group container, presented to the
+extension as a custom stream property. It can't work: the extension runs as
+**`_cmiodalassistants`** (checked on isocast-m2-b: `ps` shows
+`_cmiodalassistants … IsocastCamera`), so its app group container is under
+`/var/db/cmiodalassistants`, not the user's `~/Library/Group Containers`,
+and the engine (the user) can't write there. Any secret the engine can store
+for itself (a file, its Keychain) is readable by another process of the same
+user or invisible to the extension's user, and CMIOExtensionClient (macOS 27
+SDK) still gives only a client id, a signing id and a pid: no audit token to
+verify the caller's code. So the producer check stays the path pin. What it
+leaves open: a process running as the same user that installs its own app
+at `/Applications/<name>.app/Contents/Helpers/Isocast Engine.app/Contents/MacOS/Isocast Engine`
+(writable without a password for an admin user) can feed the camera. Such a
+process can already do far more with the user's account; the camera shows
+only what a producer sends and never reads anything back.
 
 Samples have host-clock PTS, frame duration, Rec.709 primaries/transfer/matrix
 and full-range RGB pixels. Program PTS is the engine's canvas timestamp,

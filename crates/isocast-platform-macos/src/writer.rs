@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::ptr::{self, NonNull};
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -10,9 +10,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use block2::RcBlock;
 use isocast_engine::{
-    FileWriter, MOVIE_FRAGMENT_SECONDS, SAMPLE_RATE, Time, VideoTrackSpec, WriterSpec,
+    FileWriter, Finished, MOVIE_FRAGMENT_SECONDS, SAMPLE_RATE, Time, VideoTrackSpec, WriterSpec,
 };
-use isocast_protocol::{Codec, Container};
+use isocast_protocol::{CanvasId, Codec, Container};
 use objc2::Message;
 use objc2::exception;
 use objc2::rc::{Retained, autoreleasepool};
@@ -50,10 +50,11 @@ use objc2_video_toolbox::{
 use crate::PixelBuffer;
 
 /// Bound encoder back-pressure without blocking the other inputs of the
-/// same file. Video buffers are retained, never copied.
-const PENDING_VIDEO: usize = 32;
+/// same file. Crash-safe writers retain permitted buffers through native
+/// completion; AVAssetWriter copies into its private bounded pool.
+pub(crate) const PENDING_VIDEO: usize = 32;
 /// ISOs must not build a long hardware backlog ahead of a protected output.
-const PENDING_ISO: usize = 4;
+pub(crate) const PENDING_ISO: usize = 4;
 const PENDING_AUDIO: usize = 64;
 /// Bound how long queued inputs may remain stalled during Stop.
 const FINISH_WAIT: Duration = Duration::from_secs(10);
@@ -63,11 +64,11 @@ const KEYFRAME_INTERVAL_SECONDS: f64 = 1.0;
 /// boundary has reached disk. Queued encoding and AAC timing can lag inputs.
 const FRAGMENT_SECONDS: i64 = MOVIE_FRAGMENT_SECONDS;
 
-static PRIORITY_OUTPUTS: AtomicUsize = AtomicUsize::new(0);
-static PRIORITY_PRESSURE: AtomicUsize = AtomicUsize::new(0);
-/// Fraction of ISO pictures admitted, in thousandths. Reduce promptly under
-/// pressure, then probe for spare capacity slowly instead of sending bursts.
-static ISO_SHARE: AtomicU32 = AtomicU32::new(1000);
+// The shared-encoder admission controller is portable and lives in the
+// engine, which applies ISO admission before drawing a frame (#29).
+pub(crate) use isocast_engine::record::pressure::{
+    EncoderPressure, PRIORITY_OUTPUTS, PRIORITY_PRESSURE,
+};
 
 /// How far apart hardware sessions get their first pictures, and in what
 /// order. VideoToolbox places a session on one of the chip's video encode
@@ -116,9 +117,13 @@ fn encoder_starts() -> std::sync::MutexGuard<'static, EncoderStarts> {
 
 /// A session's place in the start order: protected outputs first, then
 /// by size, largest first.
-pub(crate) fn encoder_start_rank(protected: bool, width: u32, height: u32) -> (u8, u32) {
+pub(crate) fn encoder_start_rank(canvas: Option<CanvasId>, width: u32, height: u32) -> (u8, u32) {
     (
-        u8::from(!protected),
+        match canvas {
+            Some(CanvasId::Main) => 0,
+            Some(_) => 1,
+            None => 2,
+        },
         u32::MAX - width.saturating_mul(height),
     )
 }
@@ -178,61 +183,6 @@ pub(crate) fn cancel_encoder_start(ticket: u64) {
     encoder_starts().waiting.retain(|(.., t)| *t != ticket);
 }
 
-/// Admission feedback across the native sessions sharing this process's
-/// hardware encoders. Only an output's worker mutates its guard. Capture and
-/// the compositor never wait; low-priority writers return a counted refusal.
-pub(crate) struct EncoderPressure {
-    stalled: bool,
-    adjusted: Instant,
-}
-
-impl EncoderPressure {
-    pub(crate) fn new() -> Self {
-        if PRIORITY_OUTPUTS.fetch_add(1, Ordering::Relaxed) == 0 {
-            ISO_SHARE.store(1000, Ordering::Relaxed);
-        }
-        Self {
-            stalled: false,
-            adjusted: Instant::now(),
-        }
-    }
-
-    pub(crate) fn set(&mut self, stalled: bool) {
-        let now = Instant::now();
-        if stalled
-            && (!self.stalled || now.duration_since(self.adjusted) >= Duration::from_millis(100))
-        {
-            let _ = ISO_SHARE.try_update(Ordering::Relaxed, Ordering::Relaxed, |share| {
-                Some(share * 3 / 4)
-            });
-            self.adjusted = now;
-        } else if !stalled
-            && PRIORITY_PRESSURE.load(Ordering::Relaxed) == 0
-            && now.duration_since(self.adjusted) >= Duration::from_millis(500)
-        {
-            let _ = ISO_SHARE.try_update(Ordering::Relaxed, Ordering::Relaxed, |share| {
-                Some((share + 10).min(1000))
-            });
-            self.adjusted = now;
-        }
-        if stalled != self.stalled {
-            if stalled {
-                PRIORITY_PRESSURE.fetch_add(1, Ordering::Relaxed);
-            } else {
-                PRIORITY_PRESSURE.fetch_sub(1, Ordering::Relaxed);
-            }
-            self.stalled = stalled;
-        }
-    }
-}
-
-impl Drop for EncoderPressure {
-    fn drop(&mut self) {
-        self.set(false);
-        PRIORITY_OUTPUTS.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
 /// One .mov or .mp4 file written by AVAssetWriter.
 pub struct AssetWriter {
     writer: Retained<AVAssetWriter>,
@@ -245,11 +195,11 @@ pub struct AssetWriter {
     /// The file's start on the host clock, and as the writer sees it.
     start: Option<(Time, CMTime)>,
     pending_video: VecDeque<(PixelBuffer, CMTime)>,
+    frame_pool: Option<crate::FramePool>,
     /// A tail repeat preserves audio if the final video slots were refused.
     last_video: Option<(PixelBuffer, CMTime)>,
     frame_duration: CMTime,
     priority: Option<EncoderPressure>,
-    iso_credit: u32,
     /// The video input has its first picture, so its hardware session has
     /// started; until then pictures wait for their turn in the start order
     /// (`start_ticket` is the request; see [`claim_encoder_start`]).
@@ -397,10 +347,10 @@ impl AssetWriter {
             timescale,
             start: None,
             pending_video: VecDeque::new(),
+            frame_pool: None,
             last_video: None,
             frame_duration: unsafe { CMTime::new(1, spec.video.fps as i32) },
             priority: None,
-            iso_credit: 0,
             encoding: false,
             start_ticket: None,
             pixels: (spec.video.width, spec.video.height),
@@ -430,8 +380,15 @@ impl AssetWriter {
 impl FileWriter for AssetWriter {
     type Frame = PixelBuffer;
 
-    fn prioritize_video(&mut self) {
-        self.priority.get_or_insert_with(EncoderPressure::new);
+    fn intentional_video_drops(&self) -> u64 {
+        self.priority
+            .as_ref()
+            .map_or(0, |priority| priority.refused())
+    }
+
+    fn prioritize_video(&mut self, canvas: CanvasId) {
+        self.priority
+            .get_or_insert_with(|| EncoderPressure::new(canvas));
     }
 
     fn start(&mut self, at: Time) -> Result<()> {
@@ -440,6 +397,10 @@ impl FileWriter for AssetWriter {
 
     fn append_video(&mut self, frame: &PixelBuffer, pts: Time) -> Result<bool> {
         autoreleasepool(|_| self.append_frame(frame, pts))
+    }
+
+    fn skip_video(&mut self) -> Result<()> {
+        autoreleasepool(|_| self.drain_ready())
     }
 
     // Developer mode (#47): frames waiting for AVAssetWriter's input.
@@ -451,8 +412,11 @@ impl FileWriter for AssetWriter {
         autoreleasepool(|_| self.append_samples(track, samples, pts))
     }
 
-    fn finish(self, end: Time) -> Result<u64> {
-        autoreleasepool(|_| self.finish_at(end))
+    fn finish(self, end: Time) -> Result<Finished> {
+        autoreleasepool(|_| self.finish_at(end)).map(|repeated| Finished {
+            repeated,
+            ..Finished::default()
+        })
     }
 
     fn cancel(self) {
@@ -480,6 +444,18 @@ impl AssetWriter {
     }
 
     fn append_frame(&mut self, frame: &PixelBuffer, pts: Time) -> Result<bool> {
+        if self.last_video.is_some()
+            && self.priority.as_mut().is_some_and(|p| {
+                if self.gated {
+                    !p.admit()
+                } else {
+                    !p.admit_governor()
+                }
+            })
+        {
+            self.drain_ready()?;
+            return Ok(false);
+        }
         // Pictures waiting for the session's start all fit, and the ISO
         // limit only applies once they have drained: a wait for the start
         // must never turn into refusals.
@@ -492,23 +468,14 @@ impl AssetWriter {
         } else {
             PENDING_VIDEO
         };
+        // The engine admits ISO frames by the ISO share before drawing
+        // them (#29). Pressure that rose since then still pauses them.
         if self.priority.is_none()
             && self.last_video.is_some()
-            && PRIORITY_OUTPUTS.load(Ordering::Relaxed) > 0
+            && PRIORITY_PRESSURE.load(Ordering::Relaxed) > 0
         {
-            // Stop adding low-priority work immediately while a protected
-            // queue catches up. The reduced steady share avoids repeatedly
-            // refilling every encoder at full rate when that pause ends.
-            if PRIORITY_PRESSURE.load(Ordering::Relaxed) > 0 {
-                self.drain_ready()?;
-                return Ok(false);
-            }
-            self.iso_credit += ISO_SHARE.load(Ordering::Relaxed);
-            if self.iso_credit < 1000 {
-                self.drain_ready()?;
-                return Ok(false);
-            }
-            self.iso_credit -= 1000;
+            self.drain_ready()?;
+            return Ok(false);
         }
         if self.pending_video.len() >= limit {
             self.drain_ready()?;
@@ -517,8 +484,12 @@ impl AssetWriter {
             }
         }
         let time = self.media_time(pts, self.timescale);
+        let Some(frame) = crate::FramePool::copy_native(&mut self.frame_pool, &frame.0)? else {
+            self.drain_ready()?;
+            return Ok(false);
+        };
         self.pending_video.push_back((frame.clone(), time));
-        self.last_video = Some((frame.clone(), time));
+        self.last_video = Some((frame, time));
         self.drain_ready()?;
         Ok(true)
     }
@@ -546,7 +517,11 @@ impl AssetWriter {
         }
         let ticket = *self.start_ticket.get_or_insert_with(|| {
             let (width, height) = self.pixels;
-            request_encoder_start(encoder_start_rank(self.priority.is_some(), width, height))
+            request_encoder_start(encoder_start_rank(
+                self.priority.as_ref().map(|p| p.canvas),
+                width,
+                height,
+            ))
         });
         claim_encoder_start(ticket)
     }
@@ -563,7 +538,9 @@ impl AssetWriter {
             for audio in &mut self.audio {
                 if !audio.pending.is_empty() && unsafe { audio.input.isReadyForMoreMediaData() } {
                     let buffer = audio.pending.pop_front().expect("not empty");
-                    if !unsafe { audio.input.appendSampleBuffer(&buffer) } {
+                    if !catch(|| unsafe { audio.input.appendSampleBuffer(&buffer) })
+                        .context("could not append audio")?
+                    {
                         return Err(writer_error(&self.writer).context("could not append audio"));
                     }
                     progressed = true;
@@ -579,10 +556,12 @@ impl AssetWriter {
                     self.backlog = true;
                 }
                 let (frame, time) = self.pending_video.pop_front().expect("not empty");
-                if !unsafe {
+                if !catch(|| unsafe {
                     self.adaptor
                         .appendPixelBuffer_withPresentationTime(&frame.0, time)
-                } {
+                })
+                .context("could not append a video frame")?
+                {
                     return Err(
                         writer_error(&self.writer).context("could not append a video frame")
                     );
@@ -666,7 +645,7 @@ impl AssetWriter {
 }
 
 /// A media timescale in which every frame time is a whole number of ticks.
-fn video_timescale(fps: u32) -> i32 {
+pub(crate) fn video_timescale(fps: u32) -> i32 {
     if 60_000 % fps == 0 {
         60_000
     } else {
@@ -934,7 +913,20 @@ fn not_plain(path: &std::path::Path) -> Option<String> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
         Err(err) => Some(format!("it can't be checked ({err})")),
         Ok(meta) if !meta.file_type().is_file() => Some("it isn't a plain file".into()),
-        Ok(meta) if meta.nlink() != 1 => Some(format!("it has {} names", meta.nlink())),
+        // A second name is a hard link only where the volume can make one;
+        // elsewhere (or a count of 0) it's how the volume reports links,
+        // and refusing would refuse every take on it (#56).
+        Ok(meta) if meta.nlink() > 1 && crate::hard_links_possible(path) => {
+            Some(format!("it has {} names", meta.nlink()))
+        }
+        Ok(meta) if meta.nlink() != 1 => {
+            isocast_diagnostics::diagnostic!("warn";
+                "isocastd: {} reports {} names, which can't be a hard link there; recording into it",
+                path.display(),
+                meta.nlink()
+            );
+            None
+        }
         Ok(_) => None,
     }
 }
@@ -943,4 +935,54 @@ fn not_plain(path: &std::path::Path) -> Option<String> {
 /// the macOS versions Isocast supports.
 fn key(constant: Option<&'static NSString>) -> &'static NSString {
     constant.expect("AVFoundation constant")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use isocast_engine::{AudioTrackSpec, FramePool};
+
+    #[test]
+    fn append_exceptions_are_errors_without_unwinding_into_rust() {
+        autoreleasepool(|_| {
+            let path = std::env::temp_dir().join(format!(
+                "isocast-append-exception-{}.mov",
+                std::process::id()
+            ));
+            let writer = AssetWriter::create(&WriterSpec {
+                path,
+                container: Container::Mov,
+                video: VideoTrackSpec {
+                    width: 64,
+                    height: 64,
+                    fps: 30,
+                    encoder: isocast_protocol::Encoder {
+                        codec: Codec::H264,
+                        ..Default::default()
+                    },
+                },
+                audio: vec![AudioTrackSpec { channels: 1 }],
+                created: std::time::SystemTime::now(),
+            })
+            .unwrap();
+            let mut pool = crate::frames::FramePool::new(64, 64).unwrap();
+            let frame = pool.draw(&mut |pixels, _| pixels.fill(0)).unwrap().unwrap();
+            let at = unsafe { CMTime::new(0, 30) };
+            // Writing has started, but the source-time session has not.
+            // These are real AVFoundation exceptions, not Rust panics.
+            let video = catch(|| unsafe {
+                writer
+                    .adaptor
+                    .appendPixelBuffer_withPresentationTime(&frame.0, at)
+            });
+            let audio = &writer.audio[0];
+            let sample = audio_sample_buffer(&audio.format, 1, &[0.0; 480], at).unwrap();
+            let audio = catch(|| unsafe { audio.input.appendSampleBuffer(&sample) });
+            writer.cancel();
+            for error in [video, audio] {
+                let error = error.expect_err("append before startSession must throw");
+                assert!(error.to_string().contains("exception"), "{error:#}");
+            }
+        });
+    }
 }

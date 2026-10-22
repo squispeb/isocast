@@ -224,18 +224,23 @@ pub fn generate(
     // Newest segments win the bounded collection budget; reserve room for
     // crash reports and manifests instead of filling the zip with old logs.
     // Developer mode's segments (verbose records and traces) can fill the
-    // report on their own: only each launch's newest one comes along.
-    let mut developer = HashSet::new();
+    // report on their own: each launch's newest ones come along, up to one
+    // full segment's worth, so a newest segment left tiny by a toggle or a
+    // rotation brings the one before it too (#55).
+    let mut developer: HashMap<String, u64> = HashMap::new();
     for path in all.iter().rev() {
         let name = path.file_name().unwrap().to_string_lossy();
         if launches.iter().any(|launch| name.starts_with(launch)) {
-            if let Some(at) = name.find("-developer-")
-                && !developer.insert(name[..at].to_string())
-            {
-                omitted.push(format!(
-                    "logs/{name}: older developer-mode segment omitted (isocast logs reads it)"
-                ));
-                continue;
+            if let Some(at) = name.find("-developer-") {
+                let size = path.metadata().map_or(0, |m| m.len());
+                let taken = developer.entry(name[..at].to_string()).or_insert(0);
+                if *taken > 0 && *taken + size > MAX_FILE {
+                    omitted.push(format!(
+                        "logs/{name}: older developer-mode segment omitted (isocast logs reads it)"
+                    ));
+                    continue;
+                }
+                *taken += size.max(1);
             }
             if path.extension().is_some_and(|e| e == "jsonl")
                 && contents.values().map(String::len).sum::<usize>() >= (24 << 20)
@@ -256,8 +261,7 @@ pub fn generate(
                             .or_else(|| value["fields"]["report"]["folder"].as_str());
                         if let Some(folder) = folder {
                             let folder = if let Some(rest) = folder.strip_prefix("~/") {
-                                PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
-                                    .join(rest)
+                                isocast_protocol::api::home_folder().join(rest)
                             } else {
                                 PathBuf::from(folder)
                             };
@@ -277,7 +281,7 @@ pub fn generate(
             );
         }
     }
-    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    let home = isocast_protocol::api::home_folder();
     let bootstrap = isocast_protocol::api::socket_path().with_extension("log");
     if bootstrap.exists() {
         collect(
@@ -559,7 +563,7 @@ fn build(
         report.preview_id = Some(crate::preview::save(contents)?);
         return Ok(report);
     }
-    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    let home = isocast_protocol::api::home_folder();
     let out = params.out.clone().unwrap_or_else(|| {
         if std::env::var_os("ISOCAST_SOCKET").is_some() {
             logs_folder().with_extension("reports")

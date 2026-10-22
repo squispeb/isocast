@@ -31,6 +31,10 @@ export struct FormField {
     label: string,
     kind: string,
     text: string,
+    // A path with its middle left out ("/Volumes/…/slides/brb.jpg"), shown
+    // in place of `text` while the field isn't being typed in and the
+    // whole path doesn't fit (#108).
+    rest-text: string,
     number: float,
     // A number left out (it shows `placeholder`, like "Auto").
     empty: bool,
@@ -137,7 +141,7 @@ component FilesField inherits VerticalLayout {
                     VerticalLayout {
                         alignment: center;
                         Icon {
-                            path: Icons.reel;
+                            path: root.f.options.length > 0 ? Icons.app-audio : Icons.reel;
                             size: Theme.icon-xs;
                             stroke-width: 1.125px;
                             color: Theme.text-3;
@@ -191,7 +195,20 @@ component FilesField inherits VerticalLayout {
             }
         }
     }
-    HorizontalLayout {
+    // Apps to add from (a system audio source's apps to leave out).
+    if root.f.options.length > 0: HorizontalLayout {
+        alignment: start;
+        Dropdown {
+            width: root.width;
+            on-control: true;
+            show-detail: true;
+            options: root.f.options;
+            value: root.f.value;
+            label: root.f.label;
+            selected(v) => { SettingsForms.choose(root.form, root.f.key, v); }
+        }
+    }
+    if root.f.options.length == 0: HorizontalLayout {
         alignment: start;
         Button {
             text: "Add Files…";
@@ -286,6 +303,7 @@ export component FieldRow inherits GroupRow {
                         mono: true;
                         icon: Icons.folder;
                         text: root.f.text;
+                        rest-text: root.f.rest-text;
                         placeholder: root.f.placeholder;
                         label: root.f.label;
                         committed(text) => { SettingsForms.text(root.form, root.f.key, text); }

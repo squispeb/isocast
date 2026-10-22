@@ -21,6 +21,9 @@ use crate::{Daemon, State, content_size, devices, now, relative_folder};
 
 /// A scene collection or profile in hand.
 #[derive(Debug, Clone)]
+// Administrative I/O only, not a media queue. Keeping these owned documents
+// inline avoids boxing every library read just for the profile's small policy.
+#[allow(clippy::large_enum_variant)]
 enum Document {
     Collection(Collection),
     Profile(Profile),
@@ -177,6 +180,13 @@ fn switch_refusal(state: &State, what: &str) -> Option<String> {
              setup; stop it first (`isocast stop`, or MCP's stop_recording), then switch"
         ));
     }
+    if state.replay.active() {
+        return Some(format!(
+            "can't switch {what} while the replay buffer runs: it keeps the current canvas; \
+             stop it first ({}), then switch",
+            state.replay.stop_hint()
+        ));
+    }
     if state.streaming() || state.streams_starting > 0 {
         return Some(format!(
             "can't switch {what} while streaming: the stream would change under its viewers; \
@@ -202,7 +212,7 @@ impl Daemon {
     /// The library's folder and the pair in use, read under the lock so
     /// the files can be read without it.
     fn library_view(&self) -> (PathBuf, Option<CurrentFile>) {
-        let state = self.state.lock().unwrap();
+        let state = self.state.read();
         (
             state.file.root().to_path_buf(),
             state.file.current().cloned(),
@@ -271,27 +281,46 @@ impl Daemon {
     fn document(&self, kind: LibraryKind, field: &str, id: &str) -> Result<Document, RpcError> {
         let (root, _) = self.library_view();
         check_exists(&root, kind, field, id)?;
-        {
-            let state = self.state.lock().unwrap();
+        let path = store::document_path(&root, kind, id);
+        let live = {
+            let state = self.state.read();
             let in_use = state.file.current().is_some_and(|c| match kind {
                 LibraryKind::Collection => c.collection == id,
                 LibraryKind::Profile => c.profile == id,
             });
-            if in_use && let Some(setup) = &state.setup {
-                let profile_name = state
-                    .file
-                    .current_names(None)
-                    .1
-                    .map(|p| p.name)
-                    .unwrap_or_default();
-                let (collection, profile) = setup.clone().into_parts(&profile_name);
-                return Ok(match kind {
-                    LibraryKind::Collection => Document::Collection(collection),
-                    LibraryKind::Profile => Document::Profile(profile),
-                });
+            match &state.setup {
+                Some(setup) if in_use => {
+                    let profile_name = state
+                        .file
+                        .current_names(None)
+                        .1
+                        .map(|p| p.name)
+                        .unwrap_or_default();
+                    Some((
+                        setup.vertical.is_none(),
+                        setup.clone().into_parts(&profile_name),
+                    ))
+                }
+                _ => None,
             }
+        };
+        if let Some((parked, (collection, mut profile))) = live {
+            return Ok(match kind {
+                LibraryKind::Collection => Document::Collection(collection),
+                LibraryKind::Profile => {
+                    // The live setup has no vertical canvas (its collection
+                    // has none), but the saved profile keeps its vertical
+                    // frame rate, recording and stream for one that does
+                    // (`store::write` parks them): show them as saved.
+                    if parked && profile.vertical.is_none() {
+                        profile.vertical = store::read_profile(&path)
+                            .ok()
+                            .and_then(|saved| saved.vertical);
+                    }
+                    Document::Profile(profile)
+                }
+            });
         }
-        let path = store::document_path(&root, kind, id);
         let read = match kind {
             LibraryKind::Collection => store::read_document(&path).map(Document::Collection),
             LibraryKind::Profile => store::read_profile(&path).map(Document::Profile),
@@ -331,14 +360,19 @@ impl Daemon {
                     let canvas = self
                         .state
                         .lock()
-                        .unwrap()
                         .setup
                         .as_ref()
                         .map(|s| (s.canvas.width, s.canvas.height));
                     let (width, height) = canvas.unwrap_or((1920, 1080));
                     Document::Collection(Collection::blank(&name, width, height))
                 }
-                LibraryKind::Profile => Document::Profile(Profile::starter(&name)),
+                LibraryKind::Profile => {
+                    let mut profile = Profile::starter(&name);
+                    if let Some(machine) = crate::this_machine() {
+                        profile.canvas.fps = isocast_protocol::init::starting_fps(machine);
+                    }
+                    Document::Profile(profile)
+                }
             },
         };
         document.set_name(&name);
@@ -399,7 +433,7 @@ impl Daemon {
     /// name). Returns the id.
     fn add(&self, root: &Path, document: &Document, id: Option<&str>) -> Result<String, RpcError> {
         let kind = document.kind();
-        let _files = self.saved.lock().unwrap();
+        let _files = self.saved.lock();
         // Imports/copies can keep the same display name while receiving a
         // fresh id. Give only the incoming document a distinguishable label.
         let mut document = document.clone();
@@ -491,13 +525,13 @@ impl Daemon {
             LibraryKind::Collection => c.collection == id,
             LibraryKind::Profile => c.profile == id,
         });
-        let live = self.state.lock().unwrap().setup.is_some();
+        let live = self.state.lock().setup.is_some();
         let mut revision = None;
         let mut notes = Vec::new();
         if in_use && live && kind == LibraryKind::Collection {
             // The collection's name is the live setup's: a change like any
             // other, saved with it.
-            let at = self.state.lock().unwrap().revision;
+            let at = self.state.lock().revision;
             let applied = self.apply(ApplyParams {
                 revision: at,
                 change: Change::Patch(serde_json::json!({ "name": name })),
@@ -509,7 +543,7 @@ impl Daemon {
             // A change waiting to be saved goes first; the file then gets
             // the new name (later saves keep it).
             self.flush_live_save();
-            let _files = self.saved.lock().unwrap();
+            let _files = self.saved.lock();
             let path = store::document_path(&root, kind, &id);
             let mut document = match kind {
                 LibraryKind::Collection => store::read_document(&path).map(Document::Collection),
@@ -521,7 +555,7 @@ impl Daemon {
                 failed(format!("couldn't rename {} {id:?}: {err:#}", kind.label()))
             })?;
             if in_use && kind == LibraryKind::Profile {
-                self.state.lock().unwrap().file.renamed_profile(&name);
+                self.state.lock().file.renamed_profile(&name);
             }
         }
         self.library_changed(LibraryAction::Renamed, Some(kind), Some(&id));
@@ -540,11 +574,10 @@ impl Daemon {
         self.flush_live_save();
         let entry = self.entry(kind, &id);
         let kept = {
-            let mut files = self.saved.lock().unwrap();
+            let mut files = self.saved.lock();
             let in_use = self
                 .state
                 .lock()
-                .unwrap()
                 .file
                 .current()
                 .is_some_and(|c| match kind {
@@ -603,7 +636,7 @@ impl Daemon {
             (Some(_), None) => "the scene collection",
             (None, Some(_)) => "the profile",
         };
-        if let Some(message) = switch_refusal(&self.state.lock().unwrap(), what) {
+        if let Some(message) = switch_refusal(&self.state.lock(), what) {
             return Err(wrong_state(message));
         }
         // The pair in use has its newest change on disk before another
@@ -637,7 +670,10 @@ impl Daemon {
             unreachable!()
         };
         let names = (collection.name.clone(), profile.name.clone());
-        let setup = Setup::from_parts(collection, profile);
+        let mut setup = Setup::from_parts(collection, profile);
+        // Sources whose ids became reserved (#94) get new ones, as at start;
+        // the collection is saved with them once the switch is made.
+        let renamed = setup.rename_reserved_sources();
         let mut problems = setup.validate();
         if let Some(message) = relative_folder(&setup.recording.folder) {
             problems.push(Issue {
@@ -655,7 +691,7 @@ impl Daemon {
         let same = current
             .as_ref()
             .is_some_and(|c| c.collection == collection_id && c.profile == profile_id);
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         let collection_changed = state
             .file
             .current()
@@ -685,7 +721,15 @@ impl Daemon {
                 })
             })
             .flatten();
-        let mut notes = Vec::new();
+        let mut notes: Vec<String> = renamed
+            .iter()
+            .map(|(old, new)| {
+                format!(
+                    "source {old:?} was renamed {new:?}: {old:?} is now reserved for a timeline \
+                     export's file; scenes, recording lists and hotkeys follow the new id"
+                )
+            })
+            .collect();
         let view = if collection_changed {
             let file = store::document_path(&root, LibraryKind::Collection, &collection_id);
             match store::read_view(&file) {
@@ -704,6 +748,7 @@ impl Daemon {
             }
         }
         .restore(&setup);
+        let vertical_before = crate::canvas_links(&state);
         // The live engine runs the new pair from its next frame: sources
         // open and close as for any change.
         if let Some(engine) = &state.engine {
@@ -711,6 +756,7 @@ impl Daemon {
                 .update(&setup, state.revision + 1)
                 .map_err(wrong_state)?;
         }
+        let save_renamed = (!renamed.is_empty()).then(|| setup.clone());
         state.setup = Some(setup);
         state.hotkey_holds.clear();
         state.revision += 1;
@@ -718,6 +764,14 @@ impl Daemon {
         let written = state
             .file
             .set_current((&collection_id, &profile_id), (&names.0, &names.1));
+        // The renamed setup's files are chosen now, with it, under the same
+        // lock: another switch may change the pair in use before the save
+        // below, and must not get this collection written over its own.
+        let save_renamed = save_renamed.and_then(|setup| {
+            let (prepared, target) = state.file.prepare();
+            notes.extend(prepared);
+            target.map(|target| (setup, target))
+        });
         // Each collection remembers its own on-air and Studio preview ids.
         let mut on_air = None;
         if collection_changed || state.scene != view.scene {
@@ -733,9 +787,13 @@ impl Daemon {
             engine.set_preview(state.preview.clone());
         }
         let preview = state.preview.clone();
+        // A new collection's vertical canvas starts from its restored main
+        // scene and preview: ids the one before chose may mean other scenes.
+        let vertical_events =
+            crate::sync_canvases(&mut state, &vertical_before, collection_changed);
         drop(state);
         {
-            let _files = self.saved.lock().unwrap();
+            let _files = self.saved.lock();
             if let Some((file, view)) = leaving
                 && let Err(err) = store::write_view(&file, &view)
             {
@@ -749,6 +807,9 @@ impl Daemon {
                      would start with the ones before"
                 ));
             }
+        }
+        if let Some((setup, target)) = save_renamed {
+            notes.extend(self.save(revision, &setup, &target));
         }
         // Kept data keys belong to the collection: the one before's are
         // saved with it, and this one's come back.
@@ -769,6 +830,9 @@ impl Daemon {
                 time_seconds: None,
                 transition: None,
             });
+        }
+        for event in vertical_events {
+            self.publish(event);
         }
         let (kind, id) = match (&params.collection, &params.profile) {
             (Some(id), None) => (Some(LibraryKind::Collection), Some(id.as_str())),
@@ -854,6 +918,18 @@ impl Daemon {
                     describe(&problems)
                 )));
             }
+            // A plugin's profile records only into a recordings folder
+            // there is already: switching to it would otherwise widen the
+            // plugins' sandboxes (#103).
+            if let Document::Profile(profile) = document {
+                let roots = self.recording_roots();
+                crate::plugin_folder_refusal(
+                    "profile.recording.folder",
+                    &crate::expand_home(&profile.recording.folder),
+                    &roots,
+                )?;
+                crate::plugin_hotkeys_refusal("profile.hotkeys", &profile.hotkeys, None, &roots)?;
+            }
         }
         let (root, _) = self.library_view();
         let mut added = Vec::new();
@@ -926,6 +1002,13 @@ impl Daemon {
         let mut unsupported = Vec::new();
         let mut notes = Vec::new();
         let mut iso = None;
+        // A stream key OBS keeps in plain text, moved only when asked.
+        let mut stream_key = None;
+        if params.stream_key && params.profile.is_none() {
+            return Err(invalid(
+                "stream_key: give the OBS `profile` whose service.json holds the key",
+            ));
+        }
         if let Some(collection) = &params.collection {
             let devices = devices();
             let options = obs::Options {
@@ -977,6 +1060,21 @@ impl Daemon {
             let imported = obs::import_profile(profile, home.as_deref())
                 .map_err(|message| invalid(format!("profile: {message}")))?;
             let mut part = imported.profile;
+            if params.stream_key {
+                match (&part.stream, obs::plain_stream_key(&imported.path)) {
+                    (Some(stream), Some(key)) => stream_key = Some((stream.clone(), key)),
+                    (None, _) => notes.push(
+                        "stream_key: the OBS profile has no stream Isocast can use, so its key \
+                         stayed behind"
+                            .into(),
+                    ),
+                    (Some(_), None) => notes.push(
+                        "stream_key: OBS keeps no stream key in this profile's service.json \
+                         (or keeps it in the Keychain), so set it with `isocast stream key set`"
+                            .into(),
+                    ),
+                }
+            }
             if let Some(name) = &params.name {
                 part.name = check_name("name", name)?;
             }
@@ -988,6 +1086,38 @@ impl Daemon {
             unsupported.extend(imported.unsupported);
             notes.extend(imported.notes);
         }
-        self.add_documents(documents, params.switch, unsupported, notes)
+        let mut change = self.add_documents(documents, params.switch, unsupported, notes)?;
+        if let Some((stream, key)) = stream_key {
+            let server = (stream.service == isocast_protocol::stream::StreamService::Custom)
+                .then(|| stream.server.clone())
+                .flatten();
+            let params = isocast_protocol::api::StreamKeyParams {
+                key,
+                target: isocast_protocol::api::StreamKeyTarget {
+                    destination: None,
+                    service: Some(stream.service),
+                    server,
+                    canvas: isocast_protocol::CanvasId::Main,
+                },
+            };
+            match self.stream_key_set(params) {
+                Ok(stored) => {
+                    // The profile's own note says the key stayed behind.
+                    change
+                        .notes
+                        .retain(|n| !n.contains("its stream key stays in OBS"));
+                    change.notes.push(format!(
+                        "moved the stream key from OBS's service.json to the Keychain (account \
+                     {:?}); OBS's copy is untouched",
+                        stored.account
+                    ))
+                }
+                Err(err) => change.notes.push(format!(
+                    "imported, but the stream key couldn't be kept in the Keychain: {}",
+                    err.message
+                )),
+            }
+        }
+        Ok(change)
     }
 }

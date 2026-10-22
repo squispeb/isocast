@@ -53,26 +53,69 @@ impl WindowAdapter for OffscreenWindow {
     }
 }
 
-/// The snapshot's platform: one offscreen window, and a clock that only
-/// moves when the snapshot says so.
+/// The snapshot's platform: the offscreen main window (and the editor
+/// window, C.3, once opened), and a clock that only moves when the
+/// snapshot says so.
 struct OffscreenPlatform {
     window: Rc<OffscreenWindow>,
+    /// Windows after the first (the editor's), made as asked for.
+    others: Rc<std::cell::RefCell<Vec<Rc<OffscreenWindow>>>>,
+    gpu: Gpu,
+    made: Cell<bool>,
     now: Rc<Cell<Duration>>,
 }
 
 impl Platform for OffscreenPlatform {
     fn create_window_adapter(&self) -> Result<Rc<dyn WindowAdapter>, slint::PlatformError> {
-        Ok(self.window.clone())
+        if !self.made.replace(true) {
+            return Ok(self.window.clone());
+        }
+        let renderer = SkiaWGPU30Renderer::new(
+            self.gpu.instance.clone(),
+            self.gpu.adapter.clone(),
+            self.gpu.device.clone(),
+            self.gpu.queue.clone(),
+        )
+        .map_err(|e| slint::PlatformError::Other(format!("Skia could not use the GPU: {e}")))?;
+        let size = self.window.size.get();
+        let scale = self.window.window.scale_factor();
+        let window = Rc::new_cyclic(|weak: &Weak<OffscreenWindow>| OffscreenWindow {
+            window: slint::Window::new(weak.clone()),
+            renderer,
+            size: Cell::new(size),
+        });
+        window
+            .window
+            .dispatch_event(WindowEvent::ScaleFactorChanged {
+                scale_factor: scale,
+            });
+        window.window.dispatch_event(WindowEvent::Resized {
+            size: size.to_logical(scale),
+        });
+        self.others.borrow_mut().push(window.clone());
+        Ok(window)
     }
 
     fn duration_since_start(&self) -> Duration {
         self.now.get()
+    }
+
+    /// Slint's `debug()` output, less the element search's complaint about
+    /// missing debug info, which the interpreter (`live-slint`) makes for
+    /// each of thousands of internal items on every search.
+    fn debug_log(&self, arguments: core::fmt::Arguments) {
+        let text = arguments.to_string();
+        if !text.starts_with("The use of the ElementHandle API requires") {
+            eprintln!("{text}");
+        }
     }
 }
 
 struct Offscreen {
     gpu: Gpu,
     window: Rc<OffscreenWindow>,
+    /// The editor window's (C.3), once opened: snapshots draw it then.
+    others: Rc<std::cell::RefCell<Vec<Rc<OffscreenWindow>>>>,
     app: AppWindow,
     hub: Rc<App>,
     updates: Receiver<Update>,
@@ -110,8 +153,12 @@ pub fn run(options: &Options) -> Result<()> {
         )),
     });
     let now = Rc::new(Cell::new(Duration::ZERO));
+    let others = Rc::new(std::cell::RefCell::new(Vec::new()));
     slint::platform::set_platform(Box::new(OffscreenPlatform {
         window: window.clone(),
+        others: others.clone(),
+        gpu: gpu.clone(),
+        made: Cell::new(false),
         now: now.clone(),
     }))
     .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -127,6 +174,8 @@ pub fn run(options: &Options) -> Result<()> {
         size: LogicalSize::new(width as f32, height as f32),
     });
     app.show()?;
+    #[cfg(feature = "live-slint")]
+    live_resize(&window.window, width as f32, height as f32);
 
     let (tx, updates) = channel();
     let commands = daemon::start(move |update| {
@@ -138,10 +187,13 @@ pub fn run(options: &Options) -> Result<()> {
     let hub = App::new(&app, commands, Mode { offscreen: true }, canvas);
     hub.sources
         .set_device(gpu.device.clone(), gpu.queue.clone());
+    hub.projectors
+        .set_device(gpu.device.clone(), gpu.queue.clone());
 
     let mut offscreen = Offscreen {
         gpu,
         window,
+        others,
         app,
         hub,
         updates,
@@ -151,11 +203,23 @@ pub fn run(options: &Options) -> Result<()> {
         still: std::env::var_os("ISOCAST_SNAPSHOT_STILL").is_some(),
     };
     offscreen.wait_for_daemon(Duration::from_millis(options.wait_ms))?;
-    for state in &options.states {
-        offscreen
-            .state(state)
-            .with_context(|| format!("--state {state}"))?;
+    let mut done = 0;
+    for (path, states) in &options.snapshots {
+        offscreen.states(&options.states[done..(*states).max(done)])?;
+        done = done.max(*states);
+        offscreen.settle();
+        let started = Instant::now();
+        offscreen.snapshot(path, options.crop.as_deref())?;
+        isocast_diagnostics::diagnostic!(
+            "saved {} ({}x{} at {}x, drawn in {} ms)",
+            path.display(),
+            width,
+            height,
+            scale,
+            started.elapsed().as_millis()
+        );
     }
+    offscreen.states(&options.states[done..])?;
     offscreen.settle();
 
     if options.a11y {
@@ -165,15 +229,8 @@ pub fn run(options: &Options) -> Result<()> {
         offscreen.settle();
         crate::a11y::print(&offscreen.app)?;
     }
-    if let Some(path) = &options.snapshot {
-        offscreen.snapshot(path)?;
-        isocast_diagnostics::diagnostic!(
-            "saved {} ({}x{} at {}x)",
-            path.display(),
-            width,
-            height,
-            scale
-        );
+    if let Some(dir) = &options.watch {
+        offscreen.watch(dir, options.crop.as_deref())?;
     }
     if let Some(seconds) = options.soak {
         offscreen.soak(seconds, options.check, options.still)?;
@@ -182,6 +239,14 @@ pub fn run(options: &Options) -> Result<()> {
 }
 
 impl Offscreen {
+    fn states(&mut self, states: &[String]) -> Result<()> {
+        for state in states {
+            self.state(state)
+                .with_context(|| format!("--state {state}"))?;
+        }
+        Ok(())
+    }
+
     /// Apply what the daemon sent until it has answered (or said it can't
     /// be reached), then a moment longer for anything that follows.
     fn wait_for_daemon(&mut self, extra: Duration) -> Result<()> {
@@ -264,7 +329,10 @@ impl Offscreen {
     /// `drag:X1,Y1,X2,Y2` (a pointer drag in window points), `hover:X,Y`
     /// (the pointer moved there, not pressed), `hide:DOCK`
     /// (scenes, sources, mixer, transitions, controls, toolbar, status),
-    /// `wait:MS` (for the daemon), `quit:WHAT` (the quit question).
+    /// `wait:MS` (for the daemon), `quit:WHAT` (the quit question),
+    /// `events:FILE` (replay `isocast watch --json` lines),
+    /// `devices:FILE` (this Mac's devices as `isocast devices --json`
+    /// wrote them, in place of the engine's).
     fn state(&mut self, state: &str) -> Result<()> {
         let (name, arg) = state.split_once(':').unwrap_or((state, ""));
         let app = &self.app;
@@ -276,8 +344,22 @@ impl Offscreen {
             }
             "menu" => {
                 let (w, h) = (app.get_preview_width(), app.get_preview_height());
-                app.global::<Menus>()
-                    .invoke_request(arg.into(), w / 2.0, h / 2.0, 0.0, 0.0);
+                // The editor's own menus (`menu:create:export`) in its window.
+                match self.hub.create.editor_window() {
+                    Some(editor) if arg.starts_with("create:") && self.hub.create.editor_open() => {
+                        editor.global::<Menus>().invoke_request(
+                            arg.into(),
+                            w / 2.0,
+                            h / 2.0,
+                            0.0,
+                            0.0,
+                        )
+                    }
+                    _ => {
+                        app.global::<Menus>()
+                            .invoke_request(arg.into(), w / 2.0, h / 2.0, 0.0, 0.0)
+                    }
+                }
             }
             "menu-bar" => self.hub.menu(arg),
             "menu-bar-open" => self.open_menu_bar(arg)?,
@@ -366,6 +448,26 @@ impl Offscreen {
                     "no dock {other:?}; one of scenes, sources, mixer, transitions, controls, toolbar, status"
                 ),
             },
+            // Replay daemon events saved by `isocast watch --json` (one per
+            // line), as if they had just come.
+            "events" => {
+                let text = std::fs::read_to_string(arg).with_context(|| format!("events:{arg}"))?;
+                for line in text.lines().filter(|l| !l.trim().is_empty()) {
+                    let event: isocast_protocol::api::Event =
+                        serde_json::from_str(line).with_context(|| format!("events:{arg}"))?;
+                    self.hub.event(event);
+                }
+            }
+            // Devices from a file (`isocast devices --json`), so a form shows
+            // a device this Mac doesn't have, such as an 8-input interface.
+            "devices" => {
+                let text =
+                    std::fs::read_to_string(arg).with_context(|| format!("devices:{arg}"))?;
+                let devices: isocast_protocol::devices::Devices =
+                    serde_json::from_str(&text).with_context(|| format!("devices:{arg}"))?;
+                self.hub.session.borrow_mut().devices = Some(devices);
+                self.hub.changed(crate::session::Changed::DEVICES);
+            }
             "wait" => {
                 let ms: u64 = arg.parse().context("wait:MS takes milliseconds")?;
                 let until = Instant::now() + Duration::from_millis(ms);
@@ -390,7 +492,7 @@ impl Offscreen {
                             .flat_map(|s| s.iter().copied())
                             .collect();
                         bail!(
-                            "unknown state {other:?}; one of dialog:KIND[:ARG], menu:OWNER, menu-bar:ID, menu-bar-open:TITLE, toast:KIND:TITLE, kit, kit-dialog, kit-menu, kit-dropdown, type:TEXT, key:NAME, drag:X1,Y1,X2,Y2, hover:X,Y, press:LABEL, hide:DOCK, wait:MS, quit:recording|streaming|both, {}",
+                            "unknown state {other:?}; one of dialog:KIND[:ARG], menu:OWNER, menu-bar:ID, menu-bar-open:TITLE, toast:KIND:TITLE, kit, kit-dialog, kit-menu, kit-dropdown, type:TEXT, key:NAME, drag:X1,Y1,X2,Y2, hover:X,Y, press:LABEL, hide:DOCK, wait:MS, quit:recording|streaming|both, events:FILE, devices:FILE, {}",
                             areas.join(", ")
                         )
                     }
@@ -437,15 +539,18 @@ impl Offscreen {
         Ok(())
     }
 
+    /// Keys and the pointer go to the window drawn (the editor's while it
+    /// is open).
     fn key(&mut self, text: slint::SharedString) {
-        let window = &self.window.window;
+        let drawn = self.drawn();
+        let window = &drawn.window;
         window.dispatch_event(WindowEvent::KeyPressed { text: text.clone() });
         window.dispatch_event(WindowEvent::KeyReleased { text });
         self.advance(Duration::from_millis(16));
     }
 
     fn pointer(&self, event: WindowEvent) {
-        self.window.window.dispatch_event(event);
+        self.drawn().window.dispatch_event(event);
     }
 
     /// Press, move in `steps`, release.
@@ -471,9 +576,21 @@ impl Offscreen {
         self.advance(Duration::from_millis(16));
     }
 
+    /// The window snapshots draw: the editor's while it is open, else the
+    /// main window.
+    fn drawn(&self) -> Rc<OffscreenWindow> {
+        match self.others.borrow().last() {
+            Some(editor) if self.hub.create.editor_open() => editor.clone(),
+            // A projector (G.4), the newest window made.
+            Some(projector) if self.hub.projectors.any_open() => projector.clone(),
+            _ => self.window.clone(),
+        }
+    }
+
     /// Draw the window into the target texture.
     fn render(&mut self) -> Result<wgpu::Texture> {
-        let size = self.window.size.get();
+        let drawn = self.drawn();
+        let size = drawn.size.get();
         let stale = self
             .target
             .as_ref()
@@ -516,20 +633,23 @@ impl Offscreen {
             ..Default::default()
         });
         self.gpu.queue.submit([encoder.finish()]);
-        self.window
+        drawn
             .renderer
             .render_to_texture(&target)
             .map_err(|e| anyhow::anyhow!("could not draw the window: {e}"))?;
         Ok(target)
     }
 
-    fn snapshot(&mut self, path: &Path) -> Result<()> {
+    fn snapshot(&mut self, path: &Path, crop: Option<&str>) -> Result<()> {
         // Two passes: the first lays out and makes the preview texture at
         // its final size.
         self.render()?;
         let target = self.render()?;
-        let (w, h) = (target.width(), target.height());
-        let rgba = read_pixels(&self.gpu, &target, 0, 0, w, h)?;
+        let (x, y, w, h) = match crop {
+            Some(crop) => self.crop(crop, &target)?,
+            None => (0, 0, target.width(), target.height()),
+        };
+        let rgba = read_pixels(&self.gpu, &target, x, y, w, h)?;
         let mut file = std::io::BufWriter::new(
             std::fs::File::create(path)
                 .with_context(|| format!("can't write {}", path.display()))?,
@@ -541,6 +661,107 @@ impl Offscreen {
         writer.write_image_data(&rgba)?;
         writer.finish()?;
         Ok(())
+    }
+
+    /// `--snapshot-watch DIR`: draw DIR/snapshot.png now and again after
+    /// every edit to a .slint file, until stopped. The new interface is
+    /// put in place of the old (the interpreter reads ui/ again); what the
+    /// Rust side gave it (properties, models, callbacks) and the daemon's
+    /// state carry over, so the states don't run again. Each picture is
+    /// written whole (renamed into place) and announced on stdout.
+    #[cfg(feature = "live-slint")]
+    fn watch(&mut self, dir: &Path, crop: Option<&str>) -> Result<()> {
+        std::fs::create_dir_all(dir).with_context(|| format!("can't make {}", dir.display()))?;
+        let out = dir.join("snapshot.png");
+        let partial = dir.join(".snapshot.png.partial");
+        let ui = Path::new(env!("CARGO_MANIFEST_DIR")).join("ui");
+        let mut seen = slint_files(&ui);
+        let draw = |this: &mut Self, started: Instant, reload_ms: u128| -> Result<()> {
+            this.snapshot(&partial, crop)?;
+            std::fs::rename(&partial, &out)?;
+            println!(
+                "drawn {} in {} ms (reload {reload_ms} ms)",
+                out.display(),
+                started.elapsed().as_millis()
+            );
+            Ok(())
+        };
+        draw(self, Instant::now(), 0)?;
+        eprintln!(
+            "watching {} for .slint edits (stop with Ctrl-C)",
+            ui.display()
+        );
+        loop {
+            self.pump(Duration::from_millis(25));
+            let now = slint_files(&ui);
+            if now == seen {
+                continue;
+            }
+            seen = now;
+            let started = Instant::now();
+            if !self.app.live_reload() {
+                println!("not drawn: the interface has errors (above); fix and save again");
+                continue;
+            }
+            let size = self.window.size.get().to_logical(self.scale);
+            live_resize(&self.window.window, size.width, size.height);
+            let reload_ms = started.elapsed().as_millis();
+            self.pump(Duration::from_millis(1));
+            self.settle();
+            // A picture that can't be drawn now (the cropped element gone
+            // mid-edit, DIR removed) is reported; the next save tries again.
+            if let Err(error) = draw(self, started, reload_ms) {
+                println!("not drawn: {error:#}");
+            }
+        }
+    }
+
+    #[cfg(not(feature = "live-slint"))]
+    fn watch(&mut self, _dir: &Path, _crop: Option<&str>) -> Result<()> {
+        bail!(
+            "--snapshot-watch reads ui/*.slint at run time, which needs a development build: \
+             cargo build --profile ui-dev -p isocast-ui --features live-slint"
+        )
+    }
+
+    /// `--crop AREA|X,Y,W,H` as a rectangle of the drawn texture's pixels.
+    fn crop(&self, crop: &str, target: &wgpu::Texture) -> Result<(u32, u32, u32, u32)> {
+        let (x, y, w, h) = if let Ok([x, y, w, h]) = numbers::<4>(crop) {
+            (x, y, w, h)
+        } else {
+            use i_slint_backend_testing::{ElementHandle, ElementRoot};
+            // An id is qualified by the component that declares it
+            // (`Workspace::controls`).
+            let suffix = format!("::{}", crop.replace('_', "-"));
+            let shown = |e: &ElementHandle| e.size().width > 0.0 && e.size().height > 0.0;
+            let element = self
+                .app
+                .root_element()
+                .query_descendants()
+                .match_predicate(move |e| e.id().is_some_and(|id| id.ends_with(&suffix)))
+                .find_all()
+                .into_iter()
+                .chain(ElementHandle::find_by_element_type_name(&self.app, crop))
+                .find(shown);
+            let Some(element) = element else {
+                bail!(
+                    "--crop: no shown element {crop:?}; an element id in ui/app.slint (scenes, \
+                     sources, mixer, transitions, controls, stage, bar), the first shown element of a \
+                     component (ControlsDock) or X,Y,W,H in window points"
+                );
+            };
+            let (at, size) = (element.absolute_position(), element.size());
+            (at.x, at.y, size.width, size.height)
+        };
+        let s = self.scale;
+        let px = |v: f32| (v * s).round().max(0.0) as u32;
+        let (x, y) = (
+            px(x).min(target.width() - 1),
+            px(y).min(target.height() - 1),
+        );
+        let w = px(w).clamp(1, target.width() - x);
+        let h = px(h).clamp(1, target.height() - y);
+        Ok((x, y, w, h))
     }
 
     /// Draw at 60 fps for `seconds` while dragging the selection box back
@@ -679,6 +900,46 @@ impl Offscreen {
 fn is_item(rgb: [u8; 3]) -> bool {
     let near = |a: [u8; 3], b: [u8; 3]| a.iter().zip(b).all(|(x, y)| x.abs_diff(y) <= 6);
     near(rgb, ITEM_RGB) || near(rgb, [86, 169, 150])
+}
+
+/// The interpreter (`live-slint`) runs the window's `init` before the
+/// Rust side hides the in-window menu bar, and doesn't run `changed
+/// height` when the bar goes, so `Viewport` keeps the window's height less
+/// the bar's (the docks came out 229 points high instead of 240). A resize
+/// there and back sets it, as the compiled interface has it from the
+/// start. After every reload too, which runs `init` again.
+#[cfg(feature = "live-slint")]
+fn live_resize(window: &slint::Window, width: f32, height: f32) {
+    for h in [height + 1.0, height] {
+        window.dispatch_event(WindowEvent::Resized {
+            size: LogicalSize::new(width, h),
+        });
+        slint::platform::update_timers_and_animations();
+    }
+}
+
+/// Every .slint file under `dir` with its modification time and size.
+#[cfg(feature = "live-slint")]
+fn slint_files(dir: &Path) -> Vec<(std::path::PathBuf, std::time::SystemTime, u64)> {
+    let mut files = Vec::new();
+    let mut dirs = vec![dir.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_dir() {
+                dirs.push(path);
+            } else if path.extension().is_some_and(|e| e == "slint") {
+                let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+                files.push((path, modified, meta.len()));
+            }
+        }
+    }
+    files.sort();
+    files
 }
 
 fn numbers<const N: usize>(text: &str) -> Result<[f32; N]> {

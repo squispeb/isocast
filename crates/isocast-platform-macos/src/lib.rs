@@ -22,23 +22,31 @@ mod audio;
 mod browser;
 mod camera;
 mod capture;
+mod crash_safe;
 mod devices;
 pub mod diagnostics;
 mod frames;
 mod gpu;
 pub mod hotkeys;
+mod inband;
 mod join;
 mod jpeg;
 mod keychain;
+mod matroska;
 mod media;
 mod output;
 mod pacing;
 mod permissions;
 pub mod plugin;
+pub mod pressure;
+mod recode;
 mod stream;
 mod system;
+mod tap;
 mod termination;
 pub mod virtual_camera;
+mod vp8;
+mod webm;
 mod writer;
 
 use isocast_engine::{
@@ -61,8 +69,128 @@ pub use camera::CameraCapture;
 pub use capture::DisplayCapture;
 pub use frames::{FramePool, PixelBuffer};
 pub use gpu::MetalImporter;
+pub use keychain::app_identifier;
 pub use stream::{AacEncoder, H264Encoder};
 pub use writer::AssetWriter;
+
+/// A recording file: AVAssetWriter's, or the crash-safe prototype's
+/// (`ISOCAST_CRASH_SAFE=1`; see `crash_safe`).
+// One writer per file, made once per take: its size doesn't matter, and
+// the AVAssetWriter path must stay exactly as it is (no box to go through).
+#[allow(clippy::large_enum_variant)]
+pub enum MacWriter {
+    Asset(AssetWriter),
+    CrashSafe(crash_safe::CrashSafeWriter),
+}
+
+impl isocast_engine::FileWriter for MacWriter {
+    type Frame = PixelBuffer;
+
+    fn hardware_accelerated(&self) -> Option<bool> {
+        match self {
+            Self::Asset(w) => w.hardware_accelerated(),
+            Self::CrashSafe(w) => w.hardware_accelerated(),
+        }
+    }
+
+    fn intentional_video_drops(&self) -> u64 {
+        match self {
+            Self::Asset(w) => w.intentional_video_drops(),
+            Self::CrashSafe(w) => w.intentional_video_drops(),
+        }
+    }
+
+    fn prioritize_video(&mut self, canvas: isocast_protocol::CanvasId) {
+        match self {
+            Self::Asset(w) => w.prioritize_video(canvas),
+            Self::CrashSafe(w) => w.prioritize_video(canvas),
+        }
+    }
+
+    fn start(&mut self, at: Time) -> anyhow::Result<()> {
+        match self {
+            Self::Asset(w) => w.start(at),
+            Self::CrashSafe(w) => w.start(at),
+        }
+    }
+
+    fn append_video(&mut self, frame: &PixelBuffer, pts: Time) -> anyhow::Result<bool> {
+        match self {
+            Self::Asset(w) => w.append_video(frame, pts),
+            Self::CrashSafe(w) => w.append_video(frame, pts),
+        }
+    }
+
+    fn skip_video(&mut self) -> anyhow::Result<()> {
+        match self {
+            Self::Asset(w) => w.skip_video(),
+            Self::CrashSafe(w) => w.skip_video(),
+        }
+    }
+
+    fn append_audio(&mut self, track: usize, samples: &[f32], pts: Time) -> anyhow::Result<bool> {
+        match self {
+            Self::Asset(w) => w.append_audio(track, samples, pts),
+            Self::CrashSafe(w) => w.append_audio(track, samples, pts),
+        }
+    }
+
+    fn queue_depth(&self) -> usize {
+        match self {
+            Self::Asset(w) => w.queue_depth(),
+            Self::CrashSafe(w) => w.queue_depth(),
+        }
+    }
+
+    fn finish(self, end: Time) -> anyhow::Result<isocast_engine::Finished> {
+        match self {
+            Self::Asset(w) => w.finish(end),
+            Self::CrashSafe(w) => w.finish(end),
+        }
+    }
+
+    fn cancel(self) {
+        match self {
+            Self::Asset(w) => w.cancel(),
+            Self::CrashSafe(w) => w.cancel(),
+        }
+    }
+
+    fn crash_safe(&self) -> bool {
+        match self {
+            Self::Asset(w) => w.crash_safe(),
+            Self::CrashSafe(w) => w.crash_safe(),
+        }
+    }
+
+    fn completed_video_frames(&self) -> Option<u64> {
+        match self {
+            Self::CrashSafe(writer) => writer.completed_video_frames(),
+            Self::Asset(writer) => writer.completed_video_frames(),
+        }
+    }
+
+    fn commit(&mut self) -> anyhow::Result<Option<std::time::Duration>> {
+        match self {
+            Self::Asset(w) => w.commit(),
+            Self::CrashSafe(w) => w.commit(),
+        }
+    }
+
+    fn committed(&self) -> Option<std::time::Duration> {
+        match self {
+            Self::Asset(w) => w.committed(),
+            Self::CrashSafe(w) => w.committed(),
+        }
+    }
+
+    fn lost_frames(&mut self) -> u64 {
+        match self {
+            Self::Asset(w) => w.lost_frames(),
+            Self::CrashSafe(w) => w.lost_frames(),
+        }
+    }
+}
 
 const NANOS_PER_SEC: i128 = 1_000_000_000;
 
@@ -81,7 +209,7 @@ pub enum Capture {
 impl Platform for MacPlatform {
     type Frame = PixelBuffer;
     type FramePool = FramePool;
-    type Writer = AssetWriter;
+    type Writer = MacWriter;
     type Capture = Capture;
     type Importer = MetalImporter;
     type Media = media::MediaReader;
@@ -103,6 +231,10 @@ impl Platform for MacPlatform {
         host_time()
     }
 
+    fn app_identifier(&self) -> Option<String> {
+        keychain::app_identifier()
+    }
+
     fn sleep_until(&self, at: Time) {
         pacing::sleep_until(at);
     }
@@ -115,6 +247,26 @@ impl Platform for MacPlatform {
         volume(path)
     }
 
+    fn same_volume(&self, left: &Path, right: &Path) -> anyhow::Result<bool> {
+        use std::os::unix::fs::MetadataExt;
+        Ok(std::fs::metadata(left)?.dev() == std::fs::metadata(right)?.dev())
+    }
+
+    fn process_cpu_seconds(&self) -> Option<f64> {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+        // SAFETY: getrusage fills only the correctly sized output structure.
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        let usage = unsafe { usage.assume_init() };
+        let seconds = |t: libc::timeval| t.tv_sec as f64 + f64::from(t.tv_usec) / 1e6;
+        Some(seconds(usage.ru_utime) + seconds(usage.ru_stime))
+    }
+
+    fn system_cpu_seconds(&self) -> Option<f64> {
+        crate::pressure::system_cpu_seconds()
+    }
+
     fn write_latency(&self, probe: &Path) -> Option<std::time::Duration> {
         write_latency(probe).ok()
     }
@@ -124,12 +276,15 @@ impl Platform for MacPlatform {
     }
 
     fn permissions(&self) -> anyhow::Result<PermissionsReport> {
-        Ok(permissions::report(devices::permissions()?))
+        Ok(permissions::live_report(devices::permissions()?))
     }
 
-    fn request_permissions(&self) -> anyhow::Result<PermissionsReport> {
-        let permissions = devices::request_permissions(std::time::Duration::from_secs(60))?;
-        Ok(permissions::report(permissions))
+    fn request_permissions(
+        &self,
+        only: Option<PermissionKind>,
+    ) -> anyhow::Result<PermissionsReport> {
+        let permissions = devices::request_permissions(std::time::Duration::from_secs(60), only)?;
+        Ok(permissions::live_report(permissions))
     }
 
     fn open_permission_settings(&self, permission: PermissionKind) -> anyhow::Result<String> {
@@ -168,11 +323,33 @@ impl Platform for MacPlatform {
         FramePool::ycbcr(width, height)
     }
 
+    fn retain_frame(frame: &PixelBuffer, usage: isocast_engine::FrameUse) -> Option<PixelBuffer> {
+        frame.retain(usage)
+    }
+
+    fn frame_budget(&self) -> Option<serde_json::Value> {
+        Some(frames::diagnostics())
+    }
+
     fn real_time_thread(&self) {
         // SAFETY: sets the calling thread's own quality of service.
         unsafe {
             libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
         }
+    }
+
+    fn calibration_priority(&self) -> Option<&'static str> {
+        // Calibration runs only in a disposable helper. Lower the whole
+        // process too: a writer creates its own threads after this call.
+        // SAFETY: changes only this process and the calling thread.
+        let process = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 15) };
+        let status =
+            unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0) };
+        (process == 0 && status == 0).then_some("nice 15, utility quality of service")
+    }
+
+    fn governor_headroom(&self) -> Option<isocast_engine::governor::Headroom> {
+        pressure::headroom()
     }
 
     fn thread_cpu_time(&self) -> Option<std::time::Duration> {
@@ -224,8 +401,19 @@ impl Platform for MacPlatform {
         jpeg::encode(frame, max_width, quality)
     }
 
-    fn create_writer(&self, spec: &WriterSpec) -> anyhow::Result<AssetWriter> {
-        AssetWriter::create(spec)
+    fn create_writer(&self, spec: &WriterSpec) -> anyhow::Result<MacWriter> {
+        if crash_safe::enabled() {
+            return crash_safe::CrashSafeWriter::create(spec).map(MacWriter::CrashSafe);
+        }
+        AssetWriter::create(spec).map(MacWriter::Asset)
+    }
+
+    fn recover_file(
+        &self,
+        folder: &Path,
+        name: &std::ffi::OsStr,
+    ) -> anyhow::Result<Option<isocast_engine::RecoveredFile>> {
+        crash_safe::recover_file(folder, name)
     }
 
     fn capture_screen(
@@ -251,17 +439,23 @@ impl Platform for MacPlatform {
         Ok((Capture::Camera(capture), format))
     }
 
-    fn capture_microphone(&self, device: &str, sink: AudioSink) -> anyhow::Result<(Capture, u32)> {
-        let (capture, channels) = audio::capture_microphone(device, sink)?;
+    fn capture_microphone(
+        &self,
+        device: &str,
+        channels: Option<&[u32]>,
+        sink: AudioSink,
+    ) -> anyhow::Result<(Capture, u32)> {
+        let (capture, channels) = audio::capture_microphone(device, channels, sink)?;
         Ok((Capture::Microphone(capture), channels))
     }
 
     fn capture_system_audio(
         &self,
+        exclude: &[String],
         sink: AudioSink,
         exclude_own: bool,
     ) -> anyhow::Result<(Capture, u32)> {
-        let (capture, channels) = audio::capture_system_audio(sink, exclude_own)?;
+        let (capture, channels) = audio::capture_system_audio(exclude, sink, exclude_own)?;
         Ok((Capture::SystemAudio(capture), channels))
     }
 
@@ -352,6 +546,30 @@ pub fn volume(path: &Path) -> anyhow::Result<Volume> {
     })
 }
 
+/// Whether the file system holding `path` can give a file a second name
+/// (`_PC_LINK_MAX` above 1). One that can't (exFAT and FAT say 1) may
+/// report any link count, and there a count above one isn't a hard link.
+/// An unanswered call counts as able, so a link check stays strict.
+pub(crate) fn hard_links_possible(path: &Path) -> bool {
+    let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
+        return true;
+    };
+    // -1 is "no limit" (or an error): able, either way.
+    !matches!(
+        unsafe { libc::pathconf(path.as_ptr(), libc::_PC_LINK_MAX) },
+        0 | 1
+    )
+}
+
+/// [`hard_links_possible`] for the file system of an open file.
+pub(crate) fn hard_links_possible_fd(file: &std::fs::File) -> bool {
+    use std::os::fd::AsRawFd;
+    !matches!(
+        unsafe { libc::fpathconf(file.as_raw_fd(), libc::_PC_LINK_MAX) },
+        0 | 1
+    )
+}
+
 /// Write 4 KB at the start of `probe` and fsync it, timed. Plain fsync,
 /// not F_FULLFSYNC (what Rust's `sync_data` does here), which would flush
 /// the drive's whole cache and slow the recording it measures.
@@ -378,6 +596,19 @@ static MAIN_LOOP: OnceLock<()> = OnceLock::new();
 /// Declare that this process's main thread is about to run
 /// [`run_main_queue`], so main-thread work asked for before it starts waits
 /// for it instead of being skipped.
+/// `isocastd --preflight-permissions`: the permissions this new process
+/// has, as an exit status with a bit for each one not granted (0: all), for
+/// a running engine to learn that a grant made in System Settings waits for
+/// its restart. Never prompts.
+pub fn preflight_permissions() -> Option<u8> {
+    (std::env::args().nth(1).as_deref() == Some(permissions::PREFLIGHT_ARG)).then(|| {
+        devices::permissions()
+            .map(|p| permissions::preflight_status(&p))
+            // Unreadable: "unknown" to the parent (not a bit pattern).
+            .unwrap_or(u8::MAX)
+    })
+}
+
 pub fn will_run_main_queue() {
     let _ = MAIN_LOOP.set(());
 }
