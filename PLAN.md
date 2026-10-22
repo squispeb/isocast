@@ -806,7 +806,20 @@ step live in `docs/notes.md`'s "Linux port WIP" section.
     correctly (codec, size, rate, timestamps).
   - [x] **L.5.2 The live AAC encoder** (`LiveAacEncoder`, libavcodec's
     AAC-LC), verified through a stream.
-  - [ ] **L.5.3 Joins on Linux** (timeline exports; the join.rs
+  - [x] **L.5.3a Joins on Linux: the video spine** (in-process libav
+    mirroring macOS's join.rs: one output mov/mp4, each part's video
+    packets copied (no decode or re-encode) and retimed so part `k`
+    starts exactly where its clip's length puts it, its `offset_seconds`
+    held before it, a frame starting past the part's end left out;
+    audio silent on the spine).
+  - [x] **L.5.3b Joins on Linux: the audio half and verification**
+    (each part's audio decoded and re-encoded as one continuous AAC
+    track, cut or rounded with silence to the part's bounds on the
+    48 kHz grid, the AAC encoder's priming skipped by an edit list at
+    the file head; the encoder flushed at the join's tail so its last
+    frames come out; verified: a timeline export through two real
+    takes, content checked sample-for-sample).
+  - [x] **L.5.3 Joins on Linux** (timeline exports; the join.rs
     findings: each part fills exactly its clip's length, edit-list
     entries to skip encoder priming at the joins).
 - [ ] **L.6 Browser sources (WPE WebKit or WebKitGTK), virtual
@@ -1614,6 +1627,37 @@ Shipped (v1): 7.1, 7.2, 7.4a, 7.5, 7.6. Next, in order:
 
 ## Log
 
+- L.5.3 joins on Linux (2026-10-22): `join.rs` in
+  `isocast-platform-linux`, mirrors of macOS's join: parts of mov/mp4
+  joined in-process with libavformat/libavcodec, no concat demuxer.
+  Each part's video packets copied bitstream-wise and retimed so part
+  `k` starts exactly at its clip's length (first frame measured where
+  the file's video starts, demuxer `start_time` when it names one), a
+  frame starting past the part's end left out; each part's audio
+  decoded, swresampled to 48 kHz interleaved floats, and fed through
+  ONE continuous `LiveAacEncoder` per track (bitrate = macOS's
+  128 kb/s up to stereo), silence padded or content skipped against
+  the region on the 48 kHz grid, encoder flushed and tail padded to
+  the frame line at the join's end so the presented audio reaches the
+  region's end (last frame's tail runs 9.3 ms of silence past it,
+  video still ends the file). AAC packet pts in the post-header audio
+  time base = `audio_ticks(packets × frame_size − delay)`, movenc
+  writes the head edit list so the priming is skipped and the content
+  lands at 0. Output to a `.partial` file first, renamed
+  into place when the join finished; progress throttled to 200 ms and
+  a false call breaks off with a partial-file cleanup. Verified
+  through a real `isocast timeline export` of two recorded takes
+  (test-pattern 640×480@30 HEVC + tone 440, tone 660): 113 video
+  frames = 82 + 31, first c2 frame exactly at c1's length tick,
+  pts monotonic, source append jitter kept in place; audio content
+  sample-for-sample equal to each take source (cos 1.0 to both sides
+  of the 131200-sample cut, head onset the take's own), no priming
+  leak at the head. Along the way: two daemon crashes found and fixed
+  (packets/frames never allocated before libav calls; debug-build enum
+  UB when bitfield ROUN constants were combined into libav's enum -
+  replaced by `av_rescale_q` plus explicit `AV_NOPTS` guards), and the
+  encoder's `flush()` added after ffprobe showed the last 2 AAC frames
+  still inside libavcodec's queue on close.
 - L.5.2 the live AAC encoder on Linux (2026-10-22): `LiveAacEncoder` in
   `isocast-platform-linux` through libavcodec's native `aac` encoder
   (the same FFmpeg n9 link as L.5.1): 48 kHz interleaved floats in,

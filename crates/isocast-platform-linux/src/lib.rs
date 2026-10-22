@@ -33,6 +33,7 @@ pub(crate) mod audio;
 pub(crate) mod camera;
 pub(crate) mod frames;
 pub(crate) mod gpu;
+pub(crate) mod join;
 mod jpeg;
 mod keychain;
 pub(crate) mod media;
@@ -517,10 +518,7 @@ impl Platform for LinuxPlatform {
     // ---- Joins --------------------------------------------------------
 
     /// Timeline exports are L.5.
-    fn join_files(&self, _spec: &JoinSpec, _progress: OnJoinProgress<'_>) -> Result<Joined> {
-        bail!(
-            "joining files isn't supported on this platform yet; timeline exports arrive at \
-             L.5 of docs/port-omarchy.md"
-        )
+    fn join_files(&self, spec: &JoinSpec, progress: OnJoinProgress<'_>) -> Result<Joined> {
+        join::join(spec, progress)
     }
 }

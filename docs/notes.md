@@ -3,6 +3,63 @@
 Short, dated facts a future session needs. Newest entries go at the top of
 each section. Delete entries that stop being true.
 
+## Linux port progress (2026-10-22, L.5.3 joins on Linux)
+
+- **Joins run in-process with libavformat/libavcodec**
+  (`crates/isocast-platform-linux/src/join.rs`, mirroring macOS's join):
+  no concat demuxer. Part video packets are copied bitstream-wise and
+  retimed (`pts − base + start_k + offset`, base = the part video's
+  first frame's pts with the demuxer's `start_time` preferred when it
+  names one); dts rebased the same way from its own first-packet base;
+  packets with `pts ≥ part end` are unref'd and counted into
+  `left_out`. Audio goes through one continuous `LiveAacEncoder` per
+  track (bitrate = macOS's 128 kbps × min(channels, 2)), decoded →
+  swresample to `AV_SAMPLE_FMT_FLT` interleaved 48 kHz, and the
+  encoder's output is muxed with pts
+  `audio_ticks(packets × frame_size − delay)` in the post-header audio
+  time base; movenc then writes the head edit list so the 1024-sample
+  priming is skipped and content presents from 0 (verified in ffprobe:
+  stream duration = packets × 1024 − 1024, first visible pts −1023
+  is movenc's own retime of our −1024).
+- **Encoder tail flush:** the native AAC encoder holds frames in its
+  internal queue until `flush()` (`avcodec_send_frame(NULL)` + drain;
+  `receive` answers EOF when the flush is spent, not just EAGAIN).
+  Without it a join ends `packets × 1024 − 1024` ≈ 40-50 ms short of
+  the region. The join now pads the fed count to the next whole frame
+  before flushing (`pad = (frame − written % frame) % frame`), and with
+  delay == frame_size the flushed packet places land presented audio at
+  exactly `ceil(written / frame) × frame`: at most one frame of
+  silent tail over the region (9.3 ms on the checked take). Video
+  still governs the container duration.
+- **The join's time bases are post-header:** all starts/lengths/offsets
+  are computed from the muxer's streams read back through
+  `avformat_write_header` (out video tb = the first part's video tb;
+  here 1/15360 from the live writer's appends). Clip lengths convert
+  via `(frames × den × 2 + fps × num) / (2 × fps × num)` rounding half
+  up - both test joins landed exactly on frame lines.
+- **Partial file:** `name.partial.ext`; every failure path removes it
+  and a daemon crash leaves nothing but the partial (the crashed first
+  export proved it). Progress: 0.0 at open, throttled to every 200 ms
+  on video pts, 1.0 after the trailer; false breaks the join.
+- **Verified through a real timeline export** (two takes recorded through
+  the daemon, HEVC mov, tone 440 / tone 660):
+  `isocast timeline export` joined c1 (82 frames) + c2 (31 frames):
+  video hevc 640×480 yuv420p, 113 frames, pts monotonic, c2's first
+  frame exactly at c1's length tick (41984 in 1/15360), source append
+  jitter (512/840/184-tick steps) kept in place; audio 178 AAC frames,
+  content sample-for-sample equal to each take's decoded audio
+  (cos 1.0 against T1[0..131200] and T2[0..49600]), head onset = the
+  take's own (20126 samples in - no priming leak, no head pad), the
+  cut exact at sample 131200, tail 448 samples (9.3 ms) of silence
+  past the region end. Scratch takes/export live under
+  `target/scratch/l5/` (cleared after the L-batch).
+- **Take-recordings quirks observed (from the tone windows, numeric
+  only):** audio starts ~0.42-0.55 s into a take (PipeWire stream
+  bring-up), tone stops ~2.5 s before the audio track's end (the
+  source's output ended while the writer's audio pipe kept running);
+  amplitudes 0.19-0.35 rms. Not join bugs; keep in mind when reading
+  numeric profiles of takes.
+
 ## Linux port progress (2026-10-22, L.5.2 the live AAC encoder)
 
 - **LiveAacEncoder design** (`crates/isocast-platform-linux/src/stream.rs`):
@@ -5454,6 +5511,22 @@ isocast-platform-linux gpu` once the modules exist.
 
 ## Gotchas
 
+- 2026-10-22 (Linux): **ffmpeg-sys's bindgen enums hate C bitfield
+  ORs.** In debug builds, combining libav's ROUN constants
+  (`AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX` = 8197, a C bitfield)
+  and `transmute`-ing into the `repr(u32)` enum panics with "invalid
+  enum construction" - it cost a daemon crash mid-join. Don't use
+  `av_rescale_q_rnd` with combined flags; call `av_rescale_q` (nearest
+  rounding, what CMTime's `RoundHalfAwayFromZero` gave macOS here) and
+  pass `AV_NOPTS` through explicitly at every call site.
+- 2026-10-22 (Linux, daemon): **daemon panics/crashes come with
+  forensics already in place.** The panic hook logs
+  `component: "panic"` with `panic_message` + backtrace into the
+  newest `~/.isocast/logs/*isocastd-0000.jsonl`; SIGSEGVs land in
+  coredumpctl (`gdb -batch` on the decompressed core - a missing
+  allocation shows the pointer as 0x0). After every rebuild of
+  isocastd, `isocast restart` before retesting; unstructured
+  `eprintln!` debug lands in `~/.isocast/logs/*isocastd-native-0000*`.
 - 2026-10-15 (Linux): **ffmpeg picks between its raw inputs by timestamp**,
   so a child with both a video and an audio pipe stops draining video
   until it has an audio packet. Feeding such a child from one thread

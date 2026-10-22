@@ -45,4 +45,4 @@ wgpu = { version = "=30.0.1", default-features = false, features = [
 # system's shared libavcodec (FFmpeg n9), linked in-process (dynamic link keeps
 # libav's LGPL fine) so `receive` can hand every frame out the moment
 # it is done, which a pipe cannot honour.
-ffmpeg-sys-next = { version = "9.0.1", default-features = false, features = ["avcodec"] }
+ffmpeg-sys-next = { version = "9.0.1", default-features = false, features = ["avcodec", "avformat", "swresample"] }

@@ -33,7 +33,7 @@ const MAX_IN_FLIGHT: usize = 8;
 const STALL_WAIT: Duration = Duration::from_millis(400);
 
 /// A libav call's error as readable text.
-fn av_error(code: c_int) -> String {
+pub(crate) fn av_error(code: c_int) -> String {
     let mut text = [0u8; 128];
     let ok = unsafe { av::av_strerror(code, text.as_mut_ptr().cast(), text.len()) };
     if ok == 0 {
@@ -49,6 +49,8 @@ fn av_error(code: c_int) -> String {
 
 /// The error libav uses for "try again": `AVERROR(EAGAIN)`.
 const AV_EAGAIN: c_int = -libc::EAGAIN;
+/// libav's answer at the end of what a codec or container has.
+const AV_EOF: c_int = -0x20464F45;
 
 /// One access unit's NAL units, without their start codes, from an
 /// Annex B payload. Answers `None` if the bytes are not Annex B (the
@@ -769,10 +771,47 @@ impl LiveAacEncoder {
                     av_error(send)
                 ));
             }
+            self.take_packets()
+        }
+    }
+
+    /// Samples per channel in one AAC frame.
+    pub(crate) fn frame_size(&self) -> usize {
+        self.frame_size
+    }
+
+    /// Everything the encoder still holds once no more samples come:
+    /// its last frames, whose pts keep the feed's sample count. The
+    /// join's tail padding has made the feed end on a whole frame by
+    /// the time this runs.
+    pub fn flush(&mut self) -> Result<Vec<Vec<u8>>> {
+        unsafe {
+            let send = av::avcodec_send_frame(self.ctx, std::ptr::null());
+            if send != 0 && send != AV_EAGAIN {
+                return Err(anyhow!(
+                    "the AAC encoder did not finish: {}",
+                    av_error(send)
+                ));
+            }
+            self.take_packets()
+        }
+    }
+
+    /// The encoder's raw context, for a muxer copying codec parameters
+    /// into a file header it writes.
+    pub(crate) fn codec_context(&self) -> *mut av::AVCodecContext {
+        self.ctx
+    }
+
+    /// Every packet the encoder answers with, buffers drained.
+    unsafe fn take_packets(&mut self) -> Result<Vec<Vec<u8>>> {
+        unsafe {
             let mut frames = Vec::new();
             loop {
                 let take = av::avcodec_receive_packet(self.ctx, self.packet);
-                if take == AV_EAGAIN {
+                if take == AV_EAGAIN || take == AV_EOF {
+                    // EAGAIN: more input wanted; EOF: the flush has
+                    // given up everything.
                     break;
                 }
                 if take != 0 {
