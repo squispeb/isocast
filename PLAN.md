@@ -906,7 +906,7 @@ step live in `docs/notes.md`'s "Linux port WIP" section.
     http pages - both verified; the transparent-page composite check
     gets its real take at L.6d. A capture with an audio sink refused
     until L.6b, with the task named).
-  - [ ] **L.6b Browser sources on Linux: page audio** (the macOS
+  - [x] **L.6b Browser sources on Linux: page audio** (the macOS
     `audio.js` routing injected as a user script, its base64 posts
     through the `WebKitUserContentManager` message handler onto the
     `AudioSink`, stereo at 48 kHz against the host clock).
@@ -2460,6 +2460,21 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
 
 ## Log
 
+- L.6b browser page audio on Linux (2026-10-22): with the engine's
+  audio sink (`control_audio`), a page gets macOS's `audio.js` at
+  document start and an `isocastAudio` script-message handler; its
+  `RATE:BASE64` posts are decoded, resampled to 48 kHz and stamped
+  against the host clock (macOS's `decode`/`Stamper`/`Resampler`, with
+  their three tests) into the `AudioSink`. The page's WebKit autoplay
+  policy is `Allow` then, since WebKitGTK otherwise keeps an
+  `AudioContext` suspended without a click (its clock frozen at 0);
+  without audio the policy stays "without sound". The handler is
+  unregistered when the page goes. Verified: a page gating a 440 Hz
+  oscillator 0.5 s on/off records a 6.0 s take, 180 frames, 0 dropped,
+  0 audio dropouts, dominant 439.9 Hz, bursts exactly 1.000 s apart;
+  a white flash timed off the same `AudioContext` puts sound 38.7 ms
+  ahead of picture at every burst (constant); the static red/green page
+  still records 90/90 with its edge at 100; no isocastd cores.
 - L.S1 sync to v0.0.8 (2026-10-22): v0.0.8 merged into the Linux line
   (`f8fd13e`, conflicts resolved as v0.0.8's code plus the smallest
   Linux change; decisions in the merge message and docs/notes.md). The

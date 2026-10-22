@@ -3,6 +3,32 @@
 Short, dated facts a future session needs. Newest entries go at the top of
 each section. Delete entries that stop being true.
 
+## Linux port progress (2026-10-22, L.6b browser page audio)
+
+- **Autoplay:** WebKitGTK keeps a page's `AudioContext` suspended until a
+  click (its `currentTime` stays 0, so anything timed off it freezes
+  too) unless the view's `WebsitePolicies` autoplay is `Allow`;
+  `Settings::set_media_playback_requires_user_gesture(false)` alone left
+  it suspended (a page painting its context's state: red = suspended
+  before, green = running after). `Allow` is set only when the engine
+  asked for the page's audio, where the sound goes to the recorder and
+  never aloud.
+- **`requestAnimationFrame` in the offscreen view** runs only at the
+  start: a flash driven by it stayed white for a whole 6 s take, the
+  same flash on `setInterval(…, 10)` toggled every second. L.6d's live
+  page will meet this; `setInterval` is the measuring tool meanwhile.
+- **A/V:** sound is 38.7 ms ahead of the picture, the same at every
+  burst (a flash and a 440 Hz burst both timed off one AudioContext,
+  video at 30 fps). About one frame; macOS's number wasn't measured
+  this way, so it is a baseline, not a verdict.
+- **Bindings:** webkit2gtk 2.0.2 hands the handler a `JavascriptResult`
+  whose `js_value()` is a `javascriptcore-rs` 1.1 `Value` (that crate
+  has to be a direct dependency for `ValueExt`); the injection-time
+  variant is `UserScriptInjectionTime::Start`.
+- The WIP commit (`WIP L.6b`, parked during the sync) doesn't build on
+  its own; the commit after it completes it. Left as two commits
+  because history isn't rewritten without Ryan.
+
 ## Linux port progress (2026-10-22, L.S1 sync to v0.0.8)
 
 - **Baseline before the merge** (`78e2700`, recorded at Step 0): fmt

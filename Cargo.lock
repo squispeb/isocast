@@ -3559,6 +3559,7 @@ name = "isocast-platform-linux"
 version = "0.0.8"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "cairo-rs",
  "ffmpeg-sys-next",
  "gdk",
@@ -3568,6 +3569,7 @@ dependencies = [
  "isocast-engine",
  "isocast-protocol",
  "isocast-surfaces",
+ "javascriptcore-rs",
  "libc",
  "pipewire",
  "serde_json",

@@ -11,11 +11,11 @@ the `PLAN.md` Log and [notes.md](notes.md).
 - **Branch:** local `main` is based on **v0.0.8** (`c3baa39`, the
   latest release, 2026-10-19), merged in by `f8fd13e` ("Sync Linux
   port to v0.0.8") on top of the 39 Linux commits, plus the fixes the
-  sync's verification found. Nothing is pushed. Upstream is tracked by
-  release tags, not commits on `main`; the sync plan is
+  sync's verification found, and L.6b (browser page audio) after it.
+  Nothing is pushed. Upstream is tracked by release tags, not commits
+  on `main`; the sync plan is
   [linux-release-sync-plan.md](linux-release-sync-plan.md). The
-  pre-sync tip is kept as `linux/pre-0.0.8` (`78e2700`) and the parked
-  L.6b work as `linux/l6b-wip`.
+  pre-sync tip is kept as `linux/pre-0.0.8` (`78e2700`).
 - **Crate:** `crates/isocast-platform-linux` implements the engine's
   `Platform` trait. The daemon selects it in
   `isocast-daemon/src/platform.rs` (`NativePlatform`, a Linux arm next
@@ -26,13 +26,13 @@ the `PLAN.md` Log and [notes.md](notes.md).
 - **What works today:** the daemon, CLI and Slint app all run. A take
   records program plus ISO files with cameras, microphones (with
   v0.0.8's channel picking), system audio, per-app audio, browser
-  pages (video only) and synthetic sources, on extra and vertical
+  pages (picture and sound) and synthetic sources, on extra and vertical
   canvases too. Live monitors and projectors use shared surfaces. Live
   H.264/AAC encoders feed monitors, the replay buffer and multistream.
   Timeline joins run in-process; obs-websocket, masks, NLE export and
   `.isoprj` projects work.
 - **What doesn't yet:** a verified real desktop take (needs one
-  picker click), browser page audio (L.6b, parked), the virtual camera,
+  picker click), the virtual camera,
   hotkeys and plugin sandboxing. Editor exports with in points, crops
   or angles, stream destinations with their own size, editor sound and
   machine calibration are refused with a message (section 3). The
@@ -53,7 +53,7 @@ the `PLAN.md` Log and [notes.md](notes.md).
 | L.5.3 Joins | done | `join.rs`: in-process libavformat/libavcodec joins, video copied as-is and retimed, audio through one continuous AAC encoder. | 113 frames with an exact seam; audio sample-for-sample across the cut; 9.3 ms tail. |
 | L.S1 Sync to v0.0.8 | done (`f8fd13e` + fixes) | v0.0.8 merged; Linux fitted to its `Platform`; every earlier verification repeated. Found and fixed: the program's H.264 (monitors, replay, streams) was a flat green picture; browser pages aborted isocastd at exit; editor joins silently wrote the wrong frames (now refused). | fmt, clippy `-D warnings` and 262 tests clean on the workspace. The table in section 3. |
 | L.6a Browser video | done (`78e2700`) | WebKitGTK `WebView` in a shown `GtkOffscreenWindow` on one shared GTK thread, snapshotted each frame into the BGRA pool. | 640×480/30 static page: 60/90 frames, 0 dropped, corner boundary exactly at row/col 100. `file://` and `http://` decode identically. Checked both in-process (`record`) and in isocastd (`start`/`stop`). |
-| L.6b Browser page audio | **in progress, parked on `linux/l6b-wip`** (doesn't build) | Port of macOS `audio.js` plus a script-message handler into the `AudioSink`. | — |
+| L.6b Browser page audio | done | macOS's `audio.js` plus a script-message handler into the `AudioSink` (decode, resample to 48 kHz, stamp); autoplay allowed while the sound is routed to Isocast. | Gated 440 Hz page: 439.9 Hz, bursts 1.000 s apart, 0 dropouts; sound 38.7 ms ahead of a flash timed off the same AudioContext. |
 | L.6c BrowserControl | code in L.6a | Refresh and load/unload over the GTK thread. | Not yet exercised by a real call (L.6d). |
 | L.6d Browser real take | open | Transparent-page composite and a live page. | — |
 | L.6e Virtual camera | **blocked** | v4l2loopback output. | Kernel module not installed (needs root). |
@@ -88,34 +88,6 @@ Each feature *works*, is *refused* with a message, or is *broken*.
 Not checked in this pass: OBS import, Studio Mode, tally colours and
 the editor window itself.
 
-### L.6b, parked
-
-L.6b is partway through and **does not build** (`cargo check -p
-isocast-platform-linux`: 9 errors at the time it was parked). It is the
-one commit on `linux/l6b-wip`, made on the pre-sync tip; rebase it onto
-the synced `main` before continuing.
-
-- `src/browser.rs` was moved to `src/browser/mod.rs` to match macOS's
-  layout. `src/browser/audio.js` is a copy of the macOS script. The
-  WIP commit carries both halves of the move.
-- `capture_browser` no longer refuses audio. `set_up` takes an
-  `Option<AudioRx>`, registers the `isocastAudio` handler, injects the
-  script at document start, and lets media play without a click.
-- Still missing:
-  1. Cargo dependencies `base64 = "0.22.1"` and
-     `java_script_core = { package = "javascriptcore-rs", version = "=1.1" }`
-     (webkit2gtk doesn't re-export it).
-  2. Imports: `UserContentManagerExt` must be in scope at module level
-     (it's only imported inside the CSS block today), and so must
-     `SettingsExt`, for `set_media_playback_requires_user_gesture`.
-  3. The `AudioRx` receiver, `decode`, `Stamper` and `Resampler` with
-     their unit tests (ported from macOS). The edit that adds them
-     failed because the `BrowserCapture::drop` anchor text had changed.
-  4. Fix the `UserScriptInjectionTime` variant name: the binding calls
-     it `Start`, not `AtDocumentStart`.
-  5. Verify with a page that plays a known tone: FFT of the recorded
-     track, plus A/V offset against the host clock.
-
 ## 4. Blocked on Ryan
 
 - **L.2 real desktop take:** a source open is bounded to 8 s, which
@@ -145,6 +117,13 @@ the synced `main` before continuing.
   never shown. `show_all()` fixes it; the `WEBKIT_DISABLE_*` env vars
   are not needed.
 - Snapshots arrive at the display scale (2× here).
+- In the offscreen view, a page's `requestAnimationFrame` loop stops
+  after its first frames (a flash driven by it stayed white for a whole
+  take), while `setInterval` keeps running. A live page (L.6d) needs
+  this looked at.
+- WebKitGTK keeps an `AudioContext` suspended without a click unless
+  the view's `WebsitePolicies` autoplay is `Allow`;
+  `media-playback-requires-user-gesture` alone isn't enough.
 - Since v0.0.8, `isocast record` runs a private isocastd and shuts it
   down afterwards, so exit-time bugs show as a failed record ("isolated
   daemon exited …; diagnostics retained in /tmp/isocast-…"). After
@@ -188,8 +167,8 @@ app), which arrives with the 0.0.9 sync:
   `isocast-remote`, `isocast-discovery`. `isocast-surfaces` also
   changed on the Windows side (DX12 shared handles).
 
-**Next:** finish L.6b from `linux/l6b-wip` (rebased onto the synced
-line), then L.6c, L.6d, L.6f and L.6g. The format changes above
+**Next:** L.6c, L.6d (a live page: see the `requestAnimationFrame`
+finding above), L.6f and L.6g, then the L.S1 follow-ups. The format changes above
 (`docs/STATE.md`, the issues-based workflow) are taken on at the 0.0.9
 sync. Nothing heads for `ci/<lane>` without Ryan, because Linux is not
 on upstream's "Now" or "Next" list.

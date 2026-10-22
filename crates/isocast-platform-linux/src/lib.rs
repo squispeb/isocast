@@ -496,8 +496,8 @@ impl Platform for LinuxPlatform {
     }
 
     /// L.6a: a web page rendered by WebKitGTK in an offscreen window
-    /// and snapshotted into BGRA frames (browser.rs); page audio is
-    /// L.6b, and a page asked for it is told so.
+    /// and snapshotted into BGRA frames (browser/); L.6b: with `audio`,
+    /// the page's sound goes there instead of playing (audio.js).
     fn capture_browser(
         &self,
         page: &isocast_engine::BrowserPage<'_>,

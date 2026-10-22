@@ -58,3 +58,8 @@ gtk = "0.18"
 # surface, and the background color speaks gdk RGBA).
 gdk = "0.18"
 cairo-rs = "0.18"
+# Page audio (L.6b): `audio.js` posts base64 strings through WebKit's
+# script-message handler, whose value is a JavaScriptCore one (webkit2gtk
+# links this crate without re-exporting it; same version as its own).
+base64 = "0.22.1"
+java_script_core = { package = "javascriptcore-rs", version = "=1.1" }

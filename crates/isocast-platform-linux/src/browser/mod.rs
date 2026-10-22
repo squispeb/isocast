@@ -5,9 +5,9 @@
 //! GTK initialization - so [`page_thread`] is the daemon's one browser
 //! thread, shared by every page. Pages are set up and taken apart
 //! there as jobs; a capture only ever holds its id, the way macOS's
-//! holds its page number. Page audio routes through an injected
-//! script at L.6b; a capture with audio asked for turns itself away
-//! here until then.
+//! holds its page number. A page's sound, when the engine asks for it,
+//! routes through `audio.js` (macOS's script, injected at document
+//! start) into a script-message handler and on to the `AudioSink`.
 //!
 //! A page thread's main loop is why every page record is `Arc` and
 //! `Mutex` rather than `Rc` and `RefCell`: a timer's closure needs to
@@ -31,8 +31,8 @@ use webkit2gtk::glib;
 use webkit2gtk::glib::translate::ToGlibPtr as _;
 // The WebKit trait set: snapshot, loading state, page control.
 use webkit2gtk::{
-    SnapshotOptions, SnapshotRegion, UserContentInjectedFrames, UserScriptInjectionTime,
-    UserStyleLevel, WebView, WebViewExt as _,
+    SettingsExt as _, SnapshotOptions, SnapshotRegion, UserContentInjectedFrames,
+    UserContentManagerExt as _, UserScriptInjectionTime, UserStyleLevel, WebView, WebViewExt as _,
 };
 
 use crate::{
@@ -162,7 +162,7 @@ pub fn capture_browser(
     let sink = Arc::new(sink);
     let (done, done_answer) = mpsc::sync_channel::<Result<()>>(1);
     let css = page.css.to_string();
-    let audio = audio.map(|audio| AudioRx::new(audio));
+    let audio = audio.map(AudioRx::new);
     post_job(Box::new(move || {
         let _ = done.send(set_up(
             id, location, css, width, height, fps, pool, sink, audio,
@@ -201,6 +201,12 @@ static NEXT_PAGE: AtomicU64 = AtomicU64::new(1);
 struct Page {
     window: gtk::OffscreenWindow,
     web: WebView,
+    /// The page's scripts and their message handler: the audio handler
+    /// is unregistered when the page goes, so nothing more reaches its
+    /// sink while WebKit takes the page down.
+    manager: webkit2gtk::UserContentManager,
+    /// Whether `audio.js` and its handler are installed.
+    audio: bool,
     timer: Option<glib::SourceId>,
     /// The page thread's main context, which holds `timer`; its id
     /// removal looks only in a context's own sources, so drop finds it
@@ -216,7 +222,10 @@ struct Page {
 
 impl Drop for Page {
     fn drop(&mut self) {
-        // The audio handler holds nothing any more (L.6b).
+        if self.audio {
+            self.manager
+                .unregister_script_message_handler(AUDIO_HANDLER);
+        }
         if let (Some(context), Some(timer)) = (self.context.as_ref(), self.timer.take())
             && let Some(source) = context.find_source_by_id(&timer)
         {
@@ -260,7 +269,7 @@ fn set_up(
     ));
 
     // A local page may fetch the files next to it, as on macOS.
-    let mut settings = webkit2gtk::Settings::builder()
+    let settings = webkit2gtk::Settings::builder()
         .allow_file_access_from_file_urls(true)
         .build();
     // With audio, a page may start its own sound without a click,
@@ -284,13 +293,12 @@ fn set_up(
         manager.add_script(&webkit2gtk::UserScript::new(
             AUDIO_SCRIPT,
             UserContentInjectedFrames::AllFrames,
-            UserScriptInjectionTime::AtDocumentStart,
+            UserScriptInjectionTime::Start,
             &[],
             &[],
         ));
     }
     if !css.trim().is_empty() {
-        use webkit2gtk::UserContentManagerExt as _;
         manager.add_style_sheet(&webkit2gtk::UserStyleSheet::new(
             &css,
             UserContentInjectedFrames::AllFrames,
@@ -300,8 +308,21 @@ fn set_up(
         ));
     }
 
+    // WebKitGTK lets a page start sound only after a click unless its
+    // autoplay policy says otherwise: a suspended AudioContext's clock
+    // never runs, so the page would be silent and its animations tied to
+    // it frozen. With its sound routed to the recorder (never aloud),
+    // the page may play.
+    let policies = webkit2gtk::WebsitePolicies::builder()
+        .autoplay(if audio.is_some() {
+            webkit2gtk::AutoplayPolicy::Allow
+        } else {
+            webkit2gtk::AutoplayPolicy::AllowWithoutSound
+        })
+        .build();
     let web = WebView::builder()
         .web_context(&PAGE_CONTEXT.with(Clone::clone))
+        .website_policies(&policies)
         .settings(&settings)
         .user_content_manager(&manager)
         .build();
@@ -372,6 +393,8 @@ fn set_up(
     .attach(Some(&context));
 
     let page = Page {
+        manager,
+        audio: audio.is_some(),
         window,
         timer: Some(timer),
         context: Some(context),
@@ -568,5 +591,178 @@ impl Drop for BrowserCapture {
         let _ = post_job(Box::new(move || {
             PAGES.with(|pages| pages.borrow_mut().remove(&id));
         }));
+    }
+}
+
+// ---- Page audio -------------------------------------------------------
+
+/// A page's sound on its way to the engine: `audio.js`'s messages,
+/// decoded, brought to [`SAMPLE_RATE`] and stamped against the host
+/// clock, as macOS's `PageAudio` does. Made on the engine's thread and
+/// used on the page thread, hence `Arc` and `Mutex`.
+#[derive(Clone)]
+struct AudioRx(Arc<AudioState>);
+
+struct AudioState {
+    sink: AudioSink,
+    timing: Mutex<(Stamper, Resampler)>,
+    /// An unreadable message has been said once.
+    reported: AtomicBool,
+}
+
+impl AudioRx {
+    fn new(sink: AudioSink) -> Self {
+        Self(Arc::new(AudioState {
+            sink,
+            timing: Mutex::new((Stamper::default(), Resampler::default())),
+            reported: AtomicBool::new(false),
+        }))
+    }
+
+    /// One message from the page's handler.
+    fn receive(&self, result: &webkit2gtk::JavascriptResult) {
+        let now = host_time();
+        let decoded = result
+            .js_value()
+            .filter(|value| value.is_string())
+            .context("not a string")
+            .and_then(|value| decode(&value.to_str()));
+        match decoded {
+            Ok((rate, samples)) => {
+                let mut timing = self.0.timing.lock().unwrap();
+                let samples = timing.1.run(rate, samples);
+                let frames = samples.len() / 2;
+                if frames > 0 {
+                    let at = timing.0.stamp(frames, now);
+                    drop(timing);
+                    (self.0.sink.samples)(&samples, at);
+                }
+            }
+            Err(err) => {
+                if !self.0.reported.swap(true, Ordering::SeqCst) {
+                    isocast_diagnostics::diagnostic!("warn";
+                        "isocastd: a browser source sent unreadable audio: {err:#}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A message from `audio.js`: `RATE:BASE64`, the base64 of interleaved
+/// stereo 32-bit floats.
+fn decode(message: &str) -> Result<(u32, Vec<f32>)> {
+    let (rate, data) = message.split_once(':').context("no sample rate")?;
+    let rate: u32 = rate.parse().context("bad sample rate")?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(data)?;
+    let samples = bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
+        .collect();
+    Ok((rate, samples))
+}
+
+/// Timestamps for audio that arrives in uneven bursts: each chunk follows
+/// the last unless that has drifted from when it arrived by more than
+/// [`AUDIO_RESYNC`].
+#[derive(Default)]
+struct Stamper {
+    next: Option<Time>,
+}
+
+impl Stamper {
+    /// When the first of `frames` frames that have just arrived was made.
+    fn stamp(&mut self, frames: usize, now: Time) -> Time {
+        let made =
+            now - Duration::from_nanos(frames as u64 * 1_000_000_000 / u64::from(SAMPLE_RATE));
+        let limit = AUDIO_RESYNC.as_nanos() as i64;
+        let at = match self.next {
+            Some(next) if (next.as_nanos() - made.as_nanos()).abs() < limit => next,
+            _ => made,
+        };
+        self.next = Some(at.add_ticks(frames as u64, SAMPLE_RATE));
+        at
+    }
+}
+
+/// Linear resampling of interleaved stereo to [`SAMPLE_RATE`], for pages
+/// whose capture context runs at another rate.
+#[derive(Default)]
+struct Resampler {
+    /// Position of the next output frame, in input frames after `last`.
+    position: f64,
+    last: [f32; 2],
+}
+
+impl Resampler {
+    fn run(&mut self, rate: u32, samples: Vec<f32>) -> Vec<f32> {
+        let input = samples.as_chunks::<2>().0;
+        if rate == SAMPLE_RATE || rate == 0 || input.is_empty() {
+            return samples;
+        }
+        let step = f64::from(rate) / f64::from(SAMPLE_RATE);
+        let last = self.last;
+        // Frame -1 is the previous chunk's last.
+        let frame = |i: isize| if i < 0 { last } else { input[i as usize] };
+        let mut out = Vec::with_capacity((input.len() as f64 / step) as usize * 2 + 2);
+        while self.position < (input.len() - 1) as f64 {
+            let i = self.position.floor();
+            let t = (self.position - i) as f32;
+            let (a, b) = (frame(i as isize), frame(i as isize + 1));
+            out.extend([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]);
+            self.position += step;
+        }
+        self.position -= input.len() as f64;
+        self.last = input[input.len() - 1];
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn messages_decode_to_samples() {
+        let samples = [0.5f32, -0.25, 1.0, 0.0];
+        let bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let message = format!(
+            "44100:{}",
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        );
+        assert_eq!(decode(&message).unwrap(), (44100, samples.to_vec()));
+        assert!(decode("no rate").is_err());
+    }
+
+    #[test]
+    fn bursts_are_stamped_back_to_back_until_they_drift() {
+        let ms = |n: i64| Time::from_nanos(n * 1_000_000);
+        let mut stamper = Stamper::default();
+        // 480 frames (10 ms) arriving at 100 ms: made at 90 ms.
+        assert_eq!(stamper.stamp(480, ms(100)), ms(90));
+        // The next arrives 30 ms late but follows on.
+        assert_eq!(stamper.stamp(480, ms(140)), ms(100));
+        // One 500 ms later starts again from when it arrived.
+        assert_eq!(stamper.stamp(480, ms(640)), ms(630));
+    }
+
+    #[test]
+    fn resampling_is_continuous_across_chunks() {
+        let mut resampler = Resampler::default();
+        // A ramp at 24 kHz comes out at 48 kHz with points in between.
+        let ramp: Vec<f32> = (0..200).flat_map(|i| [i as f32, i as f32]).collect();
+        let mut out = Vec::new();
+        for chunk in ramp.chunks(50) {
+            out.extend(resampler.run(24_000, chunk.to_vec()));
+        }
+        let left: Vec<f32> = out.iter().step_by(2).copied().collect();
+        assert!((396..=400).contains(&left.len()), "{} frames", left.len());
+        for pair in left.windows(2) {
+            assert!((pair[1] - pair[0] - 0.5).abs() < 1e-4, "{pair:?}");
+        }
+        // 48 kHz passes through untouched.
+        assert_eq!(resampler.run(48_000, vec![1.0, 2.0]), vec![1.0, 2.0]);
     }
 }
