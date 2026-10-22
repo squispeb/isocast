@@ -3,6 +3,81 @@
 Short, dated facts a future session needs. Newest entries go at the top of
 each section. Delete entries that stop being true.
 
+## Linux port progress (2026-10-22, L.S1 sync to v0.0.8)
+
+- **Baseline before the merge** (`78e2700`, recorded at Step 0): fmt
+  clean; clippy clean except isocast-ui's 12 dead-code errors (keys.rs,
+  platform.rs, preview.rs's `meter_rect`, update.rs: macOS-only
+  helpers); 219 tests pass. After the sync: fmt and clippy clean on the
+  whole workspace (v0.0.8 gates those helpers itself), 262 tests pass.
+- **Branches:** `linux/pre-0.0.8` = `78e2700` (the pre-sync tip),
+  `linux/l6b-wip` = the parked, non-building L.6b commit on top of it,
+  `linux/sync-0.0.8` = the synced line `main` fast-forwards to.
+- **Merge, not rebase**, and v0.0.8's code wherever both sides edited.
+  Dropped on purpose: our `HostPlatform` alias and every
+  `cfg(any(macos, linux))` wrapper it needed (v0.0.8's
+  `platform::native()` covers them); the CLI's in-process record (v0.0.8
+  runs a private daemon, so the CLI no longer links the Linux crate);
+  our JPEG monitor path for non-mac, non-Linux targets in isocast-ui (a
+  pre-L.4 leftover; v0.0.8 has none). Re-applied: the doctor's `busy`
+  flag (now `Daemon::busy()`), `content_size` during OBS import on
+  Linux, the surfaces' `TRANSPORT` in `shared_frames` replies, the
+  platform-worded `source_permission` sentence, `publish_shared_surface`
+  in the now-asynchronous shared-frames loop (after `in_flight.submit`,
+  before the ready event is registered), and the queue threaded to the
+  app's monitor, source preview and (new) projectors.
+- **Our three additive `Platform` methods stay**, each with a default
+  so macOS and Windows are untouched. `converts_own_inputs`: v0.0.8's
+  `EncoderFrameFormat::Bgra` would also skip the ISO stage, but it moves
+  the program to BGRA too (2.7× the pipe bytes of NV12 into ffmpeg), so
+  Linux stays `Ycbcr` and keeps the flag. `concurrent_encodes`: the
+  machine profile measures sessions in a calibration worker; the doctor's
+  quick pre-flight is something else. `publish_shared_surface`: v0.0.8
+  has no copy-out hook for a surface that isn't the texture.
+- **The defaulted methods, decided:** `same_volume` = `st_dev` equality;
+  `process_cpu_seconds` = `getrusage`; `system_cpu_seconds` =
+  `/proc/stat` busy ticks / `_SC_CLK_TCK`; `create_writer_for_frame` =
+  default (the writer picks its pixel format at the first append);
+  `recover_file` = `None` (fragmented MOV is readable as it is);
+  `retain_frame` = default clone (pool slots are refcounted);
+  `encoder_frame_format` = `Ycbcr` (above); `frame_budget`,
+  `governor_headroom`, `camera_metadata`, `calibration_priority` =
+  `None` (nothing on Linux measures them yet; L.S1d); `app_identifier` =
+  `None`, so stream keys and the obs-websocket password live under
+  `dev.isocast.unbundled.*` in the 0600 secrets file next to the socket
+  (v0.0.8 migrates keys from the legacy service once);
+  `virtual_camera_sink` = refused by name (L.6e). `FileWriter::crash_safe`
+  stays `false`: the engine then skips commit barriers and an
+  interrupted take says "recoverable duration unknown".
+- **New trait arguments:** `capture_microphone(channels)` picks inputs
+  like macOS (1–2-channel devices as they are, larger ones 1 + 2, picks
+  checked against the device's count); `capture_system_audio(exclude)`
+  refuses a non-empty list; `request_permissions(only)` shows the portal
+  picker only for the screen.
+- **THIRD_PARTY_NOTICES** is generated for the Apple build
+  (`--filter-platform aarch64-apple-darwin`), so the Linux crate's own
+  dependencies (gtk-rs, webkit2gtk, pipewire, ffmpeg-sys) are not listed
+  in it; a Linux release needs its own notices. Regenerated after the
+  merge: one build-time crate more (annotate-snippets 0.11.5, from the
+  lock's new bindgen), as before the sync.
+- **Not checked locally:** that macOS and Windows still compile. The
+  shared-code edits are small (UI queue threading,
+  `SharedFrame::texture(device, queue)`, `other.rs::upload`, manifests'
+  Linux blocks, the daemon's stub cfg); upstream CI on those targets is
+  the check.
+- **Found by the verification, fixed** (each in its own commit): the
+  live H.264 encoder never read GPU frames back, so the program's
+  monitors, replay buffer and streams were flat green (likely since
+  L.5.1, which only checked the pattern's pixels); its worker swallowed
+  encode errors and every later frame counted as dropped; browser pages
+  aborted isocastd at `exit()` (now visible because `record` shuts its
+  private daemon down); editor joins ignored v0.0.8's `in_seconds`,
+  `crop`, `audio` and `size` and wrote the wrong frames (now refused).
+- **Gotcha:** `pkill -f '<pattern>'` from an agent's shell matches the
+  shell's own command line when the pattern appears in it, and kills
+  the command. Keep PIDs in files, or match `/proc/<pid>/cmdline` of
+  `pgrep -x <name>`.
+
 ## Linux port progress (2026-10-22, L.6a browser sources on Linux)
 
 - **The WebKitGTK page thread** (`crates/isocast-platform-linux/src/browser.rs`):

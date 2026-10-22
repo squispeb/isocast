@@ -1,6 +1,14 @@
 # Linux port: syncing to upstream releases
 
-Written 2026-10-22. The Linux port follows upstream by **release**, not
+Written 2026-10-22. **Carried out the same day**: the merge is
+`f8fd13e`, the results and the feature table are in
+[linux-port-status.md](linux-port-status.md), the decisions in
+`docs/notes.md` ("L.S1 sync to v0.0.8"). Two things went differently
+from the plan below: v0.0.8's `record` runs a private daemon, so the CLI
+needed no platform selector at all; and none of our three branch-only
+trait methods turned out to be covered by v0.0.8, so all three stay.
+
+The Linux port follows upstream by **release**, not
 by commits on `main`. Work between releases is unreleased and still
 moving, so the port catches up only to a tagged release. This plan
 covers the first catch-up: from our base (v0.0.3) to **v0.0.8**, the

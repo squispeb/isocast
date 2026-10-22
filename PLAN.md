@@ -926,6 +926,29 @@ step live in `docs/notes.md`'s "Linux port WIP" section.
     run unsandboxed today; their pid from the socket, landlock rules
     from the manifest).
 
+- [x] **L.S1 Sync to v0.0.8** (merge the release tag, fit the Linux
+  crate to its `Platform`, repeat every earlier verification, and say
+  of each 0.0.4–0.0.8 feature whether it works on Linux; see
+  docs/linux-release-sync-plan.md and docs/linux-port-status.md §3).
+  Follow-ups, one each, for what the sync found refused on Linux:
+  - [ ] **L.S1a Editor joins on Linux:** a clip's in point (trims,
+    splits, deletes), crops, an angle with the program's sound, and
+    the vertical edited file's size (`JoinPart::in_seconds`, `crop`,
+    `audio`, `JoinSpec::size`); refused by `join.rs` today.
+  - [ ] **L.S1b Stream destinations at their own size:** scale in the
+    live H.264 encoder (libswscale, or a GPU stage) when a frame isn't
+    the session's size; refused today.
+  - [ ] **L.S1c Audio playback (`play_audio`) over PipeWire:** editor
+    sound and audio monitoring.
+  - [ ] **L.S1d Machine calibration on Linux:** the daemon's worker is
+    `cfg(target_os = "macos")`; Linux has `process_cpu_seconds` and
+    `system_cpu_seconds` now, `calibration_priority` and
+    `governor_headroom`/`frame_budget` are still `None`.
+  - [ ] **L.S1e System audio that leaves apps out** (`exclude`):
+    per-stream links like per-app audio's, instead of the monitor.
+  - [ ] **L.S1f Crash-safe Linux writer:** `crash_safe`/`commit` (the
+    L.1 writer row): `isocast-mux` or fragmented MP4 with commits.
+
 Continuity Camera (Ryan's iPhone) stays macOS-only; his Linux setup
 uses the UVC camera.
 
@@ -2437,6 +2460,27 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
 
 ## Log
 
+- L.S1 sync to v0.0.8 (2026-10-22): v0.0.8 merged into the Linux line
+  (`f8fd13e`, conflicts resolved as v0.0.8's code plus the smallest
+  Linux change; decisions in the merge message and docs/notes.md). The
+  daemon picks `LinuxPlatform` in `platform.rs`; the Linux crate fits
+  v0.0.8's `Platform` (`same_volume`, CPU seconds, microphone channel
+  picking, `Finished`, the new protocol fields) and keeps its three
+  additive methods, which v0.0.8 doesn't cover. Gates: workspace fmt,
+  clippy `-D warnings` (also clean in isocast-ui, whose 12 dead-code
+  errors were the baseline) and 262 tests. Repeated, numbers only:
+  devices and doctor; C920 ISO 90/90 at 30 fps, live by YAVG; mic
+  (0 dropouts), system audio (tone edges within 16 samples of the
+  fixture's), per-app audio (440 Hz), program + ISO with audio (A/V to
+  21 µs); shared monitors 30.8 fps at 38 ms (program) and 30.4 at 4 ms
+  (source); the app at 30 fps, 0 lost; the filters dialog's preview;
+  `frames` H.264 0 decode errors; the join (seam at tick 41984, audio
+  cos 1.0); browser pages by file and http, through `record` and
+  isocastd. Found and fixed (`38a2468`, `6bc82c7`, `b7f41c4`): the
+  program's H.264 was flat green (no GPU read-back), browser pages
+  aborted isocastd at exit (WebKit's default context), editor joins
+  wrote wrong frames silently (now refused by field). The 0.0.4–0.0.8
+  feature table is docs/linux-port-status.md §3.
 - L.6a browser sources on Linux (2026-10-22): `browser.rs` in
   `isocast-platform-linux`: a WebKitGTK `WebView` in a
   `GtkOffscreenWindow` on one shared GTK main-loop thread (first
