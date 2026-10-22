@@ -3,6 +3,19 @@
 Short, dated facts a future session needs. Newest entries go at the top of
 each section. Delete entries that stop being true.
 
+## Linux port progress (2026-10-22, L.S1c audio playback)
+
+- **Recording a sink's output for a check:** `parecord -d <sink>.monitor`
+  (pulse compatibility knows `.monitor` sources). `pw-record --target
+  <sink>.monitor` matches no node and silently records the default
+  *source*, the microphone (room noise with 58.8 Hz hum here).
+- The default `tone` source beeps: 100 ms of tone once a second, so a
+  monitored or recorded tone has 900 ms of silence between beeps by
+  design; compare against the take's own file before calling them gaps.
+- Playback is an ordinary PipeWire playback node, so a system-audio
+  capture of the same output hears the monitoring too (`exclude_own`
+  warns; per-stream links are L.S1e's work).
+
 ## Linux port progress (2026-10-22, L.2 a real desktop take)
 
 - **XDPH's stream is variable-rate:** its EnumFormat says framerate 0/1

@@ -1076,7 +1076,7 @@ impl Samples {
 /// The format the stream asks for: the engine's own (48 kHz float) in
 /// `channels`, with the channel positions a converter needs to downmix
 /// or upmix correctly.
-fn format_params(channels: u32) -> Result<Vec<u8>> {
+pub(crate) fn format_params(channels: u32) -> Result<Vec<u8>> {
     use spa::param::audio::{AudioFormat, AudioInfoRaw, MAX_CHANNELS};
     use spa::pod::serialize::PodSerializer;
     use spa::pod::{Object, Value};

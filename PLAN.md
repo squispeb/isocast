@@ -938,7 +938,7 @@ step live in `docs/notes.md`'s "Linux port WIP" section.
   - [ ] **L.S1b Stream destinations at their own size:** scale in the
     live H.264 encoder (libswscale, or a GPU stage) when a frame isn't
     the session's size; refused today.
-  - [ ] **L.S1c Audio playback (`play_audio`) over PipeWire:** editor
+  - [x] **L.S1c Audio playback (`play_audio`) over PipeWire:** editor
     sound and audio monitoring.
   - [ ] **L.S1d Machine calibration on Linux:** the daemon's worker is
     `cfg(target_os = "macos")`; Linux has `process_cpu_seconds` and
@@ -2460,6 +2460,18 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
 
 ## Log
 
+- L.S1c audio playback on Linux (2026-10-22): `play_audio` is one
+  PipeWire output stream on its own thread (playback.rs), 48 kHz float
+  stereo, the engine's `render` filling each buffer PipeWire asks for;
+  "default" leaves the stream untargeted so the session manager follows
+  the default output, a named output (id, name or part of one, macOS's
+  matching) is its `target.object`. Monitoring and the editor's sound
+  now play. Verified with monitoring into temporary null sinks recorded
+  by `parecord`: a monitored tone source is heard at peak 0.500 (the
+  engine's meter said -6.0 dBFS), its 100 ms beeps and 900 ms silences
+  exactly as the take's own file has them, 0 underruns, 132096 frames
+  in 2.75 s; "default" plays wherever the default sink is; an unknown
+  name fails with every output listed.
 - L.2 a real desktop take (2026-10-22): the portal's stream never
   negotiated ("no more input formats") because the consumer asked for a
   frame rate from 1/1 while XDPH offers a variable-rate 0/1; the range

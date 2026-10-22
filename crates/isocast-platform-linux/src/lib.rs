@@ -39,6 +39,7 @@ mod jpeg;
 mod keychain;
 pub(crate) mod media;
 pub(crate) mod pacing;
+mod playback;
 mod portal;
 mod screencast;
 pub(crate) mod stream;
@@ -84,7 +85,7 @@ impl Platform for LinuxPlatform {
     type Capture = Capture;
     type Importer = VulkanImporter;
     type Media = crate::media::MediaReader;
-    type Playback = system::NoPlayback;
+    type Playback = playback::Playback;
     /// Real-time streaming encoders are L.5's in-process NVENC/libav:
     /// the types are uninhabited and their `new` bails naming the
     /// milestone, so the engine's streaming paths compile today.
@@ -487,12 +488,10 @@ impl Platform for LinuxPlatform {
         ))
     }
 
-    /// Audio playback on an output device, L.3.
-    fn play_audio(&self, _device: &str, _render: AudioRender) -> Result<(Self::Playback, String)> {
-        bail!(
-            "audio monitoring is not implemented on Linux yet: it arrives at L.3 of \
-             docs/port-omarchy.md (PipeWire playback)."
-        )
+    /// L.S1c: monitoring and the editor's sound, through a PipeWire
+    /// output stream (playback.rs).
+    fn play_audio(&self, device: &str, render: AudioRender) -> Result<(Self::Playback, String)> {
+        playback::play(device, render)
     }
 
     /// L.6a: a web page rendered by WebKitGTK in an offscreen window

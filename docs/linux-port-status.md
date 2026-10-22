@@ -33,8 +33,8 @@ the `PLAN.md` Log and [notes.md](notes.md).
   `.isoprj` projects work.
 - **What doesn't yet:** the virtual camera,
   hotkeys and plugin sandboxing. Editor exports with in points, crops
-  or angles, stream destinations with their own size, editor sound and
-  machine calibration are refused with a message (section 3). The
+  or angles, stream destinations with their own size and machine
+  calibration are refused with a message (section 3). The
   writer's crash safety and zero-copy DMA-BUF are deferred.
 
 ## 2. Milestones
@@ -73,7 +73,7 @@ Each feature *works*, is *refused* with a message, or is *broken*.
 | Replay buffer | 0.0.5 | works | `replay save` after 6 s: 6.0 s, 181 frames, 0 decode errors, picture and tone. |
 | obs-websocket | 0.0.5 | works | v5 handshake with the password from the Linux secrets file; GetVersion, GetSceneList, GetRecordStatus answered. |
 | Editor: timeline edits and export | 0.0.5–0.0.7 | partly: out-point trims work; in points, crops, angles and vertical edited files refused | The Linux join copied each file from its start and ignored v0.0.8's `in_seconds`, `crop`, `audio` and `size`, so an edited export held the wrong frames. It now refuses them by field ("parts[1].in_seconds: … not available on Linux yet"). |
-| Editor sound, audio monitoring | 0.0.7 | refused | `play_audio` bails: PipeWire playback isn't written yet. |
+| Editor sound, audio monitoring | 0.0.7 | works (L.S1c) | A PipeWire output stream; a monitored tone reaches a test sink beep for beep, 0 underruns; "default" follows the default output. |
 | NLE export | 0.0.7 | works | fcpxml, xmeml (and Resolve's), otio written and well-formed. They point at the takes, so they also work around the join refusals. |
 | Projectors and multiview | 0.0.6–0.0.7 | works | The app opens both (`shown: true`); the daemon serves their shared-frame feeds (program, scene tiles, vertical) with no errors. Pixels not inspected. |
 | Masks | 0.0.8 | works | Circle shape mask on a white item: 384 px circle at x 128–511, y 48–431 (the 0.8 default box), black outside. |

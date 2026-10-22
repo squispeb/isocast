@@ -34,10 +34,6 @@ const DESKTOP_HINT: &str = "install or log in to a desktop session: displays and
 // The dead-simple types the trait's inert slots want.
 // ---------------------------------------------------------------------------
 
-/// Audio monitoring renders through PipeWire at L.3; no instance of
-/// this type is ever constructed ([`Platform::play_audio`] bails).
-pub struct NoPlayback;
-
 // ---------------------------------------------------------------------------
 // The clock and the thread.
 // ---------------------------------------------------------------------------
@@ -581,10 +577,36 @@ pub(crate) fn default_output() -> Result<String> {
     Ok(default)
 }
 
-/// The microphone a setup names: "default", an id, a name, or part of a
-/// name, matched the way macOS matches its own devices (an exact id or
-/// name, then the same ignoring case, then the shortest name containing
-/// the query).
+/// The output a setup names for playback: an id, a name, or part of a
+/// name, matched as macOS matches its outputs (an exact id or name, then
+/// the same ignoring case, then the shortest name containing the query).
+/// The error lists every output as `name (id)`.
+pub(crate) fn find_output(query: &str) -> Result<AudioOutput> {
+    let sinks = outputs().context("listing audio outputs")?;
+    let lower = query.to_lowercase();
+    sinks
+        .iter()
+        .find(|sink| sink.id == query || sink.name == query)
+        .or_else(|| sinks.iter().find(|sink| sink.name.to_lowercase() == lower))
+        .or_else(|| {
+            sinks
+                .iter()
+                .filter(|sink| sink.name.to_lowercase().contains(&lower))
+                .min_by_key(|sink| sink.name.len())
+        })
+        .cloned()
+        .with_context(|| {
+            let valid: Vec<String> = sinks
+                .iter()
+                .map(|sink| format!("{} ({})", sink.name, sink.id))
+                .collect();
+            format!(
+                "no audio output matches {query:?}; valid: \"default\", {}",
+                valid.join(", ")
+            )
+        })
+}
+
 /// The channel count to capture `microphone` in, and which of those
 /// channels go on (from 0), for a source's `channels` (from 1): a one- or
 /// two-channel device's own signal by default, a larger one's inputs
@@ -619,6 +641,10 @@ pub(crate) fn microphone_channels(
     ))
 }
 
+/// The microphone a setup names: "default", an id, a name, or part of a
+/// name, matched the way macOS matches its own devices (an exact id or
+/// name, then the same ignoring case, then the shortest name containing
+/// the query).
 pub(crate) fn find_microphone(query: &str) -> Result<Microphone> {
     let sources = microphones().context("listing microphones")?;
     if query == "default" {
