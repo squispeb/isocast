@@ -931,7 +931,7 @@ step live in `docs/notes.md`'s "Linux port WIP" section.
   of each 0.0.4–0.0.8 feature whether it works on Linux; see
   docs/linux-release-sync-plan.md and docs/linux-port-status.md §3).
   Follow-ups, one each, for what the sync found refused on Linux:
-  - [ ] **L.S1a Editor joins on Linux:** a clip's in point (trims,
+  - [x] **L.S1a Editor joins on Linux:** a clip's in point (trims,
     splits, deletes), crops, an angle with the program's sound, and
     the vertical edited file's size (`JoinPart::in_seconds`, `crop`,
     `audio`, `JoinSpec::size`); refused by `join.rs` today.
@@ -2460,6 +2460,25 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
 
 ## Log
 
+- L.S1a editor exports on Linux (2026-10-22): a join with the editor's
+  edits in it (an in point, a crop, an angle with the program's sound,
+  the vertical edited file's size) or parts in different formats is no
+  longer refused: recode.rs decodes and encodes the whole join again in
+  one ffmpeg run (each part put on the joined frame grid, cut by frame
+  from its in point, held where its file starts late or ends early,
+  cropped, fitted with black around another shape; each track cut or
+  padded to the part's exact samples; the format file's codec through
+  the recordings' encoder choice at "very high"). A plain join still
+  copies packets (its first packets byte-identical to the take's).
+  Unlike macOS there is no smart render: an edited join re-encodes
+  every part. Verified on a timeline with an angle (1-2 s) and a crop
+  (2-3 s), `--vertical`: all six files in 3.8 s, 0 decode errors; every
+  exported frame is its intended source frame (program, pattern ISO,
+  cropped program; diffs 0.01-1.5 on 0-255), the audio cos 1.0 per part
+  with the first beep on the same sample and exactly 144000 samples;
+  the vertical file 720x1280, letterboxed. The first try cut by time
+  and lost a frame to capture jitter; cutting by frame on the grid
+  fixed it.
 - L.S1c audio playback on Linux (2026-10-22): `play_audio` is one
   PipeWire output stream on its own thread (playback.rs), 48 kHz float
   stereo, the engine's `render` filling each buffer PipeWire asks for;

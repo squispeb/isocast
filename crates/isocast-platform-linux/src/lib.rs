@@ -41,6 +41,7 @@ pub(crate) mod media;
 pub(crate) mod pacing;
 mod playback;
 mod portal;
+mod recode;
 mod screencast;
 pub(crate) mod stream;
 pub(crate) mod system;

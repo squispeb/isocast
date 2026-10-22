@@ -32,8 +32,7 @@ the `PLAN.md` Log and [notes.md](notes.md).
   Timeline joins run in-process; obs-websocket, masks, NLE export and
   `.isoprj` projects work.
 - **What doesn't yet:** the virtual camera,
-  hotkeys and plugin sandboxing. Editor exports with in points, crops
-  or angles, stream destinations with their own size and machine
+  hotkeys and plugin sandboxing. Stream destinations with their own size and machine
   calibration are refused with a message (section 3). The
   writer's crash safety and zero-copy DMA-BUF are deferred.
 
@@ -72,7 +71,7 @@ Each feature *works*, is *refused* with a message, or is *broken*.
 | Multistream, per-destination settings | 0.0.5, 0.0.8 | works, except a destination's own size (refused) | Two local `ffmpeg -listen` receivers: 3039 and 802 kb/s by destination, 0 dropped, both with the picture. A destination with its own width/height fails with "scaling a stream to a destination's own size isn't available here". |
 | Replay buffer | 0.0.5 | works | `replay save` after 6 s: 6.0 s, 181 frames, 0 decode errors, picture and tone. |
 | obs-websocket | 0.0.5 | works | v5 handshake with the password from the Linux secrets file; GetVersion, GetSceneList, GetRecordStatus answered. |
-| Editor: timeline edits and export | 0.0.5–0.0.7 | partly: out-point trims work; in points, crops, angles and vertical edited files refused | The Linux join copied each file from its start and ignored v0.0.8's `in_seconds`, `crop`, `audio` and `size`, so an edited export held the wrong frames. It now refuses them by field ("parts[1].in_seconds: … not available on Linux yet"). |
+| Editor: timeline edits and export | 0.0.5–0.0.7 | works (L.S1a) | In points, crops, angles with the program's sound and the vertical edited file re-encode the whole join through ffmpeg (no smart render yet); every frame lands on its source frame, audio cos 1.0 per part. Plain joins still copy. |
 | Editor sound, audio monitoring | 0.0.7 | works (L.S1c) | A PipeWire output stream; a monitored tone reaches a test sink beep for beep, 0 underruns; "default" follows the default output. |
 | NLE export | 0.0.7 | works | fcpxml, xmeml (and Resolve's), otio written and well-formed. They point at the takes, so they also work around the join refusals. |
 | Projectors and multiview | 0.0.6–0.0.7 | works | The app opens both (`shown: true`); the daemon serves their shared-frame feeds (program, scene tiles, vertical) with no errors. Pixels not inspected. |

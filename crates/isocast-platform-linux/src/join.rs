@@ -6,7 +6,10 @@
 //! so it lines up with the video at every join. Each part fills exactly
 //! its clip's length (see [`JoinPart::length`]), so files at different
 //! frame rates joined from the same clips switch clips at the same
-//! moments.
+//! moments. A join with the editor's edits in it (an in point, a crop,
+//! an angle's sound from another file, its own picture size) or parts in
+//! different formats goes through recode.rs instead, which decodes and
+//! encodes every part again.
 //!
 //! Why not the concat demuxer: it cannot do the per-part hold, pad and
 //! cut that a clip's length asks for (a shorter take's last frame held
@@ -124,59 +127,21 @@ fn pixel_name(format: c_int) -> String {
     }
 }
 
-/// What the editor's exports ask of a join that this one can't do yet,
-/// refused before anything is written rather than joined wrong: it copies
-/// each file's video from its start, as recorded, with the file's own
-/// sound. (macOS cuts at in points, crops and re-encodes; on Linux that is
-/// a follow-up to the v0.0.8 sync, see docs/notes.md.)
-fn refuse_unsupported(spec: &JoinSpec) -> Result<()> {
-    const INSTEAD: &str = "export the timeline without that edit, or for another editor \
-         (`isocast timeline export --nle`), which points at the takes' own files";
-    if let Some((width, height)) = spec.size {
-        bail!(
-            "size: joining into a {width}x{height} picture (a vertical edited file) is not \
-             available on Linux yet; {INSTEAD}"
-        );
-    }
-    for (k, part) in spec.parts.iter().enumerate() {
-        if part.in_seconds > 0.0 {
-            bail!(
-                "parts[{k}].in_seconds: joining {} from {:.3} s into it (a clip trimmed at its \
-                 start, split or with a stretch deleted) is not available on Linux yet; {INSTEAD}",
-                part.path.display(),
-                part.in_seconds
-            );
-        }
-        if part.crop.is_some() {
-            bail!(
-                "parts[{k}].crop: cropping {} is not available on Linux yet; {INSTEAD}",
-                part.path.display()
-            );
-        }
-        if let Some((audio, _)) = &part.audio
-            && audio != &part.path
-        {
-            bail!(
-                "parts[{k}].audio: showing {} with {}'s sound (an edited file's angle) is not \
-                 available on Linux yet; {INSTEAD}",
-                part.path.display(),
-                audio.display()
-            );
-        }
-    }
-    Ok(())
-}
-
 pub fn join(spec: &JoinSpec, progress: OnJoinProgress) -> Result<Joined> {
     if spec.parts.is_empty() {
         bail!("nothing to join");
     }
-    refuse_unsupported(spec)?;
     if spec.output.exists() {
         bail!("{} already exists", spec.output.display());
     }
     let partial = partial_path(&spec.output);
-    let result = write(spec, &partial, progress);
+    // The editor's edits, and parts in another format, need the picture
+    // decoded and encoded again (recode.rs); a plain join copies.
+    let result = match crate::recode::needed(spec) {
+        Ok(true) => crate::recode::write(spec, &partial, progress),
+        Ok(false) => write(spec, &partial, progress),
+        Err(err) => Err(err),
+    };
     match result {
         Ok(joined) => {
             rename_new(&partial, &spec.output).with_context(|| {

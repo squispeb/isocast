@@ -987,7 +987,7 @@ pub(crate) fn ffmpeg_binary() -> OsString {
 
 /// The encoders this machine's ffmpeg lists, one name per line of
 /// `-encoders`' output.
-fn listed_encoders(program: &OsString) -> Result<Vec<String>> {
+pub(crate) fn listed_encoders(program: &OsString) -> Result<Vec<String>> {
     let listed = Command::new(program)
         .arg("-hide_banner")
         .arg("-encoders")
@@ -1023,7 +1023,10 @@ fn listed_encoders(program: &OsString) -> Result<Vec<String>> {
 /// The ffmpeg encoder for `spec`'s codec, and the arguments that carry
 /// its quality: the machine's own NVENC first, the software fallback
 /// behind it, ProRes through `prores_ks`'s profiles.
-fn choose_encoder(encoder: &Encoder, listed: &[String]) -> Result<(&'static str, Vec<String>)> {
+pub(crate) fn choose_encoder(
+    encoder: &Encoder,
+    listed: &[String],
+) -> Result<(&'static str, Vec<String>)> {
     let quality = u32::from(encoder.quality.value());
     let (name, args) = match encoder.codec {
         Codec::Hevc => {
@@ -1099,7 +1102,7 @@ fn prores_args(profile: u32, quality: u32) -> Vec<String> {
 }
 
 /// The muxer's name for a container.
-fn container_name(container: Container) -> &'static str {
+pub(crate) fn container_name(container: Container) -> &'static str {
     match container {
         Container::Mov => "mov",
         Container::Mp4 => "mp4",

@@ -3,6 +3,24 @@
 Short, dated facts a future session needs. Newest entries go at the top of
 each section. Delete entries that stop being true.
 
+## Linux port progress (2026-10-22, L.S1a editor exports)
+
+- **Decision:** an edited join is decoded and encoded again *whole*
+  (recode.rs, one ffmpeg run) instead of macOS's smart render, which
+  copies most packets and re-encodes from a cut to the next keyframe
+  with in-band parameter sets. Mixing copied and re-encoded HEVC from
+  two different encoder sessions in one track needs matching sample
+  descriptions this machine's encoders don't promise. Cost: an edited
+  export is slower and one generation further from the take (at
+  "very high", NVENC cq 9). Smart render is a later optimization.
+- **Gotcha:** cut by frame on a frame grid, never by time. The live
+  writer's timestamps carry capture jitter, so `trim=start=1.0` dropped
+  the frame stamped a millisecond before 1.0 and every later frame of
+  the part was one late; `fps=F,trim=start_frame=round(t*F)` takes the
+  frame on screen at the in point (macOS's rule).
+- `frames_left_out` here is estimated from the file's duration, which
+  can be a frame more than its frame count suggests.
+
 ## Linux port progress (2026-10-22, L.S1c audio playback)
 
 - **Recording a sink's output for a check:** `parecord -d <sink>.monitor`
