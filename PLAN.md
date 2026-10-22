@@ -946,7 +946,7 @@ step live in `docs/notes.md`'s "Linux port WIP" section.
     `governor_headroom`/`frame_budget` are still `None`.
   - [ ] **L.S1e System audio that leaves apps out** (`exclude`):
     per-stream links like per-app audio's, instead of the monitor.
-  - [ ] **L.S1f Crash-safe Linux writer:** `crash_safe`/`commit` (the
+  - [x] **L.S1f Crash-safe Linux writer:** `crash_safe`/`commit` (the
     L.1 writer row): `isocast-mux` or fragmented MP4 with commits.
 
 Continuity Camera (Ryan's iPhone) stays macOS-only; his Linux setup
@@ -2460,6 +2460,25 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
 
 ## Log
 
+- L.S1f crash-safe Linux writer (2026-10-22): the ffmpeg writer says
+  it is crash-safe; `committed()` reads the file's whole fragments back
+  from its boxes (fragments.rs: `moov` tracks, each `moof`'s `tfdt` and
+  sample durations, counted once its `mdat` is whole), `commit()` syncs
+  the file (and its folder entry once) and reports that; `recover_file`
+  cuts a torn tail back to the last whole fragment. Two writer bugs the
+  work exposed, fixed: fragments of a quiet picture sat in ffmpeg's I/O
+  buffer (the program file was 20 bytes 6 s into a take) until
+  `-flush_packets 1`; and the engine's untagged Rec. 709 NV12 was taken
+  for another matrix and converted through RGB on the CPU, shifting the
+  program's colours (green +5 against the ISO of the same picture; now
+  within 0.4), with `-vf` moved after every input (before an audio
+  input it was that input's option and failed). Verified: committed
+  grows 2.02/4.02/6.02 s with each 2 s fragment in both files; a pause
+  reports recoverable 6.02 s with no errors; `kill -9` of isocastd and
+  both ffmpeg writers at 7.3 s leaves 180 frames each (the committed
+  6.0 s), 0 decode errors; a file cut 1000 bytes into its last fragment
+  is finished at launch from 2 whole fragments (120 pictures, 4.02 s,
+  decode errors 3 to 0) with the manifest saying what was left out.
 - L.S1a editor exports on Linux (2026-10-22): a join with the editor's
   edits in it (an in point, a crop, an angle with the program's sound,
   the vertical edited file's size) or parts in different formats is no

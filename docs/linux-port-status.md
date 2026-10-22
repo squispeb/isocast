@@ -33,8 +33,8 @@ the `PLAN.md` Log and [notes.md](notes.md).
   `.isoprj` projects work.
 - **What doesn't yet:** the virtual camera,
   hotkeys and plugin sandboxing. Stream destinations with their own size and machine
-  calibration are refused with a message (section 3). The
-  writer's crash safety and zero-copy DMA-BUF are deferred.
+  calibration are refused with a message (section 3). Zero-copy
+  DMA-BUF is deferred.
 
 ## 2. Milestones
 
@@ -66,7 +66,7 @@ Each feature *works*, is *refused* with a message, or is *broken*.
 
 | Feature | Release | On Linux | Evidence |
 |---|---|---|---|
-| Crash-safe takes | 0.0.5 | works, honestly not crash-safe | The ffmpeg writer keeps `crash_safe() == false`, so no commit barriers run. `kill -9` of isocastd 4 s into a take: both files keep 3.8 s (114 frames); the next start lists the take as interrupted, "recoverable duration unknown". `isocast-mux` or fragmented MP4 is the follow-up. |
+| Crash-safe takes | 0.0.5 | works (L.S1f) | The writer reads its whole fragments back from the file; a pause reports recoverable 6.02 s of 7.3; `kill -9` of isocastd and its writers keeps exactly the committed 6.0 s; a torn tail is cut back at launch. |
 | Extra canvases, vertical canvas | 0.0.6, 0.0.8 | works | Program + ISO + vertical + a 720×720 canvas: four files, 90/90 frames each, right sizes, real pictures; the vertical monitor stream decodes. |
 | Multistream, per-destination settings | 0.0.5, 0.0.8 | works, except a destination's own size (refused) | Two local `ffmpeg -listen` receivers: 3039 and 802 kb/s by destination, 0 dropped, both with the picture. A destination with its own width/height fails with "scaling a stream to a destination's own size isn't available here". |
 | Replay buffer | 0.0.5 | works | `replay save` after 6 s: 6.0 s, 181 frames, 0 decode errors, picture and tone. |

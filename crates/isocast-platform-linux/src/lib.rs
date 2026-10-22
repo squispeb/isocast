@@ -32,6 +32,7 @@ use isocast_protocol::{Canvas, Codec, SourceKind};
 pub(crate) mod audio;
 pub(crate) mod browser;
 pub(crate) mod camera;
+mod fragments;
 pub(crate) mod frames;
 pub(crate) mod gpu;
 pub(crate) mod join;
@@ -323,6 +324,58 @@ impl Platform for LinuxPlatform {
     /// stored.
     fn create_writer(&self, spec: &WriterSpec) -> Result<FfmpegFileWriter> {
         FfmpegFileWriter::spawn(spec)
+    }
+
+    /// L.S1f: a fragmented file an interruption tore (a fragment's `moof`
+    /// without its whole `mdat`, as a power loss leaves) is cut back to
+    /// its last whole fragment, which every player reads. A file whose
+    /// fragments are all whole is a movie already (`None`), as is one
+    /// that isn't fragmented. Only a regular file is touched, never a
+    /// link, and only once its size has stopped changing: a writer that
+    /// outlived its daemon may still be flushing its tail.
+    fn recover_file(
+        &self,
+        folder: &Path,
+        name: &std::ffi::OsStr,
+    ) -> Result<Option<isocast_engine::RecoveredFile>> {
+        let path = folder.join(name);
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
+        };
+        if !metadata.file_type().is_file() {
+            bail!(
+                "{} is not a regular file; it is left as it is",
+                path.display()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let length = std::fs::metadata(&path)?.len();
+        if length != metadata.len() {
+            return Ok(None);
+        }
+        let mut scan = fragments::Scan::default();
+        scan.advance(&path)?;
+        if !scan.fragmented() || scan.whole_end >= length {
+            return Ok(None);
+        }
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("opening {} to cut its torn fragment", path.display()))?;
+        file.set_len(scan.whole_end)?;
+        file.sync_all()?;
+        Ok(Some(isocast_engine::RecoveredFile {
+            fragments: scan.fragments,
+            frames: scan.frames(),
+            seconds: Some(scan.covered().as_secs_f64()),
+            summary: format!(
+                "{}; left out: {} bytes of a fragment that didn't reach the disk whole",
+                scan.summary(),
+                length - scan.whole_end
+            ),
+        }))
     }
 
     /// L.2: a monitor, shared by the desktop's ScreenCast portal. The

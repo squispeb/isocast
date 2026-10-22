@@ -3,6 +3,30 @@
 Short, dated facts a future session needs. Newest entries go at the top of
 each section. Delete entries that stop being true.
 
+## Linux port progress (2026-10-22, L.S1f crash-safe writer)
+
+- **ffmpeg buffers fragments** in its 32 KB I/O buffer unless
+  `-flush_packets 1`: a quiet program (~26 KB/s) had its first
+  fragments in memory for tens of seconds, so killing ffmpeg would have
+  lost them. Check with `/proc/<pid>/io` (`wchar` stayed at 145 bytes
+  while `rchar` grew) or the file's size.
+- **Untagged NV12 is not Rec. 709 to ffmpeg:** rawvideo input has no
+  colour metadata, and with the output tagged bt709 ffmpeg converted
+  "YUV->YUV via intermediate RGB" (verbose log) on the CPU, shifting
+  colours. `setparams=colorspace=bt709:...:range=tv` tags it.
+- **Output options after every input:** a `-vf` between `-i pipe:0` and
+  `-i pipe:3` belongs to the audio input and fails ("Option vf ...").
+  The old scale filter had this latent bug for resized files with audio.
+- **Torn-tail recovery** keeps only whole fragments: a fragment whose
+  `mdat` is short is dropped whole (2 s at the writer's keyframe
+  interval). Salvaging its samples from `trun` sizes is possible later.
+- `isocast status` answers without a daemon (and doesn't start one), so
+  launch-time recovery needs something that starts isocastd
+  (`isocast restart`, `start`, `devices`).
+- A debugging wrapper for the writers: `ISOCAST_FFMPEG=<script>` in the
+  daemon's environment, the script re-running `/usr/bin/ffmpeg` with
+  `-loglevel verbose` and teeing stderr to a file.
+
 ## Linux port progress (2026-10-22, L.S1a editor exports)
 
 - **Decision:** an edited join is decoded and encoded again *whole*

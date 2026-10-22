@@ -141,6 +141,12 @@ pub struct FfmpegFileWriter {
     failure: Arc<Mutex<Option<String>>>,
     /// The raw stream's frame size, fixed where the child started.
     pixels: Option<(u32, u32)>,
+    /// How far the file's whole fragments reach, read back from the file
+    /// (crash safety, fragments.rs). Behind a lock because `committed`
+    /// reads it through `&self`.
+    fragments: Mutex<crate::fragments::Scan>,
+    /// The folder's entry for the file has been synced (once is enough).
+    entry_synced: bool,
 }
 
 /// One audio track's pipe: the samples that arrived before the child
@@ -239,6 +245,8 @@ impl FfmpegFileWriter {
             broken: false,
             failure: Arc::new(Mutex::new(None)),
             pixels: None,
+            fragments: Mutex::new(crate::fragments::Scan::default()),
+            entry_synced: false,
         };
         isocast_diagnostics::debug!(
             "writer: {} {:?} {}x{}@{} ({} audio tracks): {} preflighted",
@@ -290,12 +298,26 @@ impl FfmpegFileWriter {
         // macOS: the picture keeps its shape, centred, with black bars
         // beside it.
         let (out_width, out_height) = (self.spec.video.width, self.spec.video.height);
+        let mut filters = Vec::new();
+        if kind == FrameKind::Ycbcr8 {
+            // The engine's Y'CbCr is Rec. 709, video range, which a raw
+            // pipe can't say: untagged, ffmpeg took it for another matrix
+            // and converted every picture through RGB on the CPU to the
+            // Rec. 709 the output is tagged with, shifting its colours.
+            filters.push(
+                "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv"
+                    .to_string(),
+            );
+        }
         if pixels != (out_width, out_height) {
-            command.arg("-vf").arg(format!(
+            filters.push(format!(
                 "scale={out_width}:{out_height}:force_original_aspect_ratio=decrease,\
                  pad={out_width}:{out_height}:(ow-iw)/2:(oh-ih)/2"
             ));
         }
+        // Output options: they go after every input, or ffmpeg applies
+        // them to the next input on the line (an audio pipe), and fails.
+        let filters = filters.join(",");
         // One pipe per audio track, its read end at the fixed fd
         // `3 + the track's index`. The read ends are first duplicated
         // onto high fds (100 and up): every pipe2 hands out numbers
@@ -385,6 +407,9 @@ impl FfmpegFileWriter {
         for index in 0..self.spec.audio.len() {
             command.arg("-map").arg(format!("{}:a", index + 1));
         }
+        if !filters.is_empty() {
+            command.arg("-vf").arg(&filters);
+        }
         // The video encoder and its quality, then what every file
         // takes: no B-pictures (a recoverable fragment timeline keeps
         // presentation order), a keyframe every two seconds (the
@@ -405,8 +430,13 @@ impl FfmpegFileWriter {
         if !self.spec.audio.is_empty() {
             command.arg("-c:a").arg("aac");
         }
-        // Fragmented muxing: a killed process keeps what it stored.
+        // Fragmented muxing: a killed process keeps what it stored. Each
+        // fragment goes to the file when the muxer has it (`flush_packets`):
+        // left to its I/O buffer, a quiet picture's fragments waited in
+        // memory for tens of seconds, where a crash of ffmpeg loses them.
         command
+            .arg("-flush_packets")
+            .arg("1")
             .arg("-movflags")
             .arg("+frag_keyframe+empty_moov+default_base_moof")
             .arg("-f")
@@ -688,6 +718,48 @@ impl FfmpegFileWriter {
 
 impl FileWriter for FfmpegFileWriter {
     type Frame = LinuxFrame;
+
+    /// The file is fragmented MOV/MP4, playable up to its last whole
+    /// fragment: what that reaches is read back from the file itself.
+    fn crash_safe(&self) -> bool {
+        true
+    }
+
+    /// Everything ffmpeg has written reaches the disk (`fsync`, and the
+    /// folder's entry the first time), and the answer is what the whole
+    /// fragments then cover. Pictures still inside ffmpeg's encoder, or in
+    /// the fragment it is filling (a keyframe every 2 s ends one), are
+    /// not in it: the answer is a fact, not a promise.
+    fn commit(&mut self) -> Result<Option<std::time::Duration>> {
+        let covered = {
+            let mut scan = self.fragments.lock().unwrap();
+            scan.advance(&self.spec.path)?;
+            scan.covered()
+        };
+        match std::fs::File::open(&self.spec.path) {
+            Ok(file) => file
+                .sync_data()
+                .with_context(|| format!("syncing {}", self.spec.path.display()))?,
+            // ffmpeg starts at the first picture: nothing to keep yet.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Some(std::time::Duration::ZERO));
+            }
+            Err(err) => return Err(err).context("opening the file to sync it"),
+        }
+        if !self.entry_synced
+            && let Some(folder) = self.spec.path.parent()
+            && let Ok(folder) = std::fs::File::open(folder)
+        {
+            self.entry_synced = folder.sync_all().is_ok();
+        }
+        Ok(Some(covered))
+    }
+
+    fn committed(&self) -> Option<std::time::Duration> {
+        let mut scan = self.fragments.lock().unwrap();
+        scan.advance(&self.spec.path).ok()?;
+        Some(scan.covered())
+    }
 
     /// The timeline's start, recorded: the raw streams carry no
     /// timestamps, so the first picture's own bytes start the file.
