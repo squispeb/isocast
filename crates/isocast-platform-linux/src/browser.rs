@@ -170,6 +170,13 @@ pub fn capture_browser(
 
 // The pages being rendered, on the page thread.
 thread_local! {
+    /// The pages' WebKit context, this thread's own and never dropped.
+    /// The default context is a C++ static that `exit()` destroys on
+    /// whichever thread exits, and WebKit aborts when its timers die off
+    /// the thread that made them (a daemon quitting after a browser
+    /// source: SIGABRT in `WTF::RunLoop::TimerBase`).
+    static PAGE_CONTEXT: webkit2gtk::WebContext = webkit2gtk::WebContext::new();
+
     static PAGES: std::cell::RefCell<HashMap<u64, Page>> =
         std::cell::RefCell::new(HashMap::new());
 }
@@ -259,6 +266,7 @@ fn set_up(
     }
 
     let web = WebView::builder()
+        .web_context(&PAGE_CONTEXT.with(Clone::clone))
         .settings(&settings)
         .user_content_manager(&manager)
         .build();
