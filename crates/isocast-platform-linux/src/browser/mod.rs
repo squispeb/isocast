@@ -24,13 +24,15 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, anyhow, bail};
+use base64::Engine as _;
 use gtk::prelude::{ContainerExt as _, GtkWindowExt as _, WidgetExt as _, WidgetExtManual as _};
+use java_script_core::ValueExt as _;
 use webkit2gtk::glib;
 use webkit2gtk::glib::translate::ToGlibPtr as _;
 // The WebKit trait set: snapshot, loading state, page control.
 use webkit2gtk::{
-    SnapshotOptions, SnapshotRegion, UserContentInjectedFrames, UserStyleLevel, WebView,
-    WebViewExt as _,
+    SnapshotOptions, SnapshotRegion, UserContentInjectedFrames, UserScriptInjectionTime,
+    UserStyleLevel, WebView, WebViewExt as _,
 };
 
 use crate::{
@@ -40,6 +42,16 @@ use crate::{
 
 /// How long a page's set-up may take on its thread, as on macOS.
 const SETUP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The script that captures a page's sound.
+const AUDIO_SCRIPT: &str = include_str!("audio.js");
+
+/// The message handler `audio.js` posts to.
+const AUDIO_HANDLER: &str = "isocastAudio";
+
+/// How far the page's audio may drift from the host clock before its
+/// timestamps are reset to it.
+const AUDIO_RESYNC: Duration = Duration::from_millis(150);
 
 /// What the thread's boot says when GTK did not take off by itself.
 const THREAD_ERROR: &str = "the browser thread did not start";
@@ -120,7 +132,8 @@ fn post_job(job: Job) -> Result<()> {
 // ---- The engine's entry ---------------------------------------------
 
 use isocast_engine::{
-    AudioSink, BrowserControl, BrowserPage, CaptureFormat, FramePool as _, PageLocation, VideoSink,
+    AudioSink, BrowserControl, BrowserPage, CaptureFormat, FramePool as _, PageLocation,
+    SAMPLE_RATE, Time, VideoSink,
 };
 
 /// Start rendering `page`'s web address into `sink`, answering the
@@ -132,11 +145,6 @@ pub fn capture_browser(
     audio: Option<AudioSink>,
 ) -> Result<(BrowserCapture, CaptureFormat, Arc<PageControl>)> {
     let (width, height, fps) = (page.width, page.height, page.fps);
-    if audio.is_some() {
-        // A page's sound not playing aloud is L.6b: name the task
-        // rather than open a silent browser without telling anyone.
-        bail!("browser page audio arrives at L.6b of docs/port-omarchy.md");
-    }
     let location = match page.location {
         PageLocation::Url(url) => url.to_string(),
         PageLocation::File(path) => {
@@ -154,8 +162,11 @@ pub fn capture_browser(
     let sink = Arc::new(sink);
     let (done, done_answer) = mpsc::sync_channel::<Result<()>>(1);
     let css = page.css.to_string();
+    let audio = audio.map(|audio| AudioRx::new(audio));
     post_job(Box::new(move || {
-        let _ = done.send(set_up(id, location, css, width, height, fps, pool, sink));
+        let _ = done.send(set_up(
+            id, location, css, width, height, fps, pool, sink, audio,
+        ));
     }))?;
     match done_answer.recv_timeout(SETUP_TIMEOUT) {
         Ok(answer) => answer?,
@@ -239,6 +250,7 @@ fn set_up(
     fps: u32,
     pool: Mutex<Option<CpuPool>>,
     sink: Arc<VideoSink<LinuxFrame>>,
+    audio: Option<AudioRx>,
 ) -> Result<()> {
     let pool = Arc::new(Mutex::new(
         pool.lock()
@@ -248,12 +260,35 @@ fn set_up(
     ));
 
     // A local page may fetch the files next to it, as on macOS.
-    let settings = webkit2gtk::Settings::builder()
+    let mut settings = webkit2gtk::Settings::builder()
         .allow_file_access_from_file_urls(true)
         .build();
+    // With audio, a page may start its own sound without a click,
+    // as on macOS.
+    if audio.is_some() {
+        settings.set_media_playback_requires_user_gesture(false);
+    }
     // The custom CSS as the page's own stylesheet, applied whenever
     // the document runs (the CSS macOS adds as a user script).
     let manager = webkit2gtk::UserContentManager::new();
+    if let Some(audio) = &audio {
+        // The page's sound posts here (the macOS same: audio.js
+        // injects at the document's start, posts base64 stereo).
+        if !manager.register_script_message_handler(AUDIO_HANDLER) {
+            bail!("the page's audio handler could not be registered");
+        }
+        let audio = audio.clone();
+        manager.connect_script_message_received(Some(AUDIO_HANDLER), move |_, result| {
+            audio.receive(result);
+        });
+        manager.add_script(&webkit2gtk::UserScript::new(
+            AUDIO_SCRIPT,
+            UserContentInjectedFrames::AllFrames,
+            UserScriptInjectionTime::AtDocumentStart,
+            &[],
+            &[],
+        ));
+    }
     if !css.trim().is_empty() {
         use webkit2gtk::UserContentManagerExt as _;
         manager.add_style_sheet(&webkit2gtk::UserStyleSheet::new(
