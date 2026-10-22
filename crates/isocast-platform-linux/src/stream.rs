@@ -339,7 +339,10 @@ unsafe fn run_worker(
                     pts,
                     keyframe,
                 } => {
-                    if session.encode(&frame, pts, keyframe, output).is_err() {
+                    // A frame the session can't take ends it, and says
+                    // why: every later frame would only count as dropped.
+                    if let Err(error) = session.encode(&frame, pts, keyframe, output) {
+                        record_failure(output, format!("{error:#}"));
                         return;
                     }
                 }
@@ -499,15 +502,25 @@ impl Session {
         output: &Output,
     ) -> Result<()> {
         unsafe {
+            // macOS's encoder scales a picture to the session's size (a
+            // stream destination's own width and height); this one doesn't
+            // yet, so it says which setting asks for it.
             if frame.size() != (self.width, self.height) {
+                let (width, height) = frame.size();
                 bail!(
-                    "an H.264 frame of {:?} cannot enter a session opened for                  {}x{}",
-                    frame.size(),
+                    "a {width}x{height} picture can't be encoded at {}x{} on Linux yet: \
+                     scaling a stream to a destination's own size isn't available here; \
+                     remove the destination's width and height (or set them to \
+                     {width}x{height})",
                     self.width,
                     self.height
                 );
             }
             self.open((*self.ctx).codec, frame.kind())?;
+            // A frame the GPU drew (the program, a staged source) holds
+            // its picture in textures until it is read back, as the
+            // writer and the JPEG encoder do before reading its planes.
+            crate::gpu::read_back(frame)?;
             let planes = match frame.kind() {
                 FrameKind::Bgra => vec![frame.plane(0)?],
                 FrameKind::Ycbcr8 => vec![frame.plane(0)?, frame.plane(1)?],
