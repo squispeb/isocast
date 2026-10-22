@@ -1,6 +1,4 @@
-//! `isocast engines`: Isocast engines on other computers. For now only
-//! what advertises on the local network (`--discover`); paired engines
-//! join this output later, as their own key beside `discovered`.
+//! Paired identities alongside untrusted DNS-SD discovery hints.
 
 use std::net::SocketAddr;
 use std::process::ExitCode;
@@ -10,10 +8,8 @@ use anyhow::{Context, Result, bail};
 use isocast_discovery::{Event, Found, Txt};
 use serde_json::{Value, json};
 
-pub fn run(discover: bool, timeout: f64, json: bool) -> Result<ExitCode> {
-    if !discover {
-        bail!("engines: nothing to list yet; use --discover to find engines on the local network");
-    }
+pub fn run(_discover: bool, timeout: f64, json: bool) -> Result<ExitCode> {
+    let paired = isocast_client::remote::engines()?;
     if !(0.1..=60.0).contains(&timeout) {
         bail!("--timeout: {timeout} s; use 0.1 to 60 seconds");
     }
@@ -22,9 +18,20 @@ pub fn run(discover: bool, timeout: f64, json: bool) -> Result<ExitCode> {
         let discovered: Vec<Value> = found.iter().map(to_json).collect();
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({ "discovered": discovered }))?
+            serde_json::to_string_pretty(&json!({ "paired": paired, "discovered": discovered }))?
         );
         return Ok(ExitCode::SUCCESS);
+    }
+    if !paired.is_empty() {
+        println!("{} paired engine(s), pinned identities:", paired.len());
+        for peer in &paired {
+            println!(
+                "  {}  {}  {}",
+                peer.name,
+                peer.id,
+                peer.address.as_deref().unwrap_or("no saved address")
+            );
+        }
     }
     if found.is_empty() {
         println!("No engines found on the local network within {timeout} s.");

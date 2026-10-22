@@ -146,6 +146,7 @@ impl Daemon {
     /// Start feeding the camera without installing or updating anything:
     /// refused when the extension isn't installed or isn't this build's.
     fn start_installed_camera(self: &Arc<Self>) -> Result<VirtualCameraStatus, RpcError> {
+        #[cfg(target_os = "macos")]
         let not_here = |what: &str| RpcError {
             code: RpcError::NOT_PERMITTED,
             message: format!(

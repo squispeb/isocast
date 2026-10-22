@@ -5,6 +5,20 @@ each section. Delete entries that stop being true.
 
 ## Environment
 
+- 2026-10-22 (R1): native remote keys reuse the existing Keychain/Credential
+  Manager code through `isocast-platform-credentials`, not the full media
+  backend (otherwise the Mac CLI gained 17 media-framework dependencies).
+  `ISOCAST_REMOTE_CLIENT` isolates a client's public pin file and credential
+  account; engine pins/settings live at `<setup>.remote.json`. No private
+  key files or bearer tokens. Sign development CLI builds consistently;
+  inaccessible/missing keys never silently rotate a stored identity.
+- 2026-10-22 (R1 Windows qualification): network-only SSH logons cannot use
+  Credential Manager (0x80070520). The approved scratch desktop runner used
+  the signed-in desktop token, owner-only IPC, a bounded GPU lease and job
+  cleanup. Its SSH caller granted only same-user query rights on its own
+  ephemeral process/token objects to satisfy IPC peer inspection across
+  logons. Production IPC/credential permissions were unchanged. Runner
+  source and exact two-machine driver stay in remote-r1/scratch, not the repo.
 - 2026-10-22 (#105 microphone): actual default is Microphone (Virtual Desktop
   Audio), not Wave XLR. At native48k, continuous positions plus ~3ms QPC phase
   spikes caused ISO timestamp gaps/silence/trim. Warmed five-packet phase median
@@ -3633,6 +3647,7 @@ each section. Delete entries that stop being true.
   IPv6 per /64) and 30 across all addresses, then waits of 1, 2, 4… s (at
   most 5 min, forgotten after 15 quiet minutes); tries during a wait
   aren't checked.
+
 - 2026-10-22 (R1.d discovery): DNS-SD lives in its own small crate,
   `isocast-discovery` (free functions `register`/`browse`/`watch`, a
   backend per OS behind `cfg`, like `isocast-ipc`), not on the engine's

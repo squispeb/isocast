@@ -581,6 +581,13 @@ impl App {
             Event::RecordTarget { .. } => {}
             // Shown by the remote-engines UI (R2).
             Event::Refused { .. } => {}
+            // Presence/remote settings are presented by the R2 remote UI.
+            Event::RemoteClientConnected { .. }
+            | Event::RemoteClientDisconnected { .. }
+            | Event::RemotePaired { .. }
+            | Event::RemoteRevoked { .. }
+            | Event::RemoteDisabled
+            | Event::RemoteHeartbeat => {}
         }
         for area in self.areas() {
             area.event(self, &event);

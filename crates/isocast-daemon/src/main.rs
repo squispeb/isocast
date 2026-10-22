@@ -105,6 +105,7 @@ mod plugins;
 mod projectors;
 mod projects;
 mod recovery;
+mod remote;
 mod replay;
 mod roots;
 mod store;
@@ -219,6 +220,7 @@ fn main() -> ExitCode {
             isoprj::start(&daemon);
             start_plugins(&daemon);
             daemon.websocket.load(&daemon);
+            daemon.remote.load(&daemon);
             let saver = daemon.clone();
             thread::spawn(move || saver.contain("setup saver", || saver.save_live_changes()));
             // On Ctrl-C, SIGTERM or SIGHUP, finish the files before exiting.
@@ -350,7 +352,9 @@ fn serve(listener: UnixListener, daemon: Arc<Daemon>) {
             let mut gid = 0;
             // Darwin does not provide a security boundary from socket mode
             // alone. Check the kernel peer uid before any RPC/plugin dispatch.
-            if unsafe { libc::getpeereid(connection.as_raw_fd(), &mut uid, &mut gid) } != 0
+            if unsafe {
+                libc::getpeereid(connection.local().unwrap().as_raw_fd(), &mut uid, &mut gid)
+            } != 0
                 || uid != unsafe { libc::geteuid() }
             {
                 continue;
@@ -416,7 +420,10 @@ fn handle(
     }
     let _tracked = scope.as_ref().and_then(|scope| scope.track(&connection));
     #[cfg(target_os = "macos")]
-    let peer = isocast_platform_macos::diagnostics::peer(&connection);
+    let peer = match connection.local() {
+        Some(local) => isocast_platform_macos::diagnostics::peer(local),
+        None => serde_json::Value::Null,
+    };
     #[cfg(windows)]
     let peer =
         serde_json::json!({"transport":"named_pipe","pid":isocast_ipc::peer_pid(&connection).ok()});
@@ -425,19 +432,29 @@ fn handle(
     // A remote client's audit peer names it (decision 15).
     let peer = caller.peer().unwrap_or(peer);
     let _closed = diagnostics::PeerClosed(peer.clone());
+    let remote = connection.peer().is_some();
+    let max_request = if remote {
+        isocast_ipc::MAX_REMOTE_REQUEST
+    } else {
+        MAX_REQUEST
+    };
     let mut focused = None;
     let mut writer = connection.try_clone()?;
     let mut reader = BufReader::new(connection);
     let mut line = String::new();
     loop {
-        line.clear();
-        let read = (&mut reader)
-            .take(MAX_REQUEST as u64 + 1)
-            .read_line(&mut line)?;
-        if read == 0 {
+        // Revocation also invalidates requests already buffered by BufReader.
+        if writer.aborted() {
             return Ok(());
         }
-        if read > MAX_REQUEST {
+        line.clear();
+        let read = (&mut reader)
+            .take(max_request as u64 + 1)
+            .read_line(&mut line)?;
+        if read == 0 || writer.aborted() {
+            return Ok(());
+        }
+        if read > max_request {
             let mut audit = diagnostics::ApiCall::new(r#"{"method":"[oversized request]"}"#, &peer);
             // The rest of the line can't be skipped without reading it, so
             // the connection ends here.
@@ -447,7 +464,7 @@ fn handle(
                     code: RpcError::INVALID_REQUEST,
                     message: format!(
                         "the request is longer than {} MB; requests are one JSON object per line",
-                        MAX_REQUEST >> 20
+                        max_request >> 20
                     ),
                 },
             );
@@ -460,6 +477,14 @@ fn handle(
         }
         let request = serde_json::from_str::<Request>(&line);
         let mut audit = diagnostics::ApiCall::new(&line, &peer);
+        if audit.pairing() && request.is_err() {
+            // A mistaken JSON pairing call must not echo PINs or PAKE proofs
+            // through serde's detailed type errors into either endpoint's log.
+            let response = Response::err(id_of(&line), RpcError { code: RpcError::INVALID_PARAMS, message: "params: remote_pair_begin takes no parameters; remote_pair_finish requires the dedicated TLS-bound PAKE exchange (isocast remote pair HOST --code-stdin)".into() });
+            writeln!(writer, "{}", serde_json::to_string(&response)?)?;
+            audit.response(&response);
+            continue;
+        }
         if let (Some(scope), Ok(request)) = (&scope, &request)
             && let Some(message) = scope.refusal(&request.method)
         {
@@ -488,6 +513,10 @@ fn handle(
             audit.response(&refused);
             continue;
         }
+        let pairing_reply = matches!(
+            request.as_ref().map(|request| &request.method),
+            Ok(Method::RemotePairBegin)
+        );
         let _caller = scope.as_ref().map(|scope| PluginCaller::set(&scope.id));
         let _entered = callers::enter(caller.clone());
         let response = match request {
@@ -512,6 +541,12 @@ fn handle(
                 let params = params.unwrap_or_default();
                 match params.problem() {
                     None => {
+                        if remote && !reader.buffer().is_empty() {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "watch is one-way; unexpected trailing input",
+                            ));
+                        }
                         audit.value(serde_json::json!({"subscribed":"events"}));
                         return watch(writer, daemon, id, &params);
                     }
@@ -574,7 +609,11 @@ fn handle(
             daemon.note_refusal(&caller, method, error);
         }
         let bytes = serde_json::to_vec(&response)?;
-        audit.response_bytes(&response, bytes.len());
+        if pairing_reply && response.error.is_none() {
+            audit.value(serde_json::json!({"pairing":"opened"}));
+        } else {
+            audit.response_bytes(&response, bytes.len());
+        }
         writer.write_all(&bytes)?;
         writer.write_all(b"\n")?;
     }
@@ -603,10 +642,27 @@ fn stream_frames(
     thread::spawn({
         let left = left.clone();
         move || {
-            for line in reader.lines() {
-                let Ok(line) = line else { break };
-                if let Ok(change) = serde_json::from_str::<FrameRate>(&line) {
-                    rate.set(change.fps);
+            if reader.get_ref().peer().is_some() {
+                let mut reader = reader;
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    let read = (&mut reader)
+                        .take(isocast_ipc::MAX_REMOTE_REQUEST as u64 + 1)
+                        .read_line(&mut line);
+                    if !matches!(read, Ok(n) if n > 0 && n <= isocast_ipc::MAX_REMOTE_REQUEST) {
+                        break;
+                    }
+                    if let Ok(change) = serde_json::from_str::<FrameRate>(&line) {
+                        rate.set(change.fps);
+                    }
+                }
+            } else {
+                for line in reader.lines() {
+                    let Ok(line) = line else { break };
+                    if let Ok(change) = serde_json::from_str::<FrameRate>(&line) {
+                        rate.set(change.fps);
+                    }
                 }
             }
             left.store(true, Ordering::SeqCst);
@@ -811,7 +867,23 @@ fn watch(
             writeln!(writer, "{}", serde_json::to_string(&warning)?)?;
         }
     }
+    let mut heartbeat = std::time::Instant::now();
     loop {
+        if let UnixStream::Tls(stream) = &writer
+            && stream.readable()
+        {
+            // A watch client never sends control messages. Do not leave its
+            // unexpected input parked behind a full plaintext pipe.
+            return Ok(());
+        }
+        if writer.peer().is_some() && heartbeat.elapsed() >= Duration::from_secs(2) {
+            writeln!(
+                writer,
+                "{}",
+                serde_json::to_string(&Notification::event(Event::RemoteHeartbeat))?
+            )?;
+            heartbeat = std::time::Instant::now();
+        }
         match rx.recv_timeout(WATCH_HANGUP_CHECK) {
             Ok(event) => writer.write_all(&event)?,
             // A client that left is noticed here even when no event it
@@ -920,6 +992,7 @@ struct Daemon {
     starting: parking_lot::RwLock<()>,
     /// The obs-websocket compatibility server (`websocket_*`).
     websocket: websocket::Runtime,
+    remote: remote::Runtime,
     /// Open projectors and where each view was last shown (`projector_*`).
     projectors: projectors::ProjectorState,
     /// The project files' writer (#88).
@@ -1551,7 +1624,11 @@ impl Daemon {
             Method::MachineCalibrate => self.machine_calibrate().and_then(to_json),
             Method::MachineCancel => self.machine_cancel().and_then(to_json),
             Method::Status => to_json(self.status()),
-            Method::Hello => to_json(callers::hello()),
+            Method::Hello => {
+                let mut hello = callers::hello();
+                hello.engine_id = self.remote.status().identity.map(|identity| identity.id);
+                to_json(hello)
+            },
             Method::FolderRoots => to_json(self.folder_roots()),
             Method::FolderRootsSet(params) => self.folder_roots_set(params).and_then(to_json),
             Method::EncoderOptions => to_json(isocast_protocol::Codec::options()),
@@ -1693,6 +1770,13 @@ impl Daemon {
             Method::ProjectorList => to_json(self.projector_list()),
             Method::ProjectorPlace(params) => self.projector_place(*params).and_then(to_json),
             Method::WebsocketStatus => to_json(self.websocket.status()),
+            Method::RemoteStatus => to_json(self.remote.status()),
+            Method::RemoteEnable(params) => self.remote.enable(self, params.unwrap_or_default()).and_then(to_json),
+            Method::RemoteDisable => self.remote.disable(self).and_then(to_json),
+            Method::RemotePairBegin => self.remote.begin().and_then(to_json),
+            Method::RemotePairFinish => Err(RpcError { code: RpcError::NOT_PERMITTED, message: "remote_pair_finish requires the dedicated TLS-bound PAKE exchange; use `isocast remote pair HOST --code-stdin`".into() }),
+            Method::RemoteClients => self.remote.clients().and_then(to_json),
+            Method::RemoteRevoke(params) => self.remote.revoke(self, &params.client_id).and_then(to_json),
             Method::WebsocketEnable(params) => self
                 .websocket
                 .enable(self, params.unwrap_or_default())

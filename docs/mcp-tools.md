@@ -10,7 +10,7 @@ a client, for example:
 claude mcp add isocast -- isocast mcp
 ```
 
-114 tools. Arguments marked required must be given; ids, not names,
+123 tools. Arguments marked required must be given; ids, not names,
 address sources, scenes and clips. Errors name the field and list the
 valid options.
 
@@ -625,6 +625,57 @@ Point an offline clip (its take isn't where the timeline says: the project folde
 | `clip` (required) | string | The clip's id, like `c2`. |
 | `path` (required) | string | The take's manifest (`….session.json`), or the folder holding a manifest of the same name. Given a folder, every take of every timeline that was in the clip's old folder is looked for there too. |
 | `timeline` | string (optional) | The timeline's id; the current one if absent. |
+
+## remote_clients
+
+List the engine's paired public client identities.
+
+## remote_disable
+
+Disable remote control and immediately disconnect every remote client. Local only.
+
+## remote_enable
+
+Enable remote control on this local engine. Refused over remote connections.
+
+| Argument | Type | Description |
+|---|---|---|
+| `bind` | string (optional) | A numeric address of an engine interface (default: 0.0.0.0). |
+| `port` | integer (optional) |  |
+
+## remote_engines
+
+List engines paired with this client.
+
+## remote_identity
+
+Read or create this MCP client's public identity. Its private key stays in the OS credential store.
+
+## remote_pair_begin
+
+Open a single-use two-minute pairing window on the local engine. Keep the returned code private; never log it.
+
+## remote_pair_finish
+
+Pair this client with an engine using its locally opened code and TLS-bound SPAKE2. Never log pairing_secret.
+
+| Argument | Type | Description |
+|---|---|---|
+| `host` (required) | string |  |
+| `name` | string (optional) |  |
+| `pairing_secret` (required) | string |  |
+
+## remote_revoke
+
+Revoke a client and close its live connections immediately. Local only.
+
+| Argument | Type | Description |
+|---|---|---|
+| `client_id` (required) | string |  |
+
+## remote_status
+
+Read this engine's TLS remote-control status.
 
 ## remove_clip
 

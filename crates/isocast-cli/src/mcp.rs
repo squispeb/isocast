@@ -53,8 +53,20 @@ use crate::client::Client;
 
 mod events;
 
+use isocast_protocol::remote::{
+    RemoteEnableParams, RemoteIdentity, RemotePairWindow, RemotePeer, RemoteRevokeParams,
+    RemoteStatus,
+};
 use isocast_protocol::replay::{ReplayParams, ReplaySaved, ReplayStatus};
 use isocast_protocol::websocket::{WebsocketEnableParams, WebsocketStatus};
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PairRemoteParams {
+    host: String,
+    pairing_secret: String,
+    name: Option<String>,
+}
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -1522,6 +1534,97 @@ impl Isocast {
         >,
     ) -> Result<Json<isocast_protocol::roots::FolderRoots>, String> {
         self.call(Method::FolderRootsSet(params)).await
+    }
+
+    #[tool(
+        description = "Read this engine's TLS remote-control status.",
+        annotations(read_only_hint = true)
+    )]
+    async fn remote_status(&self) -> Result<Json<RemoteStatus>, String> {
+        self.call(Method::RemoteStatus).await
+    }
+
+    #[tool(
+        description = "Enable remote control on this local engine. Refused over remote connections."
+    )]
+    async fn remote_enable(
+        &self,
+        Parameters(params): Parameters<RemoteEnableParams>,
+    ) -> Result<Json<RemoteStatus>, String> {
+        self.call(Method::RemoteEnable(Some(params))).await
+    }
+
+    #[tool(
+        description = "Disable remote control and immediately disconnect every remote client. Local only."
+    )]
+    async fn remote_disable(&self) -> Result<Json<RemoteStatus>, String> {
+        self.call(Method::RemoteDisable).await
+    }
+
+    #[tool(
+        description = "Open a single-use two-minute pairing window on the local engine. Keep the returned code private; never log it."
+    )]
+    async fn remote_pair_begin(&self) -> Result<Json<RemotePairWindow>, String> {
+        self.call(Method::RemotePairBegin).await
+    }
+
+    #[tool(
+        description = "Pair this client with an engine using its locally opened code and TLS-bound SPAKE2. Never log pairing_secret."
+    )]
+    async fn remote_pair_finish(
+        &self,
+        Parameters(params): Parameters<PairRemoteParams>,
+    ) -> Result<Json<RemotePeer>, String> {
+        tokio::task::spawn_blocking(move || {
+            isocast_client::remote::pair(
+                &params.host,
+                &params.pairing_secret,
+                params.name.as_deref(),
+            )
+            .map(Json)
+            .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+
+    #[tool(
+        description = "List the engine's paired public client identities.",
+        annotations(read_only_hint = true)
+    )]
+    async fn remote_clients(&self) -> Result<Json<Vec<RemotePeer>>, String> {
+        self.call(Method::RemoteClients).await
+    }
+
+    #[tool(description = "Revoke a client and close its live connections immediately. Local only.")]
+    async fn remote_revoke(
+        &self,
+        Parameters(params): Parameters<RemoteRevokeParams>,
+    ) -> Result<Json<Vec<RemotePeer>>, String> {
+        self.call(Method::RemoteRevoke(params)).await
+    }
+
+    #[tool(
+        description = "Read or create this MCP client's public identity. Its private key stays in the OS credential store."
+    )]
+    async fn remote_identity(&self) -> Result<Json<RemoteIdentity>, String> {
+        tokio::task::spawn_blocking(|| {
+            isocast_client::remote::identity()
+                .map(Json)
+                .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+
+    #[tool(
+        description = "List engines paired with this client.",
+        annotations(read_only_hint = true)
+    )]
+    async fn remote_engines(&self) -> Result<Json<Vec<RemotePeer>>, String> {
+        isocast_client::remote::engines()
+            .map(Json)
+            .map_err(|error| error.to_string())
     }
 
     #[tool(

@@ -36,6 +36,7 @@ mod plugin;
 mod project;
 mod projector;
 mod record;
+mod remote;
 mod replay;
 mod roots;
 #[cfg(any(target_os = "macos", windows))]
@@ -88,6 +89,9 @@ fn shared_frames(_options: shared_frames::Options) -> Result<ExitCode> {
                   "Getting started: `isocast permissions` reports Windows access, `isocast setup init --apply` makes a setup from this PC's devices, `isocast frame` saves a picture of the program, `isocast start --seconds 10` records a test, and `isocast status` shows how it went. Windows Camera and Microphone settings must allow desktop apps; the recording engine is isocastd.exe. Agents: `isocast mcp`.")
 )]
 struct Cli {
+    /// Engine to control: local, a paired name/id, or host[:port]. Also ISOCAST_ENGINE.
+    #[arg(long, global = true)]
+    engine: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -113,6 +117,8 @@ enum MachineCommand {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Remote-control settings, pairing and client identities.
+    Remote(remote::RemoteArgs),
     /// Read a bounded page from a redacted report preview.
     ReportFile {
         preview_id: String,
@@ -812,10 +818,8 @@ enum Command {
         #[arg(long, global = true)]
         json: bool,
     },
-    /// Isocast engines on other computers. For now `--discover` lists the
-    /// engines advertising on the local network (DNS-SD `_isocast._tcp`,
-    /// through the system's own responder). What they advertise is
-    /// unverified until paired.
+    /// Paired engines and engines advertising on the local network. Discovery
+    /// is an unverified hint; the saved TLS pin establishes identity.
     Engines {
         /// Find engines on the local network.
         #[arg(long)]
@@ -1351,7 +1355,31 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<ExitCode> {
+    let target = match cli.engine {
+        Some(target) => isocast_client::Engine::parse(&target)?,
+        None => isocast_client::Engine::selected()?,
+    };
+    if !target.is_local()
+        && matches!(
+            &cli.command,
+            Command::Restart
+                | Command::Logs { .. }
+                | Command::Record { .. }
+                | Command::Setup {
+                    command: SetupCommand::Check { .. }
+                }
+        )
+    {
+        bail!(
+            "this command is local-only and cannot run with --engine/ISOCAST_ENGINE; run it on the engine machine, or explicitly select --engine local"
+        );
+    }
+    isocast_client::Engine::select(target)?;
     match cli.command {
+        Command::Remote(args) => {
+            remote::run(args)?;
+            Ok(ExitCode::SUCCESS)
+        }
         Command::ReportFile {
             preview_id,
             file,
@@ -4220,345 +4248,388 @@ fn watch(levels: bool, kinds: &[String], except: &[String], json: bool) -> Resul
         kinds: (!kinds.is_empty()).then_some(kinds),
         except,
     };
-    let (live, events) = Client::connect_or_launch()?.watch_some(Some(params))?;
-    if json {
-        // What the method returns first: the live setup and its revision.
-        let watching = serde_json::json!({ "type": "watching", "live": live });
-        println!("{}", serde_json::to_string(&watching)?);
-    } else {
-        println!(
-            "Watching isocastd (live setup revision {}); Ctrl-C to stop.",
-            live.revision
-        );
-    }
-    for event in events {
-        let event = event?;
+    let remote = !isocast_client::Engine::selected()?.is_local();
+    loop {
+        let (live, events) = match Client::connect_or_launch()
+            .and_then(|client| client.watch_some(Some(params.clone())))
+        {
+            Ok(watching) => watching,
+            Err(error) if remote && error.downcast_ref::<DaemonError>().is_none() => {
+                eprintln!("Reconnecting… {error}");
+                std::thread::sleep(Duration::from_secs(1));
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         if json {
-            println!("{}", serde_json::to_string(&event)?);
+            // What the method returns first: the live setup and its revision.
+            let watching = serde_json::json!({ "type": "watching", "live": live });
+            println!("{}", serde_json::to_string(&watching)?);
+        } else {
+            println!(
+                "Watching isocastd (live setup revision {}); Ctrl-C to stop.",
+                live.revision
+            );
+        }
+        for event in events {
+            let event = match event {
+                Ok(event) => event,
+                Err(error) if remote => {
+                    eprintln!("Reconnecting… {error}");
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
+            if json {
+                println!("{}", serde_json::to_string(&event)?);
+                continue;
+            }
+            match event {
+                Event::SetupChanged { revision, by } => println!(
+                    "setup changed: revision {revision}{}",
+                    by.map(|by| format!(" (by {by})")).unwrap_or_default()
+                ),
+                Event::Started {
+                    files,
+                    begins_at,
+                    take,
+                    folder,
+                    ..
+                } => {
+                    let take = take.map(|n| format!(" {n}")).unwrap_or_default();
+                    let folder = folder
+                        .map(|f| format!(" in {}", f.display()))
+                        .unwrap_or_default();
+                    match begins_at {
+                        Some(at) => println!("new take{take} (from {at}){folder}:"),
+                        None => println!("recording started{folder}:"),
+                    }
+                    for file in files {
+                        println!("  {}", file.display());
+                    }
+                }
+                Event::Status { live } => {
+                    let files: Vec<String> = live
+                        .files
+                        .iter()
+                        .map(|f| format!("{} {} frames", f.source, f.frames))
+                        .collect();
+                    println!(
+                        "recording {:.0} s: {}",
+                        live.elapsed_seconds,
+                        files.join(", ")
+                    );
+                }
+                Event::Warning { message } => println!("warning: {message}"),
+                Event::RecordingPaused { recording, .. } => println!(
+                    "{} at {:.2} s; {:.2} s paused",
+                    if recording.paused {
+                        "paused"
+                    } else {
+                        "resumed"
+                    },
+                    recording.elapsed_seconds,
+                    recording.paused_seconds
+                ),
+                Event::Stream { stream, .. } => {
+                    print!("stream: ");
+                    print_stream_lines(&stream);
+                }
+                Event::VirtualCamera { camera } => virtual_camera::print(&camera),
+                Event::Replay { replay } => replay::print(&replay),
+                Event::ReplaySaved { saved } => println!(
+                    "{}replay saved: {}",
+                    if saved.canvas.is_main() {
+                        ""
+                    } else {
+                        "vertical "
+                    },
+                    saved.path
+                ),
+                Event::SceneChanged {
+                    scene,
+                    take,
+                    time_seconds,
+                    transition,
+                } => {
+                    let how = how(transition.as_ref());
+                    match take.zip(time_seconds) {
+                        Some((take, t)) => {
+                            println!("scene {scene:?} on air{how} at {t:.2} s in take {take}")
+                        }
+                        None => println!("scene {scene:?} on air{how}"),
+                    }
+                }
+                Event::CanvasSceneChanged {
+                    canvas,
+                    scene,
+                    take,
+                    time_seconds,
+                    transition,
+                } => {
+                    let how = how(transition.as_ref());
+                    let canvas = serde_json::to_value(canvas)?;
+                    let canvas = canvas.as_str().unwrap_or("other");
+                    match take.zip(time_seconds) {
+                        Some((take, t)) => println!(
+                            "scene {scene:?} on air on the {canvas} canvas{how} at {t:.2} s in take \
+                         {take}"
+                        ),
+                        None => println!("scene {scene:?} on air on the {canvas} canvas{how}"),
+                    }
+                }
+                Event::CanvasPreviewChanged { canvas, scene } => {
+                    let canvas = serde_json::to_value(canvas)?;
+                    let canvas = canvas.as_str().unwrap_or("other");
+                    match scene {
+                        Some(scene) => println!("scene {scene:?} in the {canvas} canvas's preview"),
+                        None => println!("the {canvas} canvas's preview cleared"),
+                    }
+                }
+                Event::PreviewChanged { scene } => println!("scene {scene:?} in preview"),
+                Event::PreviewCleared => println!("preview cleared"),
+                Event::Marker {
+                    label,
+                    take,
+                    time_seconds,
+                    ..
+                } => println!("marker {label:?} at {time_seconds:.2} s in take {take}"),
+                Event::Stopped {
+                    report,
+                    error,
+                    timeline,
+                    ..
+                } => match (report, error) {
+                    (Some(report), _) => println!(
+                        "recording stopped after {:.2} s; manifest {}{}",
+                        report.duration_seconds,
+                        report.manifest.display(),
+                        timeline
+                            .map(|into| format!(
+                                "; {} take{} on timeline {} ({} clips)",
+                                into.takes,
+                                if into.takes == 1 { "" } else { "s" },
+                                into.timeline,
+                                into.clips
+                            ))
+                            .unwrap_or_default()
+                    ),
+                    (None, Some(error)) => println!("recording failed: {error}"),
+                    (None, None) => println!("recording stopped"),
+                },
+                Event::Levels { levels } => {
+                    let levels: Vec<String> = levels
+                        .iter()
+                        .map(|l| format!("{} {:.0} dB", l.source, l.peak_db))
+                        .collect();
+                    println!("levels: {}", levels.join(", "));
+                }
+                Event::SourceChanged { status } => match &status.error {
+                    Some(error) => {
+                        println!("source {}: {:?}: {error}", status.source, status.state)
+                    }
+                    None => println!("source {}: {:?}", status.source, status.state),
+                },
+                Event::EngineChanged { running } => println!(
+                    "live engine {}",
+                    if running { "started" } else { "stopped" }
+                ),
+                Event::LibraryChanged {
+                    action,
+                    kind,
+                    id,
+                    collection,
+                    profile,
+                } => {
+                    let what = match (kind, id) {
+                        (Some(kind), Some(id)) => format!("{} {id:?}", kind.label()),
+                        _ => "scene collection and profile".into(),
+                    };
+                    let action = serde_json::to_value(action)?;
+                    println!(
+                        "{what} {}; in use: collection {}, profile {}",
+                        action.as_str().unwrap_or_default(),
+                        collection.as_deref().unwrap_or("none"),
+                        profile.as_deref().unwrap_or("none")
+                    );
+                }
+                Event::PluginChanged {
+                    id,
+                    action,
+                    state,
+                    process,
+                } => {
+                    let action = serde_json::to_value(action)?;
+                    let state = serde_json::to_value(state)?;
+                    let process = process
+                        .map(serde_json::to_value)
+                        .transpose()?
+                        .map(|p| format!(", process {}", p.as_str().unwrap_or_default()))
+                        .unwrap_or_default();
+                    println!(
+                        "plugin {id} {}: {}{process}",
+                        action.as_str().unwrap_or_default(),
+                        state.as_str().unwrap_or_default()
+                    );
+                }
+                Event::DataChanged { revision, keys } => {
+                    println!("data changed (revision {revision}): {}", keys.join(", "));
+                }
+                Event::TimelineChanged {
+                    timeline,
+                    action,
+                    clip,
+                    clips,
+                    ..
+                } => {
+                    let action = serde_json::to_value(action)?;
+                    println!(
+                        "timeline {timeline} {}{}: {clips} clip{}",
+                        action.as_str().unwrap_or_default(),
+                        clip.map(|clip| format!(" {clip}")).unwrap_or_default(),
+                        if clips == 1 { "" } else { "s" }
+                    );
+                }
+                Event::ExportProgress {
+                    export, progress, ..
+                } => println!("export {export}: {:.0}%", progress * 100.0),
+                Event::ExportFinished {
+                    export,
+                    manifest,
+                    error,
+                    ..
+                } => match error {
+                    None => println!("export {export} finished: {}", manifest.display()),
+                    Some(error) => println!("export {export} failed: {error}"),
+                },
+                Event::HotkeyFired {
+                    binding,
+                    action,
+                    source,
+                    phase,
+                    error,
+                } => {
+                    println!(
+                        "hotkey {binding}: {action} ({source:?}, {phase:?}){}",
+                        error.map(|e| format!(": {e}")).unwrap_or_default()
+                    );
+                }
+                Event::TakeFinished {
+                    take,
+                    manifest,
+                    status,
+                    duration_seconds,
+                    ..
+                } => println!(
+                    "take {take} finished ({}{}): {}",
+                    serde_json::to_value(status)?.as_str().unwrap_or_default(),
+                    duration_seconds
+                        .map(|d| format!(", {d:.2} s"))
+                        .unwrap_or_default(),
+                    manifest.display()
+                ),
+                Event::ProjectCreated { project } => println!(
+                    "project {} {:?} created: {}",
+                    project.id,
+                    project.name,
+                    project.folder.display()
+                ),
+                Event::ProjectRenamed {
+                    project, old_name, ..
+                } => println!(
+                    "project {} renamed from {old_name:?} to {:?}: {}",
+                    project.id,
+                    project.name,
+                    project.folder.display()
+                ),
+                Event::DeviceChanged {
+                    action,
+                    kind,
+                    id,
+                    name,
+                } => println!(
+                    "{} {name:?} ({id}) {}",
+                    serde_json::to_value(kind)?.as_str().unwrap_or_default(),
+                    serde_json::to_value(action)?.as_str().unwrap_or_default()
+                ),
+                Event::Projectors { projectors, reason } => {
+                    if let Some(reason) = reason {
+                        println!("projector closed: {reason}");
+                    }
+                    println!("projectors: {} open", projectors.len());
+                    for projector in &projectors {
+                        print!("  ");
+                        projector::print_one(projector);
+                    }
+                }
+                Event::EncoderOverload { overload } => {
+                    println!(
+                        "encoder overload in take {}: {}",
+                        overload.take, overload.reason
+                    );
+                    for fix in overload.estimate.iter().flat_map(|e| &e.suggestions) {
+                        match &fix.change {
+                            Some(change) => println!(
+                                "  fix: {}: isocast plan --patch '{}'",
+                                fix.description,
+                                serde_json::to_string(change)?
+                            ),
+                            None => println!("  fix: {}", fix.description),
+                        }
+                    }
+                }
+                Event::GovernorChanged { governor } => println!("{}", governor.reason),
+                Event::ProjectOpened {
+                    path,
+                    timeline,
+                    editor,
+                    ..
+                } => println!(
+                    "project {} opened on timeline {timeline}{}",
+                    path.display(),
+                    if editor { " (in the editor)" } else { "" }
+                ),
+                Event::RecordTarget { target } => {
+                    println!("next recording: {}", timeline::target_words(&target))
+                }
+                Event::RemoteHeartbeat => {}
+                Event::RemoteClientConnected { peer } => println!(
+                    "remote client connected: {} ({})",
+                    peer.name, peer.client_id
+                ),
+                Event::RemoteClientDisconnected { peer } => println!(
+                    "remote client disconnected: {} ({})",
+                    peer.name, peer.client_id
+                ),
+                Event::RemotePaired { client } => {
+                    println!("paired: {} ({})", client.name, client.id)
+                }
+                Event::RemoteRevoked { client_id } => {
+                    println!("remote client revoked: {client_id}")
+                }
+                Event::RemoteDisabled => println!("remote control disabled"),
+                Event::Refused {
+                    method,
+                    message,
+                    by,
+                } => println!(
+                    "refused {method}{}: {message}",
+                    by.map(|by| format!(" from {by}")).unwrap_or_default()
+                ),
+            }
+        }
+        // Events end only when isocastd hangs up; a watcher must not mistake
+        // that for a quiet stretch.
+        if remote {
+            eprintln!("Reconnecting…");
+            std::thread::sleep(Duration::from_secs(1));
             continue;
         }
-        match event {
-            Event::SetupChanged { revision, by } => println!(
-                "setup changed: revision {revision}{}",
-                by.map(|by| format!(" (by {by})")).unwrap_or_default()
-            ),
-            Event::Started {
-                files,
-                begins_at,
-                take,
-                folder,
-                ..
-            } => {
-                let take = take.map(|n| format!(" {n}")).unwrap_or_default();
-                let folder = folder
-                    .map(|f| format!(" in {}", f.display()))
-                    .unwrap_or_default();
-                match begins_at {
-                    Some(at) => println!("new take{take} (from {at}){folder}:"),
-                    None => println!("recording started{folder}:"),
-                }
-                for file in files {
-                    println!("  {}", file.display());
-                }
-            }
-            Event::Status { live } => {
-                let files: Vec<String> = live
-                    .files
-                    .iter()
-                    .map(|f| format!("{} {} frames", f.source, f.frames))
-                    .collect();
-                println!(
-                    "recording {:.0} s: {}",
-                    live.elapsed_seconds,
-                    files.join(", ")
-                );
-            }
-            Event::Warning { message } => println!("warning: {message}"),
-            Event::RecordingPaused { recording, .. } => println!(
-                "{} at {:.2} s; {:.2} s paused",
-                if recording.paused {
-                    "paused"
-                } else {
-                    "resumed"
-                },
-                recording.elapsed_seconds,
-                recording.paused_seconds
-            ),
-            Event::Stream { stream, .. } => {
-                print!("stream: ");
-                print_stream_lines(&stream);
-            }
-            Event::VirtualCamera { camera } => virtual_camera::print(&camera),
-            Event::Replay { replay } => replay::print(&replay),
-            Event::ReplaySaved { saved } => println!(
-                "{}replay saved: {}",
-                if saved.canvas.is_main() {
-                    ""
-                } else {
-                    "vertical "
-                },
-                saved.path
-            ),
-            Event::SceneChanged {
-                scene,
-                take,
-                time_seconds,
-                transition,
-            } => {
-                let how = how(transition.as_ref());
-                match take.zip(time_seconds) {
-                    Some((take, t)) => {
-                        println!("scene {scene:?} on air{how} at {t:.2} s in take {take}")
-                    }
-                    None => println!("scene {scene:?} on air{how}"),
-                }
-            }
-            Event::CanvasSceneChanged {
-                canvas,
-                scene,
-                take,
-                time_seconds,
-                transition,
-            } => {
-                let how = how(transition.as_ref());
-                let canvas = serde_json::to_value(canvas)?;
-                let canvas = canvas.as_str().unwrap_or("other");
-                match take.zip(time_seconds) {
-                    Some((take, t)) => println!(
-                        "scene {scene:?} on air on the {canvas} canvas{how} at {t:.2} s in take \
-                         {take}"
-                    ),
-                    None => println!("scene {scene:?} on air on the {canvas} canvas{how}"),
-                }
-            }
-            Event::CanvasPreviewChanged { canvas, scene } => {
-                let canvas = serde_json::to_value(canvas)?;
-                let canvas = canvas.as_str().unwrap_or("other");
-                match scene {
-                    Some(scene) => println!("scene {scene:?} in the {canvas} canvas's preview"),
-                    None => println!("the {canvas} canvas's preview cleared"),
-                }
-            }
-            Event::PreviewChanged { scene } => println!("scene {scene:?} in preview"),
-            Event::PreviewCleared => println!("preview cleared"),
-            Event::Marker {
-                label,
-                take,
-                time_seconds,
-                ..
-            } => println!("marker {label:?} at {time_seconds:.2} s in take {take}"),
-            Event::Stopped {
-                report,
-                error,
-                timeline,
-                ..
-            } => match (report, error) {
-                (Some(report), _) => println!(
-                    "recording stopped after {:.2} s; manifest {}{}",
-                    report.duration_seconds,
-                    report.manifest.display(),
-                    timeline
-                        .map(|into| format!(
-                            "; {} take{} on timeline {} ({} clips)",
-                            into.takes,
-                            if into.takes == 1 { "" } else { "s" },
-                            into.timeline,
-                            into.clips
-                        ))
-                        .unwrap_or_default()
-                ),
-                (None, Some(error)) => println!("recording failed: {error}"),
-                (None, None) => println!("recording stopped"),
-            },
-            Event::Levels { levels } => {
-                let levels: Vec<String> = levels
-                    .iter()
-                    .map(|l| format!("{} {:.0} dB", l.source, l.peak_db))
-                    .collect();
-                println!("levels: {}", levels.join(", "));
-            }
-            Event::SourceChanged { status } => match &status.error {
-                Some(error) => println!("source {}: {:?}: {error}", status.source, status.state),
-                None => println!("source {}: {:?}", status.source, status.state),
-            },
-            Event::EngineChanged { running } => println!(
-                "live engine {}",
-                if running { "started" } else { "stopped" }
-            ),
-            Event::LibraryChanged {
-                action,
-                kind,
-                id,
-                collection,
-                profile,
-            } => {
-                let what = match (kind, id) {
-                    (Some(kind), Some(id)) => format!("{} {id:?}", kind.label()),
-                    _ => "scene collection and profile".into(),
-                };
-                let action = serde_json::to_value(action)?;
-                println!(
-                    "{what} {}; in use: collection {}, profile {}",
-                    action.as_str().unwrap_or_default(),
-                    collection.as_deref().unwrap_or("none"),
-                    profile.as_deref().unwrap_or("none")
-                );
-            }
-            Event::PluginChanged {
-                id,
-                action,
-                state,
-                process,
-            } => {
-                let action = serde_json::to_value(action)?;
-                let state = serde_json::to_value(state)?;
-                let process = process
-                    .map(serde_json::to_value)
-                    .transpose()?
-                    .map(|p| format!(", process {}", p.as_str().unwrap_or_default()))
-                    .unwrap_or_default();
-                println!(
-                    "plugin {id} {}: {}{process}",
-                    action.as_str().unwrap_or_default(),
-                    state.as_str().unwrap_or_default()
-                );
-            }
-            Event::DataChanged { revision, keys } => {
-                println!("data changed (revision {revision}): {}", keys.join(", "));
-            }
-            Event::TimelineChanged {
-                timeline,
-                action,
-                clip,
-                clips,
-                ..
-            } => {
-                let action = serde_json::to_value(action)?;
-                println!(
-                    "timeline {timeline} {}{}: {clips} clip{}",
-                    action.as_str().unwrap_or_default(),
-                    clip.map(|clip| format!(" {clip}")).unwrap_or_default(),
-                    if clips == 1 { "" } else { "s" }
-                );
-            }
-            Event::ExportProgress {
-                export, progress, ..
-            } => println!("export {export}: {:.0}%", progress * 100.0),
-            Event::ExportFinished {
-                export,
-                manifest,
-                error,
-                ..
-            } => match error {
-                None => println!("export {export} finished: {}", manifest.display()),
-                Some(error) => println!("export {export} failed: {error}"),
-            },
-            Event::HotkeyFired {
-                binding,
-                action,
-                source,
-                phase,
-                error,
-            } => {
-                println!(
-                    "hotkey {binding}: {action} ({source:?}, {phase:?}){}",
-                    error.map(|e| format!(": {e}")).unwrap_or_default()
-                );
-            }
-            Event::TakeFinished {
-                take,
-                manifest,
-                status,
-                duration_seconds,
-                ..
-            } => println!(
-                "take {take} finished ({}{}): {}",
-                serde_json::to_value(status)?.as_str().unwrap_or_default(),
-                duration_seconds
-                    .map(|d| format!(", {d:.2} s"))
-                    .unwrap_or_default(),
-                manifest.display()
-            ),
-            Event::ProjectCreated { project } => println!(
-                "project {} {:?} created: {}",
-                project.id,
-                project.name,
-                project.folder.display()
-            ),
-            Event::ProjectRenamed {
-                project, old_name, ..
-            } => println!(
-                "project {} renamed from {old_name:?} to {:?}: {}",
-                project.id,
-                project.name,
-                project.folder.display()
-            ),
-            Event::DeviceChanged {
-                action,
-                kind,
-                id,
-                name,
-            } => println!(
-                "{} {name:?} ({id}) {}",
-                serde_json::to_value(kind)?.as_str().unwrap_or_default(),
-                serde_json::to_value(action)?.as_str().unwrap_or_default()
-            ),
-            Event::Projectors { projectors, reason } => {
-                if let Some(reason) = reason {
-                    println!("projector closed: {reason}");
-                }
-                println!("projectors: {} open", projectors.len());
-                for projector in &projectors {
-                    print!("  ");
-                    projector::print_one(projector);
-                }
-            }
-            Event::EncoderOverload { overload } => {
-                println!(
-                    "encoder overload in take {}: {}",
-                    overload.take, overload.reason
-                );
-                for fix in overload.estimate.iter().flat_map(|e| &e.suggestions) {
-                    match &fix.change {
-                        Some(change) => println!(
-                            "  fix: {}: isocast plan --patch '{}'",
-                            fix.description,
-                            serde_json::to_string(change)?
-                        ),
-                        None => println!("  fix: {}", fix.description),
-                    }
-                }
-            }
-            Event::GovernorChanged { governor } => println!("{}", governor.reason),
-            Event::ProjectOpened {
-                path,
-                timeline,
-                editor,
-                ..
-            } => println!(
-                "project {} opened on timeline {timeline}{}",
-                path.display(),
-                if editor { " (in the editor)" } else { "" }
-            ),
-            Event::RecordTarget { target } => {
-                println!("next recording: {}", timeline::target_words(&target))
-            }
-            Event::Refused {
-                method,
-                message,
-                by,
-            } => println!(
-                "refused {method}{}: {message}",
-                by.map(|by| format!(" from {by}")).unwrap_or_default()
-            ),
-        }
-    }
-    // Events end only when isocastd hangs up; a watcher must not mistake
-    // that for a quiet stretch.
-    anyhow::bail!(
-        "lost the connection to isocastd (it stopped or restarted, or this watcher fell too far \
+        anyhow::bail!(
+            "lost the connection to isocastd (it stopped or restarted, or this watcher fell too far \
          behind); events from now on are not shown, so run `isocast watch` again"
-    )
+        )
+    }
 }
 
 /// Read a stream key: from stdin, or asked for without echo in a terminal.

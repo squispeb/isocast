@@ -34,6 +34,7 @@ pub mod platform_text;
 pub mod plugin;
 pub mod project;
 pub mod projector;
+pub mod remote;
 pub mod replay;
 pub mod roots;
 mod source;

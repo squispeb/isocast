@@ -96,11 +96,15 @@ pub enum Method {
     /// Resume the same take and files. Returns [`RecordingPause`].
     Resume,
     /// Mark this moment in the running recording. Returns [`Marked`].
-    Marker { label: String },
+    Marker {
+        label: String,
+    },
     /// Reload a browser source's page in the running recording, bypassing
     /// the cache (OBS's "Refresh cache of current page"). Returns
     /// [`Refreshed`].
-    RefreshBrowser { source: String },
+    RefreshBrowser {
+        source: String,
+    },
     /// Put a scene on air (by id). While recording, the switch is written to
     /// the manifest's scene timeline. Returns [`Switched`].
     SwitchScene {
@@ -179,7 +183,9 @@ pub enum Method {
     /// once; it also runs while a recording or stream does, or while a
     /// client asks for frames. Returns [`EngineInfo`], or null once
     /// stopped.
-    Engine { running: bool },
+    Engine {
+        running: bool,
+    },
     /// Read an OBS Studio scene collection into a setup, matching its
     /// devices and sizes against this Mac, without changing the live setup.
     /// Returns [`Imported`](crate::obs::Imported): the setup and what
@@ -254,7 +260,9 @@ pub enum Method {
     /// Remove a canvas from the live setup, with its arrangements, stream
     /// and recording (not while it records or streams). Returns
     /// [`Canvases`].
-    CanvasRemove { canvas: CanvasId },
+    CanvasRemove {
+        canvas: CanvasId,
+    },
     /// The scene collections and profiles (the two parts the live setup is
     /// kept in, as in OBS) and which are current. Returns
     /// [`Library`](crate::library::Library).
@@ -493,6 +501,14 @@ pub enum Method {
     /// Turn off the obs-websocket server, disconnecting its clients.
     /// Returns [`WebsocketStatus`](crate::websocket::WebsocketStatus).
     WebsocketDisable,
+    RemoteStatus,
+    RemoteEnable(Option<crate::remote::RemoteEnableParams>),
+    RemoteDisable,
+    RemotePairBegin,
+    /// Dedicated, pre-parser PAKE exchange; JSON calls explain the pairing flow.
+    RemotePairFinish,
+    RemoteClients,
+    RemoteRevoke(crate::remote::RemoteRevokeParams),
     /// Move a clip's in and/or out point, on its take's clock (rounded to
     /// its frame grid); the take's files are never touched. One revision.
     /// Returns [`TimelineInfo`](crate::timeline::TimelineInfo).
@@ -1298,9 +1314,13 @@ pub enum Event {
         by: Option<String>,
     },
     /// Live counters, about once a second while recording.
-    Status { live: LiveStatus },
+    Status {
+        live: LiveStatus,
+    },
     /// Something needs attention, like a file dropping frames.
-    Warning { message: String },
+    Warning {
+        message: String,
+    },
     /// A scene went on air.
     SceneChanged {
         scene: String,
@@ -1310,7 +1330,9 @@ pub enum Event {
         transition: Option<crate::Transition>,
     },
     /// A scene was staged in preview.
-    PreviewChanged { scene: String },
+    PreviewChanged {
+        scene: String,
+    },
     /// A marker was added to the recording.
     Marker {
         label: String,
@@ -1351,12 +1373,18 @@ pub enum Event {
     },
     /// Every audio source's and the program mix's level (`program`), about
     /// 20 times a second while the live engine runs.
-    Levels { levels: Vec<AudioLevel> },
+    Levels {
+        levels: Vec<AudioLevel>,
+    },
     /// One of the live engine's sources started opening, is running, or
     /// failed.
-    SourceChanged { status: SourceStatus },
+    SourceChanged {
+        status: SourceStatus,
+    },
     /// The live engine started or stopped.
-    EngineChanged { running: bool },
+    EngineChanged {
+        running: bool,
+    },
     /// A scene collection or profile was made, renamed, deleted, imported
     /// or switched to (`kind` and `id` say which, unless both were
     /// switched); `collection` and `profile` are the current ones after.
@@ -1381,7 +1409,10 @@ pub enum Event {
     /// Data keys were set or deleted (`data_get` reads them): every key
     /// changed since the last such event, at most 20 events a second;
     /// `revision` is the store's after them.
-    DataChanged { revision: u64, keys: Vec<String> },
+    DataChanged {
+        revision: u64,
+        keys: Vec<String>,
+    },
     /// A timeline was made, opened, closed or changed (`action` says how;
     /// `clip` is the clip concerned, if any); `current` is the current
     /// timeline after. `timeline_get` reads it.
@@ -1448,7 +1479,9 @@ pub enum Event {
         errors: Vec<String>,
     },
     /// A recording made a new project folder, as its first take began.
-    ProjectCreated { project: crate::project::Project },
+    ProjectCreated {
+        project: crate::project::Project,
+    },
     /// A project was renamed: its folder moved from `old_folder`.
     ProjectRenamed {
         project: crate::project::Project,
@@ -1464,13 +1497,19 @@ pub enum Event {
     },
     /// A replay buffer started, stopped or failed (`replay.canvas` says
     /// whose: absent for the main canvas's).
-    Replay { replay: crate::replay::ReplayStatus },
+    Replay {
+        replay: crate::replay::ReplayStatus,
+    },
     /// A replay buffer saved a file (`saved.canvas` says whose).
-    ReplaySaved { saved: crate::replay::ReplaySaved },
+    ReplaySaved {
+        saved: crate::replay::ReplaySaved,
+    },
     /// The hardware encoders can't keep up: files of the take are dropping
     /// frames (ISO files first; the program and stream are protected), and
     /// the disk isn't the cause. Comes at most once per take.
-    EncoderOverload { overload: Box<Overload> },
+    EncoderOverload {
+        overload: Box<Overload>,
+    },
     /// A projector opened, closed or moved: the open projectors now, and
     /// why one closed if it wasn't asked to (a display went away).
     Projectors {
@@ -1526,6 +1565,21 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         by: Option<String>,
     },
+    RemoteClientConnected {
+        peer: crate::remote::RemoteAuditPeer,
+    },
+    RemoteClientDisconnected {
+        peer: crate::remote::RemoteAuditPeer,
+    },
+    RemotePaired {
+        client: crate::remote::RemotePeer,
+    },
+    RemoteRevoked {
+        client_id: String,
+    },
+    RemoteDisabled,
+    /// Remote watch liveness; not published to local subscribers.
+    RemoteHeartbeat,
 }
 
 /// What began a take, in `started` events.
@@ -1595,11 +1649,17 @@ pub enum EventKind {
     GovernorChanged,
     RecordTarget,
     Refused,
+    RemoteClientConnected,
+    RemoteClientDisconnected,
+    RemotePaired,
+    RemoteRevoked,
+    RemoteDisabled,
+    RemoteHeartbeat,
 }
 
 impl EventKind {
     /// Every kind's name, as events and `watch` spell it, in this order.
-    pub const NAMES: [&str; 36] = [
+    pub const NAMES: [&str; 42] = [
         "setup_changed",
         "started",
         "status",
@@ -1636,6 +1696,12 @@ impl EventKind {
         "governor_changed",
         "record_target",
         "refused",
+        "remote_client_connected",
+        "remote_client_disconnected",
+        "remote_paired",
+        "remote_revoked",
+        "remote_disabled",
+        "remote_heartbeat",
     ];
 
     /// The kind's name, as events and `watch` spell it.
@@ -1683,6 +1749,12 @@ impl Event {
             Self::GovernorChanged { .. } => EventKind::GovernorChanged,
             Self::RecordTarget { .. } => EventKind::RecordTarget,
             Self::Refused { .. } => EventKind::Refused,
+            Self::RemoteClientConnected { .. } => EventKind::RemoteClientConnected,
+            Self::RemoteClientDisconnected { .. } => EventKind::RemoteClientDisconnected,
+            Self::RemotePaired { .. } => EventKind::RemotePaired,
+            Self::RemoteRevoked { .. } => EventKind::RemoteRevoked,
+            Self::RemoteDisabled => EventKind::RemoteDisabled,
+            Self::RemoteHeartbeat => EventKind::RemoteHeartbeat,
         }
     }
 }

@@ -159,15 +159,12 @@ pub fn local_only_reason(method: &Method) -> Option<&'static str> {
             "`replace` overwrites whatever file is at the path; leave it out (an earlier Isocast \
              export is still replaced) or choose another path",
         ),
-        // The remote lane's methods (`remote_status`, `remote_enable`,
-        // `remote_disable`, `remote_pair_begin`, `remote_pair_finish`,
-        // `remote_clients`, `remote_revoke`) join here when they're added
-        // to the method table:
-        //   Method::RemoteStatus | Method::RemoteClients => None,
-        //   Method::RemoteEnable(..) | Method::RemoteDisable | Method::RemotePairBegin(..)
-        //   | Method::RemotePairFinish(..) | Method::RemoteRevoke(..) => Some(REMOTE_SETTINGS),
-        // (`remote_pair_finish` is called by an unpaired client during
-        // pairing, which the listener confines before this check.)
+        Method::RemoteStatus | Method::RemoteClients => None,
+        Method::RemoteEnable(_)
+        | Method::RemoteDisable
+        | Method::RemotePairBegin
+        | Method::RemotePairFinish
+        | Method::RemoteRevoke(_) => Some(REMOTE_SETTINGS),
         // Allowed as methods; what they do is checked as they do it
         // (decision 25): `speed_test`, `optimize` and `tune` only against
         // configured servers, paths inside the folder roots, setup changes
