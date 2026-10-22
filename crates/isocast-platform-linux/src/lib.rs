@@ -100,6 +100,20 @@ impl Platform for LinuxPlatform {
         true
     }
 
+    /// L.6e: the virtual camera will be a v4l2loopback device; until
+    /// then it is refused by name rather than as an unknown backend.
+    fn virtual_camera_sink(
+        &self,
+        _width: u32,
+        _height: u32,
+        _fps: u32,
+    ) -> Result<Box<dyn isocast_engine::record::CameraSink<LinuxFrame>>> {
+        bail!(
+            "virtual_camera: not available on Linux yet; it arrives as a v4l2loopback camera \
+             (L.6e in PLAN.md), which needs the v4l2loopback kernel module installed"
+        )
+    }
+
     fn now(&self) -> Time {
         system::host_time()
     }

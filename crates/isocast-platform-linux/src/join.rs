@@ -124,10 +124,54 @@ fn pixel_name(format: c_int) -> String {
     }
 }
 
+/// What the editor's exports ask of a join that this one can't do yet,
+/// refused before anything is written rather than joined wrong: it copies
+/// each file's video from its start, as recorded, with the file's own
+/// sound. (macOS cuts at in points, crops and re-encodes; on Linux that is
+/// a follow-up to the v0.0.8 sync, see docs/notes.md.)
+fn refuse_unsupported(spec: &JoinSpec) -> Result<()> {
+    const INSTEAD: &str = "export the timeline without that edit, or for another editor \
+         (`isocast timeline export --nle`), which points at the takes' own files";
+    if let Some((width, height)) = spec.size {
+        bail!(
+            "size: joining into a {width}x{height} picture (a vertical edited file) is not \
+             available on Linux yet; {INSTEAD}"
+        );
+    }
+    for (k, part) in spec.parts.iter().enumerate() {
+        if part.in_seconds > 0.0 {
+            bail!(
+                "parts[{k}].in_seconds: joining {} from {:.3} s into it (a clip trimmed at its \
+                 start, split or with a stretch deleted) is not available on Linux yet; {INSTEAD}",
+                part.path.display(),
+                part.in_seconds
+            );
+        }
+        if part.crop.is_some() {
+            bail!(
+                "parts[{k}].crop: cropping {} is not available on Linux yet; {INSTEAD}",
+                part.path.display()
+            );
+        }
+        if let Some((audio, _)) = &part.audio
+            && audio != &part.path
+        {
+            bail!(
+                "parts[{k}].audio: showing {} with {}'s sound (an edited file's angle) is not \
+                 available on Linux yet; {INSTEAD}",
+                part.path.display(),
+                audio.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 pub fn join(spec: &JoinSpec, progress: OnJoinProgress) -> Result<Joined> {
     if spec.parts.is_empty() {
         bail!("nothing to join");
     }
+    refuse_unsupported(spec)?;
     if spec.output.exists() {
         bail!("{} already exists", spec.output.display());
     }
