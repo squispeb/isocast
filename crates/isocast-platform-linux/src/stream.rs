@@ -648,6 +648,31 @@ impl Scaler {
             av::SwsFlags::SWS_BICUBIC
         };
         let flags = filter as c_int | av::SwsFlags::SWS_ACCURATE_RND as c_int;
+        // swscale reads `stride * rows` bytes of each source plane through
+        // raw pointers, so a short plane is refused here, not read past.
+        let source_rows = match kind {
+            FrameKind::Bgra => vec![from.1 as usize],
+            FrameKind::Ycbcr8 => vec![from.1 as usize, from.1.div_ceil(2) as usize],
+        };
+        if planes.len() != source_rows.len() {
+            bail!(
+                "a {kind:?} picture has {} planes, not {}",
+                source_rows.len(),
+                planes.len()
+            );
+        }
+        for (index, ((bytes, stride), rows)) in planes.iter().zip(&source_rows).enumerate() {
+            let minimum_stride = from.0 as usize * bytes_per_pixel;
+            if *stride < minimum_stride || bytes.len() < stride * rows {
+                bail!(
+                    "plane {index} of a {}x{} {kind:?} picture holds {} bytes at stride {stride}, \
+                     needs {rows} rows of at least {minimum_stride} bytes",
+                    from.0,
+                    from.1,
+                    bytes.len()
+                );
+            }
+        }
         let mut source_data = [std::ptr::null::<u8>(); 4];
         let mut source_strides = [0 as c_int; 4];
         for (index, (bytes, stride)) in planes.iter().enumerate() {
@@ -660,6 +685,11 @@ impl Scaler {
             target_data[index] = bytes.as_mut_ptr();
             target_strides[index] = *stride as c_int;
         }
+        // SAFETY: every source plane was checked above to hold `stride *
+        // rows` bytes for `from` and `kind`, and `self.out` was allocated
+        // for this destination size and kind (plus slack), so swscale
+        // stays inside both sets of buffers; `self.context` is only ever
+        // touched on this thread.
         unsafe {
             self.context = av::sws_getCachedContext(
                 self.context,
