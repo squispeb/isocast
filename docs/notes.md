@@ -48,10 +48,57 @@ each section. Delete entries that stop being true.
   DMA-BUF capture works on the live Hyprland (wincap dmabuf: 60/s,
   modifier 0x300000000e08014); round 1's nested try got nothing because
   a nested output only commits when something on it changes.
-- 2026-10-23 (finding, screen): screencast.rs returned early before
-  dequeuing a picture that arrived inside the asked interval, so xdph's
-  buffers sat in our queue: xdph logged 3,033 "Out of buffers / Retrying
-  screencopy" today, and what we dequeued next was the oldest picture.
+- 2026-10-23 (fixed, screen, a96d754): screencast.rs returned early
+  before dequeuing a picture that arrived inside the asked interval, so
+  xdph's buffers sat in our queue (3,033 "Out of buffers / Retrying
+  screencopy" in its log today) and the next one we took was the
+  oldest. It now drains the queue, keeps the newest and gives the rest
+  back, and asks for max-framerate = the source's fps (xdph copied the
+  monitor at its 165 Hz otherwise). No retry lines since.
+- 2026-10-23 (fixed, window, e6a842d): window sources capture into GPU
+  buffers. Two GBM buffers (libgbm dlopened; render node matched to the
+  session's dmabuf_device) in an ARGB8888 layout the compositor offers,
+  imported into the engine's device with wgpu-hal's
+  texture_from_dmabuf_fd (the engine's Linux device now asks for
+  VULKAN_EXTERNAL_MEMORY_DMA_BUF); each picture is a GPU copy into the
+  pool frame's texture (VulkanImporter::target, gpu_synced set so no
+  stale CPU upload), and a buffer is not handed back before that copy
+  is done. Shared memory stays for apps (CPU-composited canvases),
+  resized windows, failed copies, no libgbm or no feature;
+  ISOCAST_WINDOW_SHM=1 forces it. Same btop window, back to back on the
+  live (leaked) Hyprland: 44.8 vs 29.4 fps delivered, desktop 59 vs 53,
+  max gap 34 vs 56 ms; a 7.8 s take 469 frames, 0 dropped, picture right.
+- 2026-10-23 (fixed, screen, aac2351): the screen stream offers a
+  DMA-BUF format first (BGRA, the single-plane modifiers Vulkan reports
+  importable with TRANSFER_SRC, asked through ash), shared memory
+  second; buffers are set to DmaBuf once xdph fixes the format, each is
+  imported once (keyed by fd, cleared on renegotiation), and the GPU
+  copy is waited for before the buffer goes back. A failed import
+  renegotiates to shm; ISOCAST_SCREEN_SHM=1 forces it. Live: "2560x1440
+  BGRA (at most 60/1) in GPU buffers (modifier 0x300000000606014)", no
+  "wl_shm ... legacy" from xdph, daemon CPU 11% instead of 21%.
+- 2026-10-23 (validated, desktop pacing; target not met, blocked on the
+  Hyprland restart): with the leak present the live desktop stays far
+  from 160 frames/s whatever Isocast does (bare desktop 129-140, 54%
+  Hyprland main thread at 17:50, up from 35-41% at 16:45; cause of that
+  growth not found: xdph's casts were balanced, 3 made and 3 destroyed).
+  After the fixes, app + camera + mic + window + page + screen: 33.5
+  frames/s and 77 ms gaps (before 26.2 and 130 ms); 180 s steady 29.3,
+  every second with a gap over 12 ms; takes intact (59.8 s, 3589 frames,
+  0 dropped). On a fresh nested Hyprland (no leak) the same app, camera,
+  mic, a foot window over DMA-BUF and the page keep its main thread at
+  3% (2% with nothing): Isocast's inputs cost a healthy compositor about
+  1% of a core. Scripts: target/scratch/r2 (meas.sh, phase.sh, gen.py,
+  winab.sh, brab.sh), target/scratch/nv (nested app run).
+- 2026-10-23 (finding, browser): a 1280x720 animated page costs ~52% of
+  a core in our own processes (daemon + WebKit web process), with no
+  Wayland traffic to the compositor; GDK_SCALE=1 changes nothing. Its
+  desktop cost is CPU contention, which only matters while Hyprland's
+  main thread is saturated. Left as is.
+- 2026-10-23 (gotcha): `isocast collection list` with no ISOCAST_SOCKET
+  starts the default daemon from the calling shell when none runs (this
+  happened once today; stopped by pid). Start the app first, or set the
+  socket.
 - 2026-10-23 (fixed, app memory): with its window on a hidden workspace
   the app grew about 500 MB/s (6.2 GiB VmRSS 10 s after it started, much
   of it not charged to the unit, so MemoryMax did not stop it). Shared
