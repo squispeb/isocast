@@ -11,6 +11,8 @@
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::process::Command;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 /// One window, from `hyprctl clients -j`.
 #[derive(Debug, Clone, PartialEq)]
@@ -67,6 +69,29 @@ fn request(command: &str) -> Option<Vec<u8>> {
     if let Some(answer) = socket_request(command) {
         return Some(answer);
     }
+    // A `hyprctl` child that failed once (no instance to find) would fail
+    // again; asking every few hundred milliseconds would only spawn
+    // processes from the capture loop.
+    static FAILED_AT: Mutex<Option<Instant>> = Mutex::new(None);
+    {
+        let failed = FAILED_AT.lock().ok()?;
+        if failed.is_some_and(|at| at.elapsed() < HYPRCTL_RETRY) {
+            return None;
+        }
+    }
+    let answer = hyprctl_request(command);
+    if answer.is_none()
+        && let Ok(mut failed) = FAILED_AT.lock()
+    {
+        *failed = Some(Instant::now());
+    }
+    answer
+}
+
+/// How long after `hyprctl` failed it is not tried again.
+const HYPRCTL_RETRY: Duration = Duration::from_secs(30);
+
+fn hyprctl_request(command: &str) -> Option<Vec<u8>> {
     let (flag, name) = command.split_once('/')?;
     let mut hyprctl = Command::new("hyprctl");
     if flag == "j" {
@@ -86,7 +111,7 @@ fn socket_request(command: &str) -> Option<Vec<u8>> {
         .join(signature)
         .join(".socket.sock");
     let mut socket = UnixStream::connect(path).ok()?;
-    let timeout = Some(std::time::Duration::from_secs(2));
+    let timeout = Some(Duration::from_secs(2));
     socket.set_read_timeout(timeout).ok()?;
     socket.set_write_timeout(timeout).ok()?;
     socket.write_all(command.as_bytes()).ok()?;

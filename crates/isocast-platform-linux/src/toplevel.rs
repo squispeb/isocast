@@ -365,7 +365,15 @@ struct State {
     /// The compositor stopped offering toplevels altogether.
     finished: bool,
     layers: Vec<Layer>,
+    /// The size a probe's throwaway session reported.
+    probed: Option<(u32, u32)>,
 }
+
+/// A layer's id and where its window sits (x, y, monitor), if known.
+type Placed = (u64, Option<(i32, i32, i64)>);
+
+/// The id of a probe's session, which belongs to no layer.
+const PROBE_ID: u64 = 0;
 
 impl State {
     fn layer(&mut self, id: u64) -> Option<&mut Layer> {
@@ -449,6 +457,12 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, u64> for State {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        if *id == PROBE_ID {
+            if let ext_image_copy_capture_session_v1::Event::BufferSize { width, height } = event {
+                state.probed = Some((width, height));
+            }
+            return;
+        }
         let Some(layer) = state.layer(*id) else {
             return;
         };
@@ -574,6 +588,7 @@ fn connect() -> Result<(Connection, EventQueue<State>, Managers, State)> {
         changed: true,
         finished: false,
         layers: Vec::new(),
+        probed: None,
     };
     Ok((
         conn,
@@ -588,19 +603,59 @@ fn connect() -> Result<(Connection, EventQueue<State>, Managers, State)> {
     ))
 }
 
-/// Every open window's description, from a short-lived connection (what a
-/// check needs to answer without capturing).
-fn list_windows() -> Result<Vec<Info>> {
-    let (_conn, mut queue, _managers, mut state) = connect()?;
-    // The toplevels, then their descriptions.
-    queue.roundtrip(&mut state).context("listing windows")?;
-    queue.roundtrip(&mut state).context("listing windows")?;
-    Ok(state
-        .toplevels
-        .iter()
-        .map(info_of)
-        .filter(|info| info.done && !info.closed)
-        .collect())
+/// A short-lived connection that has listed the open windows: what a check
+/// needs to answer without capturing.
+struct Listing {
+    _conn: Connection,
+    queue: EventQueue<State>,
+    managers: Managers,
+    state: State,
+}
+
+impl Listing {
+    fn open() -> Result<Self> {
+        let (conn, mut queue, managers, mut state) = connect()?;
+        // The toplevels, then their descriptions.
+        queue.roundtrip(&mut state).context("listing windows")?;
+        queue.roundtrip(&mut state).context("listing windows")?;
+        Ok(Self {
+            _conn: conn,
+            queue,
+            managers,
+            state,
+        })
+    }
+
+    /// The open windows with their toplevels' indices.
+    fn windows(&self) -> Vec<(usize, Info)> {
+        self.state
+            .toplevels
+            .iter()
+            .enumerate()
+            .map(|(index, handle)| (index, info_of(handle)))
+            .filter(|(_, info)| info.done && !info.closed)
+            .collect()
+    }
+
+    /// The size the compositor gives a window's picture, from a throwaway
+    /// capture session (which needs neither Hyprland nor a frame).
+    fn picture_size(&mut self, toplevel: usize) -> Option<(u32, u32)> {
+        let qh = self.queue.handle();
+        let source =
+            self.managers
+                .source
+                .create_source(self.state.toplevels.get(toplevel)?, &qh, ());
+        let session = self
+            .managers
+            .copy
+            .create_session(&source, Options::empty(), &qh, PROBE_ID);
+        source.destroy();
+        self.state.probed = None;
+        let answered = self.queue.roundtrip(&mut self.state).is_ok();
+        session.destroy();
+        let _ = self.queue.flush();
+        self.state.probed.take().filter(|_| answered)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -660,7 +715,9 @@ impl Target {
 /// follow and the size the take would have.
 pub(crate) fn probe(target: ScreenTarget<'_>, fps: u32) -> Result<isocast_engine::Probe> {
     let target = Target::parse(target)?;
-    let infos = list_windows()?;
+    let mut listing = Listing::open()?;
+    let live = listing.windows();
+    let infos: Vec<Info> = live.iter().map(|(_, info)| info.clone()).collect();
     let clients = hyprland::clients().unwrap_or_default();
     let monitors = hyprland::monitors().unwrap_or_default();
     let candidates: Vec<Candidate> = infos
@@ -676,24 +733,27 @@ pub(crate) fn probe(target: ScreenTarget<'_>, fps: u32) -> Result<isocast_engine
                 return Err(target.nothing_found(&infos));
             };
             let candidate = &candidates[found];
-            // Hyprland's size is in layout units; the picture is in pixels.
-            let scale = candidate
-                .client
-                .as_ref()
-                .and_then(|client| monitors.iter().find(|m| m.id == client.monitor))
-                .map_or(1.0, |monitor| monitor.scale);
-            let (width, height) = candidate.client.as_ref().map_or((0, 0), |client| {
-                (
+            // The compositor's own size for the picture; failing that,
+            // Hyprland's, which is in layout units where the picture is in
+            // pixels. With neither, the size is not said rather than
+            // guessed.
+            let size = listing.picture_size(live[found].0).or_else(|| {
+                let client = candidate.client.as_ref()?;
+                let scale = monitors
+                    .iter()
+                    .find(|m| m.id == client.monitor)
+                    .map_or(1.0, |monitor| monitor.scale);
+                Some((
                     (f64::from(client.size.0) * scale).round() as u32,
                     (f64::from(client.size.1) * scale).round() as u32,
-                )
+                ))
             });
             Ok(isocast_engine::Probe {
                 device: match candidate.info.title.as_str() {
                     "" => candidate.info.app_id.clone(),
                     title => format!("{} — {title}", candidate.info.app_id),
                 },
-                video: Some(CaptureFormat {
+                video: size.map(|(width, height)| CaptureFormat {
                     width: pixels::even(width),
                     height: pixels::even(height),
                     fps,
@@ -888,6 +948,12 @@ struct Follower {
     stall_reported: bool,
     unsupported_reported: bool,
     drops: DropReport,
+    /// Where each layer's window was last seen (an app's canvas): a change
+    /// means the canvas is out of date even if no picture is new.
+    placement: Vec<Placed>,
+    /// The canvas must be drawn again although no picture is new: a window
+    /// of the app left, arrived or moved.
+    redraw: bool,
 }
 
 impl Follower {
@@ -934,6 +1000,8 @@ impl Follower {
             stall_reported: false,
             unsupported_reported: false,
             drops: DropReport::default(),
+            placement: Vec::new(),
+            redraw: false,
         };
         // The toplevels, then their descriptions.
         follower
@@ -960,6 +1028,15 @@ impl Follower {
             .into_iter()
             .map(|(_, info)| info)
             .collect();
+        if matches!(self.target, Target::Application { .. })
+            && self.clients.is_empty()
+            && !infos.is_empty()
+        {
+            bail!(
+                "capturing an app's windows needs to know where they are, which Hyprland's IPC \
+                 says: it is not answering (HYPRLAND_INSTANCE_SIGNATURE unset or stale?)"
+            );
+        }
         self.reconcile()?;
         if self.state.layers.is_empty() {
             return Err(self.target.nothing_found(&infos));
@@ -1084,9 +1161,15 @@ impl Follower {
         Ok(())
     }
 
+    /// Re-read where the windows are. An answer that does not come leaves
+    /// what was known: a take does not end for one failed question.
     fn refresh_hyprland(&mut self) {
-        self.clients = hyprland::clients().unwrap_or_default();
-        self.monitors = hyprland::monitors().unwrap_or_default();
+        if let Some(clients) = hyprland::clients() {
+            self.clients = clients;
+        }
+        if let Some(monitors) = hyprland::monitors() {
+            self.monitors = monitors;
+        }
     }
 
     /// The open windows with their toplevels' indices.
@@ -1137,13 +1220,6 @@ impl Follower {
                 }
             }
             Target::Application { app, display } => {
-                if self.clients.is_empty() && !live.is_empty() {
-                    bail!(
-                        "capturing an app's windows needs to know where they are, which \
-                         Hyprland's IPC says: it is not answering (HYPRLAND_INSTANCE_SIGNATURE \
-                         unset?)"
-                    );
-                }
                 windows_on(&candidates, app, display, &self.monitors)
             }
         };
@@ -1171,8 +1247,12 @@ impl Follower {
                 self.waiting_reported = true;
                 let infos: Vec<Info> = live.iter().map(|(_, info)| info.clone()).collect();
                 isocast_diagnostics::diagnostic!(
-                    "warn"; "window: {}; keeping the last picture until one appears",
-                    self.target.nothing_found(&infos)
+                    "warn"; "window: {}; {} until one appears",
+                    self.target.nothing_found(&infos),
+                    match self.target {
+                        Target::Window { .. } => "keeping the last picture",
+                        Target::Application { .. } => "showing an empty canvas",
+                    }
                 );
             }
         } else {
@@ -1189,6 +1269,26 @@ impl Follower {
                 "window: compositing {} windows of the app",
                 self.state.layers.len()
             );
+        }
+        if matches!(self.target, Target::Application { .. }) {
+            let placement: Vec<Placed> = self
+                .state
+                .layers
+                .iter()
+                .map(|layer| {
+                    let client = client_for(&info_of(&layer.handle), &self.clients);
+                    (
+                        layer.id,
+                        client.map(|client| (client.at.0, client.at.1, client.monitor)),
+                    )
+                })
+                .collect();
+            if placement != self.placement {
+                self.placement = placement;
+                // Before the first picture there is nothing to be out of
+                // date: the first pictures draw the canvas.
+                self.redraw = self.last_output.is_some();
+            }
         }
         Ok(())
     }
@@ -1346,7 +1446,7 @@ impl Follower {
     /// Draw the windows whose pictures are new onto the canvas, and hand
     /// the result on.
     fn compose(&mut self) -> Result<()> {
-        if !self.state.layers.iter().any(|layer| layer.fresh) {
+        if !self.redraw && !self.state.layers.iter().any(|layer| layer.fresh) {
             return Ok(());
         }
         let now = Instant::now();
@@ -1428,6 +1528,7 @@ impl Follower {
             Ok(Some(frame)) => {
                 self.drops.reset();
                 self.last_output = Some(now);
+                self.redraw = false;
                 for layer in &mut self.state.layers {
                     layer.fresh = false;
                 }
@@ -1456,7 +1557,7 @@ impl Follower {
                 wake = wake.min(due);
             }
         }
-        if self.state.layers.iter().any(|layer| layer.fresh)
+        if (self.redraw || self.state.layers.iter().any(|layer| layer.fresh))
             && let Some(at) = self.last_output
         {
             wake = wake.min((at + self.interval / 2).saturating_duration_since(now));
