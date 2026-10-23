@@ -56,6 +56,8 @@ const QUANTIZATION: u32 = 2; // V4L2_QUANTIZATION_LIM_RANGE
 /// A v4l2loopback output device, configured for one size and written one
 /// YUYV frame at a time. Dropping it closes the descriptor, which is how
 /// consumers see the stream stop and how the device releases its format.
+/// Unlike macOS, which swaps in a placeholder card, readers keep showing the
+/// last frame after a stop (the module's `timeout` option could supply one).
 struct V4l2Sink {
     fd: OwnedFd,
     width: u32,
@@ -871,7 +873,8 @@ mod tests {
     #[test]
     fn the_real_search_finds_no_loopback_on_a_machine_without_the_module() {
         // Only meaningful where the module is absent (this repo's CI and
-        // the dev box until the owner installs it).
+        // the dev box until the owner installs it). Note that it opens (and
+        // queries, never streams) every real /dev/video* node.
         if module_loaded() {
             return;
         }
