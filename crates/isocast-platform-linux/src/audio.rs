@@ -23,6 +23,15 @@
 //! its own input ports ([`Links`]), at open and for each one that
 //! appears later in the take.
 //!
+//! System audio that leaves apps out is the same machinery turned round:
+//! the monitor of the output cannot tell apps apart, so when a setup
+//! excludes some (or monitoring must not be heard twice) the capture
+//! links *every* playback stream except the excluded ones and Isocast's
+//! own ([`Target::System`], [`Select::AllExcept`]); PipeWire sums the
+//! links into each input port. Without a filter the monitor is still the
+//! better capture (it hears everything on the output, with nothing to
+//! race), so `capture_system_audio` only comes here when asked to filter.
+//!
 //! PipeWire hands a capture buffers of the graph's quantum (10-25 ms of
 //! samples by default) with no capture timestamp of their own, so a
 //! buffer's samples are dated from the stream's own sample position — they
@@ -58,6 +67,12 @@ const DROP_REPORT: Duration = Duration::from_secs(5);
 /// an app's own data put there (see [`silence_memory`]).
 const MAX_SAMPLE: f32 = 1.0e3;
 
+/// The node property Isocast's own playback streams carry (the value is
+/// the process id), so a capture that leaves Isocast out can tell them
+/// from an app's: `pw-play` and other native clients have no process id
+/// on their node to go by, and the name "Isocast" is only a convention.
+pub(crate) const OWNER_KEY: &str = "isocast.owner";
+
 /// Where an audio capture takes its samples from.
 #[derive(Clone, Debug)]
 pub(crate) enum Target {
@@ -68,6 +83,35 @@ pub(crate) enum Target {
     /// One app's own playback streams, the ones `query` matches (`name`
     /// is what the app is called in messages).
     Application { query: String, name: String },
+    /// Every app's playback streams except the ones `exclude` names (as
+    /// an app is named: see [`AppStream::matches`]) and Isocast's own.
+    System { exclude: Vec<String> },
+}
+
+/// Which playback streams a capture that links streams takes.
+#[derive(Clone, Debug)]
+pub(crate) enum Select {
+    /// The streams one app query matches.
+    Only(String),
+    /// All of them, but the ones an exclude matches and Isocast's own
+    /// (which always are left out: macOS leaves Isocast out of the
+    /// system tap by bundle id, too). An exclude that matches nothing
+    /// excludes nothing: the app may start playing later.
+    AllExcept(Vec<String>),
+}
+
+impl Select {
+    fn selects(&self, stream: &AppStream) -> bool {
+        match self {
+            Self::Only(query) => stream.matches(query),
+            Self::AllExcept(exclude) => {
+                !stream.own
+                    && !exclude
+                        .iter()
+                        .any(|query| !query.trim().is_empty() && stream.matches(query.trim()))
+            }
+        }
+    }
 }
 
 impl Target {
@@ -77,6 +121,7 @@ impl Target {
             Self::Microphone(name) => format!("microphone {name}"),
             Self::Output(name) => format!("the monitor of {name}"),
             Self::Application { name, .. } => format!("the sound of {name}"),
+            Self::System { .. } => "what the machine plays, leaving apps out".to_string(),
         }
     }
 
@@ -87,14 +132,15 @@ impl Target {
         match self {
             Self::Microphone(name) => Some((name, false)),
             Self::Output(name) => Some((name, true)),
-            Self::Application { .. } => None,
+            Self::Application { .. } | Self::System { .. } => None,
         }
     }
 
-    /// The app whose streams this capture links to, if it is one of those.
-    fn app(&self) -> Option<&str> {
+    /// Which streams this capture links to, if it links streams at all.
+    fn selector(&self) -> Option<Select> {
         match self {
-            Self::Application { query, .. } => Some(query),
+            Self::Application { query, .. } => Some(Select::Only(query.clone())),
+            Self::System { exclude, .. } => Some(Select::AllExcept(exclude.clone())),
             _ => None,
         }
     }
@@ -114,6 +160,9 @@ pub(crate) struct AppStream {
     binary: String,
     /// The node's own name (`node.name`).
     node: String,
+    /// Whether it is one of Isocast's own streams ([`OWNER_KEY`]): the
+    /// monitoring, which a capture of the machine's sound can leave out.
+    own: bool,
 }
 
 impl AppStream {
@@ -132,6 +181,7 @@ impl AppStream {
                 .unwrap_or_default()
                 .to_string(),
             node,
+            own: props.get(OWNER_KEY).is_some(),
         })
     }
 
@@ -252,16 +302,21 @@ struct Links {
     /// when the port is seen: the id our node is known by arrives after
     /// ports can, too ([`our_node`]).
     ports: BTreeMap<u32, Port>,
-    /// The app's streams, by node id: the nodes `query` has matched so
-    /// far, including ones that appear mid-take.
-    app: BTreeSet<u32>,
+    /// The streams being captured, by node id: the nodes the selector has
+    /// taken so far, including ones that appear mid-take.
+    streams: BTreeSet<u32>,
     /// Output and input port pairs already linked, so a second `global`
     /// event for one of them does not link it twice.
     linked: BTreeSet<(u32, u32)>,
     /// The links themselves, kept so they live: dropping one destroys it
     /// (as does the app's stream going away, which ends the take's sound
     /// with it).
-    links: Vec<pw::link::Link>,
+    links: BTreeMap<(u32, u32), pw::link::Link>,
+    /// The playback streams the graph has, bound so that their properties
+    /// are read again when they change: a stream's `application.*`
+    /// properties can arrive after the stream is announced (a PulseAudio
+    /// client's binary did), and what a name matches must follow them.
+    watched: BTreeMap<u32, (pw::node::Node, pw::node::NodeListener)>,
     /// Set once the app's last stream has gone and the log has said so,
     /// cleared when the app plays again (a second stop is worth saying
     /// too).
@@ -283,31 +338,99 @@ impl Links {
     fn event(
         core: &pw::core::CoreRc,
         links: &Rc<RefCell<Self>>,
-        node: &pw::stream::Stream,
-        query: &str,
+        node: &pw::stream::StreamRc,
+        select: &Select,
+        registry: &pw::registry::RegistryRc,
         object: &pw::registry::GlobalObject<&spa::utils::dict::DictRef>,
     ) {
-        let mut known = links.borrow_mut();
-        // Our own node's id is not known when the stream is connected: it
-        // is what the server calls it, which arrives with the proxy's
-        // `bound` event, so it is read again on every event until it has.
-        known.ours = known.ours.or_else(|| our_node(node));
         match object.type_ {
             pw::types::ObjectType::Node => {
-                if let Some(stream) = object.props.and_then(AppStream::from_node)
-                    && stream.matches(query)
-                    && known.app.insert(object.id)
-                {
-                    // Playing again: a later stop is worth saying, too.
-                    known.silent = false;
+                let Some(props) = object.props else {
+                    return;
+                };
+                if AppStream::from_node(props).is_none() {
+                    return;
                 }
+                Self::stream(core, links, node, select, object.id, props);
+                // Its properties are read again whenever the server
+                // changes them (see `watched`).
+                if links.borrow().watched.contains_key(&object.id) {
+                    return;
+                }
+                let Ok(proxy) = registry.bind::<pw::node::Node, _>(object) else {
+                    return;
+                };
+                let listener = proxy
+                    .add_listener_local()
+                    .info({
+                        let core = core.clone();
+                        let links = links.clone();
+                        let node = node.clone();
+                        let select = select.clone();
+                        let id = object.id;
+                        move |info| {
+                            if let Some(props) = info.props() {
+                                Self::stream(&core, &links, &node, &select, id, props);
+                            }
+                        }
+                    })
+                    .register();
+                links
+                    .borrow_mut()
+                    .watched
+                    .insert(object.id, (proxy, listener));
             }
             pw::types::ObjectType::Port => {
+                let mut known = links.borrow_mut();
+                // Our own node's id is not known when the stream is
+                // connected: it is what the server calls it, which
+                // arrives with the proxy's `bound` event, so it is read
+                // again on every event until it has.
+                known.ours = known.ours.or_else(|| our_node(node));
                 if let Some(props) = object.props {
                     known.port(object.id, props);
                 }
+                known.relink(core);
             }
             _ => {}
+        }
+    }
+
+    /// A playback stream's properties, as announced or as they changed:
+    /// take it for the capture, or let it go, by what the selector now
+    /// makes of it.
+    fn stream(
+        core: &pw::core::CoreRc,
+        links: &Rc<RefCell<Self>>,
+        node: &pw::stream::StreamRc,
+        select: &Select,
+        id: u32,
+        props: &spa::utils::dict::DictRef,
+    ) {
+        let Some(stream) = AppStream::from_node(props) else {
+            return;
+        };
+        let mut known = links.borrow_mut();
+        known.ours = known.ours.or_else(|| our_node(node));
+        if select.selects(&stream) {
+            if known.streams.insert(id) {
+                // Playing again: a later stop is worth saying, too.
+                known.silent = false;
+            }
+        } else if known.streams.remove(&id) {
+            // It was linked on what was known when it appeared and is
+            // left out now that more is: its links come down.
+            let outputs: BTreeSet<u32> = known
+                .ports
+                .iter()
+                .filter(|(_, port)| port.node == id)
+                .map(|(port, _)| *port)
+                .collect();
+            known.linked.retain(|(output, _)| !outputs.contains(output));
+            known
+                .links
+                .retain(|(output, _), _| !outputs.contains(output));
+            isocast_diagnostics::debug!("audio: {} is left out after all", stream.describe());
         }
         known.relink(core);
     }
@@ -320,20 +443,31 @@ impl Links {
     /// silence where that stream's sound was; the last stream going away
     /// is said once, because otherwise a take quietly has no sound from
     /// that moment.
-    fn removed(links: &Rc<RefCell<Self>>, described: &str, id: u32) {
+    fn removed(links: &Rc<RefCell<Self>>, select: &Select, described: &str, id: u32) {
         let mut known = links.borrow_mut();
-        let was_playing = known.app.remove(&id);
+        known.watched.remove(&id);
+        let was_playing = known.streams.remove(&id);
         known.ports.remove(&id);
         // A link with a port that is gone went with it; the pair is
         // forgotten, so a port that does come back is linked again.
         known
             .linked
             .retain(|(output, input)| *output != id && *input != id);
-        if was_playing && known.app.is_empty() && !known.silent {
+        known
+            .links
+            .retain(|(output, input), _| *output != id && *input != id);
+        if was_playing && known.streams.is_empty() && !known.silent {
             known.silent = true;
-            isocast_diagnostics::diagnostic!(
-                "warn"; "audio: {described}: stopped playing; the take goes on without its sound"
-            );
+            if matches!(select, Select::Only(_)) {
+                isocast_diagnostics::diagnostic!(
+                    "warn"; "audio: {described}: stopped playing; the take goes on without its \
+                    sound"
+                );
+            } else {
+                // Everything that plays is captured, so a quiet machine
+                // is nothing to warn about.
+                isocast_diagnostics::debug!("audio: {described}: no stream is playing now");
+            }
         }
     }
 
@@ -362,7 +496,15 @@ impl Links {
         );
     }
 
-    /// Link every pair of ports that has no link yet.
+    /// Link every pair of ports that has no link yet, and take down the
+    /// ones that turn out to be wrong.
+    ///
+    /// A stream's ports (and ours) are announced one at a time, so a
+    /// pair can be made on what is known so far: a stream whose first
+    /// port is all there is *yet* looks mono and feeds every channel
+    /// we have, and its right port, announced a moment later, then
+    /// belongs on our right only. Every event works the pairs out afresh
+    /// and drops the links that are no longer among them.
     ///
     /// Channels are matched by name where the graph names them; a stream
     /// that says nothing about its channels feeds ours in order, and one
@@ -382,7 +524,7 @@ impl Links {
         // its own, and making one must not disturb the reading of the
         // ports it goes between.
         let mut pairs: Vec<(u32, u32, u32)> = Vec::new();
-        for node in &self.app {
+        for node in &self.streams {
             let ports: Vec<(String, u32)> = self
                 .ports
                 .iter()
@@ -395,6 +537,26 @@ impl Links {
                 }
             }
         }
+        let wanted: BTreeSet<(u32, u32)> = pairs
+            .iter()
+            .map(|(_, output, input)| (*output, *input))
+            .collect();
+        let wrong: Vec<(u32, u32)> = self
+            .linked
+            .iter()
+            .filter(|pair| !wanted.contains(pair))
+            .copied()
+            .collect();
+        for pair in wrong {
+            self.linked.remove(&pair);
+            if self.links.remove(&pair).is_some() {
+                isocast_diagnostics::debug!(
+                    "audio: unlinked port {} from port {}: not that port's channel",
+                    pair.0,
+                    pair.1
+                );
+            }
+        }
         for (node, output, input) in pairs {
             if !self.linked.insert((output, input)) {
                 continue;
@@ -403,7 +565,7 @@ impl Links {
                 isocast_diagnostics::debug!(
                     "audio: linked port {output} of node {node} to port {input} of node {ours}"
                 );
-                self.links.push(link);
+                self.links.insert((output, input), link);
             }
         }
     }
@@ -647,11 +809,13 @@ fn watch(
                 props.insert(*pw::keys::STREAM_CAPTURE_SINK, "true");
             }
         }
-        // An app's streams are linked to us by `Links` and never by the
-        // session manager: asked for a playback stream it links the
-        // capture to its default *source* (the microphone) instead, which
-        // is the opposite of the app's sound. "0" is how a stream says it
-        // has no target of its own.
+        // A capture of streams is linked to them by `Links` and never by
+        // the session manager, which would link it to the default *source*
+        // (the microphone) instead: asked for a playback node it does so,
+        // and with `target.object=0` ("no target of its own") it does
+        // *too* when the stream is autoconnected at all (measured: the
+        // C920's ports linked to the capture beside the streams). So such
+        // a capture is not autoconnected (no `AUTOCONNECT` below).
         None => {
             props.insert(*pw::keys::TARGET_OBJECT, "0");
         }
@@ -660,6 +824,14 @@ fn watch(
         .context("creating the audio stream")?;
 
     let started = Arc::new(AtomicBool::new(false));
+    let format = format_params(channels)?;
+    // What a capture that links streams is built for: with nothing linked
+    // to it yet there is no negotiation to describe the format, so it is
+    // the one asked for ([`state_changed`]).
+    let mut asked = spa::param::audio::AudioInfoRaw::new();
+    asked
+        .parse(spa::pod::Pod::from_bytes(&format).context("building the audio stream's format")?)
+        .map_err(|err| anyhow::anyhow!("reading the audio stream's own format: {err}"))?;
     let samples = Samples {
         platform,
         sink,
@@ -667,7 +839,11 @@ fn watch(
         report: report.clone(),
         started: started.clone(),
         mainloop: mainloop.clone(),
-        format: Default::default(),
+        format: if target.node().is_none() {
+            asked
+        } else {
+            Default::default()
+        },
         target: target.clone(),
         drops: DropReport::default(),
         repaired: false,
@@ -687,11 +863,10 @@ fn watch(
     // own ports, which are what they are linked to).
     let links = Rc::new(RefCell::new(Links::default()));
     let _registry_watch = target
-        .app()
-        .map(|query| {
-            let query = query.to_string();
+        .selector()
+        .map(|select| {
             let registry = core
-                .get_registry()
+                .get_registry_rc()
                 .context("asking PipeWire for the graph's objects")?;
             let listener = registry
                 .add_listener_local()
@@ -699,12 +874,14 @@ fn watch(
                     let core = core.clone();
                     let links = links.clone();
                     let node = node.clone();
-                    move |object| Links::event(&core, &links, &node, &query, object)
+                    let select = select.clone();
+                    let registry = registry.clone();
+                    move |object| Links::event(&core, &links, &node, &select, &registry, object)
                 })
                 .global_remove({
                     let links = links.clone();
                     let described = target.describe();
-                    move |id| Links::removed(&links, &described, id)
+                    move |id| Links::removed(&links, &select, &described, id)
                 })
                 .register();
             Ok::<_, anyhow::Error>((registry, listener))
@@ -718,17 +895,20 @@ fn watch(
         move |()| mainloop.quit()
     });
 
-    let format = format_params(channels)?;
     let mut params =
         [spa::pod::Pod::from_bytes(&format).context("building the audio stream's format")?];
     node.connect(
         spa::utils::Direction::Input,
         None,
-        pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
+        if target.node().is_some() {
+            pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS
+        } else {
+            pw::stream::StreamFlags::MAP_BUFFERS
+        },
         &mut params,
     )
     .context("connecting to the audio node")?;
-    if target.app().is_some() {
+    if target.selector().is_some() {
         // The app's streams are linked *to* our node, so the graph's id
         // for it is what a link needs. It is read here and on every
         // registry event (see [`Links::event`]) because the server's id
@@ -737,6 +917,13 @@ fn watch(
         links.borrow_mut().ours = our_node(&node);
     }
     mainloop.run();
+    // The watchers' callbacks hold the links (and the stream), which hold
+    // the watchers: let them go, or the capture's node outlives the take.
+    {
+        let mut known = links.borrow_mut();
+        known.watched.clear();
+        known.links.clear();
+    }
     Ok(())
 }
 
@@ -880,8 +1067,20 @@ fn state_changed(
     _old: pw::stream::StreamState,
     new: pw::stream::StreamState,
 ) {
-    if let pw::stream::StreamState::Error(message) = new {
-        data.ended(format!("{} failed: {message}", data.target.describe()));
+    match new {
+        pw::stream::StreamState::Error(message) => {
+            data.ended(format!("{} failed: {message}", data.target.describe()));
+        }
+        // A capture that links streams itself may have none yet (nothing
+        // is playing, or everything that is has been left out), and with
+        // nothing linked the graph negotiates no format: it has the one
+        // it asked for, and the first stream linked renegotiates it.
+        pw::stream::StreamState::Paused
+            if data.target.node().is_none() && !data.started.swap(true, Ordering::SeqCst) =>
+        {
+            let _ = data.report.send(Ok(data.format.channels()));
+        }
+        _ => {}
     }
 }
 
@@ -1156,6 +1355,7 @@ mod tests {
             app: app.to_string(),
             binary: binary.to_string(),
             node: node.to_string(),
+            own: false,
         };
         let spotify = stream("Spotify", "spotify", "Spotify");
         assert!(spotify.matches("Spotify"));
@@ -1167,6 +1367,41 @@ mod tests {
         let limusic = stream("Limusic", "", "Limusic");
         assert!(limusic.matches("Limusic"));
         assert!(!limusic.matches("Limusic2"));
+    }
+
+    /// System audio leaves out what an exclude names (by name, binary or
+    /// node, in any case) and Isocast's own streams, and takes everything
+    /// else; an exclude that names nothing playing excludes nothing.
+    #[test]
+    fn a_system_capture_takes_every_stream_but_the_excluded_and_ours() {
+        let stream = |app: &str, binary: &str, node: &str, own: bool| AppStream {
+            app: app.to_string(),
+            binary: binary.to_string(),
+            node: node.to_string(),
+            own,
+        };
+        let pw_play = stream("pw-play", "", "pw-play", false);
+        let paplay = stream("paplay", "pacat", "paplay", false);
+        let monitor = stream("Isocast", "", "isocast monitor", true);
+        let all = Select::AllExcept(vec![]);
+        for it in [&pw_play, &paplay] {
+            assert!(all.selects(it));
+        }
+        // Our own monitoring is never taken, excluded by name or not.
+        assert!(!all.selects(&monitor));
+        // By app name (any case), by binary and by node name.
+        for exclude in ["PAPLAY", "pacat", "paplay"] {
+            let select = Select::AllExcept(vec![exclude.to_string()]);
+            assert!(!select.selects(&paplay), "{exclude}");
+            assert!(select.selects(&pw_play), "{exclude}");
+        }
+        // A name that is not playing leaves everything in; a blank one
+        // is not a name that matches everything.
+        let select = Select::AllExcept(vec!["no-such-app".to_string(), " ".to_string()]);
+        assert!(select.selects(&pw_play) && select.selects(&paplay));
+        // One app's capture is still the streams its query matches.
+        let only = Select::Only("pacat".to_string());
+        assert!(only.selects(&paplay) && !only.selects(&pw_play));
     }
 
     /// A capture is stereo: an app's own channels line up, a mono stream
