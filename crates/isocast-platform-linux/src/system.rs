@@ -381,6 +381,41 @@ const HARDWARE_SUFFIXES: [&str; 15] = [
     "_vdpau",
 ];
 
+/// The nice value calibration's helper runs at: behind interactive work,
+/// the value macOS's helper takes too.
+const CALIBRATION_NICE: libc::c_int = 15;
+
+/// Lower the calling thread's priority for the calibration helper. Linux
+/// nice is per thread, and a thread (or child process) inherits its
+/// creator's, so the measurement calls this on its main thread and again
+/// on each encode thread before they start their writers. Unprivileged:
+/// it only ever lowers. Returns what was set, for the profile's notes.
+pub(crate) fn calibration_priority() -> Option<&'static str> {
+    // SAFETY: setpriority with who 0 changes only the calling thread's nice.
+    let status = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, CALIBRATION_NICE) };
+    (status == 0).then_some("nice 15")
+}
+
+/// What calibration's measurements are filed under: `ffmpeg-nvenc` when
+/// this box's NVENC lists HEVC (the encoder the fit cells record with),
+/// else plain `ffmpeg`. Not `videotoolbox`, so the capacity fit, which is
+/// fitted for Apple's engines, never takes these rows as its input.
+pub(crate) fn encoder_backend() -> &'static str {
+    if hardware_encoders().iter().any(|name| name == "hevc_nvenc") {
+        "ffmpeg-nvenc"
+    } else {
+        "ffmpeg"
+    }
+}
+
+/// Whether an FFmpeg encoder name is a hardware encoder, by its family
+/// suffix (`hevc_nvenc`, `h264_vaapi`); `libx265` and `prores_ks` are not.
+pub(crate) fn is_hardware_encoder(name: &str) -> bool {
+    HARDWARE_SUFFIXES
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
+}
+
 /// The encoder's name and hardware family from one `-encoders` line, like
 /// ` V....D h264_nvenc           NVIDIA NVENC H.264 encoder (codec h264)`:
 /// the first word is the six flag characters, the second the name. (The
@@ -1184,6 +1219,16 @@ mod tests {
                 !headless.runs(suffix),
                 "{suffix} cannot run on a box with no video hardware"
             );
+        }
+    }
+
+    #[test]
+    fn hardware_encoders_are_told_by_their_family_suffix() {
+        for hardware in ["hevc_nvenc", "h264_vaapi", "av1_qsv", "h264_vulkan"] {
+            assert!(is_hardware_encoder(hardware), "{hardware}");
+        }
+        for software in ["libx264", "libx265", "prores_ks", "prores_aw", "libsvtav1"] {
+            assert!(!is_hardware_encoder(software), "{software}");
         }
     }
 }

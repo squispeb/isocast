@@ -17,6 +17,10 @@ use crate::Daemon;
 
 const LIMIT: Duration = Duration::from_secs(29);
 
+/// Platforms whose backend can run `machine_profile::measure` (completed
+/// picture counts, hardware selection and a calibration priority).
+const SUPPORTED: bool = cfg!(any(target_os = "macos", target_os = "linux"));
+
 #[derive(Default)]
 pub(super) struct Calibration {
     child: Option<Child>,
@@ -71,6 +75,12 @@ impl Calibration {
     fn stop(&mut self, reason: &str) -> anyhow::Result<()> {
         if let Some(child) = self.child.as_mut() {
             if child.try_wait()?.is_none() {
+                #[cfg(target_os = "linux")]
+                // SAFETY: signals the helper's own process group (it is the
+                // leader: `process_group(0)` at spawn), never ours.
+                unsafe {
+                    libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+                }
                 child.kill()?;
             }
             // Reap before permitting recording: an orphan encoder would
@@ -177,10 +187,10 @@ impl Daemon {
         if let Some(profile) = &calibration.status.profile {
             calibration.status.summary = profile.summary();
         }
-        // The disposable measurement worker is implemented only on macOS.
-        // An unavailable backend is not a failed calibration; do not launch
-        // it or write a failed-build marker on other platforms.
-        if !cfg!(target_os = "macos") {
+        // The disposable measurement worker is implemented on macOS and
+        // Linux. An unavailable backend is not a failed calibration; do not
+        // launch it or write a failed-build marker on other platforms.
+        if !SUPPORTED {
             if calibration.status.profile.is_none() {
                 calibration.status.summary =
                     "Calibration is not available on this platform yet; using the capacity table"
@@ -265,7 +275,7 @@ impl Daemon {
         if self.shutting_down.load(Ordering::SeqCst) || self.busy().is_some() {
             return Err(busy());
         }
-        if !cfg!(target_os = "macos") || crate::this_machine().is_none() {
+        if !SUPPORTED || crate::this_machine().is_none() {
             return Err(failed("this platform has no calibration backend yet"));
         }
         let previewing = {
@@ -304,13 +314,19 @@ impl Daemon {
             }
         };
         let started = Instant::now();
-        let result = Command::new(std::env::current_exe().map_err(failed)?)
+        let mut command = Command::new(std::env::current_exe().map_err(failed)?);
+        command
             .arg("--machine-calibration-worker")
             .arg(&scratch)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::from(errors))
-            .spawn();
+            .stderr(Stdio::from(errors));
+        // Linux encodes in ffmpeg child processes. A group of its own lets
+        // `stop` end them with the helper, instead of leaving each to notice
+        // its closed pipe (about 0.4 s of encoder still running).
+        #[cfg(target_os = "linux")]
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        let result = command.spawn();
         let child = match result {
             Ok(child) => child,
             Err(error) => {
@@ -411,7 +427,7 @@ pub(super) fn worker() -> Option<std::process::ExitCode> {
         std::thread::sleep(Duration::from_secs(28));
         std::process::exit(2);
     });
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     let result = (|| -> anyhow::Result<()> {
         let scratch = std::env::args_os()
             .nth(2)
@@ -427,7 +443,7 @@ pub(super) fn worker() -> Option<std::process::ExitCode> {
         file.write_all(&serde_json::to_vec(&profile)?)?;
         Ok(())
     })();
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let result: anyhow::Result<()> = Err(anyhow::anyhow!("no calibration backend"));
     Some(match result {
         Ok(()) => std::process::ExitCode::SUCCESS,

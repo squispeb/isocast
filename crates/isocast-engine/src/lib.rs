@@ -250,6 +250,18 @@ pub trait Platform: Clone + Send + Sync + 'static {
         None
     }
 
+    /// The native encoder backend a calibration measurement names
+    /// (`videotoolbox`, `ffmpeg-nvenc`). Capacity estimates trust only the
+    /// backends they were fitted for, so a new name here is evidence in
+    /// `machine show`, not an input to admission.
+    fn encoder_backend(&self) -> &'static str {
+        if cfg!(target_os = "macos") {
+            "videotoolbox"
+        } else {
+            "unknown"
+        }
+    }
+
     /// Read the existing sampler's latest non-consuming headroom observation.
     fn governor_headroom(&self) -> Option<governor::Headroom> {
         None
@@ -885,6 +897,15 @@ pub trait FileWriter: Send {
     /// exposes them. Calibration uses deltas, never queued submissions.
     fn completed_video_frames(&self) -> Option<u64> {
         None
+    }
+
+    /// The encoder process starts at the first picture appended, so its
+    /// start-up (device initialisation of up to a second) happens inside
+    /// the first appends rather than in `start`. Calibration then begins
+    /// its warm-up when the first picture has completed, instead of
+    /// charging that start-up to its timed window.
+    fn starts_at_first_picture(&self) -> bool {
+        false
     }
 
     /// Actual native session selection, not the machine's codec catalogue.

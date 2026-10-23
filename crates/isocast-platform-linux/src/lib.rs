@@ -249,6 +249,17 @@ impl Platform for LinuxPlatform {
         pacing::raise_thread();
     }
 
+    fn encoder_backend(&self) -> &'static str {
+        system::encoder_backend()
+    }
+
+    /// Nice 15 for the calling thread (and what it starts afterwards):
+    /// the calibration helper's own measurements read lower on a busy
+    /// machine, and nothing interactive waits for them.
+    fn calibration_priority(&self) -> Option<&'static str> {
+        system::calibration_priority()
+    }
+
     /// The calling thread's own CPU time, for the compositor's costs.
     fn thread_cpu_time(&self) -> Option<std::time::Duration> {
         system::thread_cpu_time()
