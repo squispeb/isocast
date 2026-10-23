@@ -50,6 +50,7 @@ mod screencast;
 pub(crate) mod stream;
 pub(crate) mod system;
 mod toplevel;
+mod vcam;
 mod window_pixels;
 pub(crate) mod writer;
 
@@ -111,18 +112,15 @@ impl Platform for LinuxPlatform {
         true
     }
 
-    /// L.6e: the virtual camera will be a v4l2loopback device; until
-    /// then it is refused by name rather than as an unknown backend.
+    /// L.6e: the virtual camera is a v4l2loopback device (vcam.rs),
+    /// refused by name when the kernel module is not loaded.
     fn virtual_camera_sink(
         &self,
-        _width: u32,
-        _height: u32,
-        _fps: u32,
+        width: u32,
+        height: u32,
+        fps: u32,
     ) -> Result<Box<dyn isocast_engine::record::CameraSink<LinuxFrame>>> {
-        bail!(
-            "virtual_camera: not available on Linux yet; it arrives as a v4l2loopback camera \
-             (L.6e in PLAN.md), which needs the v4l2loopback kernel module installed"
-        )
+        vcam::open(width, height, fps)
     }
 
     fn now(&self) -> Time {
