@@ -250,6 +250,11 @@ impl Platform for LinuxPlatform {
         pacing::raise_thread();
     }
 
+    /// The distinct-slot ledger over the CPU frame pools (frames.rs).
+    fn frame_budget(&self) -> Option<serde_json::Value> {
+        Some(frames::diagnostics())
+    }
+
     /// CPU load from /proc/stat and memory stall from the kernel's
     /// pressure information (pressure.rs); nothing else is claimed.
     fn governor_headroom(&self) -> Option<isocast_engine::governor::Headroom> {
