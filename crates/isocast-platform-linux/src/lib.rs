@@ -35,6 +35,7 @@ pub(crate) mod camera;
 mod fragments;
 pub(crate) mod frames;
 pub(crate) mod gpu;
+pub mod hotkeys;
 pub(crate) mod join;
 mod jpeg;
 mod keychain;

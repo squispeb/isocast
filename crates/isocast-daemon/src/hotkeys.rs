@@ -12,7 +12,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use base64::Engine;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use isocast_engine::hotkeys::GlobalHotkeys;
 use isocast_engine::hotkeys::{Edge, Key};
 use isocast_protocol::Setup;
@@ -389,7 +389,10 @@ impl Daemon {
         } else {
             isocast_platform_macos::hotkeys::MacHotkeys.replace(keys, generation, on_key)
         };
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
+        let registrations =
+            isocast_platform_linux::hotkeys::LinuxHotkeys.replace(keys, generation, on_key);
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         let registrations: Vec<Registration> = {
             let _ = on_key;
             keys.into_iter().map(|key| Registration { binding: key.binding, global: false,
