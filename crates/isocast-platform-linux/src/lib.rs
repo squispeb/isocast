@@ -43,6 +43,7 @@ mod keychain;
 pub(crate) mod media;
 pub(crate) mod pacing;
 mod playback;
+pub mod plugin;
 mod portal;
 mod pressure;
 mod recode;

@@ -130,7 +130,7 @@ pub struct Permissions {
     /// The recordings folders: `read` (read recording files, nothing
     /// else) or `write` (also add new files inside a project's folder,
     /// like a transcript or an export; never change or delete a file that
-    /// exists). Without it a process plugin can't read recordings at all.
+    /// exists, except that Linux's sandbox can't stop it overwriting one). Without it a process plugin can't read recordings at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recordings: Option<RecordingsAccess>,
 }
@@ -221,22 +221,36 @@ impl Permissions {
     /// One line per list that isn't empty (`methods: get, watch`), or
     /// "nothing".
     pub fn describe(&self) -> Vec<String> {
+        self.describe_on(false)
+    }
+
+    /// [`describe`](Self::describe), for a sandbox that can't keep a
+    /// `write` grant to creating files (`overwrites`: Landlock on Linux):
+    /// the line says so, instead of promising existing files are safe.
+    pub fn describe_on(&self, overwrites: bool) -> Vec<String> {
         let mut lines: Vec<String> = self
             .lists()
             .iter()
             .filter(|(_, list)| !list.is_empty())
             .map(|(name, list)| format!("{name}: {}", list.join(", ")))
             .collect();
-        match self.recordings {
-            Some(RecordingsAccess::Read) => {
+        match (self.recordings, overwrites) {
+            (Some(RecordingsAccess::Read), _) => {
                 lines.push("recordings: read (read every recording file)".into())
             }
-            Some(RecordingsAccess::Write) => lines.push(
+            (Some(RecordingsAccess::Write), false) => lines.push(
                 "recordings: write (read every recording file, and add new files inside \
                  project folders; never change or delete existing ones)"
                     .into(),
             ),
-            None => {}
+            (Some(RecordingsAccess::Write), true) => lines.push(
+                "recordings: write (read every recording file, and add new files inside \
+                 project folders; this sandbox can't stop it overwriting or truncating \
+                 existing recording files, including one being recorded, though it can't \
+                 delete or rename them)"
+                    .into(),
+            ),
+            (None, _) => {}
         }
         if lines.is_empty() {
             vec!["nothing (no methods, network, data, files or recordings)".into()]

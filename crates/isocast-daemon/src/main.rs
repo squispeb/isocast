@@ -353,6 +353,18 @@ fn serve(listener: UnixListener, daemon: Arc<Daemon>) {
                 continue;
             }
         }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            // The socket's mode already keeps other users out; the kernel's
+            // peer credentials make that independent of it (a socket moved
+            // or chmod'ed, a path another user can reach).
+            if isocast_platform_linux::plugin::peer_uid(connection.as_raw_fd())
+                != Some(unsafe { libc::geteuid() })
+            {
+                continue;
+            }
+        }
         let daemon = daemon.clone();
         // A plugin's process (unsandboxed, so it could reach this socket)
         // is held to its grant here too.

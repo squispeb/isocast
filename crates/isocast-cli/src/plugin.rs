@@ -198,7 +198,7 @@ fn print_plugin(plugin: &PluginInfo) {
     if let Some(log) = &plugin.log {
         println!("  log: {}", log.display());
     }
-    for line in plugin.granted.describe() {
+    for line in plugin.granted.describe_on(cfg!(target_os = "linux")) {
         println!("  granted {line}");
     }
     println!(

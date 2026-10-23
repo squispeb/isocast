@@ -20,9 +20,11 @@
 //!
 //! A process plugin runs sandboxed, in its own process group, without
 //! isocastd's privacy grants, and talks to isocastd only through its own
-//! socket, where every call is checked against its grant. A connection on
-//! the main socket from one of its processes (when the sandbox isn't
-//! available) is scoped the same way, by its peer process and parents. If
+//! socket, where every call is checked against its grant. The sandbox is a
+//! Seatbelt profile on macOS and a Landlock ruleset on Linux (the platform
+//! crates' `plugin` modules). A connection on the main socket from one of
+//! its processes (when the sandbox isn't available) is scoped the same way,
+//! by its peer process and parents. If
 //! it exits on its own it is restarted (1 s, doubling to 60 s, counted from
 //! its last start), and turned off after 5 crashes in 5 minutes.
 
@@ -422,10 +424,18 @@ fn resolved(root: &Path) -> Option<PathBuf> {
 impl RecordingFolders {
     fn new(roots: &[PathBuf], granted: &Permissions) -> Self {
         let mut roots: Vec<PathBuf> = roots.iter().filter_map(|root| resolved(root)).collect();
+        // A Landlock rule needs the folder to exist and is only made for a
+        // grant: a folder made later (the first recording into it) restarts
+        // the plugin (`refresh_sandboxes`) so its ruleset has it.
+        #[cfg(target_os = "linux")]
+        roots.retain(|root| granted.recordings.is_some() && root.exists());
         roots.sort();
         roots.dedup();
+        // Seatbelt denies a folder named like a project until it is one; a
+        // Landlock rule is on the whole root, so there is nothing to keep
+        // track of (and no restart to make) on Linux.
         let not_projects = match granted.recordings {
-            Some(RecordingsAccess::Write) => roots
+            Some(RecordingsAccess::Write) if !cfg!(target_os = "linux") => roots
                 .iter()
                 .flat_map(|root| isocast_protocol::project::named_like_but_not(root))
                 .collect(),
@@ -688,24 +698,54 @@ impl Registry {
         if processes == 0 {
             return None;
         }
+        let writers = entries
+            .values()
+            .filter(|entry| {
+                matches!(&entry.manifest, Ok(m) if m.process.is_some() && m.compatible())
+                    && entry.record.granted.recordings == Some(RecordingsAccess::Write)
+            })
+            .count();
         Some(if sandbox_available() {
+            let mut gaps: Vec<String> = sandbox_gaps();
+            if let (true, Some(gap)) = (writers > 0, recordings_write_gap()) {
+                gaps.push(format!(
+                    "{writers} plugin(s) with `recordings = \"write\"`: {gap}"
+                ));
+            }
+            let open_sockets = sandbox_open_sockets();
             Check {
                 name: "plugins: sandbox".into(),
-                status: CheckStatus::Ok,
+                status: if open_sockets {
+                    CheckStatus::Warning
+                } else {
+                    CheckStatus::Ok
+                },
                 detail: format!(
-                    "{processes} plugin process(es) run sandboxed (sandbox-exec), without \
-                     isocastd's camera, microphone and screen grants"
+                    "{processes} plugin process(es) run sandboxed ({}){}{}",
+                    sandbox_name(),
+                    if open_sockets {
+                        ""
+                    } else {
+                        ", without isocastd's camera, microphone and screen grants"
+                    },
+                    if gaps.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (not covered: {})", gaps.join("; "))
+                    },
                 ),
-                fix: None,
+                fix: open_sockets
+                    .then(|| "remove plugins you don't trust (`isocast plugin remove ID`), or use a kernel with Landlock ABI 9 or later".to_string()),
             }
         } else {
             Check {
                 name: "plugins: sandbox".into(),
                 status: CheckStatus::Warning,
                 detail: format!(
-                    "sandbox-exec isn't on this Mac, so {processes} plugin process(es) run \
+                    "{}, so {processes} plugin process(es) run \
                      unsandboxed: they can read your files and use the network (their calls to \
-                     isocastd are still limited to their grants)"
+                     isocastd are still limited to their grants)",
+                    sandbox_missing()
                 ),
                 fix: Some(
                     "remove plugins you don't trust (`isocast plugin remove ID`)".to_string(),
@@ -885,9 +925,23 @@ impl Registry {
         }
         if manifest.process.is_some() && manifest.compatible() {
             if !sandbox_available() {
-                notes.push(
-                    "sandbox-exec isn't on this Mac, so its process runs unsandboxed".to_string(),
-                );
+                notes.push(format!(
+                    "{}, so its process runs unsandboxed",
+                    sandbox_missing()
+                ));
+            }
+            if sandbox_available() {
+                let mut gaps = sandbox_gaps();
+                if record.granted.recordings == Some(RecordingsAccess::Write) {
+                    gaps.extend(recordings_write_gap().map(String::from));
+                }
+                if !gaps.is_empty() {
+                    notes.push(format!(
+                        "what its {} sandbox doesn't hold back here: {}",
+                        sandbox_name(),
+                        gaps.join("; ")
+                    ));
+                }
             }
             notes.push(format!(
                 "its process may call: {}; its output goes to {}",
@@ -1535,7 +1589,7 @@ impl Launch {
             &env,
             &self.folder,
             &log,
-            profile.as_deref(),
+            profile.as_ref(),
         )
         .map_err(|err| format!("{}: {err}", program.display()))?;
         if let Some((_, started)) = process_info(pid) {
@@ -1555,7 +1609,7 @@ impl Launch {
         socket: &Path,
         data: &Path,
         recordings: &RecordingFolders,
-    ) -> String {
+    ) -> Profile {
         let real = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         let home = real(Path::new(&std::env::var_os("HOME").unwrap_or_default()));
         let mut readable = vec![real(&self.dir), real(&self.folder)];
@@ -1620,14 +1674,76 @@ impl Launch {
         .profile()
     }
 
-    #[cfg(not(target_os = "macos"))]
+    /// Its Landlock sandbox: the folders it may read, run programs from and
+    /// write in (Landlock only allows, so the home folder is out unless one
+    /// of these is in it), and the sockets it may reach.
+    #[cfg(target_os = "linux")]
+    fn profile(
+        &self,
+        program: &Path,
+        _socket: &Path,
+        data: &Path,
+        recordings: &RecordingFolders,
+    ) -> Profile {
+        use isocast_platform_linux::plugin::{Recordings, Sandbox};
+        let real = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let home = real(Path::new(&std::env::var_os("HOME").unwrap_or_default()));
+        let program_real = real(program);
+        let mut read_exec = vec![
+            real(&self.folder),
+            program.to_path_buf(),
+            program_real.clone(),
+        ];
+        read_exec.extend(installation(program, &home));
+        read_exec.extend(installation(&program_real, &home));
+        let mut read = vec![real(&self.dir)];
+        for file in &self.granted.files {
+            let path = match file.strip_prefix("~/") {
+                Some(rest) => home.join(rest),
+                None => PathBuf::from(file),
+            };
+            read.push(real(&path));
+        }
+        // A recordings folder holding the home folder, the plugin's own
+        // folders or its program (`/`, say) isn't granted: that would hand
+        // over all of it, which isn't what the grant means.
+        let mut own = vec![
+            home.clone(),
+            real(&self.dir),
+            real(&self.folder),
+            program_real,
+        ];
+        own.extend(read_exec.iter().cloned());
+        let recordings = recordings
+            .roots
+            .iter()
+            .filter(|root| !own.iter().any(|path| path.starts_with(root)))
+            .cloned()
+            .collect();
+        Sandbox {
+            read_exec,
+            read,
+            write: vec![real(data)],
+            // Its own folder holds its socket to isocastd: the only one.
+            sockets: vec![real(&self.dir)],
+            network: !self.granted.network.is_empty(),
+            recordings,
+            recordings_access: match self.granted.recordings {
+                None => Recordings::None,
+                Some(RecordingsAccess::Read) => Recordings::Read,
+                Some(RecordingsAccess::Write) => Recordings::Write,
+            },
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     fn profile(
         &self,
         _program: &Path,
         _socket: &Path,
         _data: &Path,
         _recordings: &RecordingFolders,
-    ) -> String {
+    ) -> Profile {
         String::new()
     }
 }
@@ -1660,6 +1776,63 @@ fn installation(program: &Path) -> Vec<PathBuf> {
         folders.push("/Applications/Xcode.app/Contents/Developer".into());
     }
     folders
+}
+
+/// Version managers and runtime installers whose folders hold whole
+/// interpreter installations (`~/.local/share/uv/python/cpython-3.13`).
+#[cfg(target_os = "linux")]
+const INTERPRETER_HOMES: &[&str] = &[
+    "uv",
+    ".pyenv",
+    ".nvm",
+    ".asdf",
+    ".rbenv",
+    "mise",
+    ".fnm",
+    "fnm",
+    ".volta",
+    "conda",
+    "miniconda3",
+    "anaconda3",
+    "miniforge3",
+    "mambaforge",
+    ".rustup",
+];
+
+/// The folders a program's own installation may run programs from (and
+/// read libraries in), when it isn't in a system folder: for an
+/// interpreter in a version manager's folder or a virtual environment,
+/// its prefix (for `~/.local/share/uv/python/cpython-3.13/bin/python3`
+/// the folder holding `bin`). Any other program (`~/.cargo/bin/tool`,
+/// `~/work/client/bin/tool`) gets just itself: its neighbours aren't the
+/// plugin's to run or read.
+#[cfg(target_os = "linux")]
+fn installation(program: &Path, home: &Path) -> Vec<PathBuf> {
+    let Some(bin) = program.parent() else {
+        return Vec::new();
+    };
+    if ["/usr", "/bin", "/sbin", "/lib", "/opt"]
+        .iter()
+        .any(|system| program.starts_with(system))
+    {
+        return Vec::new();
+    }
+    let managed = program.components().any(|part| {
+        INTERPRETER_HOMES
+            .iter()
+            .any(|name| part.as_os_str() == *name)
+    });
+    match bin.parent() {
+        Some(prefix)
+            if bin.file_name().is_some_and(|n| n == "bin")
+                && prefix != home
+                && (managed || prefix.join("pyvenv.cfg").is_file()) =>
+        {
+            vec![prefix.to_path_buf()]
+        }
+        // A folder shared with other things (`~/.local/bin`): only the program.
+        _ => vec![program.to_path_buf()],
+    }
 }
 
 /// Where plugin processes look for programs: isocastd's PATH, then the
@@ -1767,8 +1940,7 @@ fn check_grant(
     let asked = manifest.permissions.normalized();
     let id = &manifest.id;
     let listed = |permissions: &Permissions| {
-        permissions
-            .describe()
+        describe_permissions(permissions)
             .iter()
             .map(|line| format!("\n  {line}"))
             .collect::<String>()
@@ -1836,7 +2008,7 @@ fn load_manifest(id: &str, dir: &Path, record: &Record) -> Result<Manifest, Stri
     if !more.is_empty() {
         return Err(format!(
             "its manifest now asks for more than it was granted ({}); add it again to grant it",
-            more.describe().join("; ")
+            describe_permissions(&more).join("; ")
         ));
     }
     Ok(manifest)
@@ -2073,9 +2245,92 @@ fn sandbox_available() -> bool {
     isocast_platform_macos::plugin::sandbox_available()
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+fn sandbox_available() -> bool {
+    isocast_platform_linux::plugin::sandbox_available()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn sandbox_available() -> bool {
     false
+}
+
+/// What a sandbox is made of: a Seatbelt profile on macOS, the rules a
+/// Landlock ruleset is made from on Linux (elsewhere nothing: no sandbox).
+#[cfg(target_os = "linux")]
+type Profile = isocast_platform_linux::plugin::Sandbox;
+#[cfg(not(target_os = "linux"))]
+type Profile = String;
+
+/// The sandbox's name, for `doctor` and `add`.
+#[cfg(target_os = "linux")]
+fn sandbox_name() -> &'static str {
+    "Landlock"
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sandbox_name() -> &'static str {
+    "sandbox-exec"
+}
+
+/// Why plugins aren't sandboxed here, in words.
+#[cfg(target_os = "linux")]
+fn sandbox_missing() -> String {
+    match isocast_platform_linux::plugin::abi() {
+        0 => "this kernel has no usable Landlock (it needs 5.13 or later with `landlock` in \
+              the lsm= list)"
+            .to_string(),
+        abi => format!("this kernel's Landlock is ABI {abi}, and plugins need ABI 4 or later"),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sandbox_missing() -> String {
+    "sandbox-exec isn't on this Mac".to_string()
+}
+
+/// What the sandbox here doesn't hold back.
+#[cfg(target_os = "linux")]
+fn sandbox_gaps() -> Vec<String> {
+    isocast_platform_linux::plugin::gaps()
+        .into_iter()
+        .map(String::from)
+        .collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sandbox_gaps() -> Vec<String> {
+    Vec::new()
+}
+
+/// Whether the sandbox leaves a plugin able to reach other programs'
+/// unix sockets (PipeWire, D-Bus, isocastd's own).
+#[cfg(target_os = "linux")]
+fn sandbox_open_sockets() -> bool {
+    isocast_platform_linux::plugin::unix_sockets_open()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sandbox_open_sockets() -> bool {
+    false
+}
+
+/// What a `recordings = "write"` grant allows here beyond what it says
+/// elsewhere (macOS lets a plugin only create new files).
+#[cfg(target_os = "linux")]
+fn recordings_write_gap() -> Option<&'static str> {
+    Some(isocast_platform_linux::plugin::RECORDINGS_WRITE_GAP)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn recordings_write_gap() -> Option<&'static str> {
+    None
+}
+
+/// What permissions mean to the user here: the lines `describe` gives,
+/// but with the `write` grant's wording true for the sandbox in use.
+fn describe_permissions(permissions: &Permissions) -> Vec<String> {
+    permissions.describe_on(cfg!(target_os = "linux"))
 }
 
 #[cfg(target_os = "macos")]
@@ -2085,7 +2340,7 @@ fn spawn(
     env: &[(String, String)],
     cwd: &Path,
     log: &Path,
-    profile: Option<&str>,
+    profile: Option<&Profile>,
 ) -> io::Result<u32> {
     isocast_platform_macos::plugin::spawn(&isocast_platform_macos::plugin::Spawn {
         program,
@@ -2093,19 +2348,39 @@ fn spawn(
         env,
         cwd,
         log,
-        profile,
+        profile: profile.map(String::as_str),
     })
 }
 
-/// Other Unix systems: unsandboxed, in its own process group.
-#[cfg(all(unix, not(target_os = "macos")))]
+/// Linux: under a Landlock ruleset, in its own process group.
+#[cfg(target_os = "linux")]
 fn spawn(
     program: &Path,
     args: &[String],
     env: &[(String, String)],
     cwd: &Path,
     log: &Path,
-    _profile: Option<&str>,
+    profile: Option<&Profile>,
+) -> io::Result<u32> {
+    isocast_platform_linux::plugin::spawn(&isocast_platform_linux::plugin::Spawn {
+        program,
+        args,
+        env,
+        cwd,
+        log,
+        sandbox: profile,
+    })
+}
+
+/// Other Unix systems: unsandboxed, in its own process group.
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+fn spawn(
+    program: &Path,
+    args: &[String],
+    env: &[(String, String)],
+    cwd: &Path,
+    log: &Path,
+    _profile: Option<&Profile>,
 ) -> io::Result<u32> {
     use std::os::unix::process::CommandExt;
     let log = isocast_diagnostics::output::plugin_pipe(log)?;
@@ -2131,7 +2406,7 @@ fn spawn(
     _env: &[(String, String)],
     _cwd: &Path,
     _log: &Path,
-    _profile: Option<&str>,
+    _profile: Option<&Profile>,
 ) -> io::Result<u32> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -2151,7 +2426,14 @@ fn peer_pid(stream: &UnixStream) -> Option<u32> {
     isocast_ipc::peer_pid(stream).ok()
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
+/// The connection's client process, from `SO_PEERCRED`.
+#[cfg(target_os = "linux")]
+fn peer_pid(stream: &UnixStream) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    isocast_platform_linux::plugin::peer_pid(stream.as_raw_fd())
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
 fn peer_pid(_stream: &UnixStream) -> Option<u32> {
     None
 }
@@ -2165,7 +2447,13 @@ fn process_info(pid: u32) -> Option<(u32, (u64, u64))> {
     isocast_platform_macos::plugin::process_info(pid)
 }
 
-#[cfg(not(target_os = "macos"))]
+/// From `/proc/<pid>/stat`: the start time is in clock ticks since boot.
+#[cfg(target_os = "linux")]
+fn process_info(pid: u32) -> Option<(u32, (u64, u64))> {
+    isocast_platform_linux::plugin::process_info(pid)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn process_info(_pid: u32) -> Option<(u32, (u64, u64))> {
     None
 }
@@ -2197,6 +2485,44 @@ mod tests {
         );
         assert_eq!(installation(Path::new("/usr/bin/python3")).len(), 2);
         assert!(installation(Path::new("/Users/me/bin/tool")).is_empty());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn interpreters_may_run_their_own_installation() {
+        let home = Path::new("/home/me");
+        let folders = |program: &str| installation(Path::new(program), home);
+        assert_eq!(
+            folders("/home/me/.local/share/uv/python/cpython-3.13/bin/python3.13"),
+            [PathBuf::from(
+                "/home/me/.local/share/uv/python/cpython-3.13"
+            )]
+        );
+        assert_eq!(
+            folders("/home/me/.nvm/versions/node/v22/bin/node"),
+            [PathBuf::from("/home/me/.nvm/versions/node/v22")]
+        );
+        // A virtual environment is its own prefix.
+        let venv = std::env::temp_dir().join(format!("isocast-venv-{}", std::process::id()));
+        std::fs::create_dir_all(venv.join("bin")).unwrap();
+        std::fs::write(venv.join("pyvenv.cfg"), "").unwrap();
+        assert_eq!(
+            folders(&venv.join("bin/python").to_string_lossy()),
+            std::slice::from_ref(&venv)
+        );
+        let _ = std::fs::remove_dir_all(&venv);
+        // The system's own is readable already; a shared folder's other
+        // programs aren't the plugin's to run.
+        assert!(folders("/usr/bin/python3").is_empty());
+        for shared in [
+            "/home/me/.local/bin/tool",
+            "/home/me/.cargo/bin/tool",
+            "/home/me/tool",
+            "/home/me/work/client/bin/tool",
+            "/srv/tools/py3/bin/python",
+        ] {
+            assert_eq!(folders(shared), [PathBuf::from(shared)]);
+        }
     }
 
     #[test]
