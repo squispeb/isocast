@@ -5,35 +5,53 @@ each section. Delete entries that stop being true.
 
 ## Linux port progress (2026-10-23, parity workflow: L.2b, L.6c-g, L.S1b, L.S1d, L.S1e)
 
-- 2026-10-23 (open, desktop pacing): with the app on air the 165 Hz
-  desktop drops frames. Measured with a scratch 1x1 layer-shell probe
-  counting Hyprland's frame callbacks (target/scratch/presprobe, run in
-  unit isocast-presprobe; 165/s idle): app with camera and mic 158/s,
-  plus a window source 104/s, plus a browser page 75-77/s, gaps up to
-  72 ms; Hyprland's main thread goes from about 47% to 87% CPU. GPU use
-  stays near 35%. What was ruled out: the window capture itself (a
-  scratch client capturing the same window with shm at 60/s costs
-  nothing; target/scratch/wincap), the shm format, PaintCursors,
-  Hyprland IPC polling (j/clients at 4/s costs nothing), plain CPU load
-  (6 busy threads cost nothing). What costs: our side reading the pages
-  Hyprland reads the window back into (one 14 MB memcpy per frame at
-  50/s costs 17 frames/s; memory traffic generally, 2x dd costs 13), and
-  WebKitGTK 2.54 itself, reproduced outside Isocast with PyGObject
-  (target/scratch/webrepro/page.py: an offscreen view animating plus
-  30 snapshots/s costs 40 frames/s; repaint alone 14, snapshots alone
-  24; no Wayland traffic after start-up, no NVIDIA EGL in the web
-  process). WEBKIT_SKIA_ENABLE_CPU_RENDERING, _DISABLE_DMABUF_RENDERER,
-  _DISABLE_COMPOSITING_MODE, _FORCE_VBLANK_TIMER, _SKIA_CPU_PAINTING_THREADS
-  and Mesa EGL changed nothing (three attempts: stopped). Most likely
-  wrong assumption: that the cost is CPU or GPU work; it behaves like
-  memory or cache contention with Hyprland's render thread, which only a
-  profiler (no perf on this box) can show. Next step for windows:
-  DMA-BUF capture, so Hyprland renders the window into our buffer on the
-  GPU (copyDmabuf) instead of glReadPixels into shm; a first scratch try
-  (wincap dmabuf, GBM with the 13 offered block-linear modifiers; LINEAR
-  is not offered and fails) never got ready or failed back from a nested
-  Hyprland, cause not found. Repro: `target/scratch/fix/measure.sh LABEL`
-  while sources are added (`target/scratch/fix/step.sh`).
+- 2026-10-23 (root cause, desktop pacing; replaces the round-1 "open,
+  desktop pacing" bullet): Hyprland 0.56.2 leaks screencopy sessions, and
+  the leaked ones cost it on every frame. Profiled with a passive
+  perf_event_open sampler (no perf here; Yama blocks attach, not this:
+  target/scratch/prof/sample TID SECS HZ, symbolized by sym.py): on the
+  bare desktop with no Isocast running, 92% of Hyprland's main thread is
+  in CMonitor::needsACopyFB -> CScreenshareManager::outputCopyFBState /
+  CScreenshareSession::isActive, walking thousands of live (not stopped)
+  monitor sessions on DP-3, about 5 times a frame plus once per texture
+  drawn (about 0.6 ms a walk). Real rendering is about 5%. Source
+  (target/scratch/hypr-src, Screencopy.cpp from v0.56.2): wlr-screencopy
+  frames use getManagedSession(client, monitor), and a managed monitor
+  session is stopped only when the monitor disconnects, never when its
+  client does. Reproduced in a nested Hyprland
+  (target/scratch/leaker: `leaker wlrmany 900` opens 900 clients at once,
+  each captures the output once, then all leave): 0% -> 13% -> 34.5% of
+  the nested main thread after 900 and 2700, with no client left.
+  Sequential one-shot clients reuse the freed wl_client address and leak
+  nothing, which is why 40,000 of them showed no cost. Short-lived
+  screencopy clients here: the share picker (37 prompts and 34 crashes
+  today, mostly Isocast's retries) and other screen tools; Isocast itself
+  uses ext-image-copy-capture and the portal, which leak nothing
+  (tested). Effect: the desktop cannot hold 165 Hz even bare (131-143
+  frames/s, gaps 16-22 ms), and every surface or capture added costs
+  far more than it should, because each texture draw pays one walk. Only
+  restarting Hyprland clears it (see Waiting on Ryan).
+- 2026-10-23 (finding): the RTX 3060 Ti idles between P3 and P5 (memory
+  clock 810 MHz); with Hyprland's opengl:nvidia_anti_flicker its main
+  thread waits for each frame's GPU work, so a light desktop drops
+  frames at low clocks, and any steady GPU load (a 1 ms compute
+  dispatch at 60/s) raises it to P0 and the desktop from ~138 to 161.
+  Compare A/B windows a few seconds apart; desktop frames/s alone is
+  noisy (other agents' builds also cost 60 frames/s while they ran).
+- 2026-10-23 (finding): round 1's "WebKit costs 40 frames/s" was the
+  noise above: page.py's offscreen view animating costs Hyprland 1-4%
+  CPU and no clear frame rate. The shm window copy is real: Hyprland's
+  CScreenshareFrame::copyShm allocates a framebuffer, renders and
+  readPixels synchronously inside onOutputCommit (+28% Hyprland CPU at
+  60 captures/s, gaps 28-30 ms); copyDmabuf renders into the client's
+  buffer and completes asynchronously (+15%, gaps at baseline).
+  DMA-BUF capture works on the live Hyprland (wincap dmabuf: 60/s,
+  modifier 0x300000000e08014); round 1's nested try got nothing because
+  a nested output only commits when something on it changes.
+- 2026-10-23 (finding, screen): screencast.rs returned early before
+  dequeuing a picture that arrived inside the asked interval, so xdph's
+  buffers sat in our queue: xdph logged 3,033 "Out of buffers / Retrying
+  screencopy" today, and what we dequeued next was the oldest picture.
 - 2026-10-23 (fixed, app memory): with its window on a hidden workspace
   the app grew about 500 MB/s (6.2 GiB VmRSS 10 s after it started, much
   of it not charged to the unit, so MemoryMax did not stop it). Shared
@@ -2709,10 +2727,21 @@ isocast-platform-linux gpu` once the modules exist.
 
 ## Waiting on Ryan
 
-- 2026-10-23 (Hyprland in safe mode): the live session runs `Hyprland
-  --safe-mode` since the 2026-10-22 22:10 crash (see the incident note
-  above). Log out and back in (or reboot) to get the normal config back.
-  Retry check: `pgrep -a Hyprland` shows no `--safe-mode`.
+- 2026-10-23 (Hyprland in safe mode, and its leaked screencopy
+  sessions): the live session runs `Hyprland --safe-mode` since the
+  2026-10-22 22:10 crash (see the incident note above), and that same
+  Hyprland now holds thousands of leaked monitor screencopy sessions
+  that cost it most of a core (Linux section, "root cause, desktop
+  pacing"). Agents may not restart it. Log out and back in (or reboot):
+  it brings the normal config back and clears the leak. It blocks the
+  owner's "160 frames/s, gaps under 12 ms" target, which the bare
+  desktop misses today. Retry check: `pgrep -a Hyprland` shows no
+  `--safe-mode`, then with the app on air run
+  `target/scratch/prof/sample $(pgrep -x Hyprland) 5 1000 > /tmp/h.txt;
+  python3 target/scratch/prof/sym.py $(pgrep -x Hyprland) /tmp/h.txt`
+  (expect no Screenshare:: symbols near the top) and
+  `target/scratch/r2/meas.sh check 15` with unit isocast-presprobe
+  running.
 - 2026-10-16 (L.2's one real take): the desktop's screen-sharing picker
   needs one click from Ryan, and that is the last step of L.2. A
   source's open is engine-bounded to 8 s (`bounded_open`), which is not
