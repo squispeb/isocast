@@ -1979,7 +1979,14 @@ fn reconcile<P: Platform>(inner: &Arc<Inner<P>>, setup: Arc<Setup>) {
         } else {
             SourceRun::Opening
         };
-        pending.error = permission.as_ref().map(|p| format!("waiting for permission: {p}; check macOS Privacy & Security or its permission prompt"));
+        let pointer = if cfg!(target_os = "macos") {
+            "; check macOS Privacy & Security or its permission prompt"
+        } else {
+            ""
+        };
+        pending.error = permission
+            .as_ref()
+            .map(|p| format!("waiting for permission: {p}{pointer}"));
         let event = pending.status(&id);
         let old = {
             let mut state = inner.state.lock();

@@ -45,6 +45,8 @@ export global PermissionsArea {
     in property <bool> ready;
     // What macOS lists them under ("Isocast").
     in property <string> app-name: "Isocast";
+    // Who asks, in words for this platform (the sheet's first line).
+    in property <string> intro;
     // The first launch (Continue leads on to Welcome) or later (Done).
     in property <bool> first-launch;
     // The floating helper beside System Settings is showing.

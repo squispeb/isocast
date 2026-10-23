@@ -5,6 +5,18 @@ each section. Delete entries that stop being true.
 
 ## Linux port progress (2026-10-23, parity workflow: L.2b, L.6c-g, L.S1b, L.S1d, L.S1e)
 
+- 2026-10-23 (permissions wording): the app's permission sheet, its
+  error toast, `isocast permissions --request` and a source waiting for
+  permission said "macOS" on Linux. They now use the desktop's words
+  there (the screen-sharing picker; windows and apps need no prompt;
+  "Couldn't ask the desktop"); macOS text is unchanged.
+- 2026-10-23 (gotcha): the portal answers "cancelled" (response 1) both
+  when the picker is closed and when it crashes. On 2026-10-23
+  11:44-11:45 `hyprland-preview-share-picker` 0.2.1 segfaulted 21 times
+  in GTK 4's renderer (`gsk_renderer_render`) while two test copies of
+  the app were running; a request made with no app open showed the
+  picker normally. The error now says a picker that never appeared
+  crashed, and to try again.
 - 2026-10-23 (incident): agents probing Hyprland's Lua API through
   `hyprctl dispatch` crashed Ryan's live Hyprland 0.56.2 several times on
   2026-10-22 (coredumps at 20:45, 20:55 and 22:10; `Keybind:remove()`

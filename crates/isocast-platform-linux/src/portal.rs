@@ -278,7 +278,11 @@ fn answer(answers: &mut SignalIterator<'static>) -> Result<HashMap<String, Owned
         .context("reading the desktop's answer")?;
     match code {
         0 => Ok(results),
-        1 => bail!("the desktop's screen-capture picker was dismissed"),
+        // The portal answers the same when its picker crashes, so say so.
+        1 => bail!(
+            "the desktop's screen-sharing picker closed without a choice; if no picker \
+             appeared, it crashed (`coredumpctl list` shows it), so try again"
+        ),
         2 => bail!("the desktop ended the screen-capture request"),
         other => bail!("the desktop refused the screen-capture request (response {other})"),
     }

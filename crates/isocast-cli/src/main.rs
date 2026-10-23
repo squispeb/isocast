@@ -3361,7 +3361,12 @@ fn permissions(
         });
         if undecided {
             isocast_diagnostics::diagnostic!(
-                "Asking macOS; answer its prompts (waiting up to a minute)…"
+                "{}",
+                if cfg!(target_os = "linux") {
+                    "Asking the desktop; choose a screen in its screen-sharing picker (waiting up to a minute)…"
+                } else {
+                    "Asking macOS; answer its prompts (waiting up to a minute)…"
+                }
             );
         }
     }

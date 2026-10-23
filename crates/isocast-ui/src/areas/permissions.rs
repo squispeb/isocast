@@ -255,7 +255,7 @@ impl PermissionsStep {
             match answer {
                 Ok(report) => self.take(app, report),
                 Err(error) => {
-                    app.toast(ToastKind::Error, "Couldn’t ask macOS", error);
+                    app.toast(ToastKind::Error, ASK_FAILED, error);
                 }
             }
             self.show(app);
@@ -511,6 +511,7 @@ impl PermissionsStep {
             }
             .into(),
         );
+        area.set_intro(intro(&area.get_app_name()).into());
         area.set_ready(
             report
                 .details
@@ -535,15 +536,10 @@ fn row(d: &PermissionDetail, needed: bool, busy: Option<&str>) -> PermissionItem
         PermissionKind::ScreenRecording => (
             "display",
             "Screen Recording",
-            "Displays, windows and apps, and what this Mac plays.",
+            SCREEN_PURPOSE,
             "Screen & System Audio Recording",
         ),
-        PermissionKind::Camera => (
-            "camera",
-            "Camera",
-            "Cameras, capture cards and iPhone or iPad screens.",
-            "Camera",
-        ),
+        PermissionKind::Camera => ("camera", "Camera", CAMERA_PURPOSE, "Camera"),
         PermissionKind::Microphone => (
             "mic",
             "Microphone",
@@ -553,7 +549,7 @@ fn row(d: &PermissionDetail, needed: bool, busy: Option<&str>) -> PermissionItem
         PermissionKind::SystemAudio => (
             "speaker",
             "System Audio",
-            "Optional: what this Mac and its apps play, recorded without Screen Recording.",
+            SYSTEM_AUDIO_PURPOSE,
             "Screen & System Audio Recording",
         ),
     };
@@ -617,6 +613,15 @@ fn row(d: &PermissionDetail, needed: bool, busy: Option<&str>) -> PermissionItem
                 "",
                 "",
             ),
+            Permission::Denied if cfg!(target_os = "linux") => (
+                "denied",
+                "Not chosen",
+                "The desktop's screen-sharing picker closed without a choice. Ask again and \
+                 choose a screen."
+                    .to_string(),
+                "ask",
+                "Allow…",
+            ),
             Permission::Denied => (
                 "denied",
                 "Turned off",
@@ -656,6 +661,43 @@ fn row(d: &PermissionDetail, needed: bool, busy: Option<&str>) -> PermissionItem
         alt_label: alt.1.into(),
         busy: busy.is_some(),
         needed,
+    }
+}
+
+/// Who asks for each permission, in this platform's words.
+#[cfg(target_os = "linux")]
+const ASK_FAILED: &str = "Couldn’t ask the desktop";
+#[cfg(not(target_os = "linux"))]
+const ASK_FAILED: &str = "Couldn’t ask macOS";
+
+#[cfg(target_os = "linux")]
+const SCREEN_PURPOSE: &str = "Displays, chosen once in the desktop's screen-sharing picker. Windows and apps need no prompt.";
+#[cfg(not(target_os = "linux"))]
+const SCREEN_PURPOSE: &str = "Displays, windows and apps, and what this Mac plays.";
+
+#[cfg(target_os = "linux")]
+const CAMERA_PURPOSE: &str = "Cameras and capture cards.";
+#[cfg(not(target_os = "linux"))]
+const CAMERA_PURPOSE: &str = "Cameras, capture cards and iPhone or iPad screens.";
+
+#[cfg(target_os = "linux")]
+const SYSTEM_AUDIO_PURPOSE: &str = "Optional: what this computer and its apps play.";
+#[cfg(not(target_os = "linux"))]
+const SYSTEM_AUDIO_PURPOSE: &str =
+    "Optional: what this Mac and its apps play, recorded without Screen Recording.";
+
+/// The sheet's first line.
+fn intro(app: &str) -> String {
+    if cfg!(target_os = "linux") {
+        format!(
+            "The desktop asks once which screen to share. {app} only records the screens, \
+             cameras and microphones you add to a scene."
+        )
+    } else {
+        format!(
+            "macOS asks once for each. {app} only records the screens, cameras and \
+             microphones you add to a scene."
+        )
     }
 }
 
