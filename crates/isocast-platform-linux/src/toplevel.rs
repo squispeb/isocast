@@ -1526,11 +1526,24 @@ impl Follower {
                 && rect.y + rect.h as i32 >= canvas.1 as i32
         };
         let opaque_cover = drawn.len() == 1 && covers(&drawn[0].0) && !drawn[0].1.layout.alpha;
+        // A window drawn at exactly the canvas's size replaces every pixel
+        // (its alpha is copied, not blended), so clearing first is 14 MB
+        // a frame of writes for nothing at 2528x1374: memory traffic that
+        // showed as missed frames in the compositor.
+        let replaces_all = whole
+            && drawn.len() == 1
+            && drawn[0].0
+                == Rect {
+                    x: 0,
+                    y: 0,
+                    w: canvas.0,
+                    h: canvas.1,
+                };
         let taken = pool.draw(&mut |bytes, stride| {
             // Reused frames hold an older picture: what a window does not
             // cover starts clear (transparent), unless one opaque picture
             // covers all of it.
-            if !opaque_cover {
+            if !opaque_cover && !replaces_all {
                 bytes.fill(0);
             }
             for (rect, picture) in &drawn {
