@@ -83,8 +83,11 @@ fn page_thread() -> Result<&'static glib::MainContext> {
     std::thread::Builder::new()
         .name("isocast browser".into())
         .spawn(move || {
-            // GTK on this thread, with the main context it owns alone -
-            // the rest of the daemon keeps whatever contexts it runs.
+            // GTK on this thread. gtk::init acquires GLib's global
+            // default context here, so this thread owns it: any future
+            // GLib/GIO user in the daemon that attaches a source to the
+            // default context from another thread is dispatched on this
+            // thread (nothing in the workspace does today).
             let started = gtk::init();
             if started.is_err() {
                 let _ = up.send(Err(anyhow!("{THREAD_ERROR}: {started:?}")));
@@ -121,8 +124,9 @@ fn page_thread() -> Result<&'static glib::MainContext> {
         Ok(Err(the_reason)) => return Err(the_reason),
         Err(_) => bail!("{THREAD_ERROR} within 10 s"),
     };
-    // The boot thread holds the context as thread default forever, so
-    // it owns the loop; the caller has the shared handle just the same.
+    // The boot thread runs GLib's default context forever (which gtk::init
+    // acquired there), so it owns the loop; the caller has the shared
+    // handle just the same.
     let owned = CONTEXT_ONCE.get_or_init(|| context);
     *shared = Some(owned);
     Ok(owned)
@@ -460,8 +464,8 @@ fn tick(
         Option::<&webkit2gtk::gio::Cancellable>::None,
         move |snapshot: Result<cairo::Surface, glib::Error>| {
             busy.store(false, Ordering::SeqCst);
-            // A snapshot already in flight when the page was unloaded
-            // would put one stale frame after the empty one.
+            // A snapshot finishing after the unload is dropped, so the
+            // empty frame is the next thing the sink sees.
             if !callback_loaded.load(Ordering::SeqCst) {
                 return;
             }
