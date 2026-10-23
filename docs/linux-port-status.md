@@ -6,6 +6,46 @@ sync. Design and rationale
 live in [port-omarchy.md](port-omarchy.md); per-task evidence lives in
 the `PLAN.md` Log and [notes.md](notes.md).
 
+## Requirements (Arch / Omarchy)
+
+Everything in this list except `v4l2loopback-dkms` is installed on the
+development machine; the build and every verification in this document
+ran against it.
+
+**Build:** a stable Rust toolchain (`rustup`), plus the C libraries the
+Linux crate binds to and `clang` for their bindings:
+
+```sh
+sudo pacman -S --needed rustup clang pkgconf ffmpeg pipewire webkit2gtk-4.1 gtk3 wayland
+```
+
+**Run:**
+
+| Package | Needed for | Required? |
+|---|---|---|
+| `pipewire`, `wireplumber`, `pipewire-pulse` (`libpulse` gives `pactl`) | microphones, system and per-app audio, playback | yes |
+| `ffmpeg` (`ffmpeg`, `ffprobe`) | the file writer, cameras, media sources, editor exports | yes |
+| `xdg-desktop-portal`, `xdg-desktop-portal-hyprland` | screen capture (the ScreenCast portal) | for screen sources |
+| `hyprland` | global hotkeys (session binds), app-capture window positions (`hyprctl`); window capture uses the ext-image-copy-capture protocol | for hotkeys and window/app sources |
+| `webkit2gtk-4.1` | browser sources | for browser sources |
+| `nvidia-utils` (or another hardware encoder) | NVENC encoding; software encoders are used without it | recommended |
+| `v4l2loopback-dkms` and the running kernel's headers (`linux-omarchy-headers` on Omarchy, `linux-headers` on stock Arch) | the virtual camera (L.6e) | for the virtual camera |
+| Landlock enabled in the kernel (`landlock` in `/sys/kernel/security/lsm`, ABI 4 or newer; 10 here) | the plugin sandbox (L.6g) | for sandboxed plugins |
+
+The virtual camera's module, once (root):
+
+```sh
+sudo pacman -S --needed v4l2loopback-dkms linux-omarchy-headers   # linux-headers on stock Arch
+sudo modprobe v4l2loopback devices=1 video_nr=10 card_label="Isocast Camera" exclusive_caps=1
+# keep it across reboots, with the same options:
+echo v4l2loopback | sudo tee /etc/modules-load.d/isocast-v4l2loopback.conf
+echo 'options v4l2loopback devices=1 video_nr=10 card_label="Isocast Camera" exclusive_caps=1' \
+  | sudo tee /etc/modprobe.d/isocast-v4l2loopback.conf
+```
+
+Check: `lsmod | grep v4l2loopback` and `v4l2-ctl --list-devices` show
+"Isocast Camera" at `/dev/video10`.
+
 ## 1. Summary
 
 - **Branch:** local `main` is based on **v0.0.8** (`c3baa39`, the
@@ -103,10 +143,9 @@ the editor window itself.
   answered first. Run `./target/debug/isocast permissions --request`,
   pick DP-3, then do a take and expect 2560×1440. The token then opens
   later captures silently.
-- **L.6e virtual camera:** install the module with
-  `sudo pacman -S v4l2loopback-dkms`, `modprobe v4l2loopback` and a
-  `modules-load.d` entry (exact commands in notes.md, "Waiting on
-  Ryan").
+- **L.6e virtual camera:** install and load the v4l2loopback module
+  (commands under "Requirements" above), then verify the live path
+  (notes.md, "Waiting on Ryan").
 - **Text-guard commits** `2b85ce3`/`a59ed86`: the CI CJK grep guard
   (`scripts/check-text.sh`) question is still open.
 

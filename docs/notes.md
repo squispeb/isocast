@@ -2561,10 +2561,10 @@ isocast-platform-linux gpu` once the modules exist.
   colours and frames_sent.
 - 2026-10-22 (L.6e virtual camera): the `v4l2loopback` kernel module is
   not installed on this machine. The virtual camera needs it once, as
-  root: `sudo pacman -S v4l2loopback-dkms && sudo modprobe
-  v4l2loopback devices=1 video_nr=10 card_label="Isocast Camera" &&
-  sudo tee /etc/modules-load.d/isocast-v4l2loopback.conf <<< v4l2loopback`
-  (module auto-load on boot). Retry with
+  root: the commands are in docs/linux-port-status.md, "Requirements"
+  (`v4l2loopback-dkms` plus the running kernel's headers,
+  `linux-omarchy-headers` here; load with `exclusive_caps=1`, and a
+  `modprobe.d` options file so a reboot loads it the same way). Retry with
   `lsmod | grep v4l2loopback`; L.6e can start once it answers.
 - 2026-10-16 (L.2's one real take): the desktop's screen-sharing picker
   needs one click from Ryan, and that is the last step of L.2. A
