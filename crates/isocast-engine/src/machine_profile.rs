@@ -48,9 +48,19 @@ const WARM_UP: Duration = Duration::from_millis(250);
 /// How long completed encoder pictures are counted. Finalization is
 /// required afterwards, but is not steady-state encoder work.
 const WINDOW: Duration = Duration::from_millis(600);
+/// How long a lazily started encoder may take to return its first picture
+/// before its warm-up starts anyway (so a stalled one reads as stalled).
+const START_GRACE: Duration = Duration::from_millis(3000);
 /// What opening a session and finishing its file add to a cell's time, as
 /// planned for the deadline.
-const OPEN_AND_FINISH: Duration = Duration::from_millis(600);
+const OPEN_AND_FINISH: Duration = if cfg!(target_os = "linux") {
+    // An ffmpeg child starts at the first picture and takes about a second
+    // to initialise NVENC and, at the end, to drain its pipe (measured on
+    // Linux: a cell takes 1.5 to 1.8 s where 600 ms plans for 1.5 s).
+    Duration::from_millis(1000)
+} else {
+    Duration::from_millis(600)
+};
 /// The gap the macOS writer leaves between hardware sessions' first
 /// pictures (#41), as planned for the deadline.
 const SESSION_GAP: Duration = Duration::from_millis(25);
@@ -159,7 +169,7 @@ pub fn measure<P: Platform>(platform: &P, scratch: &Path) -> Result<MachineProfi
          bitrate, counting pictures it returned. Required cells (the capacity fit's concurrent \
          HEVC cells, which need full {FIT_MIN_SECONDS} s windows, then 4K60 HEVC 10-bit and \
          live H.264) run before diagnostic cells; only fit cells may back capacity",
-        backend = backend()
+        backend = platform.encoder_backend()
     ));
     let mut encoders = Vec::new();
     let mut skipped = Vec::new();
@@ -313,11 +323,17 @@ impl Cell {
     }
 
     /// Its labels for a measurement: only fit cells are fit evidence.
-    fn measurement(&self, frames: u64, seconds: f64, dropped: Option<u64>) -> EncoderMeasurement {
+    fn measurement(
+        &self,
+        backend: &str,
+        frames: u64,
+        seconds: f64,
+        dropped: Option<u64>,
+    ) -> EncoderMeasurement {
         let recording = self.resource == EncoderResource::RecordingWriter;
         EncoderMeasurement {
             resource: self.resource,
-            backend: backend().into(),
+            backend: backend.into(),
             evidence: if self.priority == Priority::Fit {
                 Evidence::Fit
             } else if self.priority == Priority::ProresResource {
@@ -393,16 +409,6 @@ impl Cell {
             audio: Vec::new(),
             created: std::time::SystemTime::now(),
         }
-    }
-}
-
-/// The native encoder backend measurements name. The platform trait has
-/// no backend identity yet; macOS is the only calibration backend.
-fn backend() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "videotoolbox"
-    } else {
-        "unknown"
     }
 }
 
@@ -584,7 +590,7 @@ fn encode_cell<P: Platform>(
             shortest.as_secs_f64()
         );
     }
-    let mut measurement = finished(cell, frames_done, longest, None)?;
+    let mut measurement = finished(platform.encoder_backend(), cell, frames_done, longest, None)?;
     measurement.hardware_accelerated = backends
         .first()
         .copied()
@@ -607,6 +613,7 @@ fn encode_cell<P: Platform>(
 /// `cell`'s measurement of `frames` completed over `timed`, if enough
 /// frames completed to report it.
 fn finished(
+    backend: &str,
     cell: &Cell,
     frames: u64,
     timed: Duration,
@@ -619,7 +626,7 @@ fn finished(
     if !(frames as f64 / seconds).is_finite() {
         bail!("its timing was not a finite number");
     }
-    Ok(cell.measurement(frames, seconds, dropped))
+    Ok(cell.measurement(backend, frames, seconds, dropped))
 }
 
 /// The live H.264 cell: the stream's real-time encoder at its default
@@ -681,6 +688,7 @@ fn live_cell<P: Platform>(
     let dropped = encoder.dropped().saturating_sub(dropped_before);
     drop(encoder);
     finished(
+        platform.encoder_backend(),
         cell,
         received.saturating_sub(before),
         done.duration_since(from),
@@ -707,23 +715,41 @@ fn encode_session<P: Platform>(
     }
     let fps = spec.video.fps;
     let start = Instant::now();
-    let warm_end = start + WARM_UP;
-    let window_end = warm_end + WINDOW;
+    let mut warm_end = start + WARM_UP;
+    let mut window_end = warm_end + WINDOW;
     // A session capped by file size still keeps most of its frames timed.
     let warm_cap = (max_frames / 4).max(1);
     let base = Time::from_nanos(0);
     writer.start(base)?;
+    // An encoder that starts at its first picture (an ffmpeg process) is
+    // given until its first completed picture, or [`START_GRACE`], before
+    // the warm-up begins: its start-up is not steady-state work.
+    let lazy = writer.starts_at_first_picture();
+    let grace_end = start + START_GRACE;
+    let mut running = !lazy;
+    let mut first = 0;
     let mut n: u64 = 0;
     let mut timed_from: Option<(Instant, u64)> = None;
     loop {
         let now = Instant::now();
-        if timed_from.is_none() && (now >= warm_end || n >= warm_cap) {
+        if !running
+            && (writer
+                .completed_video_frames()
+                .is_some_and(|done| done >= 1)
+                || now >= grace_end)
+        {
+            running = true;
+            first = n;
+            warm_end = now + WARM_UP;
+            window_end = warm_end + WINDOW;
+        }
+        if running && timed_from.is_none() && (now >= warm_end || n - first >= warm_cap) {
             let completed = writer
                 .completed_video_frames()
                 .context("backend does not expose completed video frames")?;
             timed_from = Some((now, completed));
         }
-        if timed_from.is_some() && (now >= window_end || n >= max_frames) {
+        if timed_from.is_some() && (now >= window_end || n - first >= max_frames) {
             break;
         }
         let frame = &frames[(n % frames.len() as u64) as usize];

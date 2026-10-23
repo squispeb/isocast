@@ -127,12 +127,55 @@ pub fn doctor<P: Platform>(
         let refused = budget["refused"]
             .as_array()
             .is_some_and(|counts| counts.iter().any(|n| n.as_u64().unwrap_or(0) != 0));
+        // A platform reports the reserves it has: macOS's per-output
+        // domains, Linux's single slot limit per pool.
+        let reserves: Vec<String> = [
+            ("production", "production_reserve"),
+            ("recording", "recording_reserve"),
+            ("auxiliary", "auxiliary_limit"),
+            ("composition", "composition_reserve"),
+        ]
+        .iter()
+        .filter(|(_, key)| !budget[*key].is_null())
+        .map(|(name, key)| format!("{name} {}", budget[*key]))
+        .collect();
+        let reserves = if reserves.is_empty() {
+            String::new()
+        } else {
+            format!("; base reserves: {}", reserves.join(", "))
+        };
+        let slots = if budget["distinct_buffers"].is_null() {
+            String::new()
+        } else {
+            format!(
+                "; {} distinct buffers in {} pools ({} out now, at most {} at once, limit {} per pool)",
+                budget["distinct_buffers"],
+                budget["pool_count"],
+                budget["in_use"],
+                budget["peak_in_use"],
+                budget["physical_limit"]
+            )
+        };
+        let hint = if budget["auxiliary_limit"].is_null() {
+            "a source frame was dropped because writers held every frame of its pool: a slow encoder or disk; status.diagnostics.frame_budget has the counts"
+        } else {
+            "reduce auxiliary viewers/outputs; status.diagnostics.frame_budget identifies the exhausted domain"
+        };
         checks.push(check(
             "frame budget",
-            if !invariant { CheckStatus::Problem } else if refused { CheckStatus::Warning } else { CheckStatus::Ok },
-            format!("distinct-buffer invariant {}; base reserves: production {}, recording {}, auxiliary {}, composition {}; refusals {} (since daemon start)",
-                if invariant { "holds" } else { "FAILED" }, budget["production_reserve"], budget["recording_reserve"], budget["auxiliary_limit"], budget["composition_reserve"], budget["refused"]),
-            refused.then_some("reduce auxiliary viewers/outputs; status.diagnostics.frame_budget identifies the exhausted domain"),
+            if !invariant {
+                CheckStatus::Problem
+            } else if refused {
+                CheckStatus::Warning
+            } else {
+                CheckStatus::Ok
+            },
+            format!(
+                "distinct-buffer invariant {}{reserves}{slots}; refusals {} (since daemon start)",
+                if invariant { "holds" } else { "FAILED" },
+                budget["refused"]
+            ),
+            refused.then_some(hint),
         ));
     }
 

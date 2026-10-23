@@ -67,23 +67,53 @@ pub(crate) fn process_cpu_seconds() -> Option<f64> {
     Some(seconds(usage.ru_utime) + seconds(usage.ru_stime))
 }
 
-/// Busy core-seconds across the machine since boot, from `/proc/stat`'s
-/// `cpu` line: every column but idle and iowait, in clock ticks.
-pub(crate) fn system_cpu_seconds() -> Option<f64> {
-    let stat = std::fs::read_to_string("/proc/stat").ok()?;
-    let ticks: Vec<u64> = stat
-        .lines()
-        .find(|line| line.starts_with("cpu "))?
-        .split_whitespace()
-        .skip(1)
-        .filter_map(|value| value.parse().ok())
-        .collect();
-    // user nice system idle iowait irq softirq steal (guest time is
-    // already counted in user and nice).
-    if ticks.len() < 8 {
-        return None;
+/// Clock ticks the machine's CPUs have spent since boot, summed over all
+/// of them (`/proc/stat`'s `cpu` line).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CpuTicks {
+    /// Every column but idle and iowait.
+    pub busy: u64,
+    /// Every column, idle included.
+    pub total: u64,
+}
+
+impl CpuTicks {
+    /// Parse one `cpu ` line of `/proc/stat`: user nice system idle iowait
+    /// irq softirq steal (guest time is already counted in user and nice).
+    pub(crate) fn parse(line: &str) -> Option<Self> {
+        let mut words = line.split_whitespace();
+        if words.next()? != "cpu" {
+            return None;
+        }
+        let ticks: Vec<u64> = words.filter_map(|value| value.parse().ok()).collect();
+        if ticks.len() < 8 {
+            return None;
+        }
+        let total: u64 = ticks[..8].iter().sum();
+        Some(Self {
+            busy: total - ticks[3] - ticks[4],
+            total,
+        })
     }
-    let busy: u64 = ticks[..8].iter().sum::<u64>() - ticks[3] - ticks[4];
+
+    /// How busy the CPUs were between `earlier` and `self`, in percent of
+    /// all of them; `None` if no ticks passed (or the counters went back).
+    pub(crate) fn percent_since(&self, earlier: &Self) -> Option<f64> {
+        let total = self.total.checked_sub(earlier.total).filter(|t| *t > 0)?;
+        let busy = self.busy.checked_sub(earlier.busy)?;
+        Some((busy as f64 / total as f64 * 100.0).clamp(0.0, 100.0))
+    }
+}
+
+pub(crate) fn cpu_ticks() -> Option<CpuTicks> {
+    let stat = std::fs::read_to_string("/proc/stat").ok()?;
+    stat.lines().find_map(CpuTicks::parse)
+}
+
+/// Busy core-seconds across the machine since boot, from `/proc/stat`'s
+/// `cpu` line, in clock ticks.
+pub(crate) fn system_cpu_seconds() -> Option<f64> {
+    let busy = cpu_ticks()?.busy;
     // SAFETY: sysconf only reads a configuration value.
     let per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
     (per_second > 0).then(|| busy as f64 / per_second as f64)
@@ -380,6 +410,38 @@ const HARDWARE_SUFFIXES: [&str; 15] = [
     "_dxva2",
     "_vdpau",
 ];
+
+/// The nice value calibration's helper runs at: behind interactive work,
+/// the value macOS's helper takes too.
+const CALIBRATION_NICE: libc::c_int = 15;
+
+/// Lower the calling thread's priority for the calibration helper. Linux
+/// nice is per thread, and a thread (or child process) inherits its
+/// creator's, so the measurement calls this on its main thread and again
+/// on each encode thread before they start their writers. Unprivileged:
+/// it only ever lowers. Returns what was set, for the profile's notes.
+pub(crate) fn calibration_priority() -> Option<&'static str> {
+    // SAFETY: setpriority with who 0 changes only the calling thread's nice.
+    let status = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, CALIBRATION_NICE) };
+    (status == 0).then_some("nice 15")
+}
+
+/// What calibration's measurements are filed under: plain `ffmpeg`, since
+/// the rows mix NVENC and software encoders (ProRes is `prores_ks`); each
+/// row's `hardware_accelerated` says which. Not `videotoolbox`, so the
+/// capacity fit, which is fitted for Apple's engines, never takes these
+/// rows as its input.
+pub(crate) fn encoder_backend() -> &'static str {
+    "ffmpeg"
+}
+
+/// Whether an FFmpeg encoder name is a hardware encoder, by its family
+/// suffix (`hevc_nvenc`, `h264_vaapi`); `libx265` and `prores_ks` are not.
+pub(crate) fn is_hardware_encoder(name: &str) -> bool {
+    HARDWARE_SUFFIXES
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
+}
 
 /// The encoder's name and hardware family from one `-encoders` line, like
 /// ` V....D h264_nvenc           NVIDIA NVENC H.264 encoder (codec h264)`:
@@ -1184,6 +1246,16 @@ mod tests {
                 !headless.runs(suffix),
                 "{suffix} cannot run on a box with no video hardware"
             );
+        }
+    }
+
+    #[test]
+    fn hardware_encoders_are_told_by_their_family_suffix() {
+        for hardware in ["hevc_nvenc", "h264_vaapi", "av1_qsv", "h264_vulkan"] {
+            assert!(is_hardware_encoder(hardware), "{hardware}");
+        }
+        for software in ["libx264", "libx265", "prores_ks", "prores_aw", "libsvtav1"] {
+            assert!(!is_hardware_encoder(software), "{software}");
         }
     }
 }

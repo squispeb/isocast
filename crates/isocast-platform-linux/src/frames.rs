@@ -13,7 +13,7 @@
 //! numbers are compared against.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use anyhow::{Result, bail};
 use isocast_engine::FramePool;
@@ -247,7 +247,56 @@ pub struct CpuPool {
     width: u32,
     height: u32,
     kind: FrameKind,
+    ledger: Arc<Ledger>,
+}
+
+/// One pool's slots and its counters, shared with the registry the
+/// doctor's frame-budget check reads (held weakly there: a pool that is
+/// dropped leaves the ledger).
+struct Ledger {
     slots: Mutex<Vec<Arc<Shared>>>,
+    /// The most slots the pool has ever had out at once.
+    peak_in_use: AtomicU64,
+    /// Draws and takes refused because every slot was out.
+    refused: AtomicU64,
+}
+
+/// Every live pool, for `frame_budget`.
+static POOLS: Mutex<Vec<Weak<Ledger>>> = Mutex::new(Vec::new());
+
+/// The distinct-buffer ledger over every live pool, for the doctor and
+/// `status.diagnostics.frame_budget`. Linux pools have one limit
+/// ([`MAX_FRAMES_IN_FLIGHT`] slots each) and no per-output reserves, so
+/// that is all this reports: slots (distinct buffers), those out right
+/// now, the most ever out, and the refusals since the daemon started
+/// (a refusal is a source frame dropped because writers still held every
+/// slot).
+pub(crate) fn diagnostics() -> serde_json::Value {
+    let mut pools = POOLS.lock().unwrap_or_else(|e| e.into_inner());
+    pools.retain(|pool| pool.strong_count() > 0);
+    let (mut distinct, mut in_use, mut peak, mut refused, mut within) = (0, 0, 0, 0, true);
+    let mut count = 0;
+    for ledger in pools.iter().filter_map(Weak::upgrade) {
+        let slots = ledger.slots.lock().unwrap_or_else(|e| e.into_inner());
+        distinct += slots.len();
+        in_use += slots
+            .iter()
+            .filter(|slot| Arc::strong_count(slot) > 1)
+            .count();
+        within &= slots.len() <= MAX_FRAMES_IN_FLIGHT;
+        peak = peak.max(ledger.peak_in_use.load(Ordering::Relaxed));
+        refused += ledger.refused.load(Ordering::Relaxed);
+        count += 1;
+    }
+    serde_json::json!({
+        "invariant": within,
+        "pool_count": count,
+        "distinct_buffers": distinct,
+        "in_use": in_use,
+        "peak_in_use": peak,
+        "physical_limit": MAX_FRAMES_IN_FLIGHT,
+        "refused": [refused],
+    })
 }
 
 impl CpuPool {
@@ -264,11 +313,19 @@ impl CpuPool {
     }
 
     fn with_kind(width: u32, height: u32, kind: FrameKind) -> Self {
+        let ledger = Arc::new(Ledger {
+            slots: Mutex::new(Vec::new()),
+            peak_in_use: AtomicU64::new(0),
+            refused: AtomicU64::new(0),
+        });
+        let mut pools = POOLS.lock().unwrap_or_else(|e| e.into_inner());
+        pools.retain(|pool| pool.strong_count() > 0);
+        pools.push(Arc::downgrade(&ledger));
         Self {
             width,
             height,
             kind,
-            slots: Mutex::new(Vec::new()),
+            ledger,
         }
     }
 
@@ -337,34 +394,44 @@ impl CpuPool {
     /// to the in-flight cap) a brand-new one. `None` if every frame is
     /// out.
     fn take_slot(&mut self) -> Option<Arc<Shared>> {
-        let mut slots = self.slots.lock().expect("pool slots poisoned");
-        if let Some(slot) = slots.iter().find(|slot| Arc::strong_count(slot) == 1) {
-            return Some(slot.clone());
-        }
-        if slots.len() >= MAX_FRAMES_IN_FLIGHT {
+        let ledger = &self.ledger;
+        let mut slots = ledger.slots.lock().expect("pool slots poisoned");
+        let slot = if let Some(slot) = slots.iter().find(|slot| Arc::strong_count(slot) == 1) {
+            slot.clone()
+        } else if slots.len() >= MAX_FRAMES_IN_FLIGHT {
+            ledger.refused.fetch_add(1, Ordering::Relaxed);
             return None;
-        }
-        let slot = Arc::new(Shared {
-            width: self.width,
-            height: self.height,
-            kind: self.kind,
-            planes: Mutex::new(self.initial_planes()),
-            cpu_version: AtomicU64::new(0),
-            render_version: AtomicU64::new(0),
-            written_back: AtomicU64::new(0),
-            gpu_synced: AtomicU64::new(u64::MAX),
-            textures: Mutex::new(None),
-        });
-        slots.push(slot.clone());
+        } else {
+            let slot = Arc::new(Shared {
+                width: self.width,
+                height: self.height,
+                kind: self.kind,
+                planes: Mutex::new(self.initial_planes()),
+                cpu_version: AtomicU64::new(0),
+                render_version: AtomicU64::new(0),
+                written_back: AtomicU64::new(0),
+                gpu_synced: AtomicU64::new(u64::MAX),
+                textures: Mutex::new(None),
+            });
+            slots.push(slot.clone());
+            slot
+        };
+        // The slot just taken counts as out (its clone is returned).
+        let out = slots
+            .iter()
+            .filter(|slot| Arc::strong_count(slot) > 1)
+            .count() as u64;
+        ledger.peak_in_use.fetch_max(out, Ordering::Relaxed);
         Some(slot)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::CpuPool;
+    use super::{CpuPool, diagnostics};
     use isocast_engine::FramePool;
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn bgra_draw_and_recycles_slot() {
@@ -390,5 +457,31 @@ mod tests {
         assert!(frame.render_version() > frame.written_back());
         assert!(frame.is_ycbcr());
         assert_eq!(frame.plane(1).unwrap().0.len(), 1024);
+    }
+
+    #[test]
+    fn the_ledger_counts_slots_peak_and_refusals() {
+        // Other tests make pools too: look at this pool's own ledger.
+        let mut pool = CpuPool::bgra(16, 16);
+        let mut fill = |bytes: &mut [u8], _stride: usize| bytes.fill(1);
+        let held: Vec<_> = (0..super::MAX_FRAMES_IN_FLIGHT)
+            .map(|_| pool.draw(&mut fill).unwrap().unwrap())
+            .collect();
+        assert!(pool.draw(&mut fill).unwrap().is_none());
+        assert!(pool.take().unwrap().is_none());
+        assert_eq!(pool.ledger.slots.lock().unwrap().len(), 32);
+        assert_eq!(pool.ledger.refused.load(Ordering::Relaxed), 2);
+        assert_eq!(pool.ledger.peak_in_use.load(Ordering::Relaxed), 32);
+        let ledger = diagnostics();
+        assert_eq!(ledger["physical_limit"], 32);
+        assert_eq!(ledger["invariant"], true);
+        assert!(ledger["in_use"].as_u64().unwrap() >= 32);
+        assert!(ledger["refused"][0].as_u64().unwrap() >= 2);
+        drop(held);
+        // Frames released: slots stay (distinct buffers), none is out,
+        // and the next draw recycles one rather than refusing.
+        assert!(pool.draw(&mut fill).unwrap().is_some());
+        assert_eq!(pool.ledger.slots.lock().unwrap().len(), 32);
+        assert_eq!(pool.ledger.refused.load(Ordering::Relaxed), 2);
     }
 }

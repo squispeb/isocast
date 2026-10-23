@@ -1,6 +1,6 @@
 //! One sampler/decision owner, outside media callbacks and without disk I/O.
 use crate::{Daemon, streams::Output};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use isocast_engine::Platform;
 use isocast_engine::governor::canvas_slot;
 use isocast_engine::governor::{Controller, Sample};
@@ -119,12 +119,13 @@ pub(super) fn start(daemon: &Arc<Daemon>) {
                     controller.observe_monitors();
                     // Keep #90 alive even with automatic policy disabled.
                     #[cfg(target_os = "macos")]
+                    if let Some(warning) = monitor.poll() {
+                        daemon.publish(Event::Warning {
+                            message: warning.message,
+                        });
+                    }
+                    #[cfg(any(target_os = "macos", target_os = "linux"))]
                     {
-                        if let Some(warning) = monitor.poll() {
-                            daemon.publish(Event::Warning {
-                                message: warning.message,
-                            });
-                        }
                         pressure |=
                             crate::platform::native()
                                 .governor_headroom()
@@ -222,7 +223,7 @@ fn sample(
     sample.encoder_pressure = pressure > 0 || stalls != previous.stalls;
     sample.native_iso_percent = iso;
     previous.stalls = stalls;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         sample.headroom = crate::platform::native().governor_headroom();
     }

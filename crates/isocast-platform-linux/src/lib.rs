@@ -42,6 +42,7 @@ pub(crate) mod media;
 pub(crate) mod pacing;
 mod playback;
 mod portal;
+mod pressure;
 mod recode;
 mod screencast;
 pub(crate) mod stream;
@@ -247,6 +248,28 @@ impl Platform for LinuxPlatform {
     /// small enough that pacing doesn't depend on it.
     fn real_time_thread(&self) {
         pacing::raise_thread();
+    }
+
+    /// The distinct-slot ledger over the CPU frame pools (frames.rs).
+    fn frame_budget(&self) -> Option<serde_json::Value> {
+        Some(frames::diagnostics())
+    }
+
+    /// CPU load from /proc/stat and memory stall from the kernel's
+    /// pressure information (pressure.rs); nothing else is claimed.
+    fn governor_headroom(&self) -> Option<isocast_engine::governor::Headroom> {
+        pressure::headroom()
+    }
+
+    fn encoder_backend(&self) -> &'static str {
+        system::encoder_backend()
+    }
+
+    /// Nice 15 for the calling thread (and what it starts afterwards):
+    /// the calibration helper's own measurements read lower on a busy
+    /// machine, and nothing interactive waits for them.
+    fn calibration_priority(&self) -> Option<&'static str> {
+        system::calibration_priority()
     }
 
     /// The calling thread's own CPU time, for the compositor's costs.

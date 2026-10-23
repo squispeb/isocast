@@ -36,7 +36,7 @@ use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Child, ChildStderr, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
@@ -89,6 +89,8 @@ const STDERR_WAIT: Duration = Duration::from_secs(2);
 /// in an error message: it has said what it has said by then, and a
 /// take must not wait on a child that is still running.
 const STDERR_GLANCE: Duration = Duration::from_millis(250);
+/// How often ffmpeg reports its progress, in seconds (`-stats_period`).
+const PROGRESS_PERIOD: &str = "0.1";
 /// How often the watchdog looks.
 const WATCHDOG_TICK: Duration = Duration::from_millis(100);
 
@@ -126,6 +128,13 @@ pub struct FfmpegFileWriter {
     /// be waited for without waiting for a child that is still running.
     stderr_ended: Arc<AtomicBool>,
     reader: Option<thread::JoinHandle<()>>,
+    /// Pictures the encoder has returned, as ffmpeg's `-progress` reports
+    /// them (its own `frame=`), kept by a thread of its own. This is what
+    /// calibration counts: completed pictures, not what the pipe accepted.
+    completed: Arc<AtomicU64>,
+    /// The progress reader started, so `completed` is a real count.
+    counting: bool,
+    progress_reader: Option<thread::JoinHandle<()>>,
     /// The last picture written: its time and its bytes, what a later
     /// frame's gaps repeat and the tail repeats at Stop.
     last_pts: Option<Time>,
@@ -206,7 +215,8 @@ impl FfmpegFileWriter {
     pub fn spawn(spec: &WriterSpec) -> Result<Self> {
         let program = ffmpeg_binary();
         let listed = listed_encoders(&program)?;
-        let (encoder, encoder_args) = choose_encoder(&spec.video.encoder, &listed)?;
+        let (encoder, mut encoder_args) = choose_encoder(&spec.video.encoder, &listed)?;
+        encoder_args.extend(depth_args(&spec.video.encoder, encoder));
         probe_folder(&spec.path)?;
         if spec.path.exists() {
             bail!(
@@ -239,6 +249,9 @@ impl FfmpegFileWriter {
             stderr: Arc::new(Mutex::new(Vec::new())),
             stderr_ended: Arc::new(AtomicBool::new(false)),
             reader: None,
+            completed: Arc::new(AtomicU64::new(0)),
+            counting: false,
+            progress_reader: None,
             last_pts: None,
             last_bytes: None,
             repeats: 0,
@@ -270,12 +283,17 @@ impl FfmpegFileWriter {
         let mut command = Command::new(&self.program);
         command
             .stdin(Stdio::piped())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        // Nothing it says goes anywhere but stderr, and nothing it
-        // reads comes from anywhere but the pipes; nothing is ever
-        // overwritten.
+        // Nothing it says goes anywhere but stderr (its errors) and
+        // stdout (only the machine-readable `-progress` report, a
+        // pipe of its own so it never mixes with the errors), and
+        // nothing it reads comes from anywhere but the pipes; nothing
+        // is ever overwritten.
         command.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-n"]);
+        // The completed-picture counter's source: a report every 0.1 s
+        // (the default 0.5 s is too coarse for calibration's 0.6 s window).
+        command.args(["-progress", "pipe:1", "-stats_period", PROGRESS_PERIOD]);
         // The raw input: BGRA as it lies, Y'CbCr's two planes in
         // NV12's order, luma then interleaved chroma.
         let pixel_format = match kind {
@@ -458,6 +476,9 @@ impl FfmpegFileWriter {
         let stderr = child.stderr.take();
         if let Some(stderr) = stderr {
             self.start_stderr_reader(stderr);
+        }
+        if let Some(stdout) = child.stdout.take() {
+            self.start_progress_reader(stdout);
         }
         // The pictures go in from a thread of their own as well. The
         // child picks between its inputs by timestamp, so it stops
@@ -716,8 +737,77 @@ impl FfmpegFileWriter {
     }
 }
 
+impl FfmpegFileWriter {
+    /// The thread that reads ffmpeg's `-progress` report and keeps its
+    /// latest `frame=`. Without the thread the pipe would fill and stall
+    /// the encoder, so if it can't start the read end is dropped instead
+    /// (ffmpeg then ignores the closed pipe) and no count is offered.
+    fn start_progress_reader(&mut self, stdout: ChildStdout) {
+        let completed = self.completed.clone();
+        let reader = isocast_diagnostics::spawn(
+            "ffmpeg progress",
+            move || {
+                let mut lines = std::io::BufReader::new(stdout);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match std::io::BufRead::read_line(&mut lines, &mut line) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            if let Some(frames) = progress_frames(&line) {
+                                completed.store(frames, Ordering::Release);
+                            }
+                        }
+                    }
+                }
+            },
+            |why| {
+                isocast_diagnostics::diagnostic!(
+                    "error"; "the ffmpeg progress reader stopped: {why}"
+                );
+            },
+        );
+        self.counting = reader.is_ok();
+        self.progress_reader = reader.ok();
+    }
+
+    /// Join the progress reader once the child is reaped (its pipe is at
+    /// EOF, so this doesn't wait).
+    fn join_progress_reader(&mut self) {
+        if let Some(reader) = self.progress_reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+/// The picture count in one line of ffmpeg's `-progress` report
+/// (`frame=123`), if it is that line.
+fn progress_frames(line: &str) -> Option<u64> {
+    line.trim().strip_prefix("frame=")?.trim().parse().ok()
+}
+
 impl FileWriter for FfmpegFileWriter {
     type Frame = LinuxFrame;
+
+    /// The ffmpeg child starts at the first picture, whose pixel format
+    /// it needs, so NVENC's initialisation happens after `start`.
+    fn starts_at_first_picture(&self) -> bool {
+        true
+    }
+
+    /// Pictures ffmpeg's encoder has returned so far (its `-progress`
+    /// `frame=`, at most 0.1 s old), `None` before the child starts or if
+    /// the report can't be read.
+    fn completed_video_frames(&self) -> Option<u64> {
+        (self.counting && self.child.is_some()).then(|| self.completed.load(Ordering::Acquire))
+    }
+
+    /// Whether the chosen ffmpeg encoder is a hardware one, by the family
+    /// suffix of its name (`hevc_nvenc`); `prores_ks`, `libx264` and
+    /// `libx265` are software.
+    fn hardware_accelerated(&self) -> Option<bool> {
+        Some(crate::system::is_hardware_encoder(&self.encoder))
+    }
 
     /// The file is fragmented MOV/MP4, playable up to its last whole
     /// fragment: what that reaches is read back from the file itself.
@@ -961,6 +1051,9 @@ impl FileWriter for FfmpegFileWriter {
             thread::sleep(Duration::from_millis(5));
         };
         self.drain_stderr(STDERR_WAIT);
+        if exited.is_some() {
+            self.join_progress_reader();
+        }
         let tail = self.stderr_tail();
         // A stream thread's own failure is the story the exit status
         // can't tell: its pipe closed early, so the child may still
@@ -1030,6 +1123,7 @@ impl FileWriter for FfmpegFileWriter {
             let _ = thread.join();
         }
         self.drain_stderr(STDERR_WAIT);
+        self.join_progress_reader();
         if let Err(err) = std::fs::remove_file(&self.spec.path)
             && err.kind() != std::io::ErrorKind::NotFound
         {
@@ -1137,6 +1231,25 @@ pub(crate) fn choose_encoder(
         );
     }
     Ok((name, args))
+}
+
+/// What a 10-bit HEVC file needs on top of `choose_encoder`'s arguments:
+/// Main 10, with the encoder given 10-bit 4:2:0 (an 8-bit input is
+/// widened by ffmpeg). Without it the file would be written as 8-bit
+/// Main whatever `bit_depth` said. ProRes is always 10-bit and H.264
+/// always 8.
+fn depth_args(encoder: &Encoder, name: &str) -> Vec<String> {
+    if encoder.codec != Codec::Hevc || encoder.bit_depth != 10 {
+        return Vec::new();
+    }
+    let format = if name == "hevc_nvenc" {
+        "p010le"
+    } else {
+        "yuv420p10le"
+    };
+    ["-profile:v", "main10", "-pix_fmt", format]
+        .map(String::from)
+        .into()
 }
 
 /// NVENC's constant quality on ffmpeg's 1–51 `-cq` scale, which runs
@@ -1467,6 +1580,34 @@ mod tests {
             .iter()
             .map(|four| f32::from_ne_bytes(*four))
             .collect()
+    }
+
+    #[test]
+    fn progress_report_lines_give_the_picture_count() {
+        assert_eq!(progress_frames("frame=42\n"), Some(42));
+        assert_eq!(progress_frames("frame=  7 \n"), Some(7));
+        assert_eq!(progress_frames("frame=N/A\n"), None);
+        assert_eq!(progress_frames("out_time_us=16667\n"), None);
+        assert_eq!(progress_frames("progress=continue\n"), None);
+        assert_eq!(progress_frames("\n"), None);
+    }
+
+    #[test]
+    fn ten_bit_hevc_asks_for_main_10() {
+        use isocast_protocol::{EncoderQuality, QualityPreset};
+        let encoder = |codec, bit_depth| Encoder {
+            codec,
+            quality: EncoderQuality::Preset(QualityPreset::High),
+            container: Container::Mov,
+            bit_depth,
+        };
+        let ten = depth_args(&encoder(Codec::Hevc, 10), "hevc_nvenc");
+        assert_eq!(ten, ["-profile:v", "main10", "-pix_fmt", "p010le"]);
+        let soft = depth_args(&encoder(Codec::Hevc, 10), "libx265");
+        assert_eq!(soft.last().map(String::as_str), Some("yuv420p10le"));
+        assert!(depth_args(&encoder(Codec::Hevc, 8), "hevc_nvenc").is_empty());
+        assert!(depth_args(&encoder(Codec::H264, 8), "h264_nvenc").is_empty());
+        assert!(depth_args(&encoder(Codec::Prores422, 10), "prores_ks").is_empty());
     }
 
     /// A block a full queue refused is owed, and goes in as silence
