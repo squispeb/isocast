@@ -690,6 +690,10 @@ step live in `docs/notes.md`'s "Linux port WIP" section.
     device-creation hook: L.4's shared surfaces want it too. Until
     then a node that hands over an unmappable DMA-BUF fails the
     capture with a message naming xdph's `force_shm`.
+  - [x] **L.2b Window and app capture** (`ScreenTarget::Window` and
+    `Application`): the compositor's ext-foreign-toplevel-list and
+    ext-image-copy-capture protocols as a Wayland client, no portal or
+    picker; an app's windows composited at their positions.
 - [x] **L.3 Camera, mic and system audio through PipeWire and
   V4L2.** Per-app audio by linking a capture stream to the app's
   stream node (the reviewer's correction: this *is* possible on
@@ -910,19 +914,22 @@ step live in `docs/notes.md`'s "Linux port WIP" section.
     `audio.js` routing injected as a user script, its base64 posts
     through the `WebKitUserContentManager` message handler onto the
     `AudioSink`, stereo at 48 kHz against the host clock).
-  - [ ] **L.6c Browser sources on Linux: `BrowserControl`** (reload,
+  - [x] **L.6c Browser sources on Linux: `BrowserControl`** (reload,
     unload/load, tear-down over the GTK thread; the same semantics
     macOS's pages have).
-  - [ ] **L.6d Browser sources on Linux verified through a real take**
+  - [x] **L.6d Browser sources on Linux verified through a real take**
     (`isocast frames`/a recorded take with a static page checked
     numerically, then a live page).
   - [ ] **L.6e Virtual camera (v4l2loopback)** (frames pushed into a
     loopback device for other apps to read; needs the
     `v4l2loopback` kernel module, which is not installed - root, one
     time: waiting on Ryan, see docs/notes.md).
-  - [ ] **L.6f Hotkeys on Linux** (omarchy: Hyprland `bind` IPC, with
+    Code done (`vcam.rs`, a v4l2loopback OUTPUT sink, refused with the
+    install commands while the module is absent); the live ioctl and
+    write path waits on the module.
+  - [x] **L.6f Hotkeys on Linux** (omarchy: Hyprland `bind` IPC, with
     the global-shortcuts portal as the portable fallback).
-  - [ ] **L.6g Plugin sandboxing (SO_PEERCRED + Landlock)** (plugins
+  - [x] **L.6g Plugin sandboxing (SO_PEERCRED + Landlock)** (plugins
     run unsandboxed today; their pid from the socket, landlock rules
     from the manifest).
 
@@ -935,16 +942,16 @@ step live in `docs/notes.md`'s "Linux port WIP" section.
     splits, deletes), crops, an angle with the program's sound, and
     the vertical edited file's size (`JoinPart::in_seconds`, `crop`,
     `audio`, `JoinSpec::size`); refused by `join.rs` today.
-  - [ ] **L.S1b Stream destinations at their own size:** scale in the
+  - [x] **L.S1b Stream destinations at their own size:** scale in the
     live H.264 encoder (libswscale, or a GPU stage) when a frame isn't
     the session's size; refused today.
   - [x] **L.S1c Audio playback (`play_audio`) over PipeWire:** editor
     sound and audio monitoring.
-  - [ ] **L.S1d Machine calibration on Linux:** the daemon's worker is
+  - [x] **L.S1d Machine calibration on Linux:** the daemon's worker is
     `cfg(target_os = "macos")`; Linux has `process_cpu_seconds` and
     `system_cpu_seconds` now, `calibration_priority` and
     `governor_headroom`/`frame_budget` are still `None`.
-  - [ ] **L.S1e System audio that leaves apps out** (`exclude`):
+  - [x] **L.S1e System audio that leaves apps out** (`exclude`):
     per-stream links like per-app audio's, instead of the monitor.
   - [x] **L.S1f Crash-safe Linux writer:** `crash_safe`/`commit` (the
     L.1 writer row): `isocast-mux` or fragmented MP4 with commits.
@@ -2460,6 +2467,14 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
 
 ## Log
 
+- L.2b (2026-10-22): Window and app capture work on Linux. A plain Wayland client (toplevel.rs) of ext-foreign-toplevel-list, ext-image-capture-source and ext-image-copy-capture copies a window's own pixels from wl_shm buffers into the BGRA pool: no portal, picker or restore token, so it runs unattended. A Window source matches app id and title like macOS find_window (largest match wins), follows the window (keeps the last picture when it closes and resumes when a match reappears), holds the take size fixed at open (even-rounded) and letterboxes a resized window. An Application source composites each of the app's windows on the display's shown workspaces at their hyprctl positions onto a transparent display-sized canvas, and redraws (to an empty canvas when none is left) when a window closes, arrives or moves. Verified with a foot window painting red/blue/green blocks: red x 0-279, blue 280-559, y 0-383 exact, equal to grim's crop except under an occluding dialog. A 12 s take across a resize, close and reopen: 0 dropped on the program file, window warn on close and resumed on reopen. Two foot windows composited at their positions, matching grim with 0 stray pixels. An Application take whose only window was closed gives a fully transparent snapshot afterwards. The doctor probe reads the size from the compositor (1250x1322) with a stale HYPRLAND_INSTANCE_SIGNATURE too. Wrong app or title lists the valid pairs. DPMS-off, hidden-workspace windows and a monitor scale other than 1 are unverified.
+- L.6c/L.6d browser pages live on Linux (2026-10-22): `requestAnimationFrame` now animates in the offscreen WebKitGTK view. The cause was two things. The page thread's GLib loop ran on a private MainContext, so GDK's frame clock and WebKit's paint handshake (attached to GLib's default context) never ticked. And accelerated compositing needs a GL context a GtkOffscreenWindow cannot create (SIGABRT on Wayland). The thread now runs the default context and the view uses `HardwareAccelerationPolicy::Never`; each fix alone fails. A snapshot finishing after an unload is dropped, so the empty frame is the next thing the sink sees. `BrowserControl` is exercised for real. Verified through isocastd takes (640x480@30, hevc): an rAF page toggling every 15 callbacks gives 32 luma transitions in 7.8 s (rAF about 62 Hz; 0 before), the setInterval control 43; a second independent take of an rAF-stepped page ran at about 57.6 callbacks/s to the end. A transparent page over a green source is exact: red square edges at 100/200, 50% blue square (0,126,127), background (0,254,0). `refresh` mid-take switches the colour with a second no-cache GET (an unknown id lists the browser sources). `shutdown_when_hidden` loads afresh on return, with the page ISO empty while hidden. `refresh_when_shown` reloads with a no-cache GET, the page staying loaded. A page's audio is still 439.9 Hz. No isocastd cores at exit.
+- L.6f (2026-10-22): global hotkeys on Linux. The daemon registers each chord as a session-only Hyprland bind (`hl.dsp.event("isocast:<pid>:<gen>:<n>:d|u")`, key by position `code:<evdev+8>`, media keys by keysym), and one reader thread on `.socket2.sock` turns the events into Press/Release edges. Verified in a nested Hyprland with a virtual keyboard: ctrl+alt+z push-to-talk held 2.5 s gave press, held {mic}, release, {}, also when the modifiers are lifted first (non-consuming release binds for every smaller modifier set). A plain z fired nothing. f13 fired. `hyprctl reload` re-installs the binds and releases a key held across it. User binds give a conflict warning and are never unbound: a chord another bind holds is refused as a press chord and left out as a release chord (checked with Omarchy-like SUPER + code:10 and XF86AudioPlay binds that survive unset, reload and shutdown). Two daemons only get their own chords. SIGTERM removes every bind, kill -9 leaves them and the next start sweeps them. hyprctl calls time out after 5 s. A parent-owned record engine registers nothing global. Not run against the real session or a physical keyboard.
+- L.6e (2026-10-22): the Linux virtual camera is a v4l2loopback output sink (isocast-platform-linux/src/vcam.rs). The engine's BGRA frames are read back from the GPU, converted to YUYV (integer limited-range BT.601, tagged SMPTE170M) and written whole with write(2); a full device counts as a dropped frame. The device is found by QUERYCAP driver name ("Isocast Camera" preferred, ISOCAST_VCAM_DEVICE overrides), and S_FMT, S_PARM and G_FMT run per start so landscape and vertical sizes can alternate. Refusals are named: module absent (with the pacman and modprobe commands), every device already has a writer, nodes unopenable, S_FMT busy, size above the module's max_width/max_height. On stop, readers keep the last frame (no placeholder card as on macOS). Verified: 13 new unit tests (ioctl numbers and sizes against a C program on videodev2.h, BT.601 values, stride, odd width, device selection, refusal text, memfd write path); fmt, clippy --workspace and 50 platform-linux tests clean; an isolated isocastd without the module answers `vcam start` with the module-naming refusal and status failed; conversion measured at 4.1 ms (1080p) and 16.4 ms (4K) single-threaded. The live ioctl and write path waits for the owner to install v4l2loopback (docs/notes.md "Waiting on Ryan").
+- L.6g (2026-10-22): process plugins run under a Landlock sandbox on Linux (raw landlock syscalls, ABI 10 here, applied in pre_exec) and the daemon socket checks SO_PEERCRED (same-uid only, pid-ancestry scope, /proc/<pid>/stat process_info); verified with a scratch probe plugin and examples/plugins/deck under a private daemon: $HOME, /tmp, /proc, plugin-folder writes, main socket, abstract sockets, signals, exec, TCP connect and (ABI 10) UDP/DNS sends were denied without a grant, and own folder, data/, granted files and 127.0.0.1 serving worked; recordings none/read/write behaved (write can overwrite existing files, disclosed in the consent text, plugin add, doctor and docs/plugins.md); an unsandboxed control run proved the denials were the sandbox.
+- L.S1b (2026-10-22): a stream destination's own width/height works on Linux: the live H.264 encoder scales canvas-size frames to the session's size with libswscale (NV12 to NV12 or BGRA to BGRA, area averaging down, bicubic up, on the encoder worker thread, so the BT.709 matrix is untouched); the "scaling isn't available" refusal is gone. Verified with two local RTMP receivers: 1280x720@30 canvas with a 640x360 destination, 234 packets each, 0 dropped, the 640x360 stream matches the big stream downscaled at 46 dB PSNR (mean abs diff 0.33), and an independent re-run gave 295 packets each, 0 dropped; 2560x1440@60 canvas with 1920x1080 and 640x360 destinations, 0 dropped, 47 dB; a 641-wide destination is refused by validation with the field path. Scaling costs 0.7-0.9 ms per frame to 640x360 (4.4 ms to 1080p from 1440p) in a debug test. The scaler checks its source planes' lengths before swscale reads them.
+- L.S1d (2026-10-23): `isocast machine calibrate` and `machine show` work on Linux: the daemon's helper measures NVENC and ProRes recording cells through the ffmpeg writer, which counts completed pictures from `-progress pipe:1 -stats_period 0.1`. The helper runs at nice 15 with its ffmpeg children and is killed as a process group on cancel, even if the helper has already exited. Rows are filed under backend `ffmpeg`, and each row's `hardware_accelerated` says NVENC or software (the capacity fit stays macOS-only). The warm-up now starts at the encoder's first completed picture (new `FileWriter::starts_at_first_picture`), the HEVC `bit_depth = 10` ffmpeg bug is fixed (Main 10), and `OPEN_AND_FINISH` is 1000 ms on Linux. Also added: Linux governor headroom (CPU % from /proc/stat, memory PSI) and a frame-budget ledger over the CPU pools (`pool_count`, `distinct_buffers`, `in_use`, `peak_in_use`, `refused`), with the doctor check printing only reported keys. Verified: release build, own daemon: calibration in 22.1 to 22.3 s wall (limit 29 s) with 10 to 15 encoder rows, 5 to 6 ProRes resource rows, 2 graphics rows, and helper and ffmpeg children at NI 15. Also verified: cancel reaps all ffmpeg within 200 ms and keeps the profile, the profile persists across restart, a 4 s take with `bit_depth = 10` is ffprobe Main 10 yuv420p10le, headroom CPU matches an independent /proc/stat reading (7.0 vs 7.1 %, 56.9 vs 56.9 %, 100 vs 100 %), and the governor reports bottleneck memory under real PSI 27 without dropping frames.
+- L.S1e (2026-10-22): system audio that leaves apps out works on Linux: `exclude` (and `exclude_own`, i.e. monitoring on) links every playback stream except the named apps and Isocast's own monitoring (node property `isocast.owner`) to the capture through the registry, picking up streams that start mid-take; without either, the default sink's monitor is used as before. Verified with pw-play 440 Hz and paplay 1000 Hz into a null sink, 7 s takes, FFT: exclude paplay gives 440 Hz only (1000 Hz bin 0.0), exclude pw-play gives 1000 Hz only, exclude pacat (binary) gives 440 only, both excluded gives exact silence (peak 0.0), a typo'd exclude records both with no error; a paplay started mid-take stays out (1000 Hz 0.0 every second) or comes in from second 2 when it is not excluded; the included player ending mid-take keeps the take (0 dropouts, no warning); exclude_own with a monitored 2000 Hz tone on the same sink leaves it out (pw-link shows no link from isocast monitor to the capture); per-app capture and the monitor path still pass; an independent reviewer re-ran exclude and exclude_own with the same results; no graph leftovers, default sink unchanged. Also fixed: capture streams that link themselves are no longer autoconnected (WirePlumber linked the microphone to them beside the streams).
 - L.S1f crash-safe Linux writer (2026-10-22): the ffmpeg writer says
   it is crash-safe; `committed()` reads the file's whole fragments back
   from its boxes (fragments.rs: `moov` tracks, each `moof`'s `tfdt` and
