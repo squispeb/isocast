@@ -1370,6 +1370,9 @@ impl Daemon {
         // and a close, not a dropped socket.
         self.websocket.stop();
         self.plugins.stop_all();
+        // Session-scoped compositor binds do not outlive the daemon.
+        #[cfg(target_os = "linux")]
+        isocast_platform_linux::hotkeys::clear();
         #[cfg(unix)]
         let _ = std::fs::remove_file(socket_path());
         isocast_diagnostics::clean_exit();
