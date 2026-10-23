@@ -90,7 +90,10 @@ const ALL_FS: u64 = FS_EXECUTE
 
 /// ABI 4: TCP connect (and bind).
 const NET_CONNECT_TCP: u64 = 1 << 1;
-const ALL_NET: u64 = NET_CONNECT_TCP;
+/// ABI 10: setting the remote port of a UDP socket, which sending a
+/// datagram (DNS included) needs. `BIND_UDP` stays unhandled, so a
+/// plugin's sockets still get their automatic local port.
+const NET_CONNECT_SEND_UDP: u64 = 1 << 3;
 
 /// ABI 6: abstract unix sockets and signals outside the sandbox.
 const SCOPE_ABSTRACT_UNIX: u64 = 1 << 0;
@@ -154,12 +157,31 @@ pub fn gaps() -> Vec<&'static str> {
     if abi < 6 {
         gaps.push("abstract unix sockets and signals aren't limited (Landlock ABI 6)");
     }
-    if abi < 9 {
-        gaps.push("it can connect to any unix socket its files allow (Landlock ABI 9)");
+    if unix_sockets_open() {
+        gaps.push(
+            "it can connect to any unix socket its files allow, such as PipeWire's (microphone, \
+             camera and screen streams), the D-Bus session bus (portals, the keyring) and \
+             isocastd's own (Landlock ABI 9)",
+        );
     }
-    gaps.push("UDP, DNS and raw sockets aren't limited, so a `network` denial is TCP only");
+    if abi < 10 {
+        gaps.push(
+            "UDP and DNS aren't limited, so a `network` denial is TCP only (Landlock ABI 10)",
+        );
+    }
     gaps
 }
+
+/// Whether this kernel's sandbox lets a plugin connect to unix sockets
+/// its files allow (below Landlock ABI 9, which can deny it): PipeWire,
+/// D-Bus and isocastd's own socket are then reachable.
+pub fn unix_sockets_open() -> bool {
+    abi() < 9
+}
+
+/// What a `recordings = "write"` grant allows that macOS's doesn't.
+pub const RECORDINGS_WRITE_GAP: &str = "the Linux sandbox can't stop it changing or truncating \
+     existing recording files (Landlock has no per-file patterns), including the one being recorded";
 
 /// What a plugin's process may touch. Paths are canonical (resolved);
 /// one that doesn't exist is left out of the ruleset.
@@ -180,7 +202,8 @@ pub struct Sandbox {
     /// socket to isocastd, and so no other socket (the main one, the
     /// compositor's, PipeWire's, D-Bus).
     pub sockets: Vec<PathBuf>,
-    /// It may connect out over TCP. Without it, it can only serve.
+    /// It may connect out over TCP (and send UDP, where the kernel can
+    /// hold that back). Without it, it can only serve.
     pub network: bool,
     /// The recordings folders and what it may do in them. Landlock has no
     /// patterns, so `Write` is a rule on each folder that lets it make
@@ -265,10 +288,10 @@ impl Sandbox {
             };
         // Serving stays possible: bind isn't handled, so a plugin binds
         // 127.0.0.1 itself (Landlock can't hold a bind to loopback).
-        let handled_net = if abi >= 4 && !self.network {
-            ALL_NET
-        } else {
-            0
+        let handled_net = match (abi, self.network) {
+            (0..=3, _) | (_, true) => 0,
+            (4..=9, false) => NET_CONNECT_TCP,
+            (_, false) => NET_CONNECT_TCP | NET_CONNECT_SEND_UDP,
         };
         let scoped = if abi >= 6 { ALL_SCOPE } else { 0 };
         let mut rules: Vec<(PathBuf, u64)> = Vec::new();
@@ -557,7 +580,7 @@ mod tests {
         // Connecting to unix sockets, TCP connecting, abstract sockets and
         // signals are all denied by default.
         assert_ne!(plan.handled_fs & FS_RESOLVE_UNIX, 0);
-        assert_eq!(plan.handled_net, NET_CONNECT_TCP);
+        assert_eq!(plan.handled_net, NET_CONNECT_TCP | NET_CONNECT_SEND_UDP);
         assert_eq!(plan.scoped, ALL_SCOPE);
         assert_eq!(rights(&plan, "/dev/null").len(), 1);
     }
@@ -590,6 +613,26 @@ mod tests {
         ] {
             assert_eq!(access & denied, 0);
         }
+    }
+
+    #[test]
+    fn udp_is_held_back_only_where_the_kernel_can() {
+        // ABI 9 has TCP rules only; 10 adds sending UDP (and with it DNS).
+        assert_eq!(sandbox().plan(9).handled_net, NET_CONNECT_TCP);
+        assert_eq!(sandbox().plan(4).handled_net, NET_CONNECT_TCP);
+        assert_eq!(
+            sandbox().plan(10).handled_net,
+            NET_CONNECT_TCP | NET_CONNECT_SEND_UDP
+        );
+        // Binding is never handled, so a plugin can still serve and its
+        // UDP sockets get an automatic port.
+        assert_eq!(sandbox().plan(10).handled_net & 0b101, 0);
+        let network = Sandbox {
+            network: true,
+            ..sandbox()
+        };
+        assert_eq!(network.plan(9).handled_net, 0);
+        assert_eq!(network.plan(10).handled_net, 0);
     }
 
     #[test]

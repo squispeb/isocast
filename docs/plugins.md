@@ -52,7 +52,13 @@ autostart = true
   on without a password has the same full access; keep a password on it.)
 - It runs in a macOS sandbox: it can write only to its own data folder, has
   no network unless granted, cannot open cameras or microphones, and
-  cannot read recordings unless granted (below).
+  cannot read recordings unless granted (below). On Linux the sandbox is
+  Landlock: it can read only its own folder, the system's libraries and
+  the files it was granted, run only its program (and its interpreter's
+  installation), and cannot connect to any other program's socket.
+  `isocast doctor` lists what the kernel's Landlock version doesn't cover
+  (below ABI 10, UDP and DNS; below ABI 9, unix sockets such as PipeWire's
+  and D-Bus's).
 - If it exits five times in five minutes, it is turned off until you enable
   it again.
 
@@ -95,6 +101,15 @@ and `project_created` events, so read `list_projects` when it starts.
 Isocast also looks at the folders every 5 seconds, so one only a
 standalone `isocast record` used, or a folder named like a project made
 while idle, gets its rules within about 5 seconds.
+
+On Linux, Landlock has no name patterns, so `write` is a rule on each
+recordings folder: the plugin can make files and folders in any project
+folder, and **can also overwrite or truncate existing files**, including
+the one being recorded and the engine's `.session.json` and `.partial`
+files (it still can't delete or rename them). `plugin add` and
+`doctor` say so; grant `write` there only to plugins you trust. Recordings
+folders must exist when the plugin starts; one made later restarts it
+within about 5 seconds.
 
 A plugin can't add a recordings folder, since that would widen its own
 sandbox and every other plugin's. A folder it gives must be a recordings
