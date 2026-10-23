@@ -45,6 +45,12 @@ each section. Delete entries that stop being true.
 
 ### L.6f hotkeys
 
+- 2026-10-23 (L.6f, real session): verified with Ryan's physical
+  keyboard on the live Hyprland (safe mode, 227 binds): `ctrl+alt+z`
+  push-to-talk registered `global: true` with no conflict warning
+  (5 isocast binds added), a press held `{"mic": false}` from
+  10:35:06.002 to 10:35:09.682 and released to `{}`, and stopping the
+  daemon (SIGTERM) left 0 isocast binds. The compositor stayed up.
 - 2026-10-22 (L.6f, incident, unchanged): `hyprctl dispatch` with `Keybind:remove()` crashed the owner's real Hyprland 0.56.2 (SIGABRT from a caught SEGV inside a Lua eval). The watchdog restarted it in --safe-mode, and the owner must restart the session. Never call `Keybind:remove()`; use `hl.unbind("<chord>")`. Test Hyprland Lua experiments in a nested instance first: `env -u HYPRLAND_INSTANCE_SIGNATURE WAYLAND_DISPLAY=wayland-1 Hyprland --config <own>.lua`. AQ_BACKENDS=headless does not work on this build (CBackend::create fails).\n- 2026-10-22 (L.6f, review): `hl.unbind(chord)` removes EVERY bind on that chord. It matches the modifier mask plus the key as written, ignoring case. A `code:N` bind keeps the WHOLE chord string as its key (`SUPER + code:10`), so `CTRL + SUPER + code:10` does not match `SUPER + CTRL + code:10`. `hyprctl binds -j` shows such a key as empty, the plain `hyprctl binds` listing shows the chord string. The backend reads both (same order, count must match) and never binds or unbinds a chord that a bind of someone else holds: press chord refused, modifier-subset release chord skipped (warning 'key-up is missed if a modifier is released before the key'). Omarchy's `SUPER + CTRL + code:10..18` panel binds make `ctrl+cmd+1..9` unavailable (it would fire both).\n- 2026-10-22 (L.6f, review): parent-owned engines (foreground record) register no global hotkeys on Linux, as on macOS. Reload and reconnect now re-run the whole registration (conflict checks included) and send a release for held keys. hyprctl runs have a 5 s limit.\n- 2026-10-22 (L.6f): `hl.bind(\"CTRL + ALT + code:52\", ...)` works (code = evdev + 8). Keysym `F13` never fires: the xkb evdev map gives KEY_F13..F18 as XF86Tools and XF86Launch5..9, and KEY_F20 as XF86AudioMicMute. So binds are by position. Media keys bind by keysym and normally collide with Omarchy's locked XF86 binds, reported as a conflict warning.\n- 2026-10-22 (L.6f): a Hyprland release bind fires only when the held modifier mask equals its own at key-up. The backend adds non_consuming release binds for each smaller modifier subset and forwards a release only for a key seen pressed.\n- 2026-10-22 (L.6f): binds are described `isocast <pid> <chord>`, which finds another daemon's chord and sweeps dead daemons' binds. After a compositor restart HYPRLAND_INSTANCE_SIGNATURE can be stale; the backend uses the env signature when `.socket.sock` answers, else the newest live instance under `$XDG_RUNTIME_DIR/hypr`.\n- 2026-10-22 (L.6f): wtype cannot drive binds here (layout 'error'). A virtual-keyboard-v1 client with the system us keymap works (scratch C client target/scratch/hotkeys/vk, outside git; usage `vk <mods> <evdev> [hold-ms] [lift-mods-first]`).\n- 2026-10-22 (L.6f): decisions. Token is the daemon pid and the events carry the generation. The portal GlobalShortcuts route stays deferred (GNOME/KDE). `ISOCAST_DEBUG_KEYS=1` logs the n-to-binding table.\n- 2026-10-22 (process): do not run bare `isocast ...` from a worktree shell: it can auto-start a daemon on the default socket. Always set ISOCAST_SOCKET and ISOCAST_SETUP.\n- Waiting on Ryan: restart the Hyprland session out of --safe-mode. Then one physical-keyboard press of ctrl+alt+z with a daemon on the real session, to confirm the last leg with Handy running.
 
 ### L.6e virtual camera
@@ -2550,11 +2556,6 @@ isocast-platform-linux gpu` once the modules exist.
   --safe-mode` since the 2026-10-22 22:10 crash (see the incident note
   above). Log out and back in (or reboot) to get the normal config back.
   Retry check: `pgrep -a Hyprland` shows no `--safe-mode`.
-- 2026-10-23 (L.6f last leg): with a daemon on the real session, one
-  physical press: `isocast hotkeys set ptt ctrl+alt+z
-  audio.push_to_talk --args '{"source":"mic"}'`, `isocast hotkeys list
-  --json` (expect `global: true`), hold ctrl+alt+z and watch
-  `isocast status --json` for the held source.
 - 2026-10-23 (L.6e live path): after installing v4l2loopback (entry
   below), start the virtual camera and read it with `ffmpeg -f v4l2 -i
   /dev/video10 -frames:v 30 target/scratch/vcam.mkv`; check size,
