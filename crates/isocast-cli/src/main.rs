@@ -2703,7 +2703,14 @@ fn status(json: bool) -> Result<ExitCode> {
         None => println!("Live engine: stopped"),
     }
     if let Some(cpu) = status.cpu_percent {
-        println!("CPU: {cpu:.1}% of this Mac (isocastd)");
+        println!(
+            "CPU: {cpu:.1}% of this {} (isocastd)",
+            if cfg!(target_os = "macos") {
+                "Mac"
+            } else {
+                "computer"
+            }
+        );
     }
     if let Some(timeline) = &status.timeline {
         println!(
