@@ -335,3 +335,48 @@ pub(crate) fn import(
         ))
     }
 }
+
+/// The one-plane layouts (DRM modifiers) the engine's GPU can import a
+/// 32-bit BGRA DMA-BUF in and copy out of: what a stream may be offered
+/// in. Empty when the GPU cannot import at all.
+pub(crate) fn importable_modifiers(gpu: &Gpu) -> Vec<u64> {
+    use ash::vk;
+    if !importable(gpu) {
+        return Vec::new();
+    }
+    // SAFETY: read-only queries on the engine's own physical device.
+    unsafe {
+        let Some(device) = gpu.device.as_hal::<hal::api::Vulkan>() else {
+            return Vec::new();
+        };
+        let instance = device.shared_instance().raw_instance();
+        let physical = device.raw_physical_device();
+        let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
+        let mut properties = vk::FormatProperties2::default().push_next(&mut list);
+        instance.get_physical_device_format_properties2(
+            physical,
+            vk::Format::B8G8R8A8_UNORM,
+            &mut properties,
+        );
+        let count = list.drm_format_modifier_count as usize;
+        let mut modifiers = vec![vk::DrmFormatModifierPropertiesEXT::default(); count];
+        let mut list = vk::DrmFormatModifierPropertiesListEXT::default()
+            .drm_format_modifier_properties(&mut modifiers);
+        let mut properties = vk::FormatProperties2::default().push_next(&mut list);
+        instance.get_physical_device_format_properties2(
+            physical,
+            vk::Format::B8G8R8A8_UNORM,
+            &mut properties,
+        );
+        modifiers
+            .iter()
+            .filter(|modifier| {
+                modifier.drm_format_modifier_plane_count == 1
+                    && modifier
+                        .drm_format_modifier_tiling_features
+                        .contains(vk::FormatFeatureFlags::TRANSFER_SRC)
+            })
+            .map(|modifier| modifier.drm_format_modifier)
+            .collect()
+    }
+}

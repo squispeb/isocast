@@ -3559,6 +3559,7 @@ name = "isocast-platform-linux"
 version = "0.0.8"
 dependencies = [
  "anyhow",
+ "ash",
  "base64 0.22.1",
  "cairo-rs",
  "ffmpeg-sys-next",

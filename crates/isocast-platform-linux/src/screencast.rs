@@ -24,7 +24,11 @@ use isocast_engine::{CaptureFormat, FramePool, Platform, VideoSink};
 use pipewire as pw;
 use pw::spa;
 
+use isocast_engine::gpu::{FrameImporter, Gpu};
+
+use crate::dmabuf;
 use crate::frames::{CpuPool, LinuxFrame};
+use crate::gpu::VulkanImporter;
 use crate::{LinuxPlatform, portal};
 
 /// How long the stream has to describe its picture once it is connected:
@@ -165,6 +169,12 @@ fn watch(
     )
     .context("creating the screen stream")?;
 
+    // The engine's GPU, when the compositor may render the screen into
+    // DMA-BUFs it imports (dmabuf.rs); shared memory otherwise.
+    let (gpu, modifiers) = match screen_gpu() {
+        Some((gpu, importer, modifiers)) => (Some((gpu, importer)), modifiers),
+        None => (None, Vec::new()),
+    };
     let started = Arc::new(AtomicBool::new(false));
     let pictures = Pictures {
         platform,
@@ -180,6 +190,10 @@ fn watch(
         last: None,
         drops: DropReport::default(),
         unmapped: false,
+        gpu,
+        dmabuf: false,
+        imported: Vec::new(),
+        shm_format: format_params(fps, None)?,
     };
     let _listener = node
         .add_local_listener_with_user_data(pictures)
@@ -196,12 +210,24 @@ fn watch(
         move |()| mainloop.quit()
     });
 
-    let picture = format_params(fps)?;
-    let buffers = buffer_params()?;
-    let mut params = [
-        spa::pod::Pod::from_bytes(&picture).context("building the screen stream's format")?,
-        spa::pod::Pod::from_bytes(&buffers).context("building the screen stream's buffers")?,
-    ];
+    // GPU buffers first, in the layouts the engine's GPU imports, then
+    // shared memory: the compositor picks the first it can serve. The
+    // buffer kind follows in `param_changed`, once the format is fixed.
+    let dmabuf_format = if modifiers.is_empty() {
+        None
+    } else {
+        Some(format_params(fps, Some(&modifiers))?)
+    };
+    let shm_format = format_params(fps, None)?;
+    let mut params = Vec::new();
+    if let Some(format) = &dmabuf_format {
+        params.push(
+            spa::pod::Pod::from_bytes(format).context("building the screen stream's format")?,
+        );
+    }
+    params.push(
+        spa::pod::Pod::from_bytes(&shm_format).context("building the screen stream's format")?,
+    );
     node.connect(
         spa::utils::Direction::Input,
         Some(stream.node),
@@ -209,6 +235,7 @@ fn watch(
         &mut params,
     )
     .context("connecting to the desktop's screen node")?;
+
     mainloop.run();
     Ok(())
 }
@@ -236,6 +263,15 @@ struct Pictures {
     drops: DropReport,
     /// Complained about an unreadable buffer already.
     unmapped: bool,
+    /// The engine's GPU, while the stream may be in DMA-BUFs.
+    gpu: Option<(Gpu, VulkanImporter)>,
+    /// The fixed format is a DMA-BUF one.
+    dmabuf: bool,
+    /// Each stream buffer's import, by its descriptor (the stream keeps
+    /// its buffers until the format changes).
+    imported: Vec<(std::os::fd::RawFd, wgpu::Texture)>,
+    /// The shared-memory format, offered alone if an import fails.
+    shm_format: Vec<u8>,
 }
 
 impl Pictures {
@@ -257,7 +293,7 @@ impl Pictures {
 /// The compositor settled the picture's shape: build the pool that frame
 /// size needs, and tell the caller the format it is recording at.
 fn param_changed(
-    _stream: &pw::stream::Stream,
+    stream: &pw::stream::Stream,
     data: &mut Pictures,
     id: u32,
     param: Option<&spa::pod::Pod>,
@@ -307,17 +343,38 @@ fn param_changed(
     let fps = rate.num / rate.denom.max(1);
     data.size = (width, height);
     data.pool = Some(CpuPool::bgra(width, height));
+    // A format with a layout (modifier) is a DMA-BUF one: the buffers are
+    // asked for as such, else as mapped memory.
+    data.dmabuf = data.gpu.is_some()
+        && data
+            .format
+            .flags()
+            .contains(spa::param::video::VideoFlags::MODIFIER);
+    data.imported.clear();
+    match buffer_params(data.dmabuf) {
+        Ok(buffers) => {
+            if let Ok(pod) = spa::pod::Pod::from_bytes(&buffers).context("buffers") {
+                let _ = stream.update_params(&mut [pod]);
+            }
+        }
+        Err(err) => isocast_diagnostics::diagnostic!("warn"; "screen: {err:#}"),
+    }
     data.started.store(true, Ordering::SeqCst);
     let max = data.format.max_framerate();
-    isocast_diagnostics::debug!(
-        "screen: the desktop shares {width}x{height} {pixel:?} ({} Hz, at most {}/{})",
+    isocast_diagnostics::diagnostic!(
+        "info"; "screen: the desktop shares {width}x{height} {pixel:?} ({} Hz, at most {}/{}) {}",
         if fps == 0 {
             "its own".to_string()
         } else {
             fps.to_string()
         },
         max.num,
-        max.denom
+        max.denom,
+        if data.dmabuf {
+            format!("in GPU buffers (modifier {:#x})", data.format.modifier())
+        } else {
+            "in shared memory".to_string()
+        }
     );
     // A variable-rate stream (0/1) is delivered at the take's own rate:
     // pictures closer than `interval` are dropped. The engine paces by
@@ -374,6 +431,29 @@ fn process(stream: &pw::stream::Stream, data: &mut Pictures) {
     let Some(first) = buffer.datas_mut().first_mut() else {
         return;
     };
+    if data.dmabuf && first.type_() == spa::buffer::DataType::DmaBuf {
+        let chunk = first.chunk();
+        let stride = match chunk.stride() {
+            stride if stride > 0 => stride as u32,
+            _ => row_bytes as u32,
+        };
+        let (fd, offset) = (first.fd(), chunk.offset());
+        data.last = Some(now);
+        if let Err(err) = gpu_picture(data, fd, offset, stride) {
+            // Shared memory from here on: the compositor is offered only
+            // that, and renegotiates.
+            isocast_diagnostics::diagnostic!(
+                "info"; "screen: copying the picture through shared memory ({err:#})"
+            );
+            data.gpu = None;
+            data.dmabuf = false;
+            data.imported.clear();
+            if let Ok(pod) = spa::pod::Pod::from_bytes(&data.shm_format).context("format") {
+                let _ = stream.update_params(&mut [pod]);
+            }
+        }
+        return;
+    }
     let (offset, stride) = {
         let chunk = first.chunk();
         let stride = match chunk.stride() {
@@ -386,9 +466,9 @@ fn process(stream: &pw::stream::Stream, data: &mut Pictures) {
         if !data.unmapped {
             data.unmapped = true;
             data.ended(
-                "the desktop shared the screen as a DMA-BUF this build cannot read (its import \
-                 is L.4): put `force_shm = true` in the screencopy section of \
-                 ~/.config/hypr/xdph.conf to share pictures this way"
+                "the desktop shared the screen as a DMA-BUF this process cannot import: put \
+                 `force_shm = true` in the screencopy section of ~/.config/hypr/xdph.conf to \
+                 share pictures through shared memory"
                     .into(),
             );
             data.mainloop.quit();
@@ -420,6 +500,89 @@ fn process(stream: &pw::stream::Stream, data: &mut Pictures) {
             data.mainloop.quit();
         }
     }
+}
+
+/// The engine's GPU, an importer on it and the layouts it imports
+/// 32-bit BGRA DMA-BUFs in, when the screen may come as GPU buffers.
+/// `ISOCAST_SCREEN_SHM=1` keeps shared memory (for comparisons).
+fn screen_gpu() -> Option<(Gpu, VulkanImporter, Vec<u64>)> {
+    if std::env::var_os("ISOCAST_SCREEN_SHM").is_some() {
+        return None;
+    }
+    let gpu = Gpu::new().ok()?;
+    let modifiers = dmabuf::importable_modifiers(&gpu);
+    if modifiers.is_empty() {
+        return None;
+    }
+    let importer = VulkanImporter::new(&gpu).ok()?;
+    Some((gpu, importer, modifiers))
+}
+
+/// One DMA-BUF picture: imported the first time its buffer is seen, then
+/// copied on the GPU into a pool frame's texture. The copy is waited for:
+/// the buffer goes back to the compositor when `process` returns.
+fn gpu_picture(
+    data: &mut Pictures,
+    fd: std::os::fd::RawFd,
+    offset: u32,
+    stride: u32,
+) -> Result<()> {
+    let (width, height) = data.size;
+    let (gpu, importer) = data
+        .gpu
+        .as_mut()
+        .context("no GPU for the screen's buffers")?;
+    let texture = match data.imported.iter().find(|(known, _)| *known == fd) {
+        Some((_, texture)) => texture.clone(),
+        None => {
+            // SAFETY: the stream's buffer descriptor, open while the
+            // buffer is dequeued; `import` duplicates it.
+            let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+            let texture = dmabuf::import(
+                gpu,
+                borrowed,
+                width,
+                height,
+                data.format.modifier(),
+                stride,
+                offset,
+            )?;
+            data.imported.push((fd, texture.clone()));
+            texture
+        }
+    };
+    let Some(pool) = data.pool.as_mut() else {
+        return Ok(());
+    };
+    let Some(frame) = pool.take().context("taking a frame for the screen")? else {
+        data.drops.count();
+        return Ok(());
+    };
+    let target = importer
+        .target(&frame)
+        .context("the screen's frame on the GPU")?;
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    encoder.copy_texture_to_texture(
+        texture.as_image_copy(),
+        target.as_image_copy(),
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    let submission = gpu.queue.submit([encoder.finish()]);
+    gpu.device
+        .poll(wgpu::PollType::Wait {
+            submission_index: Some(submission),
+            timeout: Some(Duration::from_secs(1)),
+        })
+        .context("the GPU did not finish copying the screen")?;
+    // The texels are the picture; the CPU bytes are not.
+    frame.set_gpu_synced(frame.cpu_version());
+    data.drops.reset();
+    (data.sink.frame)(frame, data.platform.now());
+    Ok(())
 }
 
 /// How many pictures the pool was too full to take, reported rarely: a
@@ -455,13 +618,22 @@ impl DropReport {
 }
 
 /// The picture this stream will take: 4-byte BGRA orders only, at the
-/// compositor's own size, and asking for the take's frame rate.
-fn format_params(fps: u32) -> Result<Vec<u8>> {
+/// compositor's own size, and asking for the take's frame rate; with
+/// `modifiers`, as a DMA-BUF in one of those layouts (the compositor
+/// fixes which).
+fn format_params(fps: u32, modifiers: Option<&[u64]>) -> Result<Vec<u8>> {
     use spa::param::format::{FormatProperties, MediaSubtype, MediaType};
     use spa::param::video::VideoFormat;
     use spa::pod::{Value, object, property};
     use spa::utils::{Fraction, Rectangle, SpaTypes};
-    let object = object!(
+    // In GPU buffers the alpha channel is sampled as it is, so BGRA comes
+    // first there; shared memory is copied byte for byte either way.
+    let (default, other) = if modifiers.is_some() {
+        (VideoFormat::BGRA, VideoFormat::BGRx)
+    } else {
+        (VideoFormat::BGRx, VideoFormat::BGRA)
+    };
+    let mut object = object!(
         SpaTypes::ObjectParamFormat,
         spa::param::ParamType::EnumFormat,
         property!(FormatProperties::MediaType, Id, MediaType::Video),
@@ -471,9 +643,9 @@ fn format_params(fps: u32) -> Result<Vec<u8>> {
             Choice,
             Enum,
             Id,
-            VideoFormat::BGRx,
-            VideoFormat::BGRx,
-            VideoFormat::BGRA
+            default,
+            default,
+            other
         ),
         property!(
             FormatProperties::VideoSize,
@@ -530,19 +702,40 @@ fn format_params(fps: u32) -> Result<Vec<u8>> {
             }
         ),
     );
+    if let Some(modifiers) = modifiers {
+        use spa::pod::{ChoiceValue, Property, PropertyFlags};
+        use spa::utils::{Choice, ChoiceEnum, ChoiceFlags};
+        let modifiers: Vec<i64> = modifiers.iter().map(|modifier| *modifier as i64).collect();
+        object.properties.push(Property {
+            key: FormatProperties::VideoModifier.as_raw(),
+            flags: PropertyFlags::MANDATORY | PropertyFlags::DONT_FIXATE,
+            value: Value::Choice(ChoiceValue::Long(Choice(
+                ChoiceFlags::empty(),
+                ChoiceEnum::Enum {
+                    default: modifiers[0],
+                    alternatives: modifiers,
+                },
+            ))),
+        });
+    }
     serialize(&Value::Object(object)).context("serializing the screen stream's format")
 }
 
-/// The buffers this consumer can read: mapped memory (a memfd, or plain
-/// shared memory). A DMA-BUF is an fd whose bytes want importing into the
-/// GPU (L.4) rather than copying, so the compositor is asked for the
-/// shapes [`process`] copies from; a node that hands one over anyway ends
-/// the capture with a message naming it.
-fn buffer_params() -> Result<Vec<u8>> {
+/// The buffers this consumer takes: DMA-BUFs for a format with a layout
+/// (imported into the GPU), else mapped memory (a memfd, or plain shared
+/// memory) that [`process`] copies from; a node that hands a DMA-BUF over
+/// anyway ends the capture with a message naming it.
+fn buffer_params(dmabuf: bool) -> Result<Vec<u8>> {
     use spa::pod::{ChoiceValue, Object, Property, PropertyFlags, Value};
     use spa::utils::{Choice, ChoiceEnum, ChoiceFlags, SpaTypes};
     let memfd = 1 << spa::sys::SPA_DATA_MemFd;
     let memptr = 1 << spa::sys::SPA_DATA_MemPtr;
+    let gpu = 1 << spa::sys::SPA_DATA_DmaBuf;
+    let (default, flags) = if dmabuf {
+        (gpu, vec![gpu])
+    } else {
+        (memfd, vec![memfd, memptr])
+    };
     let object = Object {
         type_: SpaTypes::ObjectParamBuffers.as_raw(),
         id: spa::param::ParamType::Buffers.as_raw(),
@@ -551,10 +744,7 @@ fn buffer_params() -> Result<Vec<u8>> {
             flags: PropertyFlags::empty(),
             value: Value::Choice(ChoiceValue::Int(Choice(
                 ChoiceFlags::empty(),
-                ChoiceEnum::Flags {
-                    default: memfd,
-                    flags: vec![memfd, memptr],
-                },
+                ChoiceEnum::Flags { default, flags },
             ))),
         }],
     };
