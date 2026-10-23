@@ -5,6 +5,46 @@ each section. Delete entries that stop being true.
 
 ## Linux port progress (2026-10-23, parity workflow: L.2b, L.6c-g, L.S1b, L.S1d, L.S1e)
 
+- 2026-10-23 (fixed, video-memory leak): with the app open, the
+  daemon's VRAM grew to fill the 8 GB GPU in about two minutes (the
+  desktop stuttered, then systemd-oomd killed the session). Cause: since
+  v0.0.8 the engine shares one wgpu device per process, but each
+  `VulkanImporter` had its own token, so every importer that wasn't a
+  slot's maker (each shared-frame viewer, scene tile and thumbnail)
+  read the frame back and uploaded it into textures of its own, kept per
+  pool slot (up to 32) for as long as the pool lived. The token is now
+  the device's (`Gpu::id`). Repro (window source on air, app open):
+  before +1.4 GB in 36 s and +884 MB held after the app closed; after
+  +290 MB steady for 2 min, daemon RAM 345 MB instead of 585 MB, all freed
+  when the app closes. Measured in capped `systemd-run` units with a
+  VRAM guard (scratch scripts in target/scratch/leak).
+- 2026-10-23 (fixed, calibration): automatic machine calibration ran
+  about 4 s after every default daemon start (no profile had ever been
+  saved): parallel 4K ffmpeg encodes, 2.5 GB+ of RAM, 9-10 cores and up
+  to 1.7 GB of VRAM, on the GPU the desktop uses. On Linux it now runs
+  only when asked (`isocast machine calibrate`, or
+  `ISOCAST_CALIBRATION=on`).
+- 2026-10-23 (gotcha): launch the app and daemon for tests in their own
+  capped units (`systemd-run --user -p MemoryMax=2G -p MemorySwapMax=0`),
+  never from the agent's shell: systemd-oomd kills the whole scope it
+  runs in, which took the session down once.
+- 2026-10-23 (gotcha): portal restore tokens are single-use. Two daemons
+  presenting the same token make the second one prompt ("restore data
+  invalid / missing, prompting" in xdph's log), and each prompt launched
+  `hyprland-preview-share-picker`, which crashed.
+- 2026-10-23 (open, Hyprland): a window source with `cursor = true` on
+  the focused Helium window playing a Twitch video captured T3 Code
+  instead (2528x1374, every time); without the cursor, or for other
+  windows with it, the right window comes back. Points at Hyprland
+  0.56.2's paint-cursors path for that window. Repro:
+  target/scratch/leak/window.toml vs window-nc.toml, `isocast snapshot
+  scree`.
+- 2026-10-23 (open): three `isocast frames --shared --check` processes
+  started at once all failed "could not open the GPU: Parent device is
+  lost"; one alone reads 124 frames back with 0 black. A daemon that
+  failed to open a device aborted in NVIDIA's `vkDestroyDevice` during
+  wgpu's cleanup (coredump 2026-10-23 12:58:50, `Gpu::with_thread` from
+  `Engine::start`).
 - 2026-10-23 (permissions wording): the app's permission sheet, its
   error toast, `isocast permissions --request` and a source waiting for
   permission said "macOS" on Linux. They now use the desktop's words

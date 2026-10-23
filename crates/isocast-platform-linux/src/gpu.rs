@@ -32,18 +32,20 @@ const ROW_ALIGN: u64 = 256;
 pub struct VulkanImporter {
     device: wgpu::Device,
     queue: wgpu::Queue,
-    /// Identifies *this* importer's device: `wgpu::Device` compares by
-    /// id, and ids start over every instance, so two devices in one
-    /// process compare equal and reusing the wrong textures ends in
-    /// "Cannot get non-existent resource". A maker's token is unique.
+    /// Identifies this importer's device ([`Gpu::id`]): `wgpu::Device`
+    /// compares by an id that starts over every instance, so two devices
+    /// in one process can compare equal, and reusing the wrong textures
+    /// ends in "Cannot get non-existent resource". Every importer on the
+    /// same device has the same token, so they share a slot's textures:
+    /// the engine opens one device per process, and a per-importer token
+    /// made every viewer copy every frame it showed into textures of its
+    /// own (read back, then uploaded), up to a pool's 32 slots each, kept
+    /// as long as the pool.
     token: u64,
     /// Copies of slots another device drew (`Foreign`), kept so a viewer
     /// showing the program doesn't remake its textures every frame.
     foreign: Vec<Foreign>,
 }
-
-/// The next importer's token.
-static TOKENS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A pool slot's textures on *this* device, for a slot whose own
 /// textures belong to another one.
@@ -81,7 +83,7 @@ impl VulkanImporter {
         Ok(Self {
             device: gpu.device.clone(),
             queue: gpu.queue.clone(),
-            token: TOKENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+            token: gpu.id,
             foreign: Vec::new(),
         })
     }
@@ -130,9 +132,8 @@ impl VulkanImporter {
 
     /// The frame's planes on this device, for a frame whose own textures
     /// belong to another one: read back out of the device that has the
-    /// picture, then uploaded here. The engine's viewers each have their
-    /// own GPU, so a viewer of the live program copies a frame — the
-    /// price of no DMA-BUF yet.
+    /// picture, then uploaded here. Only after a device is lost and a
+    /// new one opened do two devices see the same slots.
     fn textures_of_our_own(&mut self, frame: &LinuxFrame) -> Result<Vec<wgpu::Texture>> {
         // The drawing device's newest texels into the pool's CPU bytes
         // (a writer's read-back of the same version is reused).

@@ -18,6 +18,11 @@ use crate::render::{TexelKind, Texels};
 pub struct Gpu {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
+    /// This device, among every one the process opens: `wgpu::Device`
+    /// compares by an id that starts over in each instance, so two
+    /// devices can compare equal. Importers on the same device share
+    /// textures by this.
+    pub id: u64,
     poll: mpsc::SyncSender<()>,
     lost: Arc<AtomicBool>,
     fault: Option<Arc<Fault>>,
@@ -127,9 +132,11 @@ impl Gpu {
             })
             .context("could not start GPU completion thread")?;
         isocast_diagnostics::diagnostic!("debug"; "opened shared GPU");
+        static IDS: AtomicU32 = AtomicU32::new(0);
         Ok(Self {
             device,
             queue,
+            id: u64::from(IDS.fetch_add(1, Ordering::Relaxed)) + 1,
             poll,
             lost,
             fault,

@@ -204,11 +204,16 @@ impl Daemon {
         }
         // Other daemons cannot see our outputs. An isolated snapshot/test
         // engine must never spend hardware encoder capacity automatically.
+        // On Linux the encoders and the desktop share one GPU: the 4K
+        // test encodes took 2.5 GB of memory, ten cores and GBs of video
+        // memory within seconds of every start, so there it runs only when
+        // asked (`isocast machine calibrate`, or ISOCAST_CALIBRATION=on).
         let allowed = match std::env::var("ISOCAST_CALIBRATION").as_deref() {
             Ok("off") => false,
             Ok("on") => true,
             _ => {
-                std::env::var_os("ISOCAST_SOCKET").is_none()
+                !cfg!(target_os = "linux")
+                    && std::env::var_os("ISOCAST_SOCKET").is_none()
                     && std::env::var_os("ISOCAST_SETUP").is_none()
             }
         };

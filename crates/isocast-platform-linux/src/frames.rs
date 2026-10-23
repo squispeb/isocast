@@ -50,20 +50,20 @@ pub struct Shared {
     textures: Mutex<Option<Imported>>,
 }
 
-/// A slot's GPU twins and the instance they live in. The engine makes a
-/// new GPU (a new wgpu device) for each program run, snapshot and shared
-/// frame viewer, so a frame must remember which one its textures belong
-/// to: reading a frame back on another device looks its texture up in
-/// the wrong registry and panics ("Cannot get non-existent resource").
+/// A slot's GPU twins and the device they live in. The engine shares one
+/// GPU per process, but opens a new one after a device is lost, so a
+/// frame must remember which one its textures belong to: reading a frame
+/// back on another device looks its texture up in the wrong registry and
+/// panics ("Cannot get non-existent resource").
 #[derive(Clone)]
 pub(crate) struct Imported {
     pub textures: Vec<wgpu::Texture>,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
-    /// The importer instance that made them. Never compare the devices
+    /// The device that made them (`Gpu::id`). Never compare the devices
     /// (`wgpu::Device` compares by id, and ids start over every
     /// instance, so two devices in a process all look like `DeviceId(0,1)`
-    /// and compare equal — docs/notes.md); only the maker gets to reuse.
+    /// and compare equal — docs/notes.md); only the maker's device reuses.
     pub maker: u64,
 }
 
