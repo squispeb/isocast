@@ -58,8 +58,16 @@ use wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_captu
 use wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_session_v1::{
     self, ExtImageCopyCaptureSessionV1,
 };
+use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_buffer_params_v1::{
+    self, ZwpLinuxBufferParamsV1,
+};
+use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1;
 
+use isocast_engine::gpu::{FrameImporter, Gpu};
+
+use crate::dmabuf;
 use crate::frames::{CpuPool, LinuxFrame};
+use crate::gpu::VulkanImporter;
 use crate::hyprland::{self, Client, Monitor};
 use crate::window_pixels::{self as pixels, Layout, Picture, Rect};
 use crate::{LinuxPlatform, system};
@@ -183,6 +191,10 @@ fn choices(infos: &[Info]) -> String {
 struct Constraints {
     size: Option<(u32, u32)>,
     formats: Vec<u32>,
+    /// DMA-BUF formats and the layouts (modifiers) offered for each.
+    dmabuf: Vec<(u32, Vec<u64>)>,
+    /// The compositor's main device (`dev_t`) for DMA-BUFs.
+    device: Option<u64>,
 }
 
 /// How one frame ended.
@@ -308,6 +320,76 @@ impl Drop for ShmBuffer {
     }
 }
 
+/// One picture's worth of GPU memory the compositor renders into: a GBM
+/// buffer, as a `wl_buffer` for the compositor and as a texture of the
+/// engine's GPU for us (dmabuf.rs).
+struct DmaBuffer {
+    buffer: WlBuffer,
+    texture: wgpu::Texture,
+    /// The copy out of it still on the GPU: the compositor must not
+    /// render the next picture into it before that is done.
+    busy: Option<wgpu::SubmissionIndex>,
+    width: u32,
+    height: u32,
+    /// Freed after the `wl_buffer` and the texture are.
+    _bo: dmabuf::Buffer,
+}
+
+impl DmaBuffer {
+    fn new(
+        gpu: &Gpu,
+        dmabuf_global: &ZwpLinuxDmabufV1,
+        qh: &QueueHandle<State>,
+        allocator: &dmabuf::Allocator,
+        (width, height): (u32, u32),
+        modifiers: &[u64],
+    ) -> Result<Self> {
+        let bo = allocator.allocate(width, height, dmabuf::ARGB8888, modifiers)?;
+        let texture = dmabuf::import(
+            gpu,
+            bo.fd()?.as_fd(),
+            width,
+            height,
+            bo.modifier,
+            bo.stride,
+            bo.offset,
+        )?;
+        let params = dmabuf_global.create_params(qh, ());
+        let fd = bo.fd()?;
+        params.add(
+            fd.as_fd(),
+            0,
+            bo.offset,
+            bo.stride,
+            (bo.modifier >> 32) as u32,
+            bo.modifier as u32,
+        );
+        let buffer = params.create_immed(
+            width as i32,
+            height as i32,
+            dmabuf::ARGB8888,
+            zwp_linux_buffer_params_v1::Flags::empty(),
+            qh,
+            (),
+        );
+        params.destroy();
+        Ok(Self {
+            buffer,
+            texture,
+            busy: None,
+            width,
+            height,
+            _bo: bo,
+        })
+    }
+}
+
+impl Drop for DmaBuffer {
+    fn drop(&mut self) {
+        self.buffer.destroy();
+    }
+}
+
 /// One window being captured.
 struct Layer {
     id: u64,
@@ -326,6 +408,9 @@ struct Layer {
     /// Two buffers: one holds the newest complete picture while the
     /// compositor writes the next into the other.
     buffers: Vec<ShmBuffer>,
+    /// Or two GPU buffers (a window source whose picture is the take's
+    /// size, when the compositor and the GPU can share them).
+    dma: Vec<DmaBuffer>,
     layout: Layout,
     /// Which buffer holds the newest complete picture.
     latest: Option<usize>,
@@ -339,7 +424,7 @@ impl Layer {
     /// How long until the next picture is due to be asked for: `None`
     /// while one is being captured (or there is nowhere to put it yet).
     fn due_in(&self, now: Instant, interval: Duration) -> Option<Duration> {
-        if self.frame.is_some() || self.buffers.is_empty() {
+        if self.frame.is_some() || (self.buffers.is_empty() && self.dma.is_empty()) {
             return None;
         }
         Some(self.requested.map_or(Duration::ZERO, |at| {
@@ -477,6 +562,20 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, u64> for State {
                     layer.pending.formats.push(code);
                 }
             }
+            ext_image_copy_capture_session_v1::Event::DmabufFormat { format, modifiers } => {
+                let modifiers = modifiers
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|bytes| u64::from_ne_bytes(*bytes))
+                    .collect();
+                layer.pending.dmabuf.push((format, modifiers));
+            }
+            ext_image_copy_capture_session_v1::Event::DmabufDevice { device } => {
+                layer.pending.device = device
+                    .get(..8)
+                    .map(|bytes| u64::from_ne_bytes(bytes.try_into().expect("8 bytes")));
+            }
             ext_image_copy_capture_session_v1::Event::Done => {
                 let pending = std::mem::take(&mut layer.pending);
                 // A later batch only needs the parts that changed.
@@ -488,6 +587,12 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, u64> for State {
                     } else {
                         pending.formats
                     },
+                    dmabuf: if pending.dmabuf.is_empty() {
+                        previous.dmabuf
+                    } else {
+                        pending.dmabuf
+                    },
+                    device: pending.device.or(previous.device),
                 });
                 layer.changed = true;
             }
@@ -538,6 +643,8 @@ delegate_noop!(State: ignore WlBuffer);
 delegate_noop!(State: ExtForeignToplevelImageCaptureSourceManagerV1);
 delegate_noop!(State: ExtImageCaptureSourceV1);
 delegate_noop!(State: ExtImageCopyCaptureManagerV1);
+delegate_noop!(State: ignore ZwpLinuxDmabufV1);
+delegate_noop!(State: ignore ZwpLinuxBufferParamsV1);
 
 /// The globals a capture needs.
 struct Managers {
@@ -546,6 +653,8 @@ struct Managers {
     source: ExtForeignToplevelImageCaptureSourceManagerV1,
     copy: ExtImageCopyCaptureManagerV1,
     shm: WlShm,
+    /// For GPU buffers; a compositor without it gets shared memory.
+    dmabuf: Option<ZwpLinuxDmabufV1>,
 }
 
 /// Connect to the compositor and bind what window capture needs. A
@@ -583,6 +692,7 @@ fn connect() -> Result<(Connection, EventQueue<State>, Managers, State)> {
     let shm = globals
         .bind::<WlShm, _, _>(&qh, 1..=1, ())
         .map_err(|_| missing("wl_shm"))?;
+    let dmabuf = globals.bind::<ZwpLinuxDmabufV1, _, _>(&qh, 3..=4, ()).ok();
     let state = State {
         toplevels: Vec::new(),
         changed: true,
@@ -598,6 +708,7 @@ fn connect() -> Result<(Connection, EventQueue<State>, Managers, State)> {
             source,
             copy,
             shm,
+            dmabuf,
         },
         state,
     ))
@@ -948,6 +1059,12 @@ struct Follower {
     stall_reported: bool,
     unsupported_reported: bool,
     drops: DropReport,
+    /// The engine's GPU, for pictures the compositor renders into GPU
+    /// buffers (opened with the first one).
+    gpu: Option<(Gpu, VulkanImporter)>,
+    /// Why GPU buffers are not used, once they failed: the capture keeps
+    /// shared memory from then on.
+    dma_refused: Option<String>,
     /// Where each layer's window was last seen (an app's canvas): a change
     /// means the canvas is out of date even if no picture is new.
     placement: Vec<Placed>,
@@ -1000,6 +1117,9 @@ impl Follower {
             stall_reported: false,
             unsupported_reported: false,
             drops: DropReport::default(),
+            gpu: None,
+            dma_refused: std::env::var_os("ISOCAST_WINDOW_SHM")
+                .map(|_| "ISOCAST_WINDOW_SHM is set".to_string()),
             placement: Vec::new(),
             redraw: false,
         };
@@ -1332,6 +1452,7 @@ impl Follower {
             frame: None,
             outcome: None,
             buffers: Vec::new(),
+            dma: Vec::new(),
             layout: pixels::FORMATS[0].1,
             latest: None,
             fresh: false,
@@ -1346,6 +1467,7 @@ impl Follower {
     fn serve_layers(&mut self) -> Result<()> {
         let now = Instant::now();
         let interval = self.interval;
+        let whole = matches!(self.target, Target::Window { .. });
         let mut gave_up = false;
         let mut got_picture = false;
         for layer in &mut self.state.layers {
@@ -1365,6 +1487,15 @@ impl Follower {
                     Outcome::Failed(Failure::Stopped) => layer.stopped = true,
                     Outcome::Failed(Failure::Constraints) => {
                         // New constraints are on their way (or here).
+                        layer.changed = true;
+                    }
+                    Outcome::Failed(Failure::Unknown) if !layer.dma.is_empty() => {
+                        // The compositor would not render into our GPU
+                        // buffers: shared memory from here on.
+                        refuse_dma(
+                            &mut self.dma_refused,
+                            "the compositor failed to copy into a GPU buffer".into(),
+                        );
                         layer.changed = true;
                     }
                     Outcome::Failed(Failure::Unknown) => {
@@ -1401,12 +1532,36 @@ impl Follower {
                     }
                     continue;
                 };
-                let rebuild = layer.buffers.is_empty()
-                    || layer
-                        .buffers
-                        .first()
-                        .is_some_and(|b| (b.width, b.height) != (width, height))
-                    || layer.layout != layout;
+                // GPU buffers for a window picture that is the take's
+                // size (or a pixel more, cut as the CPU path cuts it);
+                // anything that needs scaling or compositing is drawn on
+                // the CPU from shared memory.
+                let canvas = self
+                    .canvas
+                    .unwrap_or((pixels::even(width), pixels::even(height)));
+                let fits = width.checked_sub(canvas.0).is_some_and(|d| d <= 1)
+                    && height.checked_sub(canvas.1).is_some_and(|d| d <= 1);
+                let modifiers = constraints
+                    .dmabuf
+                    .iter()
+                    .find(|(format, _)| *format == dmabuf::ARGB8888)
+                    .map(|(_, modifiers)| modifiers.clone());
+                let want_dma = whole
+                    && fits
+                    && self.dma_refused.is_none()
+                    && self.managers.dmabuf.is_some()
+                    && modifiers.is_some();
+                let rebuild = if want_dma {
+                    layer.dma.first().map(|b| (b.width, b.height)) != Some((width, height))
+                } else {
+                    !layer.dma.is_empty()
+                        || layer.buffers.is_empty()
+                        || layer
+                            .buffers
+                            .first()
+                            .is_some_and(|b| (b.width, b.height) != (width, height))
+                        || layer.layout != layout
+                };
                 if rebuild {
                     // The frame being captured wrote into what goes away.
                     if let Some((frame, _)) = layer.frame.take() {
@@ -1419,11 +1574,33 @@ impl Follower {
                     let format = wl_shm::Format::try_from(code)
                         .map_err(|_| anyhow!("an unknown shared-memory format {code:#x}"))?;
                     layer.buffers.clear();
-                    for _ in 0..2 {
-                        layer.buffers.push(
-                            ShmBuffer::new(&self.managers.shm, &self.qh, width, height, format)
-                                .context("allocating a buffer for the window's picture")?,
-                        );
+                    layer.dma.clear();
+                    if want_dma {
+                        match dma_buffers(
+                            &mut self.gpu,
+                            &self.managers,
+                            &self.qh,
+                            &constraints,
+                            (width, height),
+                            modifiers.as_deref().unwrap_or_default(),
+                        ) {
+                            Ok(buffers) => {
+                                layer.dma = buffers;
+                                isocast_diagnostics::diagnostic!(
+                                    "info"; "window: the compositor renders the picture into \
+                                     GPU buffers ({width}x{height})"
+                                );
+                            }
+                            Err(err) => refuse_dma(&mut self.dma_refused, format!("{err:#}")),
+                        }
+                    }
+                    if layer.dma.is_empty() {
+                        for _ in 0..2 {
+                            layer.buffers.push(
+                                ShmBuffer::new(&self.managers.shm, &self.qh, width, height, format)
+                                    .context("allocating a buffer for the window's picture")?,
+                            );
+                        }
                     }
                     if self.canvas.is_none() {
                         // The first window sets the size of the take.
@@ -1436,9 +1613,23 @@ impl Follower {
             if layer.due_in(now, interval) == Some(Duration::ZERO) {
                 let slot = layer.latest.map_or(0, |latest| 1 - latest);
                 let frame = layer.session.create_frame(&self.qh, layer.id);
-                let buffer = &layer.buffers[slot];
-                frame.attach_buffer(&buffer.buffer);
-                frame.damage_buffer(0, 0, buffer.width as i32, buffer.height as i32);
+                if let Some(buffer) = layer.dma.get_mut(slot) {
+                    // Our copy out of this buffer has to be done before
+                    // the compositor renders the next picture into it
+                    // (it is long done in practice: one frame ago).
+                    if let (Some(busy), Some((gpu, _))) = (buffer.busy.take(), self.gpu.as_ref()) {
+                        let _ = gpu.device.poll(wgpu::PollType::Wait {
+                            submission_index: Some(busy),
+                            timeout: Some(Duration::from_secs(1)),
+                        });
+                    }
+                    frame.attach_buffer(&buffer.buffer);
+                    frame.damage_buffer(0, 0, buffer.width as i32, buffer.height as i32);
+                } else {
+                    let buffer = &layer.buffers[slot];
+                    frame.attach_buffer(&buffer.buffer);
+                    frame.damage_buffer(0, 0, buffer.width as i32, buffer.height as i32);
+                }
                 frame.capture();
                 layer.frame = Some((frame, slot));
                 layer.requested = Some(now);
@@ -1475,6 +1666,57 @@ impl Follower {
         let (Some(canvas), Some(pool)) = (self.canvas, self.pool.as_mut()) else {
             return Ok(());
         };
+        // A window in GPU buffers: its picture is one GPU copy into the
+        // frame's texture, and the CPU never sees it unless a consumer
+        // reads it back.
+        if matches!(self.target, Target::Window { .. })
+            && let Some(layer) = self
+                .state
+                .layers
+                .iter_mut()
+                .find(|layer| !layer.dma.is_empty() && layer.latest.is_some())
+            && let Some((gpu, importer)) = self.gpu.as_mut()
+        {
+            let latest = layer.latest.expect("checked above");
+            let taken = pool
+                .take()
+                .context("taking a frame for the window's picture")?;
+            self.last_output = Some(now);
+            for layer in &mut self.state.layers {
+                layer.fresh = false;
+            }
+            let Some(frame) = taken else {
+                self.drops.count();
+                return Ok(());
+            };
+            let layer = self
+                .state
+                .layers
+                .iter_mut()
+                .find(|layer| !layer.dma.is_empty())
+                .expect("found above");
+            let source = &mut layer.dma[latest];
+            let target = importer
+                .target(&frame)
+                .context("the window's frame on the GPU")?;
+            let mut encoder = gpu.device.create_command_encoder(&Default::default());
+            encoder.copy_texture_to_texture(
+                source.texture.as_image_copy(),
+                target.as_image_copy(),
+                wgpu::Extent3d {
+                    width: canvas.0,
+                    height: canvas.1,
+                    depth_or_array_layers: 1,
+                },
+            );
+            source.busy = Some(gpu.queue.submit([encoder.finish()]));
+            // The texels are the picture; the CPU bytes are not.
+            frame.set_gpu_synced(frame.cpu_version());
+            self.drops.reset();
+            self.redraw = false;
+            (self.sink.frame)(frame, self.platform.now());
+            return Ok(());
+        }
         // Back to front: tiled windows under floating ones, the focused
         // one on top.
         let mut order: Vec<usize> = (0..self.state.layers.len())
@@ -1612,6 +1854,45 @@ impl Follower {
                 self.last_picture.elapsed().as_secs()
             );
         }
+    }
+}
+
+/// Two GPU buffers for a `size` window picture, on the engine's GPU
+/// (opened the first time).
+fn dma_buffers(
+    gpu: &mut Option<(Gpu, VulkanImporter)>,
+    managers: &Managers,
+    qh: &QueueHandle<State>,
+    constraints: &Constraints,
+    size: (u32, u32),
+    modifiers: &[u64],
+) -> Result<Vec<DmaBuffer>> {
+    let dmabuf_global = managers
+        .dmabuf
+        .as_ref()
+        .context("the compositor offers no zwp_linux_dmabuf_v1")?;
+    if gpu.is_none() {
+        let opened = Gpu::new().context("opening the GPU for window pictures")?;
+        if !dmabuf::importable(&opened) {
+            bail!("the GPU's Vulkan driver cannot import DMA-BUFs");
+        }
+        let importer = VulkanImporter::new(&opened)?;
+        *gpu = Some((opened, importer));
+    }
+    let (gpu, _) = gpu.as_ref().expect("opened above");
+    let allocator = dmabuf::Allocator::for_device(constraints.device)?;
+    (0..2)
+        .map(|_| DmaBuffer::new(gpu, dmabuf_global, qh, allocator, size, modifiers))
+        .collect()
+}
+
+/// GPU buffers are given up for this capture, said once.
+fn refuse_dma(refused: &mut Option<String>, why: String) {
+    if refused.is_none() {
+        isocast_diagnostics::diagnostic!(
+            "info"; "window: copying the picture through shared memory ({why})"
+        );
+        *refused = Some(why);
     }
 }
 

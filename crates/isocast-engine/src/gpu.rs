@@ -84,6 +84,11 @@ impl Gpu {
         // genuine NV12 allocations with two aspect views of one texture.
         let required_features = adapter.features()
             & (wgpu::Features::TEXTURE_FORMAT_16BIT_NORM | wgpu::Features::TEXTURE_FORMAT_NV12);
+        // On Linux the compositor renders windows and screens into
+        // DMA-BUFs this device imports (isocast-platform-linux's dmabuf).
+        #[cfg(target_os = "linux")]
+        let required_features = required_features
+            | (adapter.features() & wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF);
         let descriptor = wgpu::DeviceDescriptor {
             label: Some("isocast"),
             required_features,

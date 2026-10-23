@@ -32,6 +32,7 @@ use isocast_protocol::{Canvas, Codec, SourceKind};
 pub(crate) mod audio;
 pub(crate) mod browser;
 pub(crate) mod camera;
+mod dmabuf;
 mod fragments;
 pub(crate) mod frames;
 pub(crate) mod gpu;
