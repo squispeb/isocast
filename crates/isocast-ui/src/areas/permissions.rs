@@ -613,14 +613,28 @@ fn row(d: &PermissionDetail, needed: bool, busy: Option<&str>) -> PermissionItem
                 "",
                 "",
             ),
+            Permission::Denied
+                if cfg!(target_os = "linux") && d.permission == PermissionKind::ScreenRecording =>
+            {
+                (
+                    "denied",
+                    "Not chosen",
+                    "The desktop's screen-sharing picker closed without a choice. Ask again \
+                     and choose a screen."
+                        .to_string(),
+                    "ask",
+                    "Allow…",
+                )
+            }
+            // No settings pane to send anyone to: say what the system said.
             Permission::Denied if cfg!(target_os = "linux") => (
                 "denied",
-                "Not chosen",
-                "The desktop's screen-sharing picker closed without a choice. Ask again and \
-                 choose a screen."
-                    .to_string(),
-                "ask",
-                "Allow…",
+                "Refused",
+                d.next_step.clone().unwrap_or_else(|| {
+                    "The system refused access. Check that your user can open the device.".into()
+                }),
+                "",
+                "",
             ),
             Permission::Denied => (
                 "denied",
