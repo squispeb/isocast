@@ -1062,9 +1062,23 @@ impl Follower {
             self.step(LOOP_TICK.min(Duration::from_millis(50)))?;
         }
         let (width, height) = self.canvas.context("the capture has no size yet")?;
-        isocast_diagnostics::debug!(
-            "window: capturing at {width}x{height} ({} fps asked)",
-            self.fps
+        // Which window a source follows, said once per open: a source that
+        // shows "the wrong window" is then told apart from one whose setup
+        // names that window (a stored collection edited after its file).
+        let followed: Vec<String> = self
+            .state
+            .layers
+            .iter()
+            .map(|layer| {
+                let info = info_of(&layer.handle);
+                format!("{} — {}", info.app_id, info.title)
+            })
+            .collect();
+        isocast_diagnostics::diagnostic!(
+            "info"; "window: capturing {} at {width}x{height} ({} fps asked, cursor {})",
+            followed.join(", "),
+            self.fps,
+            if self.cursor { "painted" } else { "left out" }
         );
         Ok(CaptureFormat {
             width,
