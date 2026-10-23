@@ -5,6 +5,103 @@ each section. Delete entries that stop being true.
 
 ## Linux port progress (2026-10-23, parity workflow: L.2b, L.6c-g, L.S1b, L.S1d, L.S1e)
 
+- 2026-10-23 (open, desktop pacing): with the app on air the 165 Hz
+  desktop drops frames. Measured with a scratch 1x1 layer-shell probe
+  counting Hyprland's frame callbacks (target/scratch/presprobe, run in
+  unit isocast-presprobe; 165/s idle): app with camera and mic 158/s,
+  plus a window source 104/s, plus a browser page 75-77/s, gaps up to
+  72 ms; Hyprland's main thread goes from about 47% to 87% CPU. GPU use
+  stays near 35%. What was ruled out: the window capture itself (a
+  scratch client capturing the same window with shm at 60/s costs
+  nothing; target/scratch/wincap), the shm format, PaintCursors,
+  Hyprland IPC polling (j/clients at 4/s costs nothing), plain CPU load
+  (6 busy threads cost nothing). What costs: our side reading the pages
+  Hyprland reads the window back into (one 14 MB memcpy per frame at
+  50/s costs 17 frames/s; memory traffic generally, 2x dd costs 13), and
+  WebKitGTK 2.54 itself, reproduced outside Isocast with PyGObject
+  (target/scratch/webrepro/page.py: an offscreen view animating plus
+  30 snapshots/s costs 40 frames/s; repaint alone 14, snapshots alone
+  24; no Wayland traffic after start-up, no NVIDIA EGL in the web
+  process). WEBKIT_SKIA_ENABLE_CPU_RENDERING, _DISABLE_DMABUF_RENDERER,
+  _DISABLE_COMPOSITING_MODE, _FORCE_VBLANK_TIMER, _SKIA_CPU_PAINTING_THREADS
+  and Mesa EGL changed nothing (three attempts: stopped). Most likely
+  wrong assumption: that the cost is CPU or GPU work; it behaves like
+  memory or cache contention with Hyprland's render thread, which only a
+  profiler (no perf on this box) can show. Next step for windows:
+  DMA-BUF capture, so Hyprland renders the window into our buffer on the
+  GPU (copyDmabuf) instead of glReadPixels into shm; a first scratch try
+  (wincap dmabuf, GBM with the 13 offered block-linear modifiers; LINEAR
+  is not offered and fails) never got ready or failed back from a nested
+  Hyprland, cause not found. Repro: `target/scratch/fix/measure.sh LABEL`
+  while sources are added (`target/scratch/fix/step.sh`).
+- 2026-10-23 (fixed, app memory): with its window on a hidden workspace
+  the app grew about 500 MB/s (6.2 GiB VmRSS 10 s after it started, much
+  of it not charged to the unit, so MemoryMax did not stop it). Shared
+  frames are uploaded with Queue::write_texture on Slint's queue, which
+  only submits when the window draws. Surface::upload now submits.
+  Hidden for 60 s at 30 frames/s: 208 MiB flat.
+- 2026-10-23 (fixed, GPU): replaces the "three frames --check" open
+  bullet. NVIDIA refuses new Vulkan devices once the GPU has no free
+  channels: vkCreateDevice gives VK_ERROR_INITIALIZATION_FAILED (wgpu:
+  "Parent device is lost") and `journalctl -k` shows NV_ERR_STATE_IN_USE
+  from KernelChannelGroupApi. With the desktop's programs open only 2 to
+  4 more devices fit system-wide (scratch probe
+  target/scratch/vkcount: `vkcount 4 50` opens up to 4 and says which
+  fails). The app's daemon, started while the GPU was full, retried on
+  every request (7368 failed allocations in 11 minutes), which kept other
+  programs from getting one: `vulkaninfo` failed until it stopped. The
+  12:58 abort: wgpu-core's first steps on a new device failed and its
+  drop ran vkDestroyDevice, which aborts in NVIDIA's pthread_cond_destroy.
+  Now (gpu.rs, Linux only): HAL open, one empty submission waited for, a
+  failing device kept (mem::forget), opens cooled down 2 s doubling to
+  30 s, one instance per process, and an error that says what happened.
+- 2026-10-23 (fixed, screen sharing): one share at a time for every
+  Isocast process of the user (flock on
+  $XDG_RUNTIME_DIR/isocast-screen-cast.lock, held from reading the token
+  to keeping the new one); Start's token always replaces the old one,
+  and a spent token with no replacement is forgotten. A picker that ends
+  without a choice is kept in secrets.json as portal/screen-cast-refused;
+  screen sources then wait ("waiting for permission: ... did not give a
+  screen at 14:03 ...") and never call the portal, until Allow… or
+  `isocast permissions --request screen_recording`. The choice is read
+  from xdg-desktop-portal's permission store (`Lookup("screencast",
+  token)`; xdph's data: output, geometry in layout px, windowClass,
+  withCursor, timeIssued) and shown in `isocast permissions` and the
+  app. `reset_permissions` (CLI `--reset`, MCP, the app's "Choose
+  again…") forgets Isocast's token and record, not the portal's store.
+  Not exercised: an explicit request that shows the picker (it needs
+  Ryan to pick). Gotcha: secrets.json lives beside the socket, so a test
+  daemon with a copy of the token presents the same single-use token as
+  the real one; don't copy it (target/scratch/leak/secrets.json was one).
+- 2026-10-23 (finding): the hyprland-preview-share-picker segfaults
+  (11:44, 12:54-12:56) fall in the same minutes as the GPU refusing new
+  devices (86 and 52 NVRM errors in those minutes), so the picker's GTK 4
+  renderer probably crashed for want of a GPU context, and Isocast's
+  retry storms caused both.
+- 2026-10-23 (not a bug, window capture): replaces the "cursor = true
+  captured T3 Code" open bullet. The repro daemon's scene collection
+  (target/scratch/leak/window/collections/default.toml) had been edited
+  at 13:06 to `app = "com.t3tools.T3Code"`, after window.toml was taken
+  in (13:00); the file's hash was unchanged, so the daemon kept the
+  collection. The wrong picture is 2528 px wide (T3 Code's width; the
+  Twitch window is 2520). The other repro's collection is helium/Twitch
+  with `cursor = true`, and it captured correctly. Hyprland 0.56.2
+  creates the session the same way with or without PaintCursors. Live:
+  a focused Helium window with the pointer over it and `cursor = true`
+  came back at 2520x1374 with the I-beam drawn. The open now logs
+  "window: capturing <app> — <title> at WxH (..., cursor painted)".
+  Gotcha: a test daemon's setup file is taken in once; later edits by
+  API live in `<setup>/collections`, so edit through `isocast apply` or
+  delete that folder.
+- 2026-10-23 (verified): a window on a hidden special workspace (Ghostty
+  on "T", -1337) is captured live (btop updating).
+- 2026-10-23 (Hyprland 0.56 dispatch, verified in a nested instance
+  first): `hyprctl dispatch 'hl.dsp.window.move({ workspace = "3",
+  follow = false, window = "address:0x..." })'` moves a window to
+  workspace 3 without switching to it. `hyprctl dispatch X` evaluates
+  `return hl.dispatch(X)`, so pass exactly one dispatcher expression.
+- 2026-10-23 (tool): `grim -T <stableId>` (hyprctl clients' stableId)
+  screenshots one window even on a hidden workspace.
 - 2026-10-23 (fixed, video-memory leak): with the app open, the
   daemon's VRAM grew to fill the 8 GB GPU in about two minutes (the
   desktop stuttered, then systemd-oomd killed the session). Cause: since
@@ -32,19 +129,6 @@ each section. Delete entries that stop being true.
   presenting the same token make the second one prompt ("restore data
   invalid / missing, prompting" in xdph's log), and each prompt launched
   `hyprland-preview-share-picker`, which crashed.
-- 2026-10-23 (open, Hyprland): a window source with `cursor = true` on
-  the focused Helium window playing a Twitch video captured T3 Code
-  instead (2528x1374, every time); without the cursor, or for other
-  windows with it, the right window comes back. Points at Hyprland
-  0.56.2's paint-cursors path for that window. Repro:
-  target/scratch/leak/window.toml vs window-nc.toml, `isocast snapshot
-  scree`.
-- 2026-10-23 (open): three `isocast frames --shared --check` processes
-  started at once all failed "could not open the GPU: Parent device is
-  lost"; one alone reads 124 frames back with 0 black. A daemon that
-  failed to open a device aborted in NVIDIA's `vkDestroyDevice` during
-  wgpu's cleanup (coredump 2026-10-23 12:58:50, `Gpu::with_thread` from
-  `Engine::start`).
 - 2026-10-23 (permissions wording): the app's permission sheet, its
   error toast, `isocast permissions --request` and a source waiting for
   permission said "macOS" on Linux. They now use the desktop's words

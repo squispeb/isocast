@@ -1,8 +1,8 @@
 # Linux (Omarchy) port: status
 
 Where the Linux port stands, what is proven, what is open, and how it
-relates to upstream `main`. Snapshot: 2026-10-22, after the v0.0.8
-sync. Design and rationale
+relates to upstream `main`. Snapshot: 2026-10-23, after the v0.0.8
+sync and the 2026-10-23 robustness pass (section 4b). Design and rationale
 live in [port-omarchy.md](port-omarchy.md); per-task evidence lives in
 the `PLAN.md` Log and [notes.md](notes.md).
 
@@ -71,8 +71,9 @@ Check: `lsmod | grep v4l2loopback` and `v4l2-ctl --list-devices` show
   H.264/AAC encoders feed monitors, the replay buffer and multistream.
   Timeline joins run in-process; obs-websocket, masks, NLE export and
   `.isoprj` projects work.
-- **What doesn't yet:** the virtual camera,
-  hotkeys and plugin sandboxing. Stream destinations with their own size and machine
+- **What doesn't yet:** the desktop keeps its frame rate only with light
+  sources: with a window source and a browser page on air, Hyprland on
+  this machine draws 75-77 of its 165 frames a second (section 4b). Stream destinations with their own size and machine
   calibration are refused with a message (section 3). Zero-copy
   DMA-BUF is deferred.
 
@@ -124,7 +125,7 @@ Each feature *works*, is *refused* with a message, or is *broken*.
 | Microphone channels | 0.0.8 | works | `channels = [2]` on the C920 records mono, 0 dropouts; `[3]` is refused with "valid: 1 to 2". |
 | System audio excluding apps | 0.0.8 | works (L.S1e) | Per-stream registry links when `exclude` or `exclude_own` is used (every playback stream except the excluded and Isocast's own, tagged `isocast.owner`; picks up streams started mid-take); the default sink's monitor otherwise. Verified with pw-play and paplay tones by FFT: excluding one leaves only the other, an unmatched name excludes nothing, monitoring is left out. Limits: sound is before the sink's volume/mute; filter/loopback nodes (EasyEffects, module-loopback, a loopback from a microphone) that are themselves playback streams would be mixed in additionally and could double a signal or put a microphone into the system audio; non-stream sink audio is missed in link mode; streams on different sinks are linked under one driver (clock effect not tested). |
 | Global hotkeys | 0.0.8 | works on Hyprland (L.6f) | `LinuxHotkeys` registers session-only Hyprland binds by physical position (`code:N`; media keys by keysym) and reads Press/Release from the event socket. Push-to-talk held 2.5 s gave press, hold, release, also when the modifiers are lifted first. A plain z fires nothing. A chord that a user bind or another daemon already holds (code binds included) gives global:false and a warning, and the user's binds are never unbound. Config reload re-installs the binds, SIGTERM removes them, kill -9 leftovers are swept. Needs Hyprland (other desktops: focused input only). On the real session, a physical ctrl+alt+z held the mic 3.68 s (press, then release). Never use `Keybind:remove()`: it crashes Hyprland 0.56.2. |
-| Window and app capture | — | works (L.2b) | The standard ext-foreign-toplevel-list, ext-image-capture-source and ext-image-copy-capture protocols, as a Wayland client in toplevel.rs: no portal, picker or restore token. Window matches app id and title (largest match wins), follows the window across close and reopen, holds the take size fixed at open (even-rounded) and letterboxes a resized window. Application composites the app's windows on the display's shown workspaces at their hyprctl positions onto a transparent canvas, which clears when the windows leave. The doctor reads window sizes from the compositor, without Hyprland IPC. shm copies only, no DMA-BUF. Foot window with red/blue/green blocks: red x 0-279, blue 280-559, y 0-383 exact, matching grim's crop except under an occluding dialog. 12 s take across resize, close and reopen: resumes on reopen, 0 dropped on the program file. Two foot windows composited like grim, 0 stray pixels. Application window closed mid-take: snapshot goes fully transparent. Doctor size 1250x1322 with a live and a stale Hyprland signature. Wrong app or title lists the valid pairs. **Open:** DPMS-off, hidden-workspace and minimized windows are unverified (`hyprctl dispatch` is Lua here and has aborted the compositor), a monitor scale other than 1, release-build cost at 4K, and Isocast's own windows are not excluded. |
+| Window and app capture | — | works (L.2b) | The standard ext-foreign-toplevel-list, ext-image-capture-source and ext-image-copy-capture protocols, as a Wayland client in toplevel.rs: no portal, picker or restore token. Window matches app id and title (largest match wins), follows the window across close and reopen, holds the take size fixed at open (even-rounded) and letterboxes a resized window. Application composites the app's windows on the display's shown workspaces at their hyprctl positions onto a transparent canvas, which clears when the windows leave. The doctor reads window sizes from the compositor, without Hyprland IPC. shm copies only, no DMA-BUF. Foot window with red/blue/green blocks: red x 0-279, blue 280-559, y 0-383 exact, matching grim's crop except under an occluding dialog. 12 s take across resize, close and reopen: resumes on reopen, 0 dropped on the program file. Two foot windows composited like grim, 0 stray pixels. Application window closed mid-take: snapshot goes fully transparent. Doctor size 1250x1322 with a live and a stale Hyprland signature. Wrong app or title lists the valid pairs. A window on a hidden special workspace is captured live (2026-10-23). **Open:** DPMS-off and minimized windows are unverified (`hyprctl dispatch` is Lua here and has aborted the compositor), a monitor scale other than 1, release-build cost at 4K, and Isocast's own windows are not excluded. |
 | Live browser pages, `BrowserControl` | — | works (L.6c, L.6d) | WebKitGTK offscreen pages animate on `requestAnimationFrame` (about 62 Hz; the page thread runs GLib's default context and the view uses `HardwareAccelerationPolicy::Never`). rAF flash: 32 transitions in 7.8 s, versus 0 before. A transparent page composites exactly over another source. `refresh` (no-cache GET), `shutdown_when_hidden` (empty while hidden, GET on return) and `refresh_when_shown` (reload on return) verified in takes. Page audio still 439.9 Hz. Software rendering: heavy or WebGL pages untested. |
 | Plugin sandbox | — | works (L.6g) | Process plugins run under a Landlock ruleset (raw syscalls, applied in pre_exec; ABI 10 here, needs >= 4) with an SO_PEERCRED uid check on the main socket and a /proc-based pid scope fallback. Denied without a grant: $HOME, /tmp, /proc, main and abstract sockets, signals, exec outside the program, TCP connect, and on ABI 10 UDP and DNS sends. Allowed: own folder, data/, granted files, 127.0.0.1 serving, recordings per grant. Gaps: recordings `write` can overwrite or truncate existing files (no per-name patterns; disclosed in the consent text, `plugin add`, doctor and docs/plugins.md), and below ABI 10 UDP and DNS (below ABI 9 also PipeWire, D-Bus and the main socket, which doctor warns about) aren't limited. Verified with a probe plugin and the deck example; the macOS and Windows builds are unchecked (CI). |
 
@@ -136,6 +137,10 @@ the editor window itself.
 - **Hyprland is in safe mode** since 2026-10-22 22:10: agents' Lua
   probing through `hyprctl dispatch` crashed the session. Log out and
   back in to restore the normal config (notes.md, incident note).
+- **Screen picker, asked on purpose:** an explicit `isocast permissions
+  --request screen_recording` (or the app's Allow… / Choose again…) that
+  shows the picker was not exercised (it needs a person to pick). The
+  silent paths were: the owner's token restores DP-3 at 2560x1440.
 - **L.2 real desktop take:** a source open is bounded to 8 s, which
   isn't long enough to answer the picker, so the picker must be
   answered first. Run `./target/debug/isocast permissions --request`,
@@ -143,6 +148,17 @@ the editor window itself.
   later captures silently.
 - **Text-guard commits** `2b85ce3`/`a59ed86`: the CI CJK grep guard
   (`scripts/check-text.sh`) question is still open.
+
+## 4b. Robustness pass (2026-10-23)
+
+| Area | Before | Now | Evidence |
+|---|---|---|---|
+| Window source with `cursor = true` | "captures T3 Code" | not a capture bug: the repro daemon's stored collection named T3 Code | right window, I-beam drawn, 2520x1374; the open logs the window it follows |
+| GPU open | "Parent device is lost" for concurrent clients; a daemon aborted in NVIDIA's vkDestroyDevice; the app's daemon retried ~12 times a second | HAL open tried with one submission, a failing device kept, 2-30 s back-off, one instance, explained error | three concurrent `frames --check`: one opens, two explained errors, 4 NVRM errors, no core; recovery logged and 90 frames at 30.1 fps after the GPU freed up |
+| Screen picker and token | a picker every 5 s from source retries; two daemons sharing a token; picker crashes | one share at a time (flock), token always replaced, a failed picker remembered, choice shown, `reset_permissions` | no portal call across retries with a failed picker; lock waits 3.0 s; the owner's token restored silently ("restore data valid, not prompting"); "shares: DP-3 (the whole screen), with the cursor" |
+| App memory, window hidden | +500 MB/s (6.2 GiB, past its unit) | each shared-frame upload submits | hidden 60 s at 30 frames/s: 208 MiB flat |
+| Workspace 3 validation | — | window, C920, mic and an animated page on air | preview 55-61/s, feeds 60.0-60.2 fps, 0 missed; 3.5 min: VRAM 1656-1684 MiB, app 196 MiB, daemon 654-671 MiB, flat; takes 367/367 and 349/349 frames |
+| Desktop pacing | — | **open** | 165 Hz: 158/s with camera and mic, 104/s with a window source, 75-77/s with a page too; causes in notes.md (memory traffic on Hyprland's readback pages; WebKitGTK 2.54 reproduced outside Isocast); next step DMA-BUF window capture |
 
 ## 5. Findings worth keeping (Linux-specific)
 
