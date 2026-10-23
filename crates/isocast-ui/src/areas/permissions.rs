@@ -326,7 +326,8 @@ impl PermissionsStep {
             return;
         }
         match action {
-            "ask" => self.ask(app, kind),
+            "ask" => self.ask(app, kind, false),
+            "choose" => self.ask(app, kind, true),
             "open" => self.open_settings(app, kind),
             "relaunch" => self.relaunch(app, kind),
             // Refused without a prompt: only a newer app can ask.
@@ -338,7 +339,9 @@ impl PermissionsStep {
     /// macOS's prompt for `kind`, asked on a connection of its own: the
     /// engine waits up to a minute for the answer, and the window's calls
     /// mustn't wait with it.
-    fn ask(&self, app: &Rc<App>, kind: PermissionKind) {
+    /// With `again`, the remembered choice is forgotten first, so the
+    /// desktop's picker shows (Linux: "Choose again…").
+    fn ask(&self, app: &Rc<App>, kind: PermissionKind, again: bool) {
         self.busy.set(Some((kind, "ask")));
         let slot: Answer = Arc::default();
         *self.asking.borrow_mut() = Some(slot.clone());
@@ -346,13 +349,17 @@ impl PermissionsStep {
         std::thread::Builder::new()
             .name("permission request".into())
             .spawn(move || {
+                let params = || {
+                    Some(RequestPermissionsParams {
+                        permission: Some(kind),
+                    })
+                };
                 let result = daemon::connect()
                     .and_then(|mut client| {
-                        client.call::<PermissionsReport>(Method::RequestPermissions(Some(
-                            RequestPermissionsParams {
-                                permission: Some(kind),
-                            },
-                        )))
+                        if again {
+                            client.call::<PermissionsReport>(Method::ResetPermissions(params()))?;
+                        }
+                        client.call::<PermissionsReport>(Method::RequestPermissions(params()))
                     })
                     .map_err(|error| format!("{error:#}"));
                 if let Ok(mut slot) = slot.lock() {
@@ -556,7 +563,14 @@ fn row(d: &PermissionDetail, needed: bool, busy: Option<&str>) -> PermissionItem
     let app = shown_name(d);
     let mut alt = ("", "");
     let (status, label, detail, action, action_label) = if d.state == Permission::Granted {
-        ("allowed", "Allowed", String::new(), "", "")
+        // Linux: the screen the desktop's picker shares, and a way to pick
+        // another (`reset_permissions`, then the picker).
+        if let Some(choice) = &d.choice {
+            alt = ("choose", "Choose again…");
+            ("allowed", "Allowed", format!("Shares {choice}."), "", "")
+        } else {
+            ("allowed", "Allowed", String::new(), "", "")
+        }
     } else if d.action == PermissionAction::Restart {
         (
             "relaunch",
@@ -619,9 +633,11 @@ fn row(d: &PermissionDetail, needed: bool, busy: Option<&str>) -> PermissionItem
                 (
                     "denied",
                     "Not chosen",
-                    "The desktop's screen-sharing picker closed without a choice. Ask again \
-                     and choose a screen."
-                        .to_string(),
+                    d.next_step.clone().unwrap_or_else(|| {
+                        "The desktop's screen-sharing picker closed without a choice. Ask again \
+                         and choose a screen."
+                            .to_string()
+                    }),
                     "ask",
                     "Allow…",
                 )
@@ -812,6 +828,7 @@ fn sample_report(states: [Permission; 4], unasked: bool, restart: bool) -> Permi
                 app: "Isocast".into(),
                 app_path: None,
                 denied_without_prompt: unasked && kind == PermissionKind::Microphone,
+                choice: None,
             }
         })
         .collect();

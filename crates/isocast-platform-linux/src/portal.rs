@@ -14,7 +14,9 @@
 //! choice (per-source choices are a follow-up; see docs/notes.md).
 
 use std::collections::HashMap;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use zbus::blocking::proxy::SignalIterator;
@@ -48,8 +50,16 @@ pub(crate) struct Stream {
 }
 
 /// Start sharing a monitor: the picker the first time on this machine,
-/// the choice the token remembers afterwards.
+/// the choice the token remembers afterwards. A source's open asks the
+/// desktop at most once on its own: after a picker that failed (closed,
+/// crashed, refused) it waits with that said, until someone asks again
+/// (`request_permissions`).
 pub(crate) fn open(cursor: bool) -> Result<Stream> {
+    if !has_token() && refused().is_some() {
+        // `source_permission` says what happened and what to do.
+        bail!("not asking the desktop again by itself after its picker failed");
+    }
+    let _turn = Turn::take(SOURCE_WAIT)?;
     let mut portal = Portal::connect()?;
     let (session, node) = portal.share(cursor)?;
     let fd = portal.pipe_wire_remote(&session)?;
@@ -69,11 +79,231 @@ pub(crate) fn has_token() -> bool {
 /// Answer the picker now, and keep the token: a take's own open is
 /// bounded to 8 s by the engine, which is not long enough to ask a person
 /// to choose a screen. Used by `request_permissions`; the session is
-/// closed again, since this only wants the token.
+/// closed again, since this only wants the token. Asking is what clears a
+/// failed picker, so sources may open again.
 pub(crate) fn prepare(cursor: bool) -> Result<()> {
+    let _turn = Turn::take(REQUEST_WAIT)?;
     let mut portal = Portal::connect()?;
     let (session, _node) = portal.share(cursor)?;
     portal.close(&session)
+}
+
+/// Forget the remembered choice (and a failed picker): the next screen
+/// capture, or `request_permissions`, shows the picker again. Returns
+/// whether there was anything to forget.
+pub(crate) fn reset() -> Result<bool> {
+    let _turn = Turn::take(SOURCE_WAIT)?;
+    let token = keychain::remove(TOKEN.0, TOKEN.1).context("forgetting the screen choice")?;
+    let failed = keychain::remove(REFUSED.0, REFUSED.1).context("forgetting the screen choice")?;
+    Ok(token || failed)
+}
+
+/// The secrets entry a failed picker is kept under, as "<unix seconds>
+/// <what happened>": every Isocast process sharing this secrets file then
+/// waits instead of asking again.
+const REFUSED: (&str, &str) = ("portal", "screen-cast-refused");
+/// How long a source's open waits for another share in progress (its
+/// own open is bounded to 8 s by the engine).
+const SOURCE_WAIT: Duration = Duration::from_secs(3);
+/// How long `request_permissions` waits for one: a picker open for
+/// another share is the same picker, and answering it answers both.
+const REQUEST_WAIT: Duration = Duration::from_secs(120);
+
+/// A picker that did not end in a choice.
+pub(crate) struct Refused {
+    /// Unix seconds.
+    pub at: u64,
+    pub why: String,
+}
+
+impl Refused {
+    /// What a screen source that will not ask again says.
+    pub(crate) fn waiting(&self) -> String {
+        format!(
+            "the desktop's screen-sharing picker did not give a screen at {} ({}); screen \
+             sources wait instead of asking again by themselves: click Allow… in the app's \
+             permissions or run `isocast permissions --request screen_recording`",
+            local_time(self.at),
+            self.why
+        )
+    }
+}
+
+/// The failed picker remembered, if the last one failed.
+pub(crate) fn refused() -> Option<Refused> {
+    let text = keychain::get(REFUSED.0, REFUSED.1).ok().flatten()?;
+    let (at, why) = text.split_once(' ')?;
+    Some(Refused {
+        at: at.parse().ok()?,
+        why: why.to_string(),
+    })
+}
+
+/// One share at a time across every Isocast process of this user: a
+/// restore token is good for one `Start`, so two shares presenting it at
+/// once make the second prompt; and a picker waiting for a choice must not
+/// be joined by a second one. Held from reading the token to keeping the
+/// new one. The lock is an flock, so a process that dies frees it.
+struct Turn(#[allow(dead_code)] std::fs::File);
+
+impl Turn {
+    fn take(wait: Duration) -> Result<Self> {
+        let dir = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let path = dir.join("isocast-screen-cast.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        let deadline = Instant::now() + wait;
+        loop {
+            // SAFETY: an open descriptor; flock only reads it.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(Self(file));
+            }
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EWOULDBLOCK) {
+                return Err(err).with_context(|| format!("locking {}", path.display()));
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "another request to share a screen is still waiting for an answer (the \
+                     desktop's picker may be open, or another Isocast process is asking); \
+                     answer it, then try again (a screen source opens with that choice by \
+                     itself)"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+/// What the remembered choice shares, from the portal's own record of the
+/// token (xdg-desktop-portal's permission store; the backend's data), in
+/// words: "DP-3 (the whole screen)". `None` when there is no token or the
+/// record says nothing this knows how to read.
+pub(crate) fn choice() -> Option<String> {
+    let token = keychain::get(TOKEN.0, TOKEN.1).ok().flatten()?;
+    let conn = Connection::session().ok()?;
+    let reply = conn
+        .call_method(
+            Some("org.freedesktop.impl.portal.PermissionStore"),
+            "/org/freedesktop/impl/portal/PermissionStore",
+            Some("org.freedesktop.impl.portal.PermissionStore"),
+            "Lookup",
+            &("screencast", token.as_str()),
+        )
+        .ok()?;
+    let body = reply.body();
+    let (_, data): (HashMap<String, Vec<String>>, OwnedValue) = body.deserialize().ok()?;
+    describe_choice(&data)
+}
+
+/// xdg-desktop-portal-hyprland's restore data: `(backend, version, a{sv})`
+/// with the output, a window, or a region of an output (`geometry`, in
+/// layout coordinates).
+fn describe_choice(data: &Value<'_>) -> Option<String> {
+    let data = match data {
+        Value::Value(inner) => inner.as_ref(),
+        other => other,
+    };
+    let Value::Structure(record) = data else {
+        return None;
+    };
+    let fields = record.fields();
+    let details = match fields.get(2)? {
+        Value::Value(inner) => inner.as_ref(),
+        other => other,
+    };
+    let Value::Dict(details) = details else {
+        return None;
+    };
+    let get = |key: &str| {
+        details
+            .iter()
+            .find(|(name, _)| matches!(name, Value::Str(name) if name.as_str() == key))
+            .map(|(_, value)| match value {
+                Value::Value(inner) => inner.as_ref(),
+                other => other,
+            })
+    };
+    let text = |key: &str| match get(key) {
+        Some(Value::Str(text)) if !text.is_empty() => Some(text.to_string()),
+        _ => None,
+    };
+    let cursor = match get("withCursor") {
+        Some(Value::U32(2)) => ", with the cursor",
+        Some(Value::U32(_)) => ", without the cursor",
+        _ => "",
+    };
+    let chosen = match get("timeIssued") {
+        Some(Value::U64(at)) => format!(", chosen {}", local_time(*at)),
+        _ => String::new(),
+    };
+    if let Some(class) = text("windowClass") {
+        return Some(format!("a window of {class}{cursor}{chosen}"));
+    }
+    let output = text("output")?;
+    let region = match get("geometry") {
+        Some(Value::Structure(geometry)) => {
+            let numbers: Vec<u32> = geometry
+                .fields()
+                .iter()
+                .filter_map(|field| match field {
+                    Value::U32(n) => Some(*n),
+                    _ => None,
+                })
+                .collect();
+            match numbers[..] {
+                [x, y, w, h] => Some((x, y, w, h)),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    let whole = |w: u32, h: u32| {
+        crate::hyprland::monitors()
+            .unwrap_or_default()
+            .iter()
+            .find(|m| m.name == output)
+            .is_some_and(|m| {
+                let logical = |pixels: u32| (f64::from(pixels) / m.scale).round() as u32;
+                logical(m.width).abs_diff(w) <= 1 && logical(m.height).abs_diff(h) <= 1
+            })
+    };
+    Some(match region {
+        Some((x, y, w, h)) if (x, y) != (0, 0) || !whole(w, h) => {
+            format!("a {w}x{h} region of {output} at {x},{y}{cursor}{chosen}")
+        }
+        _ => format!("{output} (the whole screen){cursor}{chosen}"),
+    })
+}
+
+/// Unix seconds as local "YYYY-MM-DD HH:MM".
+fn local_time(at: u64) -> String {
+    let time = at as libc::time_t;
+    // SAFETY: localtime_r writes the struct it is given.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&time, &mut tm) }.is_null() {
+        return format!("{at} (unix time)");
+    }
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min
+    )
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
 }
 
 /// A session with the desktop's portal, and the bus name its request
@@ -106,12 +336,50 @@ impl Portal {
 
     /// Create a session, select a monitor, start sharing it, and keep the
     /// token that remembers the choice. Returns the session and the
-    /// node's id.
+    /// node's id. Runs inside a `Turn`. A picker that ends without a
+    /// choice is remembered (`refused`); one that ends in a choice clears
+    /// that. A presented token that ended in a picker no longer restores
+    /// anything, so it is forgotten.
     fn share(&mut self, cursor: bool) -> Result<(ObjectPath<'static>, u32)> {
-        let token = keychain::get(TOKEN.0, TOKEN.1).ok().flatten();
+        let token = keychain::get(TOKEN.0, TOKEN.1)
+            .ok()
+            .flatten()
+            .filter(|token| !token.is_empty());
         let session = self.new_session()?;
-        self.select_sources(&session, cursor, token.as_deref())?;
-        let node = self.start(&session)?;
+        let shared = self
+            .select_sources(&session, cursor, token.as_deref())
+            .and_then(|()| self.start(&session, token.is_some()));
+        match &shared {
+            Ok(_) => {
+                let _ = keychain::remove(REFUSED.0, REFUSED.1);
+            }
+            Err(err) => {
+                if let Some(unanswered) = err.downcast_ref::<Unanswered>() {
+                    let why = if token.is_some() {
+                        format!(
+                            "{unanswered}, after the remembered choice did not restore (the \
+                             desktop showed its picker instead)"
+                        )
+                    } else {
+                        unanswered.to_string()
+                    };
+                    if token.is_some() {
+                        let _ = keychain::remove(TOKEN.0, TOKEN.1);
+                    }
+                    if let Err(err) =
+                        keychain::set(REFUSED.0, REFUSED.1, &format!("{} {why}", now()))
+                    {
+                        isocast_diagnostics::diagnostic!(
+                            "warn"; "the failed screen-sharing picker could not be remembered: {err:#}"
+                        );
+                    }
+                    isocast_diagnostics::diagnostic!(
+                        "warn"; "screen sharing: {why}; screen sources wait until asked again"
+                    );
+                }
+            }
+        }
+        let node = shared?;
         Ok((session, node))
     }
 
@@ -176,8 +444,11 @@ impl Portal {
     }
 
     /// `Start`: the picker is answered (by the token or by the user), and
-    /// this is where the stream's node id and the fresh token arrive.
-    fn start(&mut self, session: &ObjectPath<'_>) -> Result<u32> {
+    /// this is where the stream's node id and the fresh token arrive. The
+    /// token presented is spent either way: the new one replaces it, and
+    /// with none coming back the old one is forgotten rather than
+    /// presented again.
+    fn start(&mut self, session: &ObjectPath<'_>, presented: bool) -> Result<u32> {
         let handle = self.mint();
         let (_, mut answers) = self.request(&handle)?;
         let options = options([("handle_token", Value::from(handle))]);
@@ -185,16 +456,19 @@ impl Portal {
             .call_method("Start", &(session, "", options))
             .context("starting the desktop's screen share")?;
         let results = answer(&mut answers)?;
-        if let Some(token) = results.get("restore_token").and_then(|v| v.try_into().ok()) {
-            let token: &str = token;
-            if let Err(err) = keychain::set(TOKEN.0, TOKEN.1, token) {
-                // A token that cannot be kept costs one picker next
-                // time; it does not fail the capture.
-                isocast_diagnostics::diagnostic!(
-                    "warn"; "the screen-capture token could not be kept (the picker will show \
-                     again): {err:#}"
-                );
-            }
+        let token: Option<&str> = results.get("restore_token").and_then(|v| v.try_into().ok());
+        let kept = match token {
+            Some(token) => keychain::set(TOKEN.0, TOKEN.1, token),
+            None if presented => keychain::remove(TOKEN.0, TOKEN.1).map(|_| ()),
+            None => Ok(()),
+        };
+        if let Err(err) = kept {
+            // A token that cannot be kept costs one picker next
+            // time; it does not fail the capture.
+            isocast_diagnostics::diagnostic!(
+                "warn"; "the screen-capture token could not be kept (the picker will show \
+                 again): {err:#}"
+            );
         }
         stream_nodes(&results)?
             .first()
@@ -267,6 +541,19 @@ where
     pairs.into_iter().collect()
 }
 
+/// A request the desktop ended without an answer (its picker closed,
+/// crashed or refused): what a screen source does not ask again after.
+#[derive(Debug)]
+struct Unanswered(&'static str);
+
+impl std::fmt::Display for Unanswered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for Unanswered {}
+
 /// Read a request's answer: the portal's response code, and its results.
 fn answer(answers: &mut SignalIterator<'static>) -> Result<HashMap<String, OwnedValue>> {
     let message = answers
@@ -279,12 +566,13 @@ fn answer(answers: &mut SignalIterator<'static>) -> Result<HashMap<String, Owned
     match code {
         0 => Ok(results),
         // The portal answers the same when its picker crashes, so say so.
-        1 => bail!(
+        1 => Err(Unanswered(
             "the desktop's screen-sharing picker closed without a choice; if no picker \
-             appeared, it crashed (`coredumpctl list` shows it), so try again"
-        ),
-        2 => bail!("the desktop ended the screen-capture request"),
-        other => bail!("the desktop refused the screen-capture request (response {other})"),
+             appeared, it crashed (`coredumpctl list hyprland-preview-share-picker` shows it)",
+        )
+        .into()),
+        2 => Err(Unanswered("the desktop ended the screen-capture request").into()),
+        _ => Err(Unanswered("the desktop refused the screen-capture request").into()),
     }
 }
 
@@ -334,6 +622,32 @@ mod tests {
             .expect("an array of streams can be owned"),
         )]);
         assert_eq!(stream_nodes(&results).unwrap(), vec![1, 7]);
+    }
+
+    /// xdg-desktop-portal-hyprland's restore data as the permission
+    /// store returns it: `v` holding `(s, u, v a{sv})`. Without Hyprland
+    /// to say the monitor's size, a geometry off the origin is a region.
+    #[test]
+    fn describe_choice_reads_hyprland_restore_data() {
+        let details: HashMap<&str, Value> = HashMap::from([
+            ("output", Value::from("DP-3")),
+            ("withCursor", Value::from(2u32)),
+            (
+                "geometry",
+                Value::from(Structure::from((235u32, 75u32, 1604u32, 1063u32))),
+            ),
+        ]);
+        let record = Value::from(Structure::from(("hyprland", 3u32, Value::from(details))));
+        assert_eq!(
+            describe_choice(&Value::Value(Box::new(record))).as_deref(),
+            Some("a 1604x1063 region of DP-3 at 235,75, with the cursor")
+        );
+        let window: HashMap<&str, Value> = HashMap::from([("windowClass", Value::from("foot"))]);
+        let record = Value::from(Structure::from(("hyprland", 3u32, Value::from(window))));
+        assert_eq!(
+            describe_choice(&record).as_deref(),
+            Some("a window of foot")
+        );
     }
 
     /// A request that came back with no streams at all is not a node.

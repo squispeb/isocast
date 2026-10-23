@@ -10,7 +10,7 @@ a client, for example:
 claude mcp add isocast -- isocast mcp
 ```
 
-108 tools. Arguments marked required must be given; ids, not names,
+109 tools. Arguments marked required must be given; ids, not names,
 address sources, scenes and clips. Errors name the field and list the
 valid options.
 
@@ -654,6 +654,14 @@ The replay buffer's state, seconds held, memory used and its limit, format, whet
 ## request_permissions
 
 Ask macOS for screen recording, camera and microphone access where it hasn't been decided yet (or only `permission`). Its prompts appear on the user's screen; waits up to a minute for answers and returns the permissions with next steps.
+
+| Argument | Type | Description |
+|---|---|---|
+| `permission` | PermissionKind | Only this one: screen_recording, camera, microphone or system_audio (all not decided yet if left out). |
+
+## reset_permissions
+
+Forget a choice Isocast itself remembers for a permission (or only `permission`), so the next capture or request_permissions asks again: on Linux, the screen the desktop's screen-sharing picker shared (and a picker that failed). macOS and Windows keep these in System Settings, so there it is an error. Returns the permissions.
 
 | Argument | Type | Description |
 |---|---|---|

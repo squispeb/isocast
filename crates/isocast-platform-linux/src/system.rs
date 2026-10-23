@@ -825,12 +825,21 @@ fn sample_rate_of(spec: &str) -> f64 {
 
 pub(crate) fn permissions_report() -> Result<PermissionsReport> {
     // The portal remembers a screen choice as a restore token; without
-    // one, the next screen capture is what shows the picker.
+    // one, the next screen capture is what shows the picker, unless the
+    // last picker failed, in which case screen sources wait to be asked.
+    let refused = (!crate::portal::has_token())
+        .then(crate::portal::refused)
+        .flatten();
     let screen = if crate::portal::has_token() {
         Permission::Granted
+    } else if refused.is_some() {
+        Permission::Denied
     } else {
         Permission::NotDetermined
     };
+    let choice = (screen == Permission::Granted)
+        .then(crate::portal::choice)
+        .flatten();
     let details = PermissionKind::ALL
         .into_iter()
         .map(|kind| {
@@ -838,13 +847,15 @@ pub(crate) fn permissions_report() -> Result<PermissionsReport> {
                 PermissionKind::ScreenRecording if screen != Permission::Granted => (
                     screen,
                     PermissionAction::Request,
-                    Some(
-                        "run `isocast permissions --request` and choose a screen in the \
-                         desktop's picker; every later capture follows that choice (or let the \
-                         first screen recording ask, within its 8 s open). Window and app \
-                         sources need no choice: the compositor offers them directly"
+                    Some(match &refused {
+                        Some(refused) => refused.waiting(),
+                        None => "run `isocast permissions --request` and choose a screen in the \
+                                 desktop's picker; every later capture follows that choice (or \
+                                 let the first screen recording ask, within its 8 s open). \
+                                 Window and app sources need no choice: the compositor offers \
+                                 them directly"
                             .to_string(),
-                    ),
+                    }),
                 ),
                 _ => (Permission::Granted, PermissionAction::None, None),
             };
@@ -860,6 +871,9 @@ pub(crate) fn permissions_report() -> Result<PermissionsReport> {
                 app: String::new(),
                 app_path: None,
                 denied_without_prompt: false,
+                choice: (kind == PermissionKind::ScreenRecording)
+                    .then(|| choice.clone())
+                    .flatten(),
             }
         })
         .collect();

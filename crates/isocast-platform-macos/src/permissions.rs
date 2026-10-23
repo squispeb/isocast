@@ -485,6 +485,7 @@ fn report_with(permissions: Permissions, waiting: [bool; KINDS]) -> PermissionsR
                 app: listed,
                 app_path: bundle.map(|b| b.to_string_lossy().into_owned()),
                 denied_without_prompt: unasked,
+                choice: None,
             }
         })
         .collect();

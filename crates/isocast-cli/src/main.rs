@@ -536,7 +536,10 @@ enum Command {
     /// recording permissions and what to do about each that isn't granted; with --request, ask macOS
     /// for the ones not decided yet (its prompts appear; --request camera
     /// asks for that one only) and wait up to a minute for the answers;
-    /// with --open, open the System Settings pane where one is turned on.
+    /// with --open, open the System Settings pane where one is turned on;
+    /// with --reset, forget a choice Isocast remembers (on Linux the screen
+    /// the desktop's picker shared), so the next capture asks again
+    /// (--reset --request asks right away).
     Permissions {
         /// screen_recording, camera, microphone or system_audio; all if
         /// left out.
@@ -551,6 +554,16 @@ enum Command {
         /// screen_recording, camera, microphone or system_audio.
         #[arg(long, value_name = "PERMISSION", value_parser = parse_permission)]
         open: Option<isocast_protocol::devices::PermissionKind>,
+        /// screen_recording, camera, microphone or system_audio; all if
+        /// left out.
+        #[arg(
+            long,
+            conflicts_with = "open",
+            value_name = "PERMISSION",
+            num_args = 0..=1,
+            value_parser = parse_permission
+        )]
+        reset: Option<Option<isocast_protocol::devices::PermissionKind>>,
         #[arg(long)]
         json: bool,
     },
@@ -1491,8 +1504,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Command::Permissions {
             request,
             open,
+            reset,
             json,
-        } => permissions(request, open, json),
+        } => permissions(request, open, reset, json),
         Command::Restart => restart(),
         Command::Audio {
             source,
@@ -3333,12 +3347,24 @@ fn restart() -> Result<ExitCode> {
 fn permissions(
     request: Option<Option<isocast_protocol::devices::PermissionKind>>,
     open: Option<isocast_protocol::devices::PermissionKind>,
+    reset: Option<Option<isocast_protocol::devices::PermissionKind>>,
     json: bool,
 ) -> Result<ExitCode> {
     let only = request.flatten();
     let request = request.is_some();
     // Ask the daemon: it records, so its permissions are the ones that count.
     let mut client = Client::connect_or_launch()?;
+    if let Some(forget) = reset {
+        let report: isocast_protocol::devices::PermissionsReport =
+            client.call(Method::ResetPermissions(forget.map(|permission| {
+                isocast_protocol::api::RequestPermissionsParams {
+                    permission: Some(permission),
+                }
+            })))?;
+        if !request {
+            return print_permissions(&report, json);
+        }
+    }
     if let Some(permission) = open {
         let opened: isocast_protocol::api::Opened =
             client.call(Method::OpenPermissionSettings { permission })?;
@@ -3379,8 +3405,15 @@ fn permissions(
     } else {
         client.call(Method::Permissions)?
     };
+    print_permissions(&report, json)
+}
+
+fn print_permissions(
+    report: &isocast_protocol::devices::PermissionsReport,
+    json: bool,
+) -> Result<ExitCode> {
     if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        println!("{}", serde_json::to_string_pretty(report)?);
         return Ok(ExitCode::SUCCESS);
     }
     for detail in &report.details {
@@ -3390,6 +3423,9 @@ fn permissions(
             detail.state.label(),
             detail.needed_for
         );
+        if let Some(choice) = &detail.choice {
+            println!("  shares: {choice} (`isocast permissions --reset` forgets it)");
+        }
         if let Some(step) = &detail.next_step {
             println!("  next: {step}");
         }

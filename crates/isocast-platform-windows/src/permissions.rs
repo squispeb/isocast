@@ -65,6 +65,7 @@ pub(crate) fn report() -> PermissionsReport {
                     app: "Isocast (desktop)".into(),
                     app_path: None,
                     denied_without_prompt: false,
+                    choice: None,
                 }
             })
             .collect(),

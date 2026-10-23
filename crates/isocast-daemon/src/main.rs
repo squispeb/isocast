@@ -1540,6 +1540,10 @@ impl Daemon {
                     .map_err(failed)
                     .and_then(to_json)
             }
+            Method::ResetPermissions(params) => native()
+                .reset_permissions(params.and_then(|p| p.permission))
+                .map_err(failed)
+                .and_then(to_json),
             Method::OpenPermissionSettings { permission } => open_permission_settings(permission)
                 .map(|url| isocast_protocol::api::Opened { url })
                 .map_err(failed)

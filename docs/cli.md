@@ -198,7 +198,7 @@ Commands:
   audio          Change an audio source's program mix in the live setup: gain in dB, mute, sync offset in ms (positive is later), balance (-1 left to 1 right) and monitoring (hearing it through `audio.monitoring_device`). A running recording follows all but the offset at once
   iso-audio      Choose the audio sources an ISO file carries, in the live setup: `isocast iso-audio camera mic` gives the camera's ISO file the mic only, --none no audio, --default back to recording.iso.audio (or, without it, the source's own sound). Without a source, list each video source's ISO tracks
   restart        Restart isocastd, for example after granting it screen recording permission. Refused, atomically by isocastd, while it records, streams, exports or feeds the virtual camera
-  permissions    Show the screen recording, camera, microphone and system audio recording permissions and what to do about each that isn't granted; with --request, ask macOS for the ones not decided yet (its prompts appear; --request camera asks for that one only) and wait up to a minute for the answers; with --open, open the System Settings pane where one is turned on
+  permissions    Show the screen recording, camera, microphone and system audio recording permissions and what to do about each that isn't granted; with --request, ask macOS for the ones not decided yet (its prompts appear; --request camera asks for that one only) and wait up to a minute for the answers; with --open, open the System Settings pane where one is turned on; with --reset, forget a choice Isocast remembers (on Linux the screen the desktop's picker shared), so the next capture asks again (--reset --request asks right away)
   get            Print the live setup (TOML, or JSON with --json) and its revision; with --resolved, also where layout put every item (each item's rect in its parent and its box on the canvas)
   plan           Show what a change to the live setup would do, without doing it: a whole setup FILE, or --patch with a JSON merge patch (lists of sources, scenes and items merge by id)
   apply          Make a change to the live setup, if it is still at --revision (from `plan` or `get`; 0 when there is no live setup yet)
@@ -1790,13 +1790,14 @@ Options:
 ## isocast permissions
 
 ```text
-Show the screen recording, camera, microphone and system audio recording permissions and what to do about each that isn't granted; with --request, ask macOS for the ones not decided yet (its prompts appear; --request camera asks for that one only) and wait up to a minute for the answers; with --open, open the System Settings pane where one is turned on
+Show the screen recording, camera, microphone and system audio recording permissions and what to do about each that isn't granted; with --request, ask macOS for the ones not decided yet (its prompts appear; --request camera asks for that one only) and wait up to a minute for the answers; with --open, open the System Settings pane where one is turned on; with --reset, forget a choice Isocast remembers (on Linux the screen the desktop's picker shared), so the next capture asks again (--reset --request asks right away)
 
 Usage: isocast permissions [OPTIONS]
 
 Options:
       --request [<PERMISSION>]  screen_recording, camera, microphone or system_audio; all if left out
       --open <PERMISSION>       screen_recording, camera, microphone or system_audio
+      --reset [<PERMISSION>]    screen_recording, camera, microphone or system_audio; all if left out
       --json                    
   -h, --help                    Print help
 ```
@@ -2535,12 +2536,12 @@ Options:
       --height <HEIGHT>    With --shared, scale it down to at most this many pixels high
       --fps <FPS>          The most frames a second (30 if absent, at most 60)
       --seconds <SECONDS>  Stop after this long (5 s if absent) [default: 5]
-      --shared             Watch through GPU surfaces shared with the daemon (zero-copy, as the native app does) instead of saving H.264: reports the rate, how late frames arrive and the setup revisions they show
+      --shared             Watch through GPU surfaces shared with the daemon (as the native app does) instead of saving H.264: reports the rate, how late frames arrive and the setup revisions they show
       --slots <SLOTS>      With --shared: surfaces in the ring (4 if absent, 2 to 8)
       --filtered           With --shared and a source: through the source's filters, as the program shows it
       --check              With --shared: read every frame back through this process's GPU and fail on black frames or pixels the daemon never drew
       --expect <EXPECT>    With --check: a pixel some frame must have, as X,Y=#RRGGBB (X and Y fractions of the width and height). Repeatable
-      --touch              With --check: halfway through, apply an empty live change (the setup stays the same, its revision goes up) and check frames show the new revision
+      --touch              With --check: halfway through, apply a live change the picture doesn't show (the scene collection's name gains a marker, briefly) and check frames show its new revision
       --canvas <CANVAS>    Which canvas: main, or vertical (its program; vertical takes `program` only) [default: main]
       --json               
   -h, --help               Print help

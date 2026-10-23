@@ -298,6 +298,11 @@ pub struct PermissionDetail {
     /// help; `next_step` says what will.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub denied_without_prompt: bool,
+    /// What the remembered choice is, where Isocast keeps one of its own
+    /// (Linux: the screen the desktop's picker shares, like "DP-3 (the
+    /// whole screen)"); `reset_permissions` forgets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub choice: Option<String>,
 }
 
 /// What to do about a permission.

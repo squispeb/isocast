@@ -150,11 +150,15 @@ impl Platform for LinuxPlatform {
         // A window or an app's windows are copied from the compositor
         // directly (toplevel.rs): nothing to answer.
         let screen = matches!(source, SourceKind::Display(_));
-        (screen && !portal::has_token()).then(|| {
-            "the desktop's screen-sharing picker is waiting for a choice: run `isocast \
-             permissions --request` and pick a screen (the choice is remembered, so later \
-             captures open silently)"
-                .to_string()
+        if !screen || portal::has_token() {
+            return None;
+        }
+        Some(match portal::refused() {
+            Some(refused) => refused.waiting(),
+            None => "the desktop's screen-sharing picker is waiting for a choice: run `isocast \
+                     permissions --request` and pick a screen (the choice is remembered, so \
+                     later captures open silently)"
+                .to_string(),
         })
     }
 
@@ -174,6 +178,24 @@ impl Platform for LinuxPlatform {
             "asking the desktop to share a screen (its picker chooses the monitor once; later \
              captures need no prompt)",
         )?;
+        system::permissions_report()
+    }
+
+    /// Forget the screen the desktop's picker chose (and a picker that
+    /// failed): the next screen capture or request shows the picker
+    /// again. Nothing else has a choice to forget.
+    fn reset_permissions(&self, only: Option<PermissionKind>) -> Result<PermissionsReport> {
+        if only.is_none_or(|kind| kind == PermissionKind::ScreenRecording) {
+            let forgot = portal::reset()?;
+            isocast_diagnostics::diagnostic!(
+                "info"; "screen sharing: {}",
+                if forgot {
+                    "the remembered choice is forgotten; the next screen capture asks again"
+                } else {
+                    "there was no remembered choice to forget"
+                }
+            );
+        }
         system::permissions_report()
     }
 

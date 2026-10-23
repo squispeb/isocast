@@ -2143,6 +2143,30 @@ impl Isocast {
     }
 
     #[tool(
+        description = "Forget a choice Isocast itself remembers for a permission (or only \
+                       `permission`), so the next capture or request_permissions asks again: on \
+                       Linux, the screen the desktop's screen-sharing picker shared (and a \
+                       picker that failed). macOS and Windows keep these in System Settings, \
+                       so there it is an error. Returns the permissions.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn reset_permissions(
+        &self,
+        Parameters(Strict(params)): Parameters<Strict<RequestPermissionsToolParams>>,
+    ) -> Result<Json<PermissionsReport>, String> {
+        self.call(Method::ResetPermissions(params.permission.map(
+            |permission| isocast_protocol::api::RequestPermissionsParams {
+                permission: Some(permission),
+            },
+        )))
+        .await
+    }
+
+    #[tool(
         description = "Open System Settings on the user's screen at the pane where a \
                        permission (screen_recording, camera, microphone or system_audio) is \
                        turned on by \

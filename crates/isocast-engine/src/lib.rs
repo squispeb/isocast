@@ -146,6 +146,18 @@ pub trait Platform: Clone + Send + Sync + 'static {
         only: Option<PermissionKind>,
     ) -> anyhow::Result<PermissionsReport>;
 
+    /// Forget the choice Isocast itself remembers for a permission (only
+    /// `only`, if given), so the next capture or request asks again.
+    /// Returns the permissions afterwards. Platforms whose choices live in
+    /// the system's settings keep nothing to forget.
+    fn reset_permissions(&self, only: Option<PermissionKind>) -> anyhow::Result<PermissionsReport> {
+        let _ = only;
+        anyhow::bail!(
+            "Isocast keeps no permission choice of its own on this system: they are in the \
+             system's settings (`isocast permissions --open PERMISSION` opens them)"
+        )
+    }
+
     /// Open the settings where `permission` is turned on by hand. Returns
     /// what was opened.
     fn open_permission_settings(&self, permission: PermissionKind) -> anyhow::Result<String>;

@@ -191,6 +191,14 @@ pub enum Method {
     /// Its params are optional: `{"method": "request_permissions"}` asks
     /// for all three.
     RequestPermissions(Option<RequestPermissionsParams>),
+    /// Forget a choice Isocast remembers for a permission, so the next
+    /// capture or `request_permissions` asks again: on Linux the screen the
+    /// desktop's picker shared (and a picker that failed). macOS and
+    /// Windows keep these choices in the system's settings, so there is
+    /// nothing of Isocast's to forget there (an error says so). Same
+    /// params as `request_permissions`. Returns
+    /// [`PermissionsReport`](crate::devices::PermissionsReport).
+    ResetPermissions(Option<RequestPermissionsParams>),
     /// Open the System Settings pane where a permission is turned on by
     /// hand. Returns [`Opened`].
     OpenPermissionSettings {
