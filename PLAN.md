@@ -920,13 +920,12 @@ step live in `docs/notes.md`'s "Linux port WIP" section.
   - [x] **L.6d Browser sources on Linux verified through a real take**
     (`isocast frames`/a recorded take with a static page checked
     numerically, then a live page).
-  - [ ] **L.6e Virtual camera (v4l2loopback)** (frames pushed into a
+  - [x] **L.6e Virtual camera (v4l2loopback)** (frames pushed into a
     loopback device for other apps to read; needs the
     `v4l2loopback` kernel module, which is not installed - root, one
     time: waiting on Ryan, see docs/notes.md).
-    Code done (`vcam.rs`, a v4l2loopback OUTPUT sink, refused with the
-    install commands while the module is absent); the live ioctl and
-    write path waits on the module.
+    Done: `vcam.rs`, a v4l2loopback OUTPUT sink, refused with the
+    install commands while the module is absent; verified live.
   - [x] **L.6f Hotkeys on Linux** (omarchy: Hyprland `bind` IPC, with
     the global-shortcuts portal as the portable fallback).
   - [x] **L.6g Plugin sandboxing (SO_PEERCRED + Landlock)** (plugins
@@ -2467,6 +2466,7 @@ slices, especially alongside the GPU, vertical-canvas and editor lanes.
 
 ## Log
 
+- L.6e live (2026-10-23): the virtual camera works on Linux with v4l2loopback installed: `/dev/video10` "Isocast Camera" advertises YUYV 1280x720 at 30 fps; a release build's camera is read by `ffmpeg -f v4l2` at 300 frames in 10.01 s (1 drop at start), colours within 3/255 of the source, motion on 298 of 299 frame steps; a reader stays attached across `vcam stop`/`start` and a daemon restart.
 - L.6f on the real session (2026-10-23): a physical ctrl+alt+z on Ryan's live Hyprland (227 user binds) held the C920 mic through push-to-talk for 3.68 s and released it; registration `global: true` with no conflict; SIGTERM left 0 isocast binds.
 - L.2b (2026-10-22): Window and app capture work on Linux. A plain Wayland client (toplevel.rs) of ext-foreign-toplevel-list, ext-image-capture-source and ext-image-copy-capture copies a window's own pixels from wl_shm buffers into the BGRA pool: no portal, picker or restore token, so it runs unattended. A Window source matches app id and title like macOS find_window (largest match wins), follows the window (keeps the last picture when it closes and resumes when a match reappears), holds the take size fixed at open (even-rounded) and letterboxes a resized window. An Application source composites each of the app's windows on the display's shown workspaces at their hyprctl positions onto a transparent display-sized canvas, and redraws (to an empty canvas when none is left) when a window closes, arrives or moves. Verified with a foot window painting red/blue/green blocks: red x 0-279, blue 280-559, y 0-383 exact, equal to grim's crop except under an occluding dialog. A 12 s take across a resize, close and reopen: 0 dropped on the program file, window warn on close and resumed on reopen. Two foot windows composited at their positions, matching grim with 0 stray pixels. An Application take whose only window was closed gives a fully transparent snapshot afterwards. The doctor probe reads the size from the compositor (1250x1322) with a stale HYPRLAND_INSTANCE_SIGNATURE too. Wrong app or title lists the valid pairs. DPMS-off, hidden-workspace windows and a monitor scale other than 1 are unverified.
 - L.6c/L.6d browser pages live on Linux (2026-10-22): `requestAnimationFrame` now animates in the offscreen WebKitGTK view. The cause was two things. The page thread's GLib loop ran on a private MainContext, so GDK's frame clock and WebKit's paint handshake (attached to GLib's default context) never ticked. And accelerated compositing needs a GL context a GtkOffscreenWindow cannot create (SIGABRT on Wayland). The thread now runs the default context and the view uses `HardwareAccelerationPolicy::Never`; each fix alone fails. A snapshot finishing after an unload is dropped, so the empty frame is the next thing the sink sees. `BrowserControl` is exercised for real. Verified through isocastd takes (640x480@30, hevc): an rAF page toggling every 15 callbacks gives 32 luma transitions in 7.8 s (rAF about 62 Hz; 0 before), the setInterval control 43; a second independent take of an rAF-stepped page ran at about 57.6 callbacks/s to the end. A transparent page over a green source is exact: red square edges at 100/200, 50% blue square (0,126,127), background (0,254,0). `refresh` mid-take switches the colour with a second no-cache GET (an unknown id lists the browser sources). `shutdown_when_hidden` loads afresh on return, with the page ISO empty while hidden. `refresh_when_shown` reloads with a no-cache GET, the page staying loaded. A page's audio is still 439.9 Hz. No isocastd cores at exit.

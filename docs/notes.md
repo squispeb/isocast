@@ -55,6 +55,27 @@ each section. Delete entries that stop being true.
 
 ### L.6e virtual camera
 
+- 2026-10-23 (L.6e, live): Ryan installed v4l2loopback (0.15.4,
+  `devices=1 video_nr=10 card_label="Isocast Camera" exclusive_caps=1`,
+  loaded at boot by modules-load.d plus a modprobe.d options file).
+  Verified with a scratch setup (four colour quarters plus a test
+  pattern, `[virtual_camera] target = "program"`): once started, the
+  device turns CAPTURE-only and advertises YUYV 1280x720, SMPTE 170M,
+  limited range, 30/1. Release build: `ffmpeg -f v4l2` read 300 frames
+  in 10.01 s with no timestamp warnings, 1 drop at start; colours red
+  (252,1,0), green (0,254,2), blue (1,0,252), gray 126 (within 3/255).
+  Debug build: 12 drops in 1576 frames and ffmpeg "non monotonically
+  increasing dts" warnings (bursty writes from the unoptimised
+  conversion loop); use a release build to judge the camera.
+- 2026-10-23 (L.6e, lifecycle): a reader stays attached across
+  `vcam stop`/`start` (holds the last picture 4.3 s, moving again 0.2 s
+  after start) and across a daemon restart with the camera stopped
+  first (the new daemon's S_FMT on a held device works at the same
+  size). `isocast restart` while the camera runs is refused, as on
+  macOS. `enqueue_latency_us` is a steady ~75 ms p50 in both builds:
+  it is canvas PTS to write, about two frames of pipeline, not
+  conversion cost. Not tried: a size change while a reader holds the
+  device (expected EBUSY), browsers and video-call apps as readers.
 - 2026-10-22 L.6e decision: Linux virtual camera = pure-Rust V4L2 output sink onto a v4l2loopback device, YUYV via write(2) (no ffmpeg child, no v4l crate, no new dependency). Reason: YUYV is the most widely accepted webcam format, and write() on a loopback copies the frame and never waits for a reader, which matches the CameraSink contract. Linux costs one GPU readback, one plane clone and one CPU conversion per frame, where macOS shares an IOSurface zero-copy.
 - 2026-10-22 L.6e colour: frames are limited-range BT.601, tagged SMPTE170M, because webcam consumers assume it. It is a taste call. To switch to 709, change COLORSPACE and YCBCR_ENC and the luma/cb/cr coefficients in vcam.rs together.
 - 2026-10-22 L.6e measured: single-thread BGRA to YUYV (standalone -O build) takes 1.8 ms at 720p, 4.1 ms at 1080p, 7.3 ms at 1440p and 16.4 ms at 4K, within the 33 ms budget, so no threads. Real end-to-end 4K 30 fps with readback is still unmeasured.
@@ -2556,17 +2577,6 @@ isocast-platform-linux gpu` once the modules exist.
   --safe-mode` since the 2026-10-22 22:10 crash (see the incident note
   above). Log out and back in (or reboot) to get the normal config back.
   Retry check: `pgrep -a Hyprland` shows no `--safe-mode`.
-- 2026-10-23 (L.6e live path): after installing v4l2loopback (entry
-  below), start the virtual camera and read it with `ffmpeg -f v4l2 -i
-  /dev/video10 -frames:v 30 target/scratch/vcam.mkv`; check size,
-  colours and frames_sent.
-- 2026-10-22 (L.6e virtual camera): the `v4l2loopback` kernel module is
-  not installed on this machine. The virtual camera needs it once, as
-  root: the commands are in docs/linux-port-status.md, "Requirements"
-  (`v4l2loopback-dkms` plus the running kernel's headers,
-  `linux-omarchy-headers` here; load with `exclusive_caps=1`, and a
-  `modprobe.d` options file so a reboot loads it the same way). Retry with
-  `lsmod | grep v4l2loopback`; L.6e can start once it answers.
 - 2026-10-16 (L.2's one real take): the desktop's screen-sharing picker
   needs one click from Ryan, and that is the last step of L.2. A
   source's open is engine-bounded to 8 s (`bounded_open`), which is not
