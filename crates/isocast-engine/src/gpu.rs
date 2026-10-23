@@ -55,12 +55,22 @@ impl Gpu {
             return Ok(gpu.clone());
         }
         *shared = None;
-        let gpu = Self::open(start)?;
+        #[cfg(target_os = "linux")]
+        if let Some(err) = linux::cooling_down() {
+            return Err(err);
+        }
+        let opened = Self::open(start);
+        #[cfg(target_os = "linux")]
+        linux::opened(opened.as_ref().err());
+        let gpu = opened?;
         *shared = Some(gpu.clone());
         Ok(gpu)
     }
 
     fn open(start: impl FnOnce() + Send + 'static) -> Result<Self> {
+        #[cfg(target_os = "linux")]
+        let instance = linux::instance();
+        #[cfg(not(target_os = "linux"))]
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
             ..wgpu::InstanceDescriptor::new_without_display_handle()
@@ -74,12 +84,16 @@ impl Gpu {
         // genuine NV12 allocations with two aspect views of one texture.
         let required_features = adapter.features()
             & (wgpu::Features::TEXTURE_FORMAT_16BIT_NORM | wgpu::Features::TEXTURE_FORMAT_NV12);
-        let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        let descriptor = wgpu::DeviceDescriptor {
             label: Some("isocast"),
             required_features,
             ..Default::default()
-        }))
-        .context("could not open the GPU")?;
+        };
+        #[cfg(target_os = "linux")]
+        let (device, queue) = linux::request_device(&adapter, &descriptor)?;
+        #[cfg(not(target_os = "linux"))]
+        let (device, queue) =
+            block_on(adapter.request_device(&descriptor)).context("could not open the GPU")?;
         let lost = Arc::new(AtomicBool::new(false));
         let failed = lost.clone();
         device.set_device_lost_callback(move |_, _| failed.store(true, Ordering::Release));
@@ -606,5 +620,204 @@ pub trait FrameImporter: Send {
     ) -> Result<Option<(wgpu::Texture, wgpu::Texture)>> {
         let _ = frame;
         Ok(None)
+    }
+}
+
+/// Opening the device on Linux, where NVIDIA's Vulkan driver refuses new
+/// devices once the GPU has no free channels (`journalctl -k` shows
+/// `NV_ERR_STATE_IN_USE`), and aborts the process (in `vkDestroyDevice`,
+/// `pthread_cond_destroy`) when a device it created but cannot run is
+/// destroyed, as wgpu does when its first steps on the device fail. So the
+/// device is opened through the HAL and tried with one empty submission
+/// before wgpu takes it; one that fails is kept, never destroyed. A failed
+/// open is not tried again at once: every viewer and output asks for the
+/// GPU, and asking a refusing driver several times a second takes the
+/// channels other programs on the desktop need.
+#[cfg(target_os = "linux")]
+mod linux {
+    use std::mem::forget;
+    use std::sync::OnceLock;
+    use std::time::{Duration, Instant};
+
+    use anyhow::{Context, Result, anyhow, bail};
+    use parking_lot::Mutex;
+    use wgpu::hal::{self, Adapter as _, CommandEncoder as _, Device as _, Queue as _};
+
+    use super::block_on;
+
+    /// After a failed open the next one waits this long, doubling up to
+    /// `MAX_WAIT` while opens keep failing.
+    const FIRST_WAIT: Duration = Duration::from_secs(2);
+    const MAX_WAIT: Duration = Duration::from_secs(30);
+    /// How long the trial submission may take.
+    const CHECK_WAIT: Duration = Duration::from_secs(2);
+
+    struct Failed {
+        at: Instant,
+        wait: Duration,
+        why: String,
+    }
+
+    static FAILED: Mutex<Option<Failed>> = Mutex::new(None);
+
+    /// The process's one instance: every open after the first (a lost
+    /// device, a retry) reuses it rather than loading the driver again.
+    pub(super) fn instance() -> wgpu::Instance {
+        static INSTANCE: OnceLock<wgpu::Instance> = OnceLock::new();
+        INSTANCE
+            .get_or_init(|| {
+                wgpu::Instance::new(wgpu::InstanceDescriptor {
+                    backends: wgpu::Backends::PRIMARY,
+                    ..wgpu::InstanceDescriptor::new_without_display_handle()
+                })
+            })
+            .clone()
+    }
+
+    /// The error to answer with while the last failed open is recent.
+    pub(super) fn cooling_down() -> Option<anyhow::Error> {
+        let failed = FAILED.lock();
+        let failed = failed.as_ref()?;
+        let since = failed.at.elapsed();
+        (since < failed.wait).then(|| {
+            anyhow!(
+                "{} (the last try was {:.1} s ago; the GPU is tried again in {:.1} s)",
+                failed.why,
+                since.as_secs_f64(),
+                (failed.wait - since).as_secs_f64()
+            )
+        })
+    }
+
+    /// Remember how an open went.
+    pub(super) fn opened(error: Option<&anyhow::Error>) {
+        let mut failed = FAILED.lock();
+        let Some(error) = error else {
+            if failed.take().is_some() {
+                isocast_diagnostics::diagnostic!("info"; "the GPU opened again");
+            }
+            return;
+        };
+        let wait = failed
+            .as_ref()
+            .map_or(FIRST_WAIT, |previous| (previous.wait * 2).min(MAX_WAIT));
+        let why = format!("{error:#}");
+        isocast_diagnostics::diagnostic!(
+            "error"; "{why}; not tried again for {} s", wait.as_secs()
+        );
+        *failed = Some(Failed {
+            at: Instant::now(),
+            wait,
+            why,
+        });
+    }
+
+    /// What a refused device means, said where wgpu's words mislead
+    /// (vkCreateDevice's `VK_ERROR_INITIALIZATION_FAILED` reads "Parent
+    /// device is lost").
+    fn explain(error: anyhow::Error) -> anyhow::Error {
+        if format!("{error:#}").contains("lost") {
+            error.context(
+                "the graphics driver refused a new GPU device (on NVIDIA: the GPU has no free \
+                 channels for another program, and `journalctl -k` shows NV_ERR_STATE_IN_USE); \
+                 closing other programs that use the GPU frees some",
+            )
+        } else {
+            error
+        }
+    }
+
+    pub(super) fn request_device(
+        adapter: &wgpu::Adapter,
+        descriptor: &wgpu::DeviceDescriptor<'_>,
+    ) -> Result<(wgpu::Device, wgpu::Queue)> {
+        // SAFETY: the HAL adapter is this adapter's, used only for the open.
+        let open = unsafe {
+            let Some(hal_adapter) = adapter.as_hal::<hal::api::Vulkan>() else {
+                return block_on(adapter.request_device(descriptor))
+                    .map_err(|err| explain(anyhow!("could not open the GPU: {err}")));
+            };
+            hal_adapter.open(
+                descriptor.required_features,
+                &descriptor.required_limits,
+                &descriptor.memory_hints,
+            )
+        }
+        .map_err(|err| explain(anyhow!("could not open the GPU: {err}")))?;
+        // SAFETY: `open` is new and used by nothing else yet.
+        if let Err(err) = unsafe { try_device(&open) } {
+            // Destroying it is what aborts the process: keep it. What it
+            // holds is the driver's again when the process exits.
+            forget(open);
+            return Err(explain(err.context(
+                "could not open the GPU: the new device failed its first steps",
+            )));
+        }
+        // SAFETY: `open` comes from this adapter, opened with exactly the
+        // descriptor's features and limits.
+        unsafe { adapter.create_device_from_hal(open, descriptor) }
+            .context("could not open the GPU")
+            .map_err(explain)
+    }
+
+    /// A buffer, a fence, and an empty submission waited for: what wgpu's
+    /// own first steps on a device need from the driver. Whatever a
+    /// failure leaves is kept rather than destroyed, as the device is.
+    unsafe fn try_device(open: &hal::OpenDevice<hal::api::Vulkan>) -> Result<()> {
+        let device = &open.device;
+        let hal = |err: hal::DeviceError| anyhow!("{err}");
+        // SAFETY (whole block): every object is this device's, destroyed
+        // only after the GPU is done with it.
+        unsafe {
+            let buffer = device
+                .create_buffer(&hal::BufferDescriptor {
+                    label: Some("isocast check"),
+                    size: 256,
+                    usage: wgpu::wgt::BufferUses::COPY_DST,
+                    memory_flags: hal::MemoryFlags::empty(),
+                })
+                .map_err(hal)?;
+            device.destroy_buffer(buffer);
+            let fence = device.create_fence().map_err(hal)?;
+            let mut encoder = match device.create_command_encoder(&hal::CommandEncoderDescriptor {
+                label: Some("isocast check"),
+                queue: &open.queue,
+            }) {
+                Ok(encoder) => encoder,
+                Err(err) => {
+                    forget(fence);
+                    return Err(hal(err));
+                }
+            };
+            let submitted = (|| {
+                encoder.begin_encoding(Some("isocast check"))?;
+                let commands = encoder.end_encoding()?;
+                open.queue.submit(&[&commands], &[], (&fence, 1))?;
+                let done = device.wait(&fence, 1, Some(CHECK_WAIT))?;
+                Ok((commands, done))
+            })();
+            match submitted {
+                Ok((commands, true)) => {
+                    encoder.reset_all(std::iter::once(commands));
+                    drop(encoder);
+                    device.destroy_fence(fence);
+                    Ok(())
+                }
+                Ok((_pending, false)) => {
+                    // The command buffer is the encoder's pool's, kept with it.
+                    forget(encoder);
+                    forget(fence);
+                    bail!(
+                        "an empty submission did not finish within {} s",
+                        CHECK_WAIT.as_secs()
+                    )
+                }
+                Err(err) => {
+                    forget(encoder);
+                    forget(fence);
+                    Err(hal(err))
+                }
+            }
+        }
     }
 }
