@@ -308,13 +308,16 @@ fn param_changed(
     data.size = (width, height);
     data.pool = Some(CpuPool::bgra(width, height));
     data.started.store(true, Ordering::SeqCst);
+    let max = data.format.max_framerate();
     isocast_diagnostics::debug!(
-        "screen: the desktop shares {width}x{height} {pixel:?} ({} Hz)",
+        "screen: the desktop shares {width}x{height} {pixel:?} ({} Hz, at most {}/{})",
         if fps == 0 {
             "its own".to_string()
         } else {
             fps.to_string()
-        }
+        },
+        max.num,
+        max.denom
     );
     // A variable-rate stream (0/1) is delivered at the take's own rate:
     // pictures closer than `interval` are dropped. The engine paces by
@@ -345,6 +348,18 @@ fn process(stream: &pw::stream::Stream, data: &mut Pictures) {
     if data.stopping.load(Ordering::SeqCst) {
         return;
     }
+    // Every queued picture is taken off the queue and only the newest is
+    // kept: a buffer left queued is one the compositor cannot copy into,
+    // and xdph then retries ("Out of buffers") instead of capturing, while
+    // what we took next was the oldest picture. Dropping a buffer gives it
+    // back to the compositor.
+    let mut newest = None;
+    while let Some(buffer) = stream.dequeue_buffer() {
+        newest = Some(buffer);
+    }
+    let Some(mut buffer) = newest else {
+        return;
+    };
     // Pictures arrive when the screen changes; the ask caps how many we
     // keep, and a screen that repaints faster than that is the only case
     // this drops.
@@ -356,9 +371,6 @@ fn process(stream: &pw::stream::Stream, data: &mut Pictures) {
     }
     let (width, height) = (data.size.0 as usize, data.size.1 as usize);
     let row_bytes = width * 4;
-    let Some(mut buffer) = stream.dequeue_buffer() else {
-        return;
-    };
     let Some(first) = buffer.datas_mut().first_mut() else {
         return;
     };
@@ -496,6 +508,24 @@ fn format_params(fps: u32) -> Result<Vec<u8>> {
             Fraction { num: 0, denom: 1 },
             Fraction {
                 num: fps.max(1) * 4,
+                denom: 1
+            }
+        ),
+        // A variable-rate cast copies the screen as often as its
+        // max-framerate allows (the monitor's refresh, 165 Hz here), and
+        // every copy is the compositor's work: no more than the ask.
+        property!(
+            FormatProperties::VideoMaxFramerate,
+            Choice,
+            Range,
+            Fraction,
+            Fraction {
+                num: fps.max(1),
+                denom: 1
+            },
+            Fraction { num: 1, denom: 1 },
+            Fraction {
+                num: fps.max(1),
                 denom: 1
             }
         ),
