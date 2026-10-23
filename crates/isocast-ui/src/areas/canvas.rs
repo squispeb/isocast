@@ -317,6 +317,14 @@ impl Canvas {
             .unwrap_or_default()
     }
 
+    /// The longest gap between shown preview frames since the last call.
+    pub fn take_preview_gap(&self) -> std::time::Duration {
+        self.preview
+            .borrow_mut()
+            .as_mut()
+            .map_or(std::time::Duration::ZERO, |p| p.take_recent_gap())
+    }
+
     /// At most `fps` frames a second, whatever the canvas's rate.
     pub fn set_max_fps(&self, fps: u32) {
         self.max_fps.set(fps.clamp(1, MAX_FPS));

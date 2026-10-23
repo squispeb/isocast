@@ -278,6 +278,8 @@ pub struct Preview {
     previous: Option<SharedFrame>,
     waiting: Option<(SharedFrame, Instant)>,
     last_shown_at: Option<Instant>,
+    /// The longest gap between shown frames since `take_recent_gap`.
+    recent_gap: Duration,
     check: bool,
     last_rows: Option<u64>,
     repeat_run: u64,
@@ -335,6 +337,7 @@ impl Preview {
             previous: None,
             waiting: None,
             last_shown_at: None,
+            recent_gap: Duration::ZERO,
             check,
             last_rows: None,
             repeat_run: 0,
@@ -593,6 +596,12 @@ impl Preview {
         self.size_asked.get()
     }
 
+    /// The longest gap between shown frames since the last call
+    /// (`ISOCAST_PREVIEW_STATS`).
+    pub fn take_recent_gap(&mut self) -> Duration {
+        std::mem::take(&mut self.recent_gap)
+    }
+
     pub fn stats(&self) -> Stats {
         Stats {
             size_requests: self.size_requests.get(),
@@ -656,6 +665,7 @@ impl Preview {
         let now = crate::clock::now();
         if let Some(last) = self.last_shown_at.replace(now) {
             self.stats.longest_gap = self.stats.longest_gap.max(now - last);
+            self.recent_gap = self.recent_gap.max(now - last);
         }
         self.previous = self.showing.replace(frame);
     }

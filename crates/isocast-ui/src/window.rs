@@ -163,6 +163,36 @@ pub fn run(options: &Options) -> Result<()> {
         );
     }
 
+    // ISOCAST_PREVIEW_STATS=1: the live preview's pacing once a second on
+    // stderr: pictures shown and received, the longest gap between shown
+    // pictures, interface redraws, and how late this 1 s timer ran (the
+    // window's thread was busy for that long).
+    let pacing = slint::Timer::default();
+    if std::env::var_os("ISOCAST_PREVIEW_STATS").is_some() {
+        let shell = shell.clone();
+        let mut last = (Instant::now(), 0u64, 0u64, 0u64);
+        pacing.start(
+            slint::TimerMode::Repeated,
+            Duration::from_secs(1),
+            move || {
+                let now = Instant::now();
+                let stats = shell.canvas.preview_stats();
+                let renders = shell.canvas.frames.get();
+                let seconds = (now - last.0).as_secs_f64();
+                eprintln!(
+                    "preview: {:.1} shown/s, {:.1} received/s, longest gap {:.1} ms, {:.1} \
+                     redraws/s, timer late {:.1} ms",
+                    (stats.shown - last.1) as f64 / seconds,
+                    (stats.received - last.2) as f64 / seconds,
+                    shell.canvas.take_preview_gap().as_secs_f64() * 1e3,
+                    (renders - last.3) as f64 / seconds,
+                    (seconds - 1.0).max(0.0) * 1e3
+                );
+                last = (now, stats.shown, stats.received, renders);
+            },
+        );
+    }
+
     if let Some(seconds) = options.drag_test {
         start_drag_test(&app, seconds, options.drag_mode);
     }
