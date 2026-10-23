@@ -67,23 +67,53 @@ pub(crate) fn process_cpu_seconds() -> Option<f64> {
     Some(seconds(usage.ru_utime) + seconds(usage.ru_stime))
 }
 
-/// Busy core-seconds across the machine since boot, from `/proc/stat`'s
-/// `cpu` line: every column but idle and iowait, in clock ticks.
-pub(crate) fn system_cpu_seconds() -> Option<f64> {
-    let stat = std::fs::read_to_string("/proc/stat").ok()?;
-    let ticks: Vec<u64> = stat
-        .lines()
-        .find(|line| line.starts_with("cpu "))?
-        .split_whitespace()
-        .skip(1)
-        .filter_map(|value| value.parse().ok())
-        .collect();
-    // user nice system idle iowait irq softirq steal (guest time is
-    // already counted in user and nice).
-    if ticks.len() < 8 {
-        return None;
+/// Clock ticks the machine's CPUs have spent since boot, summed over all
+/// of them (`/proc/stat`'s `cpu` line).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CpuTicks {
+    /// Every column but idle and iowait.
+    pub busy: u64,
+    /// Every column, idle included.
+    pub total: u64,
+}
+
+impl CpuTicks {
+    /// Parse one `cpu ` line of `/proc/stat`: user nice system idle iowait
+    /// irq softirq steal (guest time is already counted in user and nice).
+    pub(crate) fn parse(line: &str) -> Option<Self> {
+        let mut words = line.split_whitespace();
+        if words.next()? != "cpu" {
+            return None;
+        }
+        let ticks: Vec<u64> = words.filter_map(|value| value.parse().ok()).collect();
+        if ticks.len() < 8 {
+            return None;
+        }
+        let total: u64 = ticks[..8].iter().sum();
+        Some(Self {
+            busy: total - ticks[3] - ticks[4],
+            total,
+        })
     }
-    let busy: u64 = ticks[..8].iter().sum::<u64>() - ticks[3] - ticks[4];
+
+    /// How busy the CPUs were between `earlier` and `self`, in percent of
+    /// all of them; `None` if no ticks passed (or the counters went back).
+    pub(crate) fn percent_since(&self, earlier: &Self) -> Option<f64> {
+        let total = self.total.checked_sub(earlier.total).filter(|t| *t > 0)?;
+        let busy = self.busy.checked_sub(earlier.busy)?;
+        Some((busy as f64 / total as f64 * 100.0).clamp(0.0, 100.0))
+    }
+}
+
+pub(crate) fn cpu_ticks() -> Option<CpuTicks> {
+    let stat = std::fs::read_to_string("/proc/stat").ok()?;
+    stat.lines().find_map(CpuTicks::parse)
+}
+
+/// Busy core-seconds across the machine since boot, from `/proc/stat`'s
+/// `cpu` line, in clock ticks.
+pub(crate) fn system_cpu_seconds() -> Option<f64> {
+    let busy = cpu_ticks()?.busy;
     // SAFETY: sysconf only reads a configuration value.
     let per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
     (per_second > 0).then(|| busy as f64 / per_second as f64)
