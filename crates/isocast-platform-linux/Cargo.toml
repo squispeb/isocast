@@ -45,7 +45,7 @@ wgpu = { version = "=30.0.1", default-features = false, features = [
 # system's shared libavcodec (FFmpeg n9), linked in-process (dynamic link keeps
 # libav's LGPL fine) so `receive` can hand every frame out the moment
 # it is done, which a pipe cannot honour.
-ffmpeg-sys-next = { version = "9.0.1", default-features = false, features = ["avcodec", "avformat", "swresample"] }
+ffmpeg-sys-next = { version = "9.0.1", default-features = false, features = ["avcodec", "avformat", "swresample", "swscale"] }
 # Browser sources (L.6): a web page rendered by WebKitGTK offscreen
 # (the page's WebKit lives on one dedicated GTK main-loop thread). The
 # `v2_40` feature matches the installed libwebkit2gtk-4.1 (GTK3,

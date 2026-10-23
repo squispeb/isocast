@@ -370,6 +370,10 @@ struct Session {
     low_latency: bool,
     constant_bitrate: bool,
     open: bool,
+    /// Scales pictures that aren't the session's size (a stream
+    /// destination's own width and height); only the worker thread
+    /// touches it.
+    scaler: Scaler,
 }
 
 impl Session {
@@ -412,6 +416,7 @@ impl Session {
                 low_latency: spec.low_latency,
                 constant_bitrate: spec.constant_bitrate,
                 open: false,
+                scaler: Scaler::new(spec.width, spec.height),
             })
         }
     }
@@ -502,20 +507,6 @@ impl Session {
         output: &Output,
     ) -> Result<()> {
         unsafe {
-            // macOS's encoder scales a picture to the session's size (a
-            // stream destination's own width and height); this one doesn't
-            // yet, so it says which setting asks for it.
-            if frame.size() != (self.width, self.height) {
-                let (width, height) = frame.size();
-                bail!(
-                    "a {width}x{height} picture can't be encoded at {}x{} on Linux yet: \
-                     scaling a stream to a destination's own size isn't available here; \
-                     remove the destination's width and height (or set them to \
-                     {width}x{height})",
-                    self.width,
-                    self.height
-                );
-            }
             self.open((*self.ctx).codec, frame.kind())?;
             // A frame the GPU drew (the program, a staged source) holds
             // its picture in textures until it is read back, as the
@@ -524,6 +515,15 @@ impl Session {
             let planes = match frame.kind() {
                 FrameKind::Bgra => vec![frame.plane(0)?],
                 FrameKind::Ycbcr8 => vec![frame.plane(0)?, frame.plane(1)?],
+            };
+            // macOS's VideoToolbox scales a picture to the session's size
+            // (a stream destination's own width and height); here libswscale
+            // does, on this worker thread, in the picture's own format so
+            // the colour matrix is untouched.
+            let planes = if frame.size() == (self.width, self.height) {
+                &planes[..]
+            } else {
+                self.scaler.scale(frame.kind(), frame.size(), &planes)?
             };
             let av_frame = self.frame;
             (*av_frame).width = (*self.ctx).width;
@@ -578,6 +578,140 @@ impl Drop for Session {
             av::av_frame_free(&mut self.frame);
             av::av_packet_free(&mut self.packet);
             av::avcodec_free_context(&mut self.ctx);
+        }
+    }
+}
+
+/// Stretches pictures to the session's size with libswscale, in the
+/// picture's own pixel format (NV12 to NV12, BGRA to BGRA): no colour
+/// conversion happens here, so NVENC consumes the result exactly as it
+/// does a picture of the right size. The aspect ratio is stretched to
+/// the destination, as on macOS.
+struct Scaler {
+    context: *mut av::SwsContext,
+    width: u32,
+    height: u32,
+    /// The destination planes, reused frame to frame; each has its own
+    /// stride and some slack past the last row, since swscale's SIMD
+    /// loops may touch a few bytes beyond a row's end.
+    out: Vec<(Vec<u8>, usize)>,
+    out_kind: Option<FrameKind>,
+}
+
+/// Bytes of slack after each destination plane.
+const SCALE_SLACK: usize = 128;
+
+impl Scaler {
+    fn new(width: u32, height: u32) -> Scaler {
+        Scaler {
+            context: std::ptr::null_mut(),
+            width,
+            height,
+            out: Vec::new(),
+            out_kind: None,
+        }
+    }
+
+    /// `planes` (a `kind` picture of `from` size) at the destination's
+    /// size. The result is valid until the next call.
+    fn scale(
+        &mut self,
+        kind: FrameKind,
+        from: (u32, u32),
+        planes: &[(Vec<u8>, usize)],
+    ) -> Result<&[(Vec<u8>, usize)]> {
+        let (format, bytes_per_pixel, plane_rows) = match kind {
+            FrameKind::Bgra => (av::AVPixelFormat::AV_PIX_FMT_BGRA, 4, vec![self.height]),
+            FrameKind::Ycbcr8 => (
+                av::AVPixelFormat::AV_PIX_FMT_NV12,
+                1,
+                vec![self.height, self.height.div_ceil(2)],
+            ),
+        };
+        if self.out_kind != Some(kind) {
+            // 64-byte aligned strides, one buffer per plane.
+            let stride = (self.width as usize * bytes_per_pixel).next_multiple_of(64);
+            self.out = plane_rows
+                .iter()
+                .map(|rows| (vec![0u8; stride * *rows as usize + SCALE_SLACK], stride))
+                .collect();
+            self.out_kind = Some(kind);
+        }
+        let downscale =
+            u64::from(self.width) * u64::from(self.height) < u64::from(from.0) * u64::from(from.1);
+        // Area averaging (a box filter) is the right downscaler; bicubic
+        // is the better upscaler. Accurate rounding keeps flat colours
+        // flat.
+        let filter = if downscale {
+            av::SwsFlags::SWS_AREA
+        } else {
+            av::SwsFlags::SWS_BICUBIC
+        };
+        let flags = filter as c_int | av::SwsFlags::SWS_ACCURATE_RND as c_int;
+        let mut source_data = [std::ptr::null::<u8>(); 4];
+        let mut source_strides = [0 as c_int; 4];
+        for (index, (bytes, stride)) in planes.iter().enumerate() {
+            source_data[index] = bytes.as_ptr();
+            source_strides[index] = *stride as c_int;
+        }
+        let mut target_data = [std::ptr::null_mut::<u8>(); 4];
+        let mut target_strides = [0 as c_int; 4];
+        for (index, (bytes, stride)) in self.out.iter_mut().enumerate() {
+            target_data[index] = bytes.as_mut_ptr();
+            target_strides[index] = *stride as c_int;
+        }
+        unsafe {
+            self.context = av::sws_getCachedContext(
+                self.context,
+                from.0 as c_int,
+                from.1 as c_int,
+                format,
+                self.width as c_int,
+                self.height as c_int,
+                format,
+                flags,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            if self.context.is_null() {
+                bail!(
+                    "libswscale could not scale a {}x{} {kind:?} picture to {}x{}",
+                    from.0,
+                    from.1,
+                    self.width,
+                    self.height
+                );
+            }
+            let rows = av::sws_scale(
+                self.context,
+                source_data.as_ptr(),
+                source_strides.as_ptr(),
+                0,
+                from.1 as c_int,
+                target_data.as_ptr(),
+                target_strides.as_ptr(),
+            );
+            if rows != self.height as c_int {
+                bail!(
+                    "libswscale scaled {rows} rows of a {}x{} {kind:?} picture to {}x{}, \
+                     not all {}",
+                    from.0,
+                    from.1,
+                    self.width,
+                    self.height,
+                    self.height
+                );
+            }
+        }
+        Ok(&self.out)
+    }
+}
+
+impl Drop for Scaler {
+    fn drop(&mut self) {
+        if !self.context.is_null() {
+            unsafe { av::sws_freeContext(self.context) };
         }
     }
 }
@@ -912,5 +1046,62 @@ unsafe fn supported_sample_formats(
             return Ok(&[]);
         }
         Ok(std::slice::from_raw_parts(out.cast(), count as usize))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A flat NV12 picture stays flat when scaled, down and up, at an
+    /// odd source size, and the planes come back at the destination's
+    /// size with aligned strides.
+    #[test]
+    fn scaling_keeps_nv12_flat_and_sized() {
+        for (from, to) in [((97, 55), (64, 36)), ((64, 36), (130, 74))] {
+            let mut scaler = Scaler::new(to.0, to.1);
+            let luma = (vec![90u8; (from.0 * from.1) as usize], from.0 as usize);
+            let chroma_stride = (from.0 as usize).next_multiple_of(2);
+            let mut chroma = vec![0u8; chroma_stride * (from.1 as usize).div_ceil(2)];
+            for pair in chroma.as_chunks_mut::<2>().0 {
+                *pair = [120, 140];
+            }
+            let planes = vec![luma, (chroma, chroma_stride)];
+            let out = scaler
+                .scale(FrameKind::Ycbcr8, from, &planes)
+                .expect("scales");
+            assert_eq!(out.len(), 2);
+            assert_eq!(out[0].1 % 64, 0);
+            for row in 0..to.1 as usize {
+                let line = &out[0].0[row * out[0].1..][..to.0 as usize];
+                assert!(line.iter().all(|y| *y == 90), "luma row {row}: {line:?}");
+            }
+            for row in 0..(to.1 as usize) / 2 {
+                let line = &out[1].0[row * out[1].1..][..to.0 as usize];
+                assert!(
+                    line.as_chunks::<2>().0.iter().all(|uv| *uv == [120, 140]),
+                    "chroma row {row}: {line:?}"
+                );
+            }
+        }
+    }
+
+    /// BGRA scales to one plane of the destination's size.
+    #[test]
+    fn scaling_keeps_bgra_flat_and_sized() {
+        let mut scaler = Scaler::new(32, 18);
+        let plane = (vec![200u8; 128 * 72 * 4], 128 * 4);
+        let out = scaler
+            .scale(FrameKind::Bgra, (128, 72), &[plane])
+            .expect("scales");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].1, 128);
+        // Alpha may round one off (NVENC ignores it); colour must not.
+        for row in 0..18 {
+            for pixel in out[0].0[row * 128..][..32 * 4].as_chunks::<4>().0 {
+                assert_eq!(pixel[..3], [200, 200, 200], "row {row}");
+                assert!(pixel[3].abs_diff(200) <= 1, "row {row}");
+            }
+        }
     }
 }
