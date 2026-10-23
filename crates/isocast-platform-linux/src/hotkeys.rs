@@ -14,6 +14,11 @@
 //! - Binds are removed with `hl.unbind(<chord>)`, never `Keybind:remove()`:
 //!   Hyprland 0.56.2 segfaults the compositor when `remove()` is called on
 //!   a second bind that shares its key with another (a press/release pair).
+//! - `hl.unbind` takes down every bind on a chord (same modifiers, same key
+//!   as written: a `code:N` bind keeps the whole chord string, which the
+//!   plain `hyprctl binds` listing shows and the JSON one does not). So a
+//!   chord some other bind holds is never bound or unbound by us: a press
+//!   chord on it is refused, a modifier-subset release chord is left out.
 //! - A release bind only fires while the modifiers held at that moment
 //!   equal its own, so lifting a modifier first would lose the key-up (a
 //!   push-to-talk key stuck on). Each chord therefore also gets
@@ -24,18 +29,21 @@
 //!   are found (Hyprland lists `code:` binds with an empty key).
 
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 use std::sync::{Mutex, MutexGuard, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use isocast_engine::hotkeys::{Edge, GlobalHotkeys, Key, OnKey};
 use isocast_protocol::hotkeys::{Phase, Registration};
 
 const UNAVAILABLE: &str = "global registration is not available here; use focused input";
 const DESCRIPTION: &str = "isocast";
+/// A wedged compositor or hyprctl must not hold the daemon (shutdown, hotkey
+/// refresh) for longer than this per call.
+const HYPRCTL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The back end the daemon uses on Linux. All state is process-global: one
 /// reader thread and one set of binds per daemon.
@@ -49,15 +57,23 @@ impl GlobalHotkeys for LinuxHotkeys {
 
 /// Remove this process's binds (daemon shutdown). Best effort.
 pub fn clear() {
-    let mut state = lock();
-    let chords = std::mem::take(&mut state.bound);
-    state.entries.clear();
-    state.down.clear();
-    state.on_key = None;
+    let (chords, instance) = {
+        let mut state = lock();
+        let chords = std::mem::take(&mut state.bound);
+        state.entries.clear();
+        state.plan.clear();
+        state.keys.clear();
+        state.down.clear();
+        // Nothing may install the binds again (a config reload between this
+        // and process exit) once the daemon is going away.
+        state.on_key = None;
+        (chords, state.instance.clone())
+    };
     if chords.is_empty() {
         return;
     }
-    if let Some(instance) = Instance::find()
+    // The lock is not held while hyprctl runs.
+    if let Some(instance) = instance.filter(Instance::alive).or_else(Instance::find)
         && let Err(message) = instance.dispatch(&unbind_lua(&chords))
     {
         eprintln!("isocastd hotkeys: removing binds at shutdown: {message}");
@@ -68,11 +84,17 @@ pub fn clear() {
 struct State {
     generation: u64,
     on_key: Option<OnKey>,
+    /// The keys of the current profile, kept to install them again.
+    keys: Vec<Key>,
+    /// The compositor the binds were installed on and the reader listens to.
+    instance: Option<Instance>,
     /// Event index -> binding id, for the binds currently installed.
     entries: HashMap<usize, String>,
-    /// Every chord string bound (press, release and subset releases).
+    /// Every chord string bound by us (press, release and subset releases),
+    /// never one that a bind of someone else also holds: `hl.unbind` takes
+    /// down every bind on a chord.
     bound: Vec<String>,
-    /// Plan to re-apply on a config reload or a reconnect.
+    /// What is installed now.
     plan: Vec<Planned>,
     /// Event indexes whose press was seen and whose release has not been.
     down: HashSet<usize>,
@@ -113,6 +135,7 @@ fn debug(message: std::fmt::Arguments<'_>) {
 
 // ---- Hyprland instance and IPC -----------------------------------------
 
+#[derive(Clone)]
 struct Instance {
     signature: String,
     dir: PathBuf,
@@ -156,16 +179,63 @@ impl Instance {
         dirs.iter().rev().find_map(|(_, name)| live(name))
     }
 
+    fn alive(&self) -> bool {
+        UnixStream::connect(self.dir.join(".socket.sock")).is_ok()
+    }
+
+    /// Run hyprctl against this instance, giving up (and killing it) after
+    /// `HYPRCTL_TIMEOUT`.
+    fn hyprctl(&self, args: &[&str]) -> Result<Output, String> {
+        let mut child = Command::new("hyprctl")
+            .env("HYPRLAND_INSTANCE_SIGNATURE", &self.signature)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("hyprctl: {e}"))?;
+        fn drain(pipe: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<Vec<u8>> {
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                if let Some(mut pipe) = pipe {
+                    let _ = pipe.read_to_end(&mut bytes);
+                }
+                bytes
+            })
+        }
+        let stdout = drain(child.stdout.take());
+        let stderr = drain(child.stderr.take());
+        let deadline = Instant::now() + HYPRCTL_TIMEOUT;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "hyprctl {}: no answer after {} s",
+                        args.first().copied().unwrap_or(""),
+                        HYPRCTL_TIMEOUT.as_secs()
+                    ));
+                }
+                Err(e) => return Err(format!("hyprctl: {e}")),
+            }
+        };
+        Ok(Output {
+            status,
+            stdout: stdout.join().unwrap_or_default(),
+            stderr: stderr.join().unwrap_or_default(),
+        })
+    }
+
     /// Run one Lua expression through `hyprctl dispatch`. hyprctl wraps its
     /// argument as `return hl.dispatch(<expr>)`, so statements need an
     /// immediately invoked function.
     fn dispatch(&self, lua: &str) -> Result<(), String> {
-        let output = Command::new("hyprctl")
-            .env("HYPRLAND_INSTANCE_SIGNATURE", &self.signature)
-            .arg("dispatch")
-            .arg(lua)
-            .output()
-            .map_err(|e| format!("hyprctl: {e}"))?;
+        let output = self.hyprctl(&["dispatch", lua])?;
         let text = String::from_utf8_lossy(&output.stdout);
         if output.status.success() && text.trim() == "ok" {
             Ok(())
@@ -179,13 +249,22 @@ impl Instance {
         }
     }
 
+    /// Every bind. `hyprctl binds -j` gives a `code:N` bind an empty key; the
+    /// plain listing has the key as the bind was written, so it is read as
+    /// well (same order) to fill that in.
     fn binds(&self) -> Result<Vec<Bind>, String> {
-        let output = Command::new("hyprctl")
-            .env("HYPRLAND_INSTANCE_SIGNATURE", &self.signature)
-            .args(["binds", "-j"])
-            .output()
-            .map_err(|e| format!("hyprctl: {e}"))?;
-        parse_binds(&output.stdout)
+        let json = self.hyprctl(&["binds", "-j"])?;
+        let mut binds = parse_binds(&json.stdout)?;
+        let text = self
+            .hyprctl(&["binds"])
+            .ok()
+            .map(|o| parse_text_keys(&String::from_utf8_lossy(&o.stdout)));
+        if let Some(keys) = text.filter(|keys| keys.len() == binds.len()) {
+            for (bind, key) in binds.iter_mut().zip(keys) {
+                bind.literal = key;
+            }
+        }
+        Ok(binds)
     }
 
     fn event_socket(&self) -> PathBuf {
@@ -196,7 +275,12 @@ impl Instance {
 #[derive(Debug, PartialEq)]
 struct Bind {
     modmask: u32,
+    /// The `key` of the JSON listing: empty for a `code:N` bind.
     key: String,
+    /// The key as written, from the plain listing: `Q`, `XF86AudioPlay`, or
+    /// for a code bind the whole chord (`SUPER + code:10`). Empty when it
+    /// could not be read.
+    literal: String,
     description: String,
     release: bool,
     mouse: bool,
@@ -215,6 +299,7 @@ fn parse_binds(json: &[u8]) -> Result<Vec<Bind>, String> {
         .map(|b| Bind {
             modmask: b["modmask"].as_u64().unwrap_or(0) as u32,
             key: b["key"].as_str().unwrap_or("").to_string(),
+            literal: b["key"].as_str().unwrap_or("").to_string(),
             description: b["description"].as_str().unwrap_or("").to_string(),
             release: b["release"].as_bool().unwrap_or(false),
             mouse: b["mouse"].as_bool().unwrap_or(false),
@@ -222,6 +307,14 @@ fn parse_binds(json: &[u8]) -> Result<Vec<Bind>, String> {
             dispatcher: b["dispatcher"].as_str().unwrap_or("").to_string(),
         })
         .collect())
+}
+
+/// The `key:` lines of `hyprctl binds`, one per bind.
+fn parse_text_keys(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| line.strip_prefix("\tkey:"))
+        .map(|key| key.trim().to_string())
+        .collect()
 }
 
 // ---- Chord to Hyprland bind --------------------------------------------
@@ -440,6 +533,32 @@ fn chord_string(modifiers: u32, key: &str) -> String {
     parts.join(" + ")
 }
 
+/// Hyprland's modifier mask and the key as Hyprland keeps it (`literal`) for
+/// a chord string: a keysym bind keeps just the keysym, a `code:N` bind keeps
+/// the whole string (`SUPER + code:10`). `hl.unbind` matches on the mask and
+/// that literal, ignoring case, so two chords are the same bind exactly when
+/// both are equal.
+fn chord_literal(chord: &str) -> (u32, String) {
+    let mut parts: Vec<&str> = chord.split(" + ").collect();
+    let key = parts.pop().unwrap_or("");
+    let mask = parts
+        .iter()
+        .map(|m| match m.to_ascii_uppercase().as_str() {
+            "SHIFT" => 1,
+            "CTRL" | "CONTROL" => 4,
+            "ALT" => 8,
+            "SUPER" | "META" | "WIN" => 64,
+            _ => 0,
+        })
+        .sum();
+    let literal = if key.starts_with("code:") {
+        chord.to_string()
+    } else {
+        key.to_string()
+    };
+    (mask, literal)
+}
+
 /// Every modifier subset of the chord, the full set first.
 fn modifier_subsets(modifiers: u32) -> Vec<u32> {
     let mut subsets: Vec<u32> = (0..16).filter(|m| m & !modifiers == 0).collect();
@@ -490,12 +609,15 @@ fn parse_description(text: &str) -> Option<(u32, &str)> {
 
 /// One key of the plan: its press chord, its release chords and the event
 /// index the daemon's binding is looked up by.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 struct Planned {
     n: usize,
     binding: String,
     modifiers: u32,
     key: String,
+    /// Release chords not installed because another bind holds the same
+    /// chord (it would be taken down with ours).
+    skip: Vec<String>,
 }
 
 impl Planned {
@@ -510,6 +632,7 @@ impl Planned {
         modifier_subsets(self.modifiers)
             .into_iter()
             .map(|m| (chord_string(m, &self.key), m == self.modifiers))
+            .filter(|(chord, _)| !self.skip.contains(chord))
             .collect()
     }
 
@@ -591,10 +714,48 @@ fn pid_alive(pid: u32) -> bool {
     PathBuf::from(format!("/proc/{pid}")).exists()
 }
 
-/// Who already has this chord: a user bind, or another daemon's.
-fn conflict(binds: &[Bind], modifiers: u32, key: &str, press_chord: &str) -> Option<String> {
+/// The key of a bind as Hyprland holds it: another isocast daemon's from its
+/// description (the listing has no key for a `code:N` bind), otherwise as
+/// read. Empty when unreadable.
+fn foreign_literal(b: &Bind) -> String {
+    match parse_description(&b.description) {
+        Some((_, chord)) => chord_literal(chord).1,
+        None => b.literal.clone(),
+    }
+}
+
+/// Whether `b` is a bind on the chord `(mask, literal)` itself, one that
+/// `hl.unbind` of that chord would take down with ours. A bind whose key
+/// could not be read counts for every chord on its modifiers.
+fn holds(b: &Bind, mask: u32, literal: &str) -> bool {
+    if b.modmask & !(2 | 16) != mask {
+        return false;
+    }
+    let theirs = foreign_literal(b);
+    theirs.is_empty() || theirs.eq_ignore_ascii_case(literal)
+}
+
+fn describe(b: &Bind) -> String {
+    if b.description.is_empty() {
+        b.dispatcher.clone()
+    } else {
+        b.description.clone()
+    }
+}
+
+/// Who already has this chord: a user bind, or another daemon's. Two kinds
+/// of clash: a bind on the same physical key and modifiers (both would fire),
+/// and a bind on the very same chord string (our cleanup would remove it).
+fn conflict(
+    binds: &[Bind],
+    modifiers: u32,
+    portable_key: &str,
+    sym: &str,
+    press_chord: &str,
+) -> Option<String> {
     let mask = hypr_modmask(modifiers);
-    let names = us_keysyms(key);
+    let mut names = us_keysyms(portable_key);
+    names.push(sym.to_ascii_lowercase());
     for b in binds {
         if let Some((pid, chord)) = parse_description(&b.description) {
             if chord == press_chord && !b.release {
@@ -604,68 +765,127 @@ fn conflict(binds: &[Bind], modifiers: u32, key: &str, press_chord: &str) -> Opt
             }
             continue;
         }
-        if b.release || b.mouse || !b.submap.is_empty() || b.key.is_empty() {
+        if b.release || b.mouse || !b.submap.is_empty() || b.modmask & !(2 | 16) != mask {
             continue;
         }
-        if b.modmask & !(2 | 16) == mask && names.iter().any(|n| n.eq_ignore_ascii_case(&b.key)) {
-            let what = if b.description.is_empty() {
-                b.dispatcher.clone()
-            } else {
-                b.description.clone()
-            };
-            return Some(format!("chord already bound in Hyprland ({what})"));
+        // For a code bind the literal is the whole chord: compare the key.
+        let theirs = b.literal.rsplit(" + ").next().unwrap_or("");
+        if names.iter().any(|n| n.eq_ignore_ascii_case(theirs)) {
+            return Some(format!("chord already bound in Hyprland ({})", describe(b)));
         }
     }
-    None
+    let (mask, literal) = chord_literal(press_chord);
+    binds.iter().find(|b| holds(b, mask, &literal)).map(|b| {
+        if foreign_literal(b).is_empty() {
+            format!(
+                "chord may collide with a Hyprland bind whose key cannot be read ({})",
+                describe(b)
+            )
+        } else {
+            format!("chord already bound in Hyprland ({})", describe(b))
+        }
+    })
+}
+
+/// The release chords of a key that someone else's bind also holds.
+fn blocked_releases(binds: &[Bind], modifiers: u32, key: &str) -> Vec<String> {
+    modifier_subsets(modifiers)
+        .into_iter()
+        .filter(|m| *m != modifiers)
+        .map(|m| chord_string(m, key))
+        .filter(|chord| {
+            let (mask, literal) = chord_literal(chord);
+            binds.iter().any(|b| holds(b, mask, &literal))
+        })
+        .collect()
+}
+
+fn refused(keys: &[Key], warning: &str) -> Vec<Registration> {
+    keys.iter()
+        .map(|k| Registration {
+            binding: k.binding.clone(),
+            global: false,
+            warning: Some(warning.to_string()),
+        })
+        .collect()
 }
 
 fn replace(keys: Vec<Key>, generation: u64, on_key: OnKey) -> Vec<Registration> {
-    let refused = |keys: &[Key], warning: &str| -> Vec<Registration> {
-        keys.iter()
-            .map(|k| Registration {
-                binding: k.binding.clone(),
-                global: false,
-                warning: Some(warning.to_string()),
-            })
-            .collect()
-    };
     let mut state = lock();
-    let Some(instance) = Instance::find() else {
-        state.bound.clear();
-        state.entries.clear();
-        state.plan.clear();
-        return refused(&keys, UNAVAILABLE);
-    };
     state.generation = generation;
     state.on_key = Some(on_key);
+    state.keys = keys;
     state.down.clear();
-    state.entries.clear();
-    state.plan.clear();
     if !state.reader {
         state.reader = true;
         drop(state);
         start_reader();
         state = lock();
     }
+    register(&mut state)
+}
+
+/// Take down the binds this process knows it installed. Without a snapshot
+/// of the other binds this is the best that can be done; on failure the
+/// chords stay recorded so `clear` tries again.
+fn drop_installed(state: &mut State, instance: &Instance) {
+    state.entries.clear();
+    state.plan.clear();
+    if state.bound.is_empty() {
+        return;
+    }
+    if instance.dispatch(&unbind_lua(&state.bound)).is_ok() {
+        state.bound.clear();
+    }
+}
+
+/// Install `state.keys` on the compositor: sweep our earlier binds and those
+/// of dead daemons, refuse chords someone else holds, bind the rest.
+fn register(state: &mut State) -> Vec<Registration> {
+    let keys = state.keys.clone();
+    let generation = state.generation;
+    state.entries.clear();
+    state.plan.clear();
+    let Some(instance) = state
+        .instance
+        .clone()
+        .filter(Instance::alive)
+        .or_else(Instance::find)
+    else {
+        state.bound.clear();
+        return refused(&keys, UNAVAILABLE);
+    };
+    state.instance = Some(instance.clone());
     let binds = match instance.binds() {
         Ok(binds) => binds,
         Err(message) => {
+            drop_installed(state, &instance);
             return refused(&keys, &format!("{UNAVAILABLE} ({message})"));
         }
     };
     let pid = std::process::id();
     // Our own earlier binds and those of daemons that died: removed in the
     // same dispatch that installs the new ones.
-    let mut remove: Vec<String> = Vec::new();
+    let mut sweep: Vec<String> = Vec::new();
     let mut others: Vec<Bind> = Vec::new();
     for b in binds {
         match parse_description(&b.description) {
             Some((owner, chord)) if owner == pid || !pid_alive(owner) => {
-                remove.push(chord.to_string());
+                sweep.push(chord.to_string());
             }
             _ => others.push(b),
         }
     }
+    // Never a chord that another bind holds as well: unbind takes both.
+    let mut remove: Vec<String> = sweep
+        .into_iter()
+        .filter(|chord| {
+            let (mask, literal) = chord_literal(chord);
+            !others.iter().any(|b| holds(b, mask, &literal))
+        })
+        .collect();
+    remove.sort();
+    remove.dedup();
     let mut results: Vec<Result<Planned, String>> = Vec::new();
     let mut planned = Vec::new();
     for key in &keys {
@@ -677,8 +897,13 @@ fn replace(keys: Vec<Key>, generation: u64, on_key: OnKey) -> Vec<Registration> 
             continue;
         };
         let press_chord = chord_string(key.chord.modifiers, &sym);
-        if let Some(warning) = conflict(&others, key.chord.modifiers, &key.chord.key, &press_chord)
-        {
+        if let Some(warning) = conflict(
+            &others,
+            key.chord.modifiers,
+            &key.chord.key,
+            &sym,
+            &press_chord,
+        ) {
             results.push(Err(warning));
             continue;
         }
@@ -686,16 +911,21 @@ fn replace(keys: Vec<Key>, generation: u64, on_key: OnKey) -> Vec<Registration> 
             n: planned.len(),
             binding: key.binding.clone(),
             modifiers: key.chord.modifiers,
+            skip: blocked_releases(&others, key.chord.modifiers, &sym),
             key: sym,
         };
         planned.push(p.clone());
         results.push(Ok(p));
     }
-    remove.sort();
-    remove.dedup();
     let lua = install_lua(pid, generation, &remove, &planned);
     if let Err(message) = instance.dispatch(&lua) {
-        state.bound.clear();
+        // Part of the script may have run: remember everything it could have
+        // bound, so a later clear still takes it down.
+        let mut bound = std::mem::take(&mut state.bound);
+        bound.extend(planned.iter().flat_map(Planned::chords));
+        bound.sort();
+        bound.dedup();
+        state.bound = bound;
         return refused(&keys, &format!("{UNAVAILABLE} ({message})"));
     }
     // Hyprland answers "ok" even for a bind it could not parse; read back.
@@ -731,41 +961,66 @@ fn replace(keys: Vec<Key>, generation: u64, on_key: OnKey) -> Vec<Registration> 
     keys.iter()
         .zip(results)
         .map(|(key, result)| {
-            let warning = match result {
-                Err(warning) => Some(warning),
-                Ok(p) if failed.iter().any(|f| f.n == p.n) => {
-                    Some("Hyprland did not accept this bind; see `hyprctl binds`".to_string())
-                }
-                Ok(_) => None,
+            let (global, warning) = match result {
+                Err(warning) => (false, Some(warning)),
+                Ok(p) if failed.iter().any(|f| f.n == p.n) => (
+                    false,
+                    Some("Hyprland did not accept this bind; see `hyprctl binds`".to_string()),
+                ),
+                Ok(p) if !p.skip.is_empty() => (
+                    true,
+                    Some(format!(
+                        "key-up is missed if a modifier is released before the key: {} is also a Hyprland bind",
+                        p.skip.join(", ")
+                    )),
+                ),
+                Ok(_) => (true, None),
             };
             Registration {
                 binding: key.binding.clone(),
-                global: warning.is_none(),
+                global,
                 warning,
             }
         })
         .collect()
 }
 
-/// Install the current plan again, after a config reload or a reconnect
-/// (a reload drops dynamic binds). No conflict check: the chords were ours.
+/// Install the profile again, after a config reload or a reconnect (a reload
+/// drops dynamic binds). It goes through the same checks as the first time:
+/// the user's config may have changed. Keys that were held when the binds
+/// went away get their release, or they would stay down.
 fn reapply(reason: &str) {
-    let state = lock();
-    if state.plan.is_empty() {
-        return;
-    }
-    let Some(instance) = Instance::find() else {
+    let mut state = lock();
+    let Some(on_key) = state.on_key.clone() else {
         return;
     };
-    let lua = install_lua(
-        std::process::id(),
-        state.generation,
-        &state.bound,
-        &state.plan,
-    );
-    match instance.dispatch(&lua) {
-        Ok(()) => debug(format_args!("binds installed again ({reason})")),
-        Err(message) => eprintln!("isocastd hotkeys: installing binds again ({reason}): {message}"),
+    if state.keys.is_empty() {
+        return;
+    }
+    let generation = state.generation;
+    let released: Vec<Edge> = state
+        .down
+        .iter()
+        .filter_map(|n| state.entries.get(n))
+        .map(|binding| Edge {
+            binding: binding.clone(),
+            generation,
+            phase: Phase::Release,
+        })
+        .collect();
+    state.down.clear();
+    let registrations = register(&mut state);
+    drop(state);
+    for r in registrations.iter().filter(|r| !r.global) {
+        eprintln!(
+            "isocastd hotkeys: {} not bound again ({reason}): {}",
+            r.binding,
+            r.warning.as_deref().unwrap_or("")
+        );
+    }
+    debug(format_args!("binds installed again ({reason})"));
+    for edge in released {
+        on_key(edge);
     }
 }
 
@@ -779,8 +1034,13 @@ fn start_reader() {
         let mut ready = Some(ready);
         let mut connected_before = false;
         loop {
-            let stream = Instance::find().and_then(|i| UnixStream::connect(i.event_socket()).ok());
-            let Some(stream) = stream else {
+            // One instance per connection: the binds go where the events
+            // are read.
+            let connected = Instance::find().and_then(|instance| {
+                let stream = UnixStream::connect(instance.event_socket()).ok()?;
+                Some((instance, stream))
+            });
+            let Some((instance, stream)) = connected else {
                 if let Some(ready) = ready.take() {
                     let _ = ready.send(());
                 }
@@ -789,6 +1049,7 @@ fn start_reader() {
                 continue;
             };
             backoff = Duration::from_millis(500);
+            lock().instance = Some(instance);
             if let Some(ready) = ready.take() {
                 let _ = ready.send(());
             }
@@ -900,6 +1161,7 @@ mod tests {
             binding: "b".into(),
             modifiers: chord.modifiers,
             key: "code:52".into(),
+            skip: Vec::new(),
         };
         assert_eq!(
             p.release_chords(),
@@ -951,6 +1213,7 @@ mod tests {
             binding: "b".into(),
             modifiers: 1,
             key: "code:52".into(),
+            skip: Vec::new(),
         };
         let lua = install_lua(5, 3, &["OLD + code:1".to_string()], &[p]);
         assert!(lua.starts_with("(function() hl.unbind(\"OLD + code:1\"); "));
@@ -971,10 +1234,16 @@ mod tests {
         assert_eq!(lua_string("a\"b\\c\nd"), "\"a\\\"b\\\\c d\"");
     }
 
-    fn user_bind(modmask: u32, key: &str, description: &str) -> Bind {
+    fn user_bind(modmask: u32, literal: &str, description: &str) -> Bind {
         Bind {
             modmask,
-            key: key.into(),
+            // `hyprctl binds -j` gives code binds an empty key.
+            key: if literal.contains("code:") {
+                String::new()
+            } else {
+                literal.into()
+            },
+            literal: literal.into(),
             description: description.into(),
             release: false,
             mouse: false,
@@ -983,34 +1252,124 @@ mod tests {
         }
     }
 
+    fn clash(binds: &[Bind], modifiers: u32, key: &str) -> Option<String> {
+        let sym = key_string(key).unwrap();
+        let chord = chord_string(modifiers, &sym);
+        conflict(binds, modifiers, key, &sym, &chord)
+    }
+
     #[test]
     fn conflicts_name_the_existing_bind() {
         let binds = vec![
             user_bind(64, "Q", "Close window"),
             user_bind(0, "XF86AudioPlay", "Play"),
             user_bind(64 | 2, "z", "caps lock held"),
-            user_bind(0, "", "a code: bind"),
             user_bind(12, "", &description(77, "CTRL + ALT + code:52")),
         ];
-        let q = conflict(&binds, 8, "q", "SUPER + code:24");
         assert_eq!(
-            q.as_deref(),
+            clash(&binds, 8, "q").as_deref(),
             Some("chord already bound in Hyprland (Close window)")
         );
-        assert!(conflict(&binds, 8, "w", "SUPER + code:25").is_none());
+        assert!(clash(&binds, 8, "w").is_none());
         // Different modifiers are a different chord.
-        assert!(conflict(&binds, 1 | 8, "q", "CTRL + SUPER + code:24").is_none());
-        let play = conflict(&binds, 0, "media_play_pause", "XF86AudioPlay");
+        assert!(clash(&binds, 1 | 8, "q").is_none());
         assert_eq!(
-            play.as_deref(),
+            clash(&binds, 0, "media_play_pause").as_deref(),
             Some("chord already bound in Hyprland (Play)")
         );
         // Caps lock in the user's mask does not change the chord.
-        assert!(conflict(&binds, 8, "z", "SUPER + code:52").is_some());
-        let other = conflict(&binds, 1 | 2, "z", "CTRL + ALT + code:52");
+        assert!(clash(&binds, 8, "z").is_some());
         assert_eq!(
-            other.as_deref(),
+            clash(&binds, 1 | 2, "z").as_deref(),
             Some("chord already bound by another isocast daemon (pid 77)")
+        );
+    }
+
+    #[test]
+    fn code_binds_are_seen_through_their_literal() {
+        // Omarchy: SUPER + code:10 (workspace 1), SUPER + CTRL + code:10.
+        let binds = vec![
+            user_bind(64, "SUPER + code:10", "Switch to workspace 1"),
+            user_bind(64 | 4, "SUPER + CTRL + code:10", "Bar panel 1"),
+        ];
+        // ctrl+cmd+1 fires the panel bind too: refused.
+        assert_eq!(
+            clash(&binds, 1 | 8, "1").as_deref(),
+            Some("chord already bound in Hyprland (Bar panel 1)")
+        );
+        assert_eq!(
+            clash(&binds, 8, "1").as_deref(),
+            Some("chord already bound in Hyprland (Switch to workspace 1)")
+        );
+        assert!(clash(&binds, 8, "2").is_none());
+    }
+
+    #[test]
+    fn unreadable_keys_block_their_modifiers() {
+        let binds = vec![user_bind(64, "", "unreadable")];
+        assert!(
+            clash(&binds, 8, "2")
+                .unwrap()
+                .contains("cannot be read (unreadable)")
+        );
+        assert!(clash(&binds, 1, "2").is_none());
+    }
+
+    #[test]
+    fn release_chords_held_by_other_binds_are_skipped() {
+        // ctrl+cmd+1: its SUPER-only release chord is Omarchy's workspace
+        // bind, which `hl.unbind("SUPER + code:10")` would remove with ours.
+        let sym = key_string("1").unwrap();
+        let binds = vec![
+            user_bind(64, "SUPER + code:10", "Switch to workspace 1"),
+            // Same mask and key but written with another modifier order: a
+            // different literal, which unbind does not touch.
+            user_bind(64 | 4, "SUPER + CTRL + code:10", "Bar panel 1"),
+        ];
+        assert_eq!(
+            blocked_releases(&binds, 1 | 8, &sym),
+            vec!["SUPER + code:10".to_string()]
+        );
+        let p = Planned {
+            n: 0,
+            binding: "b".into(),
+            modifiers: 1 | 8,
+            key: sym.clone(),
+            skip: blocked_releases(&binds, 1 | 8, &sym),
+        };
+        assert!(!p.chords().contains(&"SUPER + code:10".to_string()));
+        assert!(p.chords().contains(&"CTRL + code:10".to_string()));
+        // Keysym binds: the media key's bare release chord is Omarchy's Play.
+        let play = vec![user_bind(0, "XF86AudioPlay", "Play")];
+        assert_eq!(
+            blocked_releases(&play, 1, "XF86AudioPlay"),
+            vec!["XF86AudioPlay".to_string()]
+        );
+    }
+
+    #[test]
+    fn chord_literals_follow_hyprland() {
+        assert_eq!(
+            chord_literal("SUPER + code:10"),
+            (64, "SUPER + code:10".into())
+        );
+        assert_eq!(chord_literal("XF86AudioPlay"), (0, "XF86AudioPlay".into()));
+        assert_eq!(
+            chord_literal("CTRL + XF86AudioPlay"),
+            (4, "XF86AudioPlay".into())
+        );
+        assert_eq!(
+            chord_literal(&chord_string(1 | 2, "code:52")),
+            (12, "CTRL + ALT + code:52".into())
+        );
+    }
+
+    #[test]
+    fn text_listing_keys_are_read() {
+        let text = "bindd\n\tmodmask: 64\n\tkey: SUPER + code:10\n\tkeycode: 0\n\nbindld\n\tkey: XF86AudioPlay\n";
+        assert_eq!(
+            parse_text_keys(text),
+            vec!["SUPER + code:10".to_string(), "XF86AudioPlay".to_string()]
         );
     }
 
