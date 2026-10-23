@@ -240,6 +240,13 @@ impl Surface {
                 depth_or_array_layers: 1,
             },
         );
+        // A write waits in the queue's staging memory until something
+        // submits on it. The app's queue is Slint's, which submits only
+        // when the window draws: a window on a hidden workspace draws
+        // nothing while frames keep arriving, and 60 uncommitted 8 MB
+        // copies a second grew isocast-ui past 6 GB in 10 s. Submitting
+        // here sends the copy now and lets wgpu free its staging memory.
+        queue.submit(std::iter::empty::<wgpu::CommandBuffer>());
         Ok(())
     }
 }
