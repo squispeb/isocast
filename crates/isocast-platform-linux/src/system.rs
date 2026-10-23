@@ -519,23 +519,32 @@ fn desktops(devices: &mut Devices, notes: &mut Vec<String>) {
     }
 }
 
-/// The windows Hyprland reports, from `hyprctl clients -j`. Its `address`
-/// (`0x6242fd272870`) is what a window is known by — there is no small
-/// integer id as on macOS — so a window's id is the low 32 bits of it,
-/// which the protocol documents as valid only while the window exists
-/// (setups match windows by app and title, which is what Hyprland
-/// carries: `class` and `title`, with `initialClass` standing in for a
-/// bundle id).
+/// The windows Hyprland reports, from `hyprctl clients -j`. There is no
+/// small integer id as on macOS, so a window's id is its `stableId`
+/// (`1800000e`, a 32-bit number that is also the `identifier` the
+/// compositor's toplevel protocol gives the window, and does not change
+/// while the window lives), else the low 32 bits of its `address`
+/// (`0x6242fd272870`). Ids are for listing only: setups match windows by
+/// app and title, which is what Hyprland carries (`class` and `title`,
+/// with `initialClass` standing in for a bundle id) and what capture
+/// follows (toplevel.rs).
 fn windows(clients: &[u8]) -> Vec<Window> {
     let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(clients) else {
         return Vec::new();
     };
     let mut windows = Vec::new();
     for client in parsed.as_array().into_iter().flatten() {
-        let Some(id) = client["address"]
+        let Some(id) = client["stableId"]
             .as_str()
-            .and_then(|address| u64::from_str_radix(address.trim_start_matches("0x"), 16).ok())
-            .map(|address| address as u32)
+            .and_then(|stable| u32::from_str_radix(stable, 16).ok())
+            .or_else(|| {
+                client["address"]
+                    .as_str()
+                    .and_then(|address| {
+                        u64::from_str_radix(address.trim_start_matches("0x"), 16).ok()
+                    })
+                    .map(|address| address as u32)
+            })
         else {
             continue;
         };
@@ -832,7 +841,8 @@ pub(crate) fn permissions_report() -> Result<PermissionsReport> {
                     Some(
                         "run `isocast permissions --request` and choose a screen in the \
                          desktop's picker; every later capture follows that choice (or let the \
-                         first screen recording ask, within its 8 s open)"
+                         first screen recording ask, within its 8 s open). Window and app \
+                         sources need no choice: the compositor offers them directly"
                             .to_string(),
                     ),
                 ),
@@ -887,10 +897,20 @@ pub(crate) fn probe(source: &SourceKind, canvas: &Canvas) -> Result<Option<Probe
                 channels: None,
             }))
         }
-        SourceKind::Window(_) | SourceKind::Application(_) => bail!(
-            "window and app capture arrive at L.2's follow-up (a monitor through the portal is \
-             what L.2 delivers)"
-        ),
+        SourceKind::Window(window) => Ok(Some(crate::toplevel::probe(
+            isocast_engine::ScreenTarget::Window {
+                app: &window.app,
+                title: window.title.as_deref(),
+            },
+            canvas.fps,
+        )?)),
+        SourceKind::Application(application) => Ok(Some(crate::toplevel::probe(
+            isocast_engine::ScreenTarget::Application {
+                app: &application.app,
+                display: &application.display,
+            },
+            canvas.fps,
+        )?)),
         SourceKind::Camera(settings) => {
             let request = CameraRequest {
                 size: settings.width.zip(settings.height),
@@ -1185,7 +1205,7 @@ mod tests {
     }
 
     /// This box's own `hyprctl clients -j` shape: a window is named by
-    /// its `address`, and reading an `id` (which Hyprland doesn't send
+    /// its `stableId` (else its `address`), and reading an `id` (which Hyprland doesn't send
     /// for windows) left the doctor's window list empty.
     #[test]
     fn hyprland_windows_are_listed_by_address() {
@@ -1193,7 +1213,8 @@ mod tests {
             {"address": "0x6242fd272870", "mapped": true, "class": "helium",
              "initialClass": "helium", "title": "A tab - Helium", "size": [2022, 1100]},
             {"address": "0x55a1b2c3d4e5", "mapped": true, "class": "",
-             "initialClass": "", "title": "Isocast", "size": [1280, 800]}
+             "initialClass": "", "title": "Isocast", "size": [1280, 800],
+             "stableId": "1800000e"}
         ]"#;
         let listed = windows(clients);
         assert_eq!(listed.len(), 2);
@@ -1202,6 +1223,7 @@ mod tests {
         assert_eq!(listed[0].title.as_deref(), Some("A tab - Helium"));
         assert_eq!((listed[0].width, listed[0].height), (2022, 1100));
         assert_eq!(listed[0].id, 0xfd27_2870);
+        assert_eq!(listed[1].id, 0x1800_000e, "stableId wins over the address");
         assert_eq!(listed[1].app, "");
         assert_ne!(
             listed[0].id, listed[1].id,

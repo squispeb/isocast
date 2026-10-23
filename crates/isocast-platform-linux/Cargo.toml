@@ -63,3 +63,9 @@ cairo-rs = "0.18"
 # links this crate without re-exporting it; same version as its own).
 base64 = "0.22.1"
 java_script_core = { package = "javascriptcore-rs", version = "=1.1" }
+# Window and app capture (L.2b): a plain Wayland client of the compositor's
+# standard ext-foreign-toplevel-list and ext-image-copy-capture protocols.
+# Both crates are already in the lock through winit's toolkit; the staging
+# feature carries the ext-* protocol XMLs.
+wayland-client = "0.31.15"
+wayland-protocols = { version = "0.32.13", features = ["client", "staging"] }

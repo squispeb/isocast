@@ -35,6 +35,7 @@ pub(crate) mod camera;
 mod fragments;
 pub(crate) mod frames;
 pub(crate) mod gpu;
+mod hyprland;
 pub(crate) mod join;
 mod jpeg;
 mod keychain;
@@ -47,6 +48,8 @@ mod recode;
 mod screencast;
 pub(crate) mod stream;
 pub(crate) mod system;
+mod toplevel;
+mod window_pixels;
 pub(crate) mod writer;
 
 pub use frames::LinuxFrame;
@@ -74,6 +77,9 @@ enum Running {
     Camera { _camera: camera::CameraCapture },
     /// A screen shared through the desktop's portal (screencast.rs).
     Screen { _screen: screencast::ScreenCapture },
+    /// A window, or an app's windows, copied from the compositor
+    /// (toplevel.rs).
+    Window { _window: toplevel::WindowCapture },
     /// A microphone, an output's monitor or an app's own streams
     /// (audio.rs).
     Audio { _audio: audio::AudioCapture },
@@ -141,11 +147,9 @@ impl Platform for LinuxPlatform {
     /// (L.2). A capture that runs past the engine's 8 s bound is
     /// described by that, not by "check its file/device".
     fn source_permission(&self, source: &SourceKind) -> Option<String> {
-        // Window and app capture follow the same picker when they land.
-        let screen = matches!(
-            source,
-            SourceKind::Display(_) | SourceKind::Window(_) | SourceKind::Application(_)
-        );
+        // A window or an app's windows are copied from the compositor
+        // directly (toplevel.rs): nothing to answer.
+        let screen = matches!(source, SourceKind::Display(_));
         (screen && !portal::has_token()).then(|| {
             "the desktop's screen-sharing picker is waiting for a choice: run `isocast \
              permissions --request` and pick a screen (the choice is remembered, so later \
@@ -421,11 +425,18 @@ impl Platform for LinuxPlatform {
         }
         let display = match target {
             isocast_engine::ScreenTarget::Display(display) => display,
+            // L.2b: a window, or an app's windows, straight from the
+            // compositor: no portal and no picker (see toplevel.rs).
             isocast_engine::ScreenTarget::Window { .. }
-            | isocast_engine::ScreenTarget::Application { .. } => bail!(
-                "capturing a window or an app is not available on Linux yet: L.2 captures a \
-                 monitor through the desktop's portal, so point the source at a display"
-            ),
+            | isocast_engine::ScreenTarget::Application { .. } => {
+                let (window, format) = toplevel::capture(*self, target, fps, cursor, sink)?;
+                return Ok((
+                    Capture {
+                        _running: Running::Window { _window: window },
+                    },
+                    format,
+                ));
+            }
         };
         // The portal's own picker decides which monitor is shared, so the
         // name is a check, not an instruction: a name that matches no

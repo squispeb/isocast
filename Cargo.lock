@@ -3573,6 +3573,8 @@ dependencies = [
  "libc",
  "pipewire",
  "serde_json",
+ "wayland-client",
+ "wayland-protocols",
  "webkit2gtk",
  "wgpu",
  "zbus",
