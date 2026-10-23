@@ -90,7 +90,12 @@ fn page_thread() -> Result<&'static glib::MainContext> {
                 let _ = up.send(Err(anyhow!("{THREAD_ERROR}: {started:?}")));
                 return;
             }
-            let context = glib::MainContext::new();
+            // GLib's global default context, not a private one: GDK's
+            // frame clock and WebKit's paint handshake attach their
+            // sources there, and a loop that never iterates it leaves
+            // `requestAnimationFrame` frozen after its first callbacks
+            // (timers and snapshots, on this loop's own sources, go on).
+            let context = glib::MainContext::default();
             let loop_context = context.clone();
             let up_reporter = up.clone();
             let alive = context
@@ -208,10 +213,8 @@ struct Page {
     /// Whether `audio.js` and its handler are installed.
     audio: bool,
     timer: Option<glib::SourceId>,
-    /// The page thread's main context, which holds `timer`; its id
-    /// removal looks only in a context's own sources, so drop finds it
-    /// here rather than through `g_source_remove`, which searches the
-    /// global default context and would warn.
+    /// The page thread's main context, which holds `timer`; drop finds
+    /// the source through it by id and destroys it.
     context: Option<glib::MainContext>,
     address: String,
     /// Whether the page is loaded, or unloaded while it isn't shown.
@@ -269,8 +272,14 @@ fn set_up(
     ));
 
     // A local page may fetch the files next to it, as on macOS.
+    //
+    // Software rendering, never the GPU compositor: a GtkOffscreenWindow
+    // has no GL context, so with accelerated compositing the view
+    // aborts on the Wayland backend ("GDK is not able to create a GL
+    // context") and stalls its frame handshake on X11.
     let settings = webkit2gtk::Settings::builder()
         .allow_file_access_from_file_urls(true)
+        .hardware_acceleration_policy(webkit2gtk::HardwareAccelerationPolicy::Never)
         .build();
     // With audio, a page may start its own sound without a click,
     // as on macOS.
@@ -356,12 +365,12 @@ fn set_up(
 
     // Snapshot at the frame rate, skipping a tick while one is in
     // flight (as on macOS). An unloaded page leaves one empty frame.
-    // The timer must be this thread's own main context, not glib's
-    // global default, which a daemon needs nothing of. The timer's
+    // The timer is on the page thread's main context (the default one,
+    // see [`page_thread`]), found through the thread. The timer's
     // closure is `Send`-bound, so no WebKit object goes in it: it looks
     // the page up by id in the thread's own map - same for the `Arc`
     // records, because only one thread ever runs any of it.
-    let context = glib::MainContext::thread_default().expect("the page thread's own main context");
+    let context = glib::MainContext::thread_default().unwrap_or_else(glib::MainContext::default);
     let loaded = Arc::new(AtomicBool::new(true));
     let cleared = Arc::new(AtomicBool::new(false));
     let busy = Arc::new(AtomicBool::new(false));
@@ -444,12 +453,18 @@ fn tick(
     }
     busy.store(true, Ordering::SeqCst);
     let (callback_pool, callback_sink, callback_reported) = (pool.clone(), sink.clone(), reported);
+    let callback_loaded = loaded;
     web.snapshot(
         SnapshotRegion::Visible,
         SnapshotOptions::TRANSPARENT_BACKGROUND,
         Option::<&webkit2gtk::gio::Cancellable>::None,
         move |snapshot: Result<cairo::Surface, glib::Error>| {
             busy.store(false, Ordering::SeqCst);
+            // A snapshot already in flight when the page was unloaded
+            // would put one stale frame after the empty one.
+            if !callback_loaded.load(Ordering::SeqCst) {
+                return;
+            }
             let drawn: Result<Option<LinuxFrame>> = match snapshot {
                 Ok(surface) => draw(&callback_pool, surface, width, height),
                 Err(err) => Err(err.into()),
