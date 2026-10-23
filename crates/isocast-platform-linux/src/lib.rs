@@ -522,37 +522,41 @@ impl Platform for LinuxPlatform {
     }
 
     /// L.3: what the machine plays, from the default output's *monitor*
-    /// ports (audio.rs), as stereo.
+    /// ports (audio.rs), as stereo. L.S1e: with an `exclude` (or
+    /// `exclude_own`), from every playback stream but those instead.
     fn capture_system_audio(
         &self,
         exclude: &[String],
         sink: AudioSink,
         exclude_own: bool,
     ) -> Result<(Self::Capture, u32)> {
-        // The default output's monitor carries every app's sound mixed,
-        // so leaving apps out needs per-stream links (the per-app step's
-        // way); recording what the setup said to leave out would be worse
-        // than not recording.
-        if !exclude.is_empty() {
-            bail!(
-                "exclude: leaving apps out of system audio is not available on Linux yet (the \
-                 output's monitor carries every app mixed); remove {exclude:?} from the source's \
-                 exclude, or record the apps you want as application audio sources"
+        // The default output's monitor hears everything on it, and cannot
+        // tell apps apart. With nothing to leave out it is the capture to
+        // use; with something, every playback stream but the excluded
+        // ones and Isocast's own is linked instead (audio.rs). That is
+        // sound before the output's own volume, as macOS's tap is.
+        if !exclude.is_empty() || exclude_own {
+            let (audio, channels) = audio::capture(
+                *self,
+                audio::Target::System {
+                    exclude: exclude.to_vec(),
+                },
+                2,
+                sink,
+            )
+            .context("capturing what the machine plays, leaving apps out")?;
+            isocast_diagnostics::debug!(
+                "system audio: every stream but {exclude:?} and Isocast's own: {channels} \
+                 channel(s)"
             );
+            return Ok((
+                Capture {
+                    _running: Running::Audio { _audio: audio },
+                },
+                channels,
+            ));
         }
         let output = system::default_output()?;
-        if exclude_own {
-            // What this process plays (monitoring) goes through the same
-            // sink, and a sink's monitor carries everything played on it.
-            // Exclusion is what the per-app step (linking a capture to
-            // every stream but ours) can do and this cannot; macOS gets
-            // it from ScreenCaptureKit.
-            isocast_diagnostics::diagnostic!(
-                "warn"; "system audio: monitoring is on, and what the machine plays is captured \
-                from {output}'s monitor, which carries Isocast's own monitoring too; the monitor \
-                is not filtered (docs/notes.md)"
-            );
-        }
         let (audio, channels) =
             audio::capture(*self, audio::Target::Output(output.clone()), 2, sink)
                 .with_context(|| format!("capturing what {output} plays"))?;

@@ -8,9 +8,10 @@
 //! session manager links it to the default output and moves it when that
 //! changes; a named output is the stream's `target.object`.
 //!
-//! The stream is a playback node like any app's, so a system-audio capture
-//! of the same output hears it too (see `capture_system_audio`'s
-//! `exclude_own`).
+//! The stream is a playback node like any app's, so a capture of the
+//! output's monitor hears it too. It carries [`crate::audio::OWNER_KEY`],
+//! which is how a system-audio capture that links streams (one with an
+//! `exclude`, or with `exclude_own`) leaves Isocast's own monitoring out.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -141,6 +142,7 @@ fn run(
         *pw::keys::APP_NAME => "Isocast",
         *pw::keys::NODE_NAME => "isocast monitor",
     };
+    props.insert(crate::audio::OWNER_KEY, std::process::id().to_string());
     if let Some(target) = &target {
         props.insert(*pw::keys::TARGET_OBJECT, target.as_str());
     }
