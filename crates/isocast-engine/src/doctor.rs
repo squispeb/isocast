@@ -150,7 +150,7 @@ pub fn doctor<P: Platform>(
             format!(
                 "; {} distinct buffers in {} pools ({} out now, at most {} at once, limit {} per pool)",
                 budget["distinct_buffers"],
-                budget["pools"],
+                budget["pool_count"],
                 budget["in_use"],
                 budget["peak_in_use"],
                 budget["physical_limit"]

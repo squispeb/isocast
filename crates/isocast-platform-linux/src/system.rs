@@ -426,16 +426,13 @@ pub(crate) fn calibration_priority() -> Option<&'static str> {
     (status == 0).then_some("nice 15")
 }
 
-/// What calibration's measurements are filed under: `ffmpeg-nvenc` when
-/// this box's NVENC lists HEVC (the encoder the fit cells record with),
-/// else plain `ffmpeg`. Not `videotoolbox`, so the capacity fit, which is
-/// fitted for Apple's engines, never takes these rows as its input.
+/// What calibration's measurements are filed under: plain `ffmpeg`, since
+/// the rows mix NVENC and software encoders (ProRes is `prores_ks`); each
+/// row's `hardware_accelerated` says which. Not `videotoolbox`, so the
+/// capacity fit, which is fitted for Apple's engines, never takes these
+/// rows as its input.
 pub(crate) fn encoder_backend() -> &'static str {
-    if hardware_encoders().iter().any(|name| name == "hevc_nvenc") {
-        "ffmpeg-nvenc"
-    } else {
-        "ffmpeg"
-    }
+    "ffmpeg"
 }
 
 /// Whether an FFmpeg encoder name is a hardware encoder, by its family

@@ -1582,11 +1582,6 @@ mod tests {
             .collect()
     }
 
-    /// A block a full queue refused is owed, and goes in as silence
-    /// ahead of the next block that fits: the raw pipe carries no
-    /// timestamps, so without that every later sample would move
-    /// earlier and the file's sound would drift out of sync with its
-    /// video for the rest of the take.
     #[test]
     fn progress_report_lines_give_the_picture_count() {
         assert_eq!(progress_frames("frame=42\n"), Some(42));
@@ -1615,6 +1610,11 @@ mod tests {
         assert!(depth_args(&encoder(Codec::Prores422, 10), "prores_ks").is_empty());
     }
 
+    /// A block a full queue refused is owed, and goes in as silence
+    /// ahead of the next block that fits: the raw pipe carries no
+    /// timestamps, so without that every later sample would move
+    /// earlier and the file's sound would drift out of sync with its
+    /// video for the rest of the take.
     #[test]
     fn refused_samples_are_owed_as_silence() {
         let (mut pipe, blocks) = pipe(1);

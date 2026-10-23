@@ -290,7 +290,7 @@ pub(crate) fn diagnostics() -> serde_json::Value {
     }
     serde_json::json!({
         "invariant": within,
-        "pools": count,
+        "pool_count": count,
         "distinct_buffers": distinct,
         "in_use": in_use,
         "peak_in_use": peak,

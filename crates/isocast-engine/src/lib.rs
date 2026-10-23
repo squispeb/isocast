@@ -251,7 +251,7 @@ pub trait Platform: Clone + Send + Sync + 'static {
     }
 
     /// The native encoder backend a calibration measurement names
-    /// (`videotoolbox`, `ffmpeg-nvenc`). Capacity estimates trust only the
+    /// (`videotoolbox`, `ffmpeg`). Capacity estimates trust only the
     /// backends they were fitted for, so a new name here is evidence in
     /// `machine show`, not an input to admission.
     fn encoder_backend(&self) -> &'static str {

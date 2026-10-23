@@ -74,13 +74,17 @@ impl Calibration {
 
     fn stop(&mut self, reason: &str) -> anyhow::Result<()> {
         if let Some(child) = self.child.as_mut() {
+            // The helper's ffmpeg children share its process group: end
+            // them even when the helper itself has already exited.
+            #[cfg(target_os = "linux")]
+            // SAFETY: signals the helper's own process group (it is the
+            // leader: `process_group(0)` at spawn, and the group id cannot
+            // be reused before the leader is reaped below), never ours.
+            // ESRCH, an empty group, is ignored.
+            unsafe {
+                libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+            }
             if child.try_wait()?.is_none() {
-                #[cfg(target_os = "linux")]
-                // SAFETY: signals the helper's own process group (it is the
-                // leader: `process_group(0)` at spawn), never ours.
-                unsafe {
-                    libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
-                }
                 child.kill()?;
             }
             // Reap before permitting recording: an orphan encoder would
