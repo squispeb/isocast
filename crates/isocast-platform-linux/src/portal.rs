@@ -188,93 +188,195 @@ impl Turn {
 pub(crate) fn choice() -> Option<String> {
     let token = keychain::get(TOKEN.0, TOKEN.1).ok().flatten()?;
     let conn = Connection::session().ok()?;
+    let data = restore_data(&conn, &token)?;
+    describe_choice(&data)
+}
+
+/// The portal's record of a restore token: the backend's restore data.
+fn restore_data(conn: &Connection, token: &str) -> Option<OwnedValue> {
     let reply = conn
         .call_method(
-            Some("org.freedesktop.impl.portal.PermissionStore"),
-            "/org/freedesktop/impl/portal/PermissionStore",
-            Some("org.freedesktop.impl.portal.PermissionStore"),
+            Some(PERMISSION_STORE),
+            PERMISSION_STORE_PATH,
+            Some(PERMISSION_STORE),
             "Lookup",
-            &("screencast", token.as_str()),
+            &(SCREENCAST_TABLE, token),
         )
         .ok()?;
     let body = reply.body();
     let (_, data): (HashMap<String, Vec<String>>, OwnedValue) = body.deserialize().ok()?;
-    describe_choice(&data)
+    Some(data)
+}
+
+const PERMISSION_STORE: &str = "org.freedesktop.impl.portal.PermissionStore";
+const PERMISSION_STORE_PATH: &str = "/org/freedesktop/impl/portal/PermissionStore";
+const SCREENCAST_TABLE: &str = "screencast";
+
+/// Share a remembered "region" that is the whole of its output as the
+/// output itself. xdg-desktop-portal-hyprland restores a choice that has a
+/// `geometry` as a region capture (wlr-screencopy capture_output_region),
+/// and Hyprland 0.56 keeps one capture session per region, matching the
+/// box asked for (layout coordinates) against the one it stored (pixels):
+/// on a scaled monitor nothing matches, so every frame of the share leaves
+/// a session behind that the compositor walks on every frame it draws,
+/// until it restarts (docs/notes.md, 2026-10-24). The picker records "the
+/// whole screen" that way. Without the geometry the same share is an
+/// output capture, which keeps one session. Runs inside a `Turn`, before
+/// the token is presented; returns whether the record was changed.
+fn share_whole_output(conn: &Connection, token: &str) -> Result<bool> {
+    let Some(data) = restore_data(conn, token) else {
+        return Ok(false);
+    };
+    let Some(record) = HyprlandRecord::read(&data) else {
+        return Ok(false);
+    };
+    let Some((x, y, w, h)) = record.region() else {
+        return Ok(false);
+    };
+    let Some(output) = record.text("output") else {
+        return Ok(false);
+    };
+    let monitor = crate::hyprland::monitors()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|m| m.name == output);
+    if (x, y) != (0, 0) || !monitor.as_ref().is_some_and(|m| covers(m, w, h)) {
+        if monitor.is_some_and(|m| m.scale != 1.0) {
+            isocast_diagnostics::diagnostic!(
+                "warn";
+                "screen sharing: the remembered choice is a {w}x{h} region of {output}, which is \
+                 scaled; Hyprland 0.56 slows down with every frame of a region share on a scaled \
+                 monitor until it restarts. Choose the whole screen instead (Choose again… in \
+                 the app, or `isocast permissions --reset` then `--request screen_recording`)"
+            );
+        }
+        return Ok(false);
+    }
+    let rewritten = record.without_geometry()?;
+    conn.call_method(
+        Some(PERMISSION_STORE),
+        PERMISSION_STORE_PATH,
+        Some(PERMISSION_STORE),
+        "SetValue",
+        &(SCREENCAST_TABLE, false, token, rewritten),
+    )
+    .context("rewriting the remembered screen choice in the portal's permission store")?;
+    Ok(true)
+}
+
+/// Whether a `w`x`h` box in layout coordinates is all of the monitor.
+fn covers(monitor: &crate::hyprland::Monitor, w: u32, h: u32) -> bool {
+    let logical = |pixels: u32| (f64::from(pixels) / monitor.scale).round() as u32;
+    logical(monitor.width).abs_diff(w) <= 1 && logical(monitor.height).abs_diff(h) <= 1
 }
 
 /// xdg-desktop-portal-hyprland's restore data: `(backend, version, a{sv})`
 /// with the output, a window, or a region of an output (`geometry`, in
 /// layout coordinates).
-fn describe_choice(data: &Value<'_>) -> Option<String> {
-    let data = match data {
-        Value::Value(inner) => inner.as_ref(),
-        other => other,
-    };
-    let Value::Structure(record) = data else {
-        return None;
-    };
-    let fields = record.fields();
-    let details = match fields.get(2)? {
-        Value::Value(inner) => inner.as_ref(),
-        other => other,
-    };
-    let Value::Dict(details) = details else {
-        return None;
-    };
-    let get = |key: &str| {
-        details
+struct HyprlandRecord<'a> {
+    fields: &'a [Value<'a>],
+    details: &'a zbus::zvariant::Dict<'a, 'a>,
+}
+
+impl<'a> HyprlandRecord<'a> {
+    fn read(data: &'a Value<'a>) -> Option<Self> {
+        let Value::Structure(record) = unwrap(data) else {
+            return None;
+        };
+        let fields = record.fields();
+        let Value::Dict(details) = unwrap(fields.get(2)?) else {
+            return None;
+        };
+        (fields.len() == 3).then_some(Self { fields, details })
+    }
+
+    /// The same record, `(su a{sv})` as the backend wrote it, without its
+    /// `geometry`.
+    fn without_geometry(&self) -> Result<Value<'static>> {
+        let (Value::Str(backend), Value::U32(version)) =
+            (unwrap(&self.fields[0]), unwrap(&self.fields[1]))
+        else {
+            bail!("the portal's record of the screen choice is not (backend, version, details)");
+        };
+        let mut details: HashMap<String, Value<'static>> = HashMap::new();
+        for (name, value) in self.details.iter() {
+            if let Value::Str(name) = name
+                && name.as_str() != "geometry"
+            {
+                details.insert(name.to_string(), unwrap(value).try_to_owned()?.into());
+            }
+        }
+        Ok(Value::from(Structure::from((
+            backend.to_string(),
+            *version,
+            Value::from(details),
+        ))))
+    }
+
+    fn get(&self, key: &str) -> Option<&'a Value<'a>> {
+        self.details
             .iter()
             .find(|(name, _)| matches!(name, Value::Str(name) if name.as_str() == key))
-            .map(|(_, value)| match value {
-                Value::Value(inner) => inner.as_ref(),
-                other => other,
+            .map(|(_, value)| unwrap(value))
+    }
+
+    fn text(&self, key: &str) -> Option<String> {
+        match self.get(key) {
+            Some(Value::Str(text)) if !text.is_empty() => Some(text.to_string()),
+            _ => None,
+        }
+    }
+
+    fn region(&self) -> Option<(u32, u32, u32, u32)> {
+        let Some(Value::Structure(geometry)) = self.get("geometry") else {
+            return None;
+        };
+        let numbers: Vec<u32> = geometry
+            .fields()
+            .iter()
+            .filter_map(|field| match field {
+                Value::U32(n) => Some(*n),
+                _ => None,
             })
-    };
-    let text = |key: &str| match get(key) {
-        Some(Value::Str(text)) if !text.is_empty() => Some(text.to_string()),
-        _ => None,
-    };
-    let cursor = match get("withCursor") {
+            .collect();
+        match numbers[..] {
+            [x, y, w, h] => Some((x, y, w, h)),
+            _ => None,
+        }
+    }
+}
+
+/// A variant's content (the store wraps values in variants, sometimes twice).
+fn unwrap<'a>(value: &'a Value<'a>) -> &'a Value<'a> {
+    match value {
+        Value::Value(inner) => unwrap(inner),
+        other => other,
+    }
+}
+
+fn describe_choice(data: &Value<'_>) -> Option<String> {
+    let record = HyprlandRecord::read(data)?;
+    let cursor = match record.get("withCursor") {
         Some(Value::U32(2)) => ", with the cursor",
         Some(Value::U32(_)) => ", without the cursor",
         _ => "",
     };
-    let chosen = match get("timeIssued") {
+    let chosen = match record.get("timeIssued") {
         Some(Value::U64(at)) => format!(", chosen {}", local_time(*at)),
         _ => String::new(),
     };
-    if let Some(class) = text("windowClass") {
+    if let Some(class) = record.text("windowClass") {
         return Some(format!("a window of {class}{cursor}{chosen}"));
     }
-    let output = text("output")?;
-    let region = match get("geometry") {
-        Some(Value::Structure(geometry)) => {
-            let numbers: Vec<u32> = geometry
-                .fields()
-                .iter()
-                .filter_map(|field| match field {
-                    Value::U32(n) => Some(*n),
-                    _ => None,
-                })
-                .collect();
-            match numbers[..] {
-                [x, y, w, h] => Some((x, y, w, h)),
-                _ => None,
-            }
-        }
-        _ => None,
-    };
+    let output = record.text("output")?;
     let whole = |w: u32, h: u32| {
         crate::hyprland::monitors()
             .unwrap_or_default()
             .iter()
             .find(|m| m.name == output)
-            .is_some_and(|m| {
-                let logical = |pixels: u32| (f64::from(pixels) / m.scale).round() as u32;
-                logical(m.width).abs_diff(w) <= 1 && logical(m.height).abs_diff(h) <= 1
-            })
+            .is_some_and(|m| covers(m, w, h))
     };
-    Some(match region {
+    Some(match record.region() {
         Some((x, y, w, h)) if (x, y) != (0, 0) || !whole(w, h) => {
             format!("a {w}x{h} region of {output} at {x},{y}{cursor}{chosen}")
         }
@@ -345,6 +447,18 @@ impl Portal {
             .ok()
             .flatten()
             .filter(|token| !token.is_empty());
+        if let Some(token) = token.as_deref() {
+            match share_whole_output(&self.conn, token) {
+                Ok(true) => isocast_diagnostics::diagnostic!(
+                    "info";
+                    "screen sharing: the remembered whole-screen region is now shared as the \
+                     output (a region share costs Hyprland 0.56 a session every frame on a \
+                     scaled monitor)"
+                ),
+                Ok(false) => {}
+                Err(err) => isocast_diagnostics::diagnostic!("warn"; "screen sharing: {err:#}"),
+            }
+        }
         let session = self.new_session()?;
         let shared = self
             .select_sources(&session, cursor, token.as_deref())
@@ -648,6 +762,38 @@ mod tests {
             describe_choice(&record).as_deref(),
             Some("a window of foot")
         );
+    }
+
+    /// A whole-screen region goes back to the store as the backend wrote
+    /// it, `(su a{sv})`, without the geometry: xdg-desktop-portal-hyprland
+    /// treats any other shape as no record and shows its picker.
+    #[test]
+    fn without_geometry_keeps_the_record_shape() {
+        let details: HashMap<&str, Value> = HashMap::from([
+            ("output", Value::from("DP-3")),
+            ("withCursor", Value::from(2u32)),
+            ("timeIssued", Value::from(1792848863u64)),
+            (
+                "geometry",
+                Value::from(Structure::from((0u32, 0u32, 2048u32, 1152u32))),
+            ),
+        ]);
+        let stored = Value::Value(Box::new(Value::from(Structure::from((
+            "hyprland",
+            3u32,
+            Value::from(details),
+        )))));
+        let record = HyprlandRecord::read(&stored).unwrap();
+        let rewritten = record.without_geometry().unwrap();
+        assert_eq!(rewritten.value_signature().to_string(), "(suv)");
+        let again = HyprlandRecord::read(&rewritten).unwrap();
+        assert_eq!(again.region(), None);
+        assert_eq!(again.text("output").as_deref(), Some("DP-3"));
+        assert!(matches!(again.get("withCursor"), Some(Value::U32(2))));
+        assert!(matches!(
+            again.get("timeIssued"),
+            Some(Value::U64(1792848863))
+        ));
     }
 
     /// A request that came back with no streams at all is not a node.
