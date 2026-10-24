@@ -5,6 +5,71 @@ each section. Delete entries that stop being true.
 
 ## Linux port progress (2026-10-23, parity workflow: L.2b, L.6c-g, L.S1b, L.S1d, L.S1e)
 
+- 2026-10-24 (root cause found, desktop pacing; corrects the bullet
+  below): the leaked sessions were Isocast's own screen shares. The
+  restore token Isocast kept was recorded by the picker as a region
+  covering all of DP-3 (`geometry 0 0 2048 1152`, layout px; the
+  monitor is 2560x1440 at scale 1.25). xdph 1.4.1 restores any choice
+  with a geometry as wlr-screencopy `capture_output_region`, and
+  Hyprland 0.56.2's getManagedSession(SHARE_REGION) compares the box
+  asked for (layout coordinates) with the one it stored after scaling
+  to pixels (ScreenshareSession init), so on a scaled monitor nothing
+  matches: every frame makes a new managed session, never stopped until
+  the monitor disconnects. Measured on the fresh session: Hyprland's
+  event socket showed 2,055 `screencast>>1,region` in 30 s with two
+  screen sources (one per frame); bare Hyprland went from 7% CPU (no
+  Screenshare symbols) to 21-24% within ~6 minutes of casting and stayed
+  there with Isocast stopped; with all inputs on air it took 83%.
+  Nested proof (target/scratch/nested/scaled.lua, `REGION=x,y,w,h
+  leaker wlrloop 300 1`): scale 1.25, region = whole logical output ->
+  300 sessions for 300 frames; plain capture_output -> 1; same loop at
+  scale 1 -> 1. Fixed in 4487e3e (portal.rs `share_whole_output`):
+  before presenting the token, a geometry that is the whole output is
+  dropped from the portal's record (PermissionStore.SetValue, same
+  `(su a{sv})`), so xdph restores an output capture; a real partial
+  region on a scaled monitor only warns. Verified live: a 35 s run made
+  one `monitor` session and no `region` ones. Gotcha: a record written
+  as `(vvv)` is treated as missing (xdph shows the picker, and the
+  portal deletes the token); the unit test guards the shape. The
+  already-leaked sessions stay until Hyprland restarts (or, untested,
+  DP-3 disconnects: a monitor power cycle should stop them, per
+  ScreenshareSession's monitorDestroyed listener).
+- 2026-10-24 (validated, desktop pacing; target not met, the leak above
+  is in the live compositor): fresh session, bare desktop 165.0
+  frames/s, max gap 10.3 ms, Hyprland 7%. Phases with the app on
+  workspace 3, shown (r2/phase.sh; Hyprland/daemon/app CPU):
+  open 165.0 / 7.9 ms (6/6/4%); + camera & mic 164.1-164.8, one 63.8 ms
+  stall, else <=12.9 ms (9/17/5%); + window 165.0 / 11.4 ms (14/17/11%);
+  + page 165.1 / 12.5 ms (29/61/11%: the owner's display source "main"
+  was casting since 13:23:47Z, leaking); + screen (two casts) 163.5,
+  min 158 / 15.8 ms (46/66/7%). Preview 60/60 shown/received
+  throughout, program feed 60 fps. Gaps of 12.1-13 ms are one missed
+  vblank (2 x 6.06 ms). After the leak, same phases (app hidden):
+  162.8 / 19.0 ms (38%), 142.8 / 19.0 (46%), 151.4 / 17.9 (53%),
+  110.9 / 31.1 ms (73% Hyprland). After Ryan picked the screen again
+  (08:51, a plain output record) with 4487e3e: all four inputs + screen
+  118.1 / 30.3 ms (Hyprland 81%, daemon 64%), 180 s steady 91.0
+  frames/s, max gap 204 ms, 183 of 185 s with a gap over 12 ms; and 0
+  `region` sessions over those ~4 minutes (68/s before), so the leak
+  no longer grows but the leaked sessions keep costing. Preview 60/60
+  and program 60 fps throughout; a 60 s take of the live setup: HEVC
+  1920x1080 60/1, 3600 frames in 60.000 s, 0 dropped, 0 repeated. The
+  share picker (hyprland-preview-share-picker) opened and answered
+  without crashing on the fresh session. Scripts: r2/gen.py now removes the
+  sources it does not want (merge patches merge lists by id: an empty
+  `sources` list removes nothing; `GEN=g013 r2/phase.sh LABEL`), and
+  r2/app.sh and meas.sh find the live instance and pid themselves.
+- 2026-10-24 (gotcha): a stopped nested Hyprland leaves its directory
+  under $XDG_RUNTIME_DIR/hypr, so "the newest instance" can be a dead
+  one. A daemon started with that HYPRLAND_INSTANCE_SIGNATURE lists no
+  displays (`no display matches "DP-3"; valid: "main", ` with nothing
+  after), because hyprland.rs and its hyprctl fallback both use the
+  environment. Pick the instance whose hyprland.lock holds `pgrep -o -x
+  Hyprland`.
+- 2026-10-24 (gotcha): a new window opens on the focused workspace,
+  including the owner's named workspace "E" (T3 Code). After starting
+  the app, move it: `hyprctl dispatch 'hl.dsp.window.move({ workspace =
+  "3", follow = false, window = "address:0x..." })'`.
 - 2026-10-23 (root cause, desktop pacing; replaces the round-1 "open,
   desktop pacing" bullet): Hyprland 0.56.2 leaks screencopy sessions, and
   the leaked ones cost it on every frame. Profiled with a passive
@@ -27,7 +92,9 @@ each section. Delete entries that stop being true.
   screencopy clients here: the share picker (37 prompts and 34 crashes
   today, mostly Isocast's retries) and other screen tools; Isocast itself
   uses ext-image-copy-capture and the portal, which leak nothing
-  (tested). Effect: the desktop cannot hold 165 Hz even bare (131-143
+  (tested). Wrong for the portal (2026-10-24, above): a share restored
+  from a whole-screen region token leaked one session per frame.
+  Effect: the desktop cannot hold 165 Hz even bare (131-143
   frames/s, gaps 16-22 ms), and every surface or capture added costs
   far more than it should, because each texture draw pays one walk. Only
   restarting Hyprland clears it (see Waiting on Ryan).
@@ -2774,21 +2841,23 @@ isocast-platform-linux gpu` once the modules exist.
 
 ## Waiting on Ryan
 
-- 2026-10-23 (Hyprland in safe mode, and its leaked screencopy
-  sessions): the live session runs `Hyprland --safe-mode` since the
-  2026-10-22 22:10 crash (see the incident note above), and that same
-  Hyprland now holds thousands of leaked monitor screencopy sessions
-  that cost it most of a core (Linux section, "root cause, desktop
-  pacing"). Agents may not restart it. Log out and back in (or reboot):
-  it brings the normal config back and clears the leak. It blocks the
-  owner's "160 frames/s, gaps under 12 ms" target, which the bare
-  desktop misses today. Retry check: `pgrep -a Hyprland` shows no
-  `--safe-mode`, then with the app on air run
-  `target/scratch/prof/sample $(pgrep -x Hyprland) 5 1000 > /tmp/h.txt;
-  python3 target/scratch/prof/sym.py $(pgrep -x Hyprland) /tmp/h.txt`
-  (expect no Screenshare:: symbols near the top) and
-  `target/scratch/r2/meas.sh check 15` with unit isocast-presprobe
-  running.
+- 2026-10-24 (desktop pacing; replaces the 2026-10-23 "safe mode"
+  entry, which the reboot resolved): clear the screencopy sessions
+  Hyprland leaked this morning, before 4487e3e (bare Hyprland 21-24%
+  CPU instead of 7%; desktop 91-118 frames/s with all inputs on air).
+  Log out and back in, or (untested, cheaper) power-cycle the DP-3
+  monitor so Hyprland sees it disconnect. Isocast no longer adds to the
+  leak, and the screen choice is already re-picked (08:51, a plain
+  output record). Blocks the "160 frames/s, gaps under 12 ms" target.
+  Retry check: `target/scratch/prof/sample $(pgrep -o -x Hyprland) 5
+  1000 > /tmp/h.txt; python3 target/scratch/prof/sym.py $(pgrep -o -x
+  Hyprland) /tmp/h.txt` (no Screenshare:: near the top, ~300 samples);
+  then from target/scratch/r2, with unit isocast-presprobe running,
+  `./app.sh start`, move the window to workspace 3, and
+  `GEN=0 ./phase.sh p1`, `GEN=1`, `GEN=2`, `GEN=3`, `GEN=4`, then
+  `SETTLE=1 SECS=180 ./phase.sh steady`; while it runs, `socat -u
+  UNIX-CONNECT:$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket2.sock
+  - | grep -c 'screencast>>1,region'` must stay 0.
 - 2026-10-16 (L.2's one real take): the desktop's screen-sharing picker
   needs one click from Ryan, and that is the last step of L.2. A
   source's open is engine-bounded to 8 s (`bounded_open`), which is not
